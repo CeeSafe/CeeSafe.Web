@@ -1,0 +1,99 @@
+// OwnedBuffer and BufferPool (Web ADR 0001 §3.1): the readable window, limits, compaction, recycling by move.
+import web_core;
+
+fn show(label: StringView, ok: bool) {
+    Console.write(label);
+    Console.writeLine(if (ok) " ok" else " FAILED");
+}
+
+fn isLimit(r: Result<void, NetError>) -> bool => match (r) {
+    Err(NetError.LimitExceeded) => true,
+    _ => false,
+};
+
+fn isOk(r: Result<void, NetError>) -> bool => match (r) {
+    Ok() => true,
+    Err(_) => false,
+};
+
+fn sameBytes(a: Slice<u8>, b: StringView) -> bool {
+    let bb = b.bytes();
+    if (a.length != bb.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != bb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn windows() -> Result<void, AllocError> {
+    var b = OwnedBuffer.create(8)?;
+    show("new: capacity 8, empty, 8 spare", b.capacity() == 8 && b.isEmpty() && b.spareLength() == 8);
+
+    // A read of 5 bytes into spare(), then commit.
+    let spare = b.spare();
+    let src = "hello".bytes();
+    for (i in 0..src.length) {
+        spare[i] = src[i];
+    }
+    show("commit 5", isOk(b.commit(5)));
+    show("readable is hello", sameBytes(b.readable(), "hello") && b.length() == 5 && b.spareLength() == 3);
+    show("commit past capacity refused", isLimit(b.commit(4)));
+    show("refused commit changed nothing", b.length() == 5);
+
+    show("consume 2", isOk(b.consume(2)));
+    show("readable is llo", sameBytes(b.readable(), "llo"));
+    show("consume past readable refused", isLimit(b.consume(4)));
+
+    // 3 spare at the end; appending 4 needs the 2 consumed bytes: compaction makes room.
+    show("append 4 compacts", isOk(b.append("!!!?".bytes())));
+    show("readable is llo!!!?", sameBytes(b.readable(), "llo!!!?") && b.spareLength() == 1);
+    show("append past capacity refused", isLimit(b.append("ab".bytes())));
+    show("refused append changed nothing", sameBytes(b.readable(), "llo!!!?"));
+
+    show("consume all resets window", isOk(b.consume(7)) && b.isEmpty() && b.spareLength() == 8);
+    show("append exactly capacity", isOk(b.append("12345678".bytes())) && b.spareLength() == 0);
+    b.clear();
+    show("clear", b.isEmpty() && b.spareLength() == 8);
+
+    var z = OwnedBuffer.create(0)?;
+    show("zero capacity", z.capacity() == 0 && z.spareLength() == 0 && isLimit(z.append("x".bytes())));
+    show("empty append on zero capacity", isOk(z.append("".bytes())));
+    return Ok();
+}
+
+fn pool() -> Result<void, AllocError> {
+    var p = BufferPool.create(16, 2);
+    show("pool starts idle 0", p.idle() == 0 && p.bufferSize() == 16);
+    var a = p.take()?;
+    let b = p.take()?;
+    let c = p.take()?;
+    show("taken buffers have the pool's size", a.capacity() == 16 && b.capacity() == 16 && c.capacity() == 16);
+    show("append before give", isOk(a.append("data".bytes())));
+    p.give(a);
+    show("given back", p.idle() == 1);
+    var again = p.take()?;
+    show("recycled buffer is empty", again.isEmpty() && again.capacity() == 16 && p.idle() == 0);
+    p.give(again);
+    p.give(b);
+    p.give(c);
+    show("maxIdle keeps 2", p.idle() == 2);
+    let other = OwnedBuffer.create(32)?;
+    p.give(other);
+    show("other size freed, not kept", p.idle() == 2);
+    return Ok();
+}
+
+fn main() {
+    match (windows()) {
+        Ok() => {}
+        Err(_) => { Console.writeLine("windows: out of memory"); }
+    }
+    match (pool()) {
+        Ok() => {}
+        Err(_) => { Console.writeLine("pool: out of memory"); }
+    }
+}

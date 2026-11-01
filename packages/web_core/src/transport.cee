@@ -1,0 +1,156 @@
+// web_core transports (Web ADR 0001 §3.2-3.6): the byte stream every protocol driver reads and writes.
+
+/// The application protocol agreed for a connection (TLS ALPN, Web ADR 0002 §3.3).
+public enum Alpn {
+    /// None was negotiated (plain TCP, or TLS without ALPN).
+    None,
+    /// `http/1.1`.
+    Http11,
+    /// `h2`.
+    Http2,
+    /// Something else the peer and the configuration agreed on.
+    Other,
+}
+
+/// Up to four byte ranges written as one vectored step (Web ADR 0001 §3.2). A struct of slots, because CeeSafe v0
+/// has no slices of slices (N0246). Unused slots are empty.
+public struct IoParts<region r> {
+    private a: Slice<r, u8>;
+    private b: Slice<r, u8>;
+    private c: Slice<r, u8>;
+    private d: Slice<r, u8>;
+    private count: u32;
+
+    /// One part.
+    public fn one(a: Slice<r, u8>) -> IoParts<r> {
+        let e = a[0..0];
+        return IoParts { a: a, b: e, c: e, d: e, count: 1 };
+    }
+
+    /// Two parts, in order.
+    public fn two(a: Slice<r, u8>, b: Slice<r, u8>) -> IoParts<r> {
+        let e = a[0..0];
+        return IoParts { a: a, b: b, c: e, d: e, count: 2 };
+    }
+
+    /// Three parts, in order.
+    public fn three(a: Slice<r, u8>, b: Slice<r, u8>, c: Slice<r, u8>) -> IoParts<r> {
+        let e = a[0..0];
+        return IoParts { a: a, b: b, c: c, d: e, count: 3 };
+    }
+
+    /// Four parts, in order.
+    public fn four(a: Slice<r, u8>, b: Slice<r, u8>, c: Slice<r, u8>, d: Slice<r, u8>) -> IoParts<r> =>
+        IoParts { a: a, b: b, c: c, d: d, count: 4 };
+
+    /// How many parts it has (1 to 4).
+    public fn parts(borrow this) -> u32 => this.count;
+
+    /// Part `i` (0-based); empty past the last part.
+    public fn part(borrow this, i: u32) -> Slice<r, u8> {
+        if (i == 0) {
+            return this.a;
+        }
+        if (i == 1 && this.count > 1) {
+            return this.b;
+        }
+        if (i == 2 && this.count > 2) {
+            return this.c;
+        }
+        if (i == 3 && this.count > 3) {
+            return this.d;
+        }
+        return this.a[0..0];
+    }
+
+    /// The total number of bytes.
+    public fn totalLength(borrow this) -> usize {
+        var n: usize = 0;
+        for (i in 0..this.count) {
+            n += this.part(truncate<u32>(i)).length;
+        }
+        return n;
+    }
+}
+
+/// An async byte stream with explicit close semantics (Web ADR 0001 §3.2). The transport owns its socket: dropping it
+/// closes at once. Implementations are concrete types (TCP, TLS, mock); drivers use them as `borrow mut dyn
+/// Transport`, and a connection holds one as `Box<dyn Transport>` (§3.3).
+public interface Transport {
+    /// Reads at least one byte into `buffer`, or returns 0 at the end of the stream. An empty `buffer` is
+    /// `Err(LimitExceeded)` without I/O. A read the kernel completed before a cancellation keeps its bytes (§3.4).
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError>;
+
+    /// Writes every byte, or fails. After a failure or a cancellation the transport is poisoned: later writes return
+    /// `Err(Closed)`, and the connection must be closed (§3.4).
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError>;
+
+    /// One vectored step: writes from the parts in order and returns how many bytes it wrote (at least 1 if any were
+    /// given), possibly fewer than all. Poisoning is as for `write`.
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError>;
+
+    /// Ends this side's writing (TCP FIN; TLS close_notify, then FIN). Reading still works.
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError>;
+
+    /// The application protocol agreed for this connection. Declared without effects, so async code may call it
+    /// through `dyn Transport` (an undeclared method there counts as possibly blocking, N0295).
+    @effects()
+    fn alpn(borrow this) -> Alpn;
+}
+
+/// Helpers over any transport.
+public struct Transports {
+    /// Writes every byte of `parts`, looping over `writeVectored`'s partial steps. A part left half written is
+    /// finished with `write`, so each step starts at a part's boundary.
+    public async fn writeAllVectored(t: borrow mut dyn Transport, parts: borrow IoParts) -> Result<void, NetError> {
+        let total = parts.totalLength();
+        if (total == 0) {
+            return Ok();
+        }
+        let wrote = await t.writeVectored(parts)?;
+        if (wrote == 0) {
+            return Err(NetError.Closed); // a step that writes nothing would loop for ever
+        }
+        if (wrote > total) {
+            return Err(NetError.LimitExceeded); // the transport broke its contract
+        }
+        // Finish the rest with whole writes, from where the step stopped.
+        var skip = wrote;
+        for (i in 0..parts.parts()) {
+            let p = parts.part(truncate<u32>(i));
+            if (skip >= p.length) {
+                skip -= p.length;
+            } else {
+                await t.write(p[skip..])?;
+                skip = 0;
+            }
+        }
+        return Ok();
+    }
+
+    /// Closes gracefully: ends writing, then reads (into `scratch`, discarding) until the peer ends its side or
+    /// `deadline` passes. Dropping the transport afterwards closes the socket. `Err(TimedOut)` if the peer did not
+    /// finish in time.
+    public async fn closeGracefully(
+        t: borrow mut dyn Transport,
+        scratch: SliceMut<u8>,
+        deadline: Deadline,
+    ) -> Result<void, NetError> {
+        await t.shutdownWrite()?;
+        let r: Result<Raced<u32>, NetError> = await Async.race(
+            async () => {
+                loop {
+                    let n = await t.read(scratch)?;
+                    if (n == 0) {
+                        return Ok(0u32);
+                    }
+                }
+            },
+            async () => await deadlineElapsed<u32>(deadline),
+        );
+        match (r) {
+            Ok(_) => { return Ok(); }
+            Err(e) => { return Err(e); }
+        }
+    }
+}

@@ -1,0 +1,58 @@
+// NetErrors (Web ADR 0001 §3.2): conversions from AsyncError, IoError and AllocError, and descriptions.
+import web_core;
+
+fn show(label: StringView, ok: bool) {
+    Console.write(label);
+    Console.writeLine(if (ok) " ok" else " FAILED");
+}
+
+fn same(a: StringView, b: StringView) -> bool {
+    let x = a.bytes();
+    let y = b.bytes();
+    if (x.length != y.length) {
+        return false;
+    }
+    for (i in 0..x.length) {
+        if (x[i] != y[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn main() {
+    show("cancelled", match (NetErrors.fromAsync(AsyncError.Cancelled)) {
+        NetError.Cancelled => true,
+        _ => false,
+    });
+    show("timed out", match (NetErrors.fromAsync(AsyncError.TimedOut)) {
+        NetError.TimedOut => true,
+        _ => false,
+    });
+    show("broken pipe is closed", match (NetErrors.fromAsync(AsyncError.Io(IoError.BrokenPipe))) {
+        NetError.Closed => true,
+        _ => false,
+    });
+    show("io out of memory", match (NetErrors.fromIo(IoError.OutOfMemory)) {
+        NetError.OutOfMemory => true,
+        _ => false,
+    });
+    show("refused stays io", match (NetErrors.fromIo(IoError.ConnectionRefused)) {
+        NetError.Io(IoError.ConnectionRefused) => true,
+        _ => false,
+    });
+    show("other errno kept", match (NetErrors.fromIo(IoError.Other(5))) {
+        NetError.Io(IoError.Other(5)) => true,
+        _ => false,
+    });
+    show("alloc", match (NetErrors.fromAlloc(AllocError.OutOfMemory)) {
+        NetError.OutOfMemory => true,
+        _ => false,
+    });
+    show("describe reset", same(NetErrors.describe(NetError.Reset), "connection reset by peer"));
+    show("describe tls", same(NetErrors.describe(NetError.Tls(TlsReason.Certificate)), "TLS certificate rejected"));
+    show("describe io uses the platform text", same(
+        NetErrors.describe(NetError.Io(IoError.ConnectionRefused)),
+        IoError.ConnectionRefused.message(),
+    ));
+}

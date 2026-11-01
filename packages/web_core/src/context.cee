@@ -1,0 +1,27 @@
+// web_core connection context (Web ADR 0001 §3.6): what a connection task knows about its connection.
+
+/// A connection's identity and timing, owned by its connection task and lent to handlers. M1 adds the peer and local
+/// addresses (with CeeSafe's SocketAddress, upstream U1) and the drain signal of graceful shutdown.
+public struct ConnectionContext {
+    private number: u64;
+    private acceptedAt: u64;
+
+    /// The context of connection `id`, accepted at `acceptedAt` on `Timer.now()`'s clock.
+    public fn create(id: u64, acceptedAt: u64) -> ConnectionContext =>
+        ConnectionContext { number: id, acceptedAt: acceptedAt };
+
+    /// The context of connection `id`, accepted now.
+    public fn acceptedNow(id: u64) -> ConnectionContext => ConnectionContext.create(id, Timer.now());
+
+    /// The connection's id, unique within one server.
+    public fn id(borrow this) -> u64 => this.number;
+
+    /// When it was accepted, on `Timer.now()`'s clock.
+    public fn acceptedAtMs(borrow this) -> u64 => this.acceptedAt;
+
+    /// Milliseconds since it was accepted.
+    public fn ageMs(borrow this) -> u64 {
+        let now = Timer.now();
+        return if (now >= this.acceptedAt) now - this.acceptedAt else 0;
+    }
+}

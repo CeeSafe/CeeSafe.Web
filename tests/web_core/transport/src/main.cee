@@ -1,0 +1,234 @@
+// Transport and Transports (Web ADR 0001 §3.2-3.6), over a scripted transport: reads at every fragment size,
+// writeAllVectored at every partial-step size, a step that writes nothing, and closeGracefully against a peer that
+// ends its side and one that never does.
+import web_core;
+
+async fn show(label: StringView, ok: bool) -> Result<void, NetError> {
+    match (await AsyncConsole.write(label)) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    match (await AsyncConsole.writeLine(if (ok) " ok" else " FAILED")) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+/// Delivers `input` at most `chunk` bytes per read; each vectored step writes at most `step` bytes; `hang` makes
+/// reads wait (cancellably) instead of reaching the end.
+struct Script {
+    input: Vector<u8>;
+    at: usize;
+    chunk: usize;
+    out: Vector<u8>;
+    step: usize;
+    hang: bool;
+    shut: bool;
+}
+
+impl Transport for Script {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        if (buffer.length == 0) {
+            return Err(NetError.LimitExceeded);
+        }
+        if (this.at == this.input.length) {
+            if (this.hang) {
+                match (await Timer.sleep(1000000)) {
+                    Ok() => {}
+                    Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                }
+            }
+            return Ok(0);
+        }
+        var n: usize = 0;
+        while (n < buffer.length && n < this.chunk && this.at < this.input.length) {
+            buffer[n] = this.input[this.at];
+            n += 1;
+            this.at += 1;
+        }
+        return Ok(n);
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        for (b in bytes) {
+            match (this.out.push(b)) {
+                Ok() => {}
+                Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+            }
+        }
+        return Ok();
+    }
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        var n: usize = 0;
+        for (i in 0..parts.parts()) {
+            let p = parts.part(truncate<u32>(i));
+            for (b in p) {
+                if (n == this.step) {
+                    return Ok(n);
+                }
+                match (this.out.push(b)) {
+                    Ok() => {}
+                    Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+                }
+                n += 1;
+            }
+        }
+        return Ok(n);
+    }
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> {
+        this.shut = true;
+        return Ok();
+    }
+
+    fn alpn(borrow this) -> Alpn => Alpn.None;
+}
+
+fn script(input: StringView, chunk: usize, step: usize, hang: bool) -> Result<Script, AllocError> {
+    var v = Vector<u8>.create();
+    for (b in input.bytes()) {
+        v.push(b)?;
+    }
+    return Ok(Script { input: v, at: 0, chunk: chunk, out: Vector<u8>.create(), step: step, hang: hang, shut: false });
+}
+
+fn equals(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+async fn readAll(t: borrow mut dyn Transport, into: borrow mut OwnedBuffer) -> Result<void, NetError> {
+    loop {
+        let n = await t.read(into.spare())?;
+        if (n == 0) {
+            return Ok();
+        }
+        into.commit(n)?;
+    }
+}
+
+async fn fragments() -> Result<bool, NetError> {
+    let text = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    var all = true;
+    for (chunk in 1..text.length + 2) {
+        var s = match (script(text, truncate<usize>(chunk), 0, false)) {
+            Ok(v) => v,
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+        };
+        var buf = match (OwnedBuffer.create(64)) {
+            Ok(v) => v,
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+        };
+        await readAll(mut s, mut buf)?;
+        all = all && equals(buf.readable(), text.bytes());
+    }
+    return Ok(all);
+}
+
+async fn vectored() -> Result<bool, NetError> {
+    let head = "HTTP/1.1 200 OK\r\n";
+    let fields = "Content-Length: 5\r\n\r\n";
+    let body = "hello";
+    let whole = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    var all = true;
+    for (step in 1..whole.length + 2) {
+        var s = match (script("", 1, truncate<usize>(step), false)) {
+            Ok(v) => v,
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+        };
+        let parts = IoParts.three(head.bytes(), fields.bytes(), body.bytes());
+        await Transports.writeAllVectored(mut s, parts)?;
+        all = all && equals(s.out.view(), whole.bytes());
+    }
+    return Ok(all);
+}
+
+async fn zeroStep() -> Result<bool, NetError> {
+    var s = match (script("", 1, 0, false)) {
+        Ok(v) => v,
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+    };
+    let x = "x";
+    let parts = IoParts.one(x.bytes());
+    return Ok(match (await Transports.writeAllVectored(mut s, parts)) {
+        Err(NetError.Closed) => true,
+        _ => false,
+    });
+}
+
+async fn parts() -> bool {
+    let a = "ab";
+    let b = "cde";
+    let p = IoParts.two(a.bytes(), b.bytes());
+    return p.parts() == 2 && p.totalLength() == 5 && p.part(1).length == 3 && p.part(2).length == 0 &&
+        p.part(7).length == 0;
+}
+
+async fn graceful() -> Result<bool, NetError> {
+    var scratch = [0u8; 8];
+    var ends = match (script("bye from peer", 4, 1, false)) {
+        Ok(v) => v,
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+    };
+    let first = await Transports.closeGracefully(mut ends, mut scratch[..], Deadline.after(1000));
+    let okEnds = match (first) {
+        Ok() => ends.shut && ends.at == ends.input.length,
+        Err(_) => false,
+    };
+    var hangs = match (script("", 4, 1, true)) {
+        Ok(v) => v,
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+    };
+    let second = await Transports.closeGracefully(mut hangs, mut scratch[..], Deadline.after(20));
+    let okHangs = match (second) {
+        Err(NetError.TimedOut) => hangs.shut,
+        _ => false,
+    };
+    return Ok(okEnds && okHangs);
+}
+
+async fn boxed() -> Result<bool, NetError> {
+    let s = match (script("abc", 2, 1, false)) {
+        Ok(v) => v,
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+    };
+    var t: Box<dyn Transport> = match (Box.create(s)) {
+        Ok(v) => v,
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+    };
+    var buf = [0u8; 8];
+    let n = await t.read(mut buf[..])?;
+    let empty = match (await t.read(mut buf[0..0])) {
+        Err(NetError.LimitExceeded) => true,
+        _ => false,
+    };
+    return Ok(n == 2 && empty && match (t.alpn()) {
+        Alpn.None => true,
+        _ => false,
+    });
+}
+
+async fn checks() -> Result<void, NetError> {
+    await show("reads at every fragment size reassemble", await fragments()?)?;
+    await show("writeAllVectored at every step size", await vectored()?)?;
+    await show("a step writing nothing is Closed", await zeroStep()?)?;
+    await show("IoParts slots", await parts())?;
+    await show("closeGracefully: peer ends, or deadline", await graceful()?)?;
+    await show("Box<dyn Transport>", await boxed()?)?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(checks())) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

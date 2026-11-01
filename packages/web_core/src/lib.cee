@@ -1,2 +1,0 @@
-// web_core: Byte buffers (OwnedBuffer, PooledBuffer), Deadline, NetError, the Transport interface, ConnectionContext.
-// Milestone M0 (docs/implementation-plan.md). Empty until then.

@@ -1,0 +1,24 @@
+new: capacity 8, empty, 8 spare ok
+commit 5 ok
+readable is hello ok
+commit past capacity refused ok
+refused commit changed nothing ok
+consume 2 ok
+readable is llo ok
+consume past readable refused ok
+append 4 compacts ok
+readable is llo!!!? ok
+append past capacity refused ok
+refused append changed nothing ok
+consume all resets window ok
+append exactly capacity ok
+clear ok
+zero capacity ok
+empty append on zero capacity ok
+pool starts idle 0 ok
+taken buffers have the pool's size ok
+append before give ok
+given back ok
+recycled buffer is empty ok
+maxIdle keeps 2 ok
+other size freed, not kept ok

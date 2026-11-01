@@ -1,0 +1,10 @@
+cancelled ok
+timed out ok
+broken pipe is closed ok
+io out of memory ok
+refused stays io ok
+other errno kept ok
+alloc ok
+describe reset ok
+describe tls ok
+describe io uses the platform text ok

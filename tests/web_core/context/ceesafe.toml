@@ -1,0 +1,7 @@
+[package]
+name = "test_core_context"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+web_core = { path = "../../../packages/web_core" }

@@ -1,0 +1,11 @@
+never never expires ok
+never has no end ok
+huge after is never ok
+after is not expired yet ok
+earlier picks the sooner ok
+earlier with never ok
+past instant is expired ok
+operation before deadline ok
+deadline before operation ok
+soon has now expired ok
+expired deadline times out ok

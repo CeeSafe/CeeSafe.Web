@@ -1,0 +1,141 @@
+// web_core buffers (Web ADR 0001 §3.1): fixed-capacity owned bytes, and a pool that recycles them by move.
+
+/// A fixed-capacity byte buffer with a readable window: bytes are written into `spare()` and made readable with
+/// `commit(n)`, then read from `readable()` and released with `consume(n)`. It never grows; a write past its capacity
+/// is `NetError.LimitExceeded`. Lending `spare()` or `readable()` to an operation borrows the buffer, so it cannot be
+/// changed, moved, recycled or dropped while the operation uses it (Web ADR 0001 §1).
+@noncopy
+public struct OwnedBuffer {
+    private data: Vector<u8>;
+    private start: usize;
+    private end: usize;
+
+    /// A buffer of `capacity` bytes, all of them spare.
+    public fn create(capacity: usize) -> Result<OwnedBuffer, AllocError> {
+        var data = Vector<u8>.withCapacity(capacity)?;
+        while (data.length < capacity) {
+            data.push(0)?; // within the capacity reserved above: no allocation
+        }
+        return Ok(OwnedBuffer { data: data, start: 0, end: 0 });
+    }
+
+    /// The fixed number of bytes it holds.
+    public fn capacity(borrow this) -> usize => this.data.length;
+
+    /// The number of readable bytes.
+    public fn length(borrow this) -> usize => this.end - this.start;
+
+    /// Whether nothing is readable.
+    public fn isEmpty(borrow this) -> bool => this.start == this.end;
+
+    /// The number of bytes `spare()` offers now (without compacting).
+    public fn spareLength(borrow this) -> usize => this.data.length - this.end;
+
+    /// The readable bytes.
+    public fn readable(borrow this) -> Slice<u8> {
+        let all = this.data.view();
+        return all[this.start..this.end];
+    }
+
+    /// The writable tail, after the readable bytes. Call `compact()` first to make room freed by `consume`.
+    public fn spare(borrow mut this) -> SliceMut<u8> {
+        let all = this.data.viewMut();
+        return borrow mut all[this.end..];
+    }
+
+    /// Makes the first `n` spare bytes readable (after a read into `spare()`).
+    public fn commit(borrow mut this, n: usize) -> Result<void, NetError> {
+        if (n > this.data.length - this.end) {
+            return Err(NetError.LimitExceeded);
+        }
+        this.end += n;
+        return Ok();
+    }
+
+    /// Releases the first `n` readable bytes. When nothing is left readable, the window returns to the start.
+    public fn consume(borrow mut this, n: usize) -> Result<void, NetError> {
+        if (n > this.end - this.start) {
+            return Err(NetError.LimitExceeded);
+        }
+        this.start += n;
+        if (this.start == this.end) {
+            this.start = 0;
+            this.end = 0;
+        }
+        return Ok();
+    }
+
+    /// Moves the readable bytes to the start, so all free space is spare.
+    public fn compact(borrow mut this) {
+        if (this.start == 0) {
+            return;
+        }
+        let n = this.end - this.start;
+        for (i in 0..n) {
+            this.data[i] = this.data[this.start + i]; // forward copy: the destination is before the source
+        }
+        this.start = 0;
+        this.end = n;
+    }
+
+    /// Appends `bytes` to the readable bytes, compacting if that makes room.
+    public fn append(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        if (bytes.length > this.data.length - this.end) {
+            this.compact();
+        }
+        if (bytes.length > this.data.length - this.end) {
+            return Err(NetError.LimitExceeded);
+        }
+        for (i in 0..bytes.length) {
+            this.data[this.end + i] = bytes[i];
+        }
+        this.end += bytes.length;
+        return Ok();
+    }
+
+    /// Forgets every readable byte.
+    public fn clear(borrow mut this) {
+        this.start = 0;
+        this.end = 0;
+    }
+}
+
+/// Recycles buffers of one size. A buffer goes back with `give`, by move: a buffer that an operation still borrows
+/// cannot be moved, so it cannot return to the pool while in use (Web ADR 0001 §3.1). A buffer dropped instead of
+/// given back is simply freed. A pool belongs to one task; it is not shared between tasks.
+public struct BufferPool {
+    private free: Vector<OwnedBuffer>;
+    private size: usize;
+    private maxIdle: usize;
+
+    /// A pool of `bufferSize`-byte buffers keeping at most `maxIdle` of them for reuse. Allocates nothing yet.
+    public fn create(bufferSize: usize, maxIdle: usize) -> BufferPool =>
+        BufferPool { free: Vector<OwnedBuffer>.create(), size: bufferSize, maxIdle: maxIdle };
+
+    /// The size of the buffers it hands out.
+    public fn bufferSize(borrow this) -> usize => this.size;
+
+    /// How many buffers wait for reuse.
+    public fn idle(borrow this) -> usize => this.free.length;
+
+    /// An empty buffer: a recycled one if any, else a new one.
+    public fn take(borrow mut this) -> Result<OwnedBuffer, AllocError> {
+        match (this.free.pop()) {
+            Some(buffer) => { return Ok(buffer); }
+            null => { return OwnedBuffer.create(this.size); }
+        }
+    }
+
+    /// Takes a buffer back for reuse, emptied. One of another size, or beyond `maxIdle`, is freed instead.
+    public fn give(borrow mut this, buffer: OwnedBuffer) {
+        if (buffer.capacity() != this.size || this.free.length >= this.maxIdle) {
+            return; // dropped: freed
+        }
+        var b = buffer;
+        b.clear();
+        match (this.free.push(b)) {
+            Ok() => {}
+            Err(_) => {} // the push failed and destroyed the buffer: freed, nothing lost
+        }
+    }
+}

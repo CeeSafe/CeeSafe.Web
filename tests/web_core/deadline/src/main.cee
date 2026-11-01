@@ -1,0 +1,71 @@
+// Deadline and deadlineElapsed (Web ADR 0001 §3.5): saturation, ordering, expiry, and bounding an operation with
+// Async.race. Only relations are printed, so the interpreter's virtual clock and the real clock agree.
+import web_core;
+
+async fn show(label: StringView, ok: bool) -> Result<void, NetError> {
+    match (await AsyncConsole.write(label)) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    match (await AsyncConsole.writeLine(if (ok) " ok" else " FAILED")) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn work(ms: u64, v: u32) -> Result<u32, NetError> {
+    match (await Timer.sleep(ms)) {
+        Ok() => { return Ok(v); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn checks() -> Result<void, NetError> {
+    let never = Deadline.never();
+    await show("never never expires", never.isNever() && !never.isExpired())?;
+    await show("never has no end", never.remaining() == 0xFFFFFFFFFFFFFFFF)?;
+    await show("huge after is never", Deadline.after(0xFFFFFFFFFFFFFFFF).isNever())?;
+
+    let soon = Deadline.after(20);
+    let later = Deadline.after(1000);
+    await show("after is not expired yet", !soon.isExpired() && soon.remaining() <= 20)?;
+    await show("earlier picks the sooner", soon.earlier(later).instant() == soon.instant())?;
+    await show("earlier with never", never.earlier(soon).instant() == soon.instant())?;
+    await show("past instant is expired", Deadline.atInstant(0).isExpired() && Deadline.atInstant(0).remaining() == 0)?;
+
+    // The operation finishes first: its value wins.
+    let fast: Result<Raced<u32>, NetError> =
+        await Async.race(async () => await work(5, 7), async () => await deadlineElapsed<u32>(later));
+    await show("operation before deadline", match (fast) {
+        Ok(r) => r.winner == 0 && r.value == 7,
+        Err(_) => false,
+    })?;
+
+    // The deadline passes first: TimedOut, and the operation is cancelled and awaited.
+    let slow: Result<Raced<u32>, NetError> =
+        await Async.race(async () => await work(1000, 9), async () => await deadlineElapsed<u32>(soon));
+    await show("deadline before operation", match (slow) {
+        Err(NetError.TimedOut) => true,
+        _ => false,
+    })?;
+    await show("soon has now expired", soon.isExpired() && soon.remaining() == 0)?;
+
+    // An already expired deadline times out at once.
+    let past: Result<Raced<u32>, NetError> =
+        await Async.race(
+            async () => await work(1000, 1),
+            async () => await deadlineElapsed<u32>(Deadline.atInstant(0)),
+        );
+    await show("expired deadline times out", match (past) {
+        Err(NetError.TimedOut) => true,
+        _ => false,
+    })?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(checks())) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

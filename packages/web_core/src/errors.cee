@@ -1,0 +1,73 @@
+// web_core errors (Web ADR 0001 §3.2): why a network operation failed, as enums, never text.
+
+/// Why a TLS operation failed. Set by web_tls (Web ADR 0002); the codes behind it are logged there.
+public enum TlsReason {
+    /// The handshake failed or was refused by the peer.
+    Handshake,
+    /// A certificate was missing, invalid, expired, or did not match the name.
+    Certificate,
+    /// The peer broke the TLS protocol (a bad record, an unexpected message).
+    Protocol,
+    /// The peer sent a fatal alert.
+    Alert,
+    /// The TLS library failed for a reason of its own.
+    Internal,
+}
+
+/// Why a network operation failed (Web ADR 0001 §3.2).
+public enum NetError {
+    /// The task was cancelled (CeeSafe's task cancellation; Web ADR 0001 §3.5).
+    Cancelled,
+    /// A deadline passed.
+    TimedOut,
+    /// The stream has ended, or the transport is poisoned by an earlier failed write (Web ADR 0001 §3.4).
+    Closed,
+    /// The peer reset the connection.
+    Reset,
+    /// A configured limit or a buffer's capacity would be exceeded; also an empty read buffer.
+    LimitExceeded,
+    /// Memory could not be allocated.
+    OutOfMemory,
+    /// A TLS failure.
+    Tls(TlsReason),
+    /// Any other I/O error from the platform.
+    Io(IoError),
+}
+
+/// Conversions to NetError and its descriptions. (An enum has no functions of its own, type-system.md §15.1.)
+public struct NetErrors {
+    /// The NetError for an async operation's failure.
+    public fn fromAsync(e: AsyncError) -> NetError => match (e) {
+        AsyncError.Cancelled => NetError.Cancelled,
+        AsyncError.TimedOut => NetError.TimedOut,
+        AsyncError.Io(io) => NetErrors.fromIo(io),
+    };
+
+    /// The NetError for a platform I/O error. A broken pipe means the peer is gone, so the stream is closed.
+    /// (With CeeSafe's network error kinds, upstream U2, ConnectionReset and ConnectionAborted become Reset and
+    /// TimedOut becomes TimedOut; the 0.6.0 release does not have them yet, docs/toolchain.md.)
+    public fn fromIo(e: IoError) -> NetError => match (e) {
+        IoError.BrokenPipe => NetError.Closed,
+        IoError.OutOfMemory => NetError.OutOfMemory,
+        _ => NetError.Io(e),
+    };
+
+    /// The NetError for a failed allocation.
+    public fn fromAlloc(e: AllocError) -> NetError => NetError.OutOfMemory;
+
+    /// A short static description, for logs.
+    public fn describe(e: borrow NetError) -> StringView => match (e) {
+        NetError.Cancelled => "cancelled",
+        NetError.TimedOut => "timed out",
+        NetError.Closed => "connection closed",
+        NetError.Reset => "connection reset by peer",
+        NetError.LimitExceeded => "limit exceeded",
+        NetError.OutOfMemory => "out of memory",
+        NetError.Tls(TlsReason.Handshake) => "TLS handshake failed",
+        NetError.Tls(TlsReason.Certificate) => "TLS certificate rejected",
+        NetError.Tls(TlsReason.Protocol) => "TLS protocol error",
+        NetError.Tls(TlsReason.Alert) => "TLS alert from peer",
+        NetError.Tls(TlsReason.Internal) => "TLS library error",
+        NetError.Io(io) => io.message(),
+    };
+}

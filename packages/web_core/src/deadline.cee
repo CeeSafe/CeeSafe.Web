@@ -1,0 +1,66 @@
+// web_core deadlines (Web ADR 0001 §3.5): absolute times on the monotonic clock, and the task that waits for one.
+
+/// A point on `Timer.now()`'s clock (milliseconds), or never. Copyable; compare with `remaining` or `isExpired`.
+public struct Deadline {
+    private at: u64;
+
+    /// A deadline that never passes.
+    public fn never() -> Deadline => Deadline { at: 0xFFFFFFFFFFFFFFFF };
+
+    /// `ms` milliseconds from now (saturating: a huge `ms` is never).
+    public fn after(ms: u64) -> Deadline {
+        let now = Timer.now();
+        if (ms >= 0xFFFFFFFFFFFFFFFF - now) {
+            return Deadline.never();
+        }
+        return Deadline { at: now + ms };
+    }
+
+    /// The deadline at `instant` on `Timer.now()`'s clock.
+    public fn atInstant(instant: u64) -> Deadline => Deadline { at: instant };
+
+    /// Whether it never passes.
+    public fn isNever(this) -> bool => this.at == 0xFFFFFFFFFFFFFFFF;
+
+    /// Its time on `Timer.now()`'s clock; the largest u64 for never.
+    public fn instant(this) -> u64 => this.at;
+
+    /// Milliseconds left: 0 once it has passed; the largest u64 for never.
+    public fn remaining(this) -> u64 {
+        if (this.isNever()) {
+            return 0xFFFFFFFFFFFFFFFF;
+        }
+        let now = Timer.now();
+        return if (now >= this.at) 0 else this.at - now;
+    }
+
+    /// Whether it has passed.
+    public fn isExpired(this) -> bool => !this.isNever() && Timer.now() >= this.at;
+
+    /// The earlier of the two.
+    public fn earlier(this, other: Deadline) -> Deadline => if (other.at < this.at) other else this;
+}
+
+/// Waits until `deadline` passes, then returns `Err(NetError.TimedOut)`; a cancelled task returns
+/// `Err(NetError.Cancelled)`. It never returns `Ok`, so it is the second child of an `Async.race` that bounds an
+/// operation by a deadline (Web ADR 0001 §3.5):
+///
+/// ```ceesafe
+/// let r: Result<Raced<usize>, NetError> =
+///     await Async.race(async () => await t.read(buffer), async () => await deadlineElapsed<usize>(d));
+/// ```
+///
+/// A generic `withDeadline(d, body)` helper waits for CeeSafe's `Async.timeout` (upstream U4).
+public async fn deadlineElapsed<T>(deadline: Deadline) -> Result<T, NetError> {
+    loop {
+        let wait = if (deadline.isNever()) 86400000u64 else deadline.remaining();
+        match (await Timer.sleep(wait)) {
+            Ok() => {
+                if (deadline.isExpired()) {
+                    return Err(NetError.TimedOut);
+                }
+            }
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+}
