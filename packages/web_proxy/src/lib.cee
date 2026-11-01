@@ -1,0 +1,2 @@
+// web_proxy: Reverse proxy: upstream pools, forwarding headers, PROXY protocol, relay.
+// Milestone M8 (docs/implementation-plan.md). Empty until then.

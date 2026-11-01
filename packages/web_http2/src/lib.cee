@@ -1,0 +1,2 @@
+// web_http2: HTTP/2: frames, HPACK, stream state machines, flow control.
+// Milestone M7 (docs/implementation-plan.md). Empty until then.

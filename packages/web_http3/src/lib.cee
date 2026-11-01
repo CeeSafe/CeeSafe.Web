@@ -1,0 +1,2 @@
+// web_http3: HTTP/3 and QPACK over ngtcp2/nghttp3 (QUIC over lib/std UDP).
+// Milestone M10 (docs/implementation-plan.md). Empty until then.

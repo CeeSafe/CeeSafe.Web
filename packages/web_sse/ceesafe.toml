@@ -1,0 +1,8 @@
+[package]
+name = "web_sse"
+version = "0.1.0"
+kind = "library"
+
+[dependencies]
+web_core = { path = "../web_core" }
+web_http = { path = "../web_http" }

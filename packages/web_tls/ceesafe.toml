@@ -1,0 +1,11 @@
+[package]
+name = "web_tls"
+version = "0.1.0"
+kind = "library"
+# OpenSSL (Web ADR 0002) is linked through the manifest once CeeSafe has U8:
+#   links = ["ssl", "crypto"]
+# Until then, builds that use web_tls pass --cflag -lssl --cflag -lcrypto.
+
+[dependencies]
+web_core = { path = "../web_core" }
+web_transport = { path = "../web_transport" }

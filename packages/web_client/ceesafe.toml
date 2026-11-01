@@ -1,0 +1,11 @@
+[package]
+name = "web_client"
+version = "0.1.0"
+kind = "library"
+
+[dependencies]
+web_core = { path = "../web_core" }
+web_transport = { path = "../web_transport" }
+web_http = { path = "../web_http" }
+web_http1 = { path = "../web_http1" }
+web_http2 = { path = "../web_http2" }
