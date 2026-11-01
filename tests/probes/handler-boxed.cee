@@ -1,0 +1,105 @@
+struct Plain {
+    left: usize;
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        let n = if (this.left < buffer.length) this.left else buffer.length;
+        this.left -= n;
+        return Ok(n);
+    }
+}
+
+struct Wrapped {
+    inner: Plain;
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        return await this.inner.read(buffer);
+    }
+}
+
+/// A closed set of transports, dispatched by match: static, no table.
+enum Conn {
+    Plain(Plain),
+    Wrapped(Wrapped),
+}
+
+struct ConnBox {
+    conn: Conn;
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        match (borrow mut this.conn) {
+            Conn.Plain(p) => { return await p.read(buffer); }
+            Conn.Wrapped(w) => { return await w.read(buffer); }
+        }
+    }
+}
+
+struct RequestBody<region r> {
+    conn: borrow mut(r) ConnBox;
+    remaining: usize;
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        if (this.remaining == 0) {
+            return Ok(0);
+        }
+        let cap = if (this.remaining < buffer.length) this.remaining else buffer.length;
+        let n = await this.conn.read(mut buffer[0..cap])?;
+        this.remaining -= n;
+        return Ok(n);
+    }
+}
+
+struct AppState {
+    greeting: u32;
+}
+
+interface Handler<S> {
+    async fn handle(borrow this, state: borrow S, body: borrow mut RequestBody) -> Result<usize, AsyncError>;
+}
+
+struct Count {}
+
+impl Handler<AppState> for Count {
+    async fn handle(borrow this, state: borrow AppState, body: borrow mut RequestBody) -> Result<usize, AsyncError> {
+        var buf = [0u8; 4];
+        var total: usize = state.greeting as usize;
+        loop {
+            let n = await body.read(mut buf[..])?;
+            if (n == 0) {
+                return Ok(total);
+            }
+            total += n;
+        }
+    }
+}
+
+struct Logged {
+    inner: Box<dyn Handler<AppState>>;
+}
+
+impl Handler<AppState> for Logged {
+    async fn handle(borrow this, state: borrow AppState, body: borrow mut RequestBody) -> Result<usize, AsyncError> {
+        let boxed = await Async.boxed(SystemHeap {}, this.inner.handle(state, body));
+        let r = match (boxed) {
+            Ok(inner) => inner?,
+            Err(_) => { return Err(AsyncError.Cancelled); },
+        };
+        return Ok(r + 1000);
+    }
+}
+
+async fn run() -> Result<usize, AsyncError> {
+    var c = ConnBox { conn: Conn.Wrapped(Wrapped { inner: Plain { left: 100 } }) };
+    var body = RequestBody { conn: borrow mut c, remaining: 10 };
+    let state = AppState { greeting: 5 };
+    var routes = Vector<Box<dyn Handler<AppState>>>.create();
+    let inner: Box<dyn Handler<AppState>> = Box.create(Count {})!;
+    routes.push(Box.create(Logged { inner: inner })!)!;
+    var sum: usize = 0;
+    for (h in routes) {
+        sum += await h.handle(state, mut body)?;
+    }
+    return Ok(sum);
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(_) => { Console.writeLine("failed"); }
+    }
+}

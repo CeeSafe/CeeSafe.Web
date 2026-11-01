@@ -1,0 +1,14 @@
+// Web ADR 0003 §3: a type with a region parameter cannot implement an interface (expect N0267).
+interface Body {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError>;
+}
+
+struct RequestBody<region r> {
+    source: Slice<r, u8>;
+}
+
+impl Body for RequestBody {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> => Ok(0);
+}
+
+fn main() {}

@@ -1,0 +1,25 @@
+// Web ADR 0003: a request's views borrow the connection's buffer; the buffer is reusable once the request is dead.
+struct Request<region r> {
+    target: StringView<r>;
+}
+
+async fn handle(request: borrow Request) -> Result<usize, AsyncError> {
+    await Timer.sleep(1)?;
+    return Ok(request.target.length);
+}
+
+async fn connection() -> Result<usize, AsyncError> {
+    var buffer = [0u8; 8];
+    buffer[0] = 'a' as u8;
+    let req = Request { target: StringView.fromUtf8(buffer[0..1])! };
+    let n = await handle(req)?;
+    buffer[1] = 'c' as u8; // fine: req is no longer used
+    return Ok(n);
+}
+
+fn main() {
+    match (Async.run(connection())) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(_) => { Console.writeLine("failed"); }
+    }
+}

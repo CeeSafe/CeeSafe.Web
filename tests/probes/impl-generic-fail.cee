@@ -1,0 +1,14 @@
+// Web ADR 0001 §2: v0 implements interfaces only for concrete, unscoped types (expect N0105 for the generic impl).
+interface Transport {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError>;
+}
+
+struct Wrap<T: Transport> {
+    inner: T;
+}
+
+impl<T: Transport> Transport for Wrap<T> {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> => await this.inner.read(buffer);
+}
+
+fn main() {}

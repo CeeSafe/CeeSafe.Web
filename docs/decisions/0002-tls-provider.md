@@ -1,0 +1,133 @@
+# Web ADR 0002 — TLS provider: OpenSSL behind a sans-I/O shim
+
+- Status: **Accepted** by the owner, 2026-11-02 (every question of §6 as recommended). The provider, system
+  OpenSSL, is the owner's earlier decision of 2026-11-02 (implementation plan §11.2).
+- Scope: which TLS library `web_tls` uses, how CeeSafe code drives it, the C shim's contract, the configuration it
+  enforces, and how it is built on each platform. Milestones M4 (TLS), M5 (client verification) and M10 (QUIC
+  crypto).
+
+## 1. Context
+
+- The roadmap asks for an established, audited C-compatible TLS implementation behind a narrow adapter: TLS 1.2 and
+  1.3, ALPN, SNI, mTLS, session resumption, certificate rotation and handshake limits.
+- CeeSafe calls C through `extern "C"` declarations; every call is `unsafe` with a `Safety:` comment
+  (`guide/unsafe-and-c.md`). It cannot call C macros. Many OpenSSL entry points are macros over `SSL_ctrl` and
+  `SSL_CTX_ctrl`: `SSL_set_tlsext_host_name`, `SSL_CTX_set_min_proto_version`, `SSL_CTX_set_max_proto_version`,
+  `SSL_CTX_set_tlsext_servername_callback`, and the ticket key callback setters.
+- A library package can ship C files (`c = [...]`, compiled for every package: CeeSafe `src/main.cee:758`), but cannot
+  yet name system libraries to link. That is upstream U8 (`docs/ceesafe-upstream-work.md`).
+- The interpreter runs no C (CeeSafe `spec/type-system.md` §28.6), so anything using `web_tls` is tested natively.
+- Web ADR 0001: a transport is a concrete type implementing `Transport`; I/O happens only in CeeSafe's `lib/std`.
+
+## 2. Options for driving OpenSSL
+
+| | A. Memory BIOs, sans-I/O (proposed) | B. A socket BIO on the descriptor | C. Custom BIO callbacks into CeeSafe |
+|---|---|---|---|
+| Who does I/O | CeeSafe (`lib/std`), through `PlainStream` | OpenSSL, on a non-blocking fd | OpenSSL calls back into CeeSafe |
+| Fits completion I/O (IOCP, io_uring) | yes | no: OpenSSL issues its own syscalls | awkward: the callbacks are synchronous |
+| C ↔ CeeSafe surface | plain functions with byte buffers | small, but breaks ADR 0035 | exported callbacks with re-entrancy |
+
+**A.** OpenSSL never touches a socket, so TLS works over every reactor and over `MockTransport`.
+
+## 3. Decision
+
+### 3.1 Versions and linking
+
+- **OpenSSL ≥ 3.0 LTS** for M4. **≥ 3.5 from M10**: its QUIC TLS API is what ngtcp2's `ngtcp2_crypto_ossl` uses, so
+  TLS and QUIC share one provider. The shim fails the build below the minimum (`#if OPENSSL_VERSION_NUMBER < …
+  #error`).
+- Linked as a system library: `links = ["ssl", "crypto"]` once U8 lands. Until then, builds pass
+  `--cflag -lssl --cflag -lcrypto` (and include and library paths); see `packages/web_tls/ceesafe.toml`. Merging M4 to
+  main waits for U8.
+- Where it comes from: Debian/Ubuntu `libssl-dev`; macOS Homebrew `openssl@3` (not the system LibreSSL); Windows
+  vcpkg `openssl:x64-windows` (or the Shining Light installers), with paths given in the manifest's
+  `[target.windows]` table (U8). CI records the exact version per host (`OpenSSL_version(OPENSSL_VERSION)`).
+
+### 3.2 The shim (`packages/web_tls/c/tls_shim.c`)
+
+One opaque context per connection: `SSL*`, a read BIO and a write BIO (`BIO_s_mem`, each with a size limit), and a
+small error buffer. **The contract:**
+
+| Function | Ownership and lengths | Result |
+|---|---|---|
+| `wt_ctx_new(config*) -> wt_ctx*` / `wt_ctx_free(wt_ctx*)` | the context owns `SSL*` and both BIOs; free is idempotent-safe once | NULL on allocation failure |
+| `wt_feed(ctx, const u8* in, size_t len) -> i64` | copies at most `len` bytes of ciphertext into the read BIO, never keeps `in` | bytes taken (may be < len when the BIO is full), or a negative `wt_status` |
+| `wt_take(ctx, u8* out, size_t cap) -> i64` | copies at most `cap` bytes of pending ciphertext out | bytes copied, 0 if none |
+| `wt_handshake(ctx) -> i32` | — | `WT_DONE`, `WT_WANT_READ`, `WT_WANT_WRITE`, `WT_CLOSED`, `WT_ERROR` |
+| `wt_read(ctx, u8* out, size_t cap) -> i64` | plaintext into `out`, at most `cap` | bytes, or a negative `wt_status` |
+| `wt_write(ctx, const u8* in, size_t len) -> i64` | encrypts from `in` during the call only | bytes accepted, or a negative `wt_status` |
+| `wt_shutdown(ctx) -> i32` | queues close_notify | as `wt_handshake` |
+| `wt_alpn(ctx, u8* out, size_t cap) -> i64`, `wt_peer_cert_der(ctx, u8* out, size_t cap) -> i64`, `wt_sni(...)` | copies out; never returns OpenSSL-owned pointers | length, or −needed if `cap` is too small |
+| `wt_error(ctx, u8* out, size_t cap) -> u64` | the `ERR_get_error` code, its text copied into `out` | the code |
+| macro wrappers: `wt_set_hostname`, `wt_set_versions(min,max)`, `wt_set_sni_callback`, `wt_set_ticket_keys` | plain functions, one line each | as OpenSSL |
+
+**Rules:**
+
+- No pointer from CeeSafe is kept after a call returns.
+- No OpenSSL-owned pointer is returned to CeeSafe; data is always copied out.
+- Every length is a `size_t`, checked.
+- `SSL_get_error` is mapped to the `wt_status` enum in one place.
+- The shim performs no I/O and no allocation of its own beyond OpenSSL's.
+- Every wrapper is listed in this table. A new wrapper is an amendment here.
+
+On the CeeSafe side, `TlsTransport.read` loops: try `wt_read`; on want-read, read ciphertext from the `PlainStream`
+and `wt_feed` it; on want-write, `wt_take` and write. It does the same for `write` and the handshake. Every loop is
+bounded by the deadlines and limits of §3.4.
+
+### 3.3 Configuration the server and client enforce
+
+- TLS 1.2 and 1.3 only. TLS 1.2 is limited to ECDHE with AEAD suites (AES-GCM, ChaCha20-Poly1305).
+- `SSL_OP_NO_RENEGOTIATION`, `SSL_OP_NO_COMPRESSION`, and `SSL_OP_CIPHER_SERVER_PREFERENCE` on servers.
+- `SSL_MODE_RELEASE_BUFFERS`. Partial writes stay off, so the shim's write semantics are all-or-want.
+- ALPN: `h2`, `http/1.1` (`h3` belongs to QUIC). The negotiated value is exposed through `Transport.alpn()` (Web
+  ADR 0001 §3.2).
+- **Server:** SNI selects a certificate set through a `CertResolver` interface. Certificates and keys hot-reload by
+  swapping an `Arc<CertSet>`; connections already handshaking keep the old set. Session tickets use rotating keys
+  (current + previous), rotated by a timer task.
+- **mTLS:** `require` or `optional`. The chain is verified against a configured CA store, and verification failure
+  fails the handshake (fail closed). The verified peer certificate is exposed to handlers as DER plus parsed subject
+  and SAN fields.
+- **Client (M5):** hostname verification with `X509_VERIFY_PARAM_set1_host` and
+  `X509_CHECK_FLAG_NEVER_CHECK_SUBJECT` (SAN only, no CN fallback). Trust from `SSL_CTX_set_default_verify_paths`,
+  plus the Windows certificate store (imported by the shim) and the macOS system bundle. Verification can never be
+  turned off by a single flag; a custom verifier is an explicit interface.
+
+### 3.4 Limits
+
+- A handshake deadline (default 10 s).
+- A cap on the ciphertext the handshake may consume (default 64 KiB) and on certificate-chain size.
+- Each BIO is limited to 2 records (about 34 KiB).
+- A cap on concurrent handshakes per listener (admission, Web ADR 0005 gates).
+- `SSL_CTX_set_max_cert_list`.
+
+Exceeding any limit closes the connection with an alert where possible.
+
+### 3.5 Memory and threads
+
+- OpenSSL 3 is thread-safe for shared `SSL_CTX` use. An `SSL*` is used by one task at a time. A connection task under
+  `spawnSend` may move between worker threads between `await`s, but never runs on two at once, which OpenSSL allows.
+- OpenSSL's own allocations are outside CeeSafe's accounting. In test builds they are routed through CeeSafe's
+  allocator with `CRYPTO_set_mem_functions` (decided, §6.1), so `--check-leaks` and `CEESAFE_FAIL_ALLOC_AT` also
+  cover OpenSSL. Release builds keep OpenSSL's allocator.
+
+## 4. Consequences
+
+- `web_tls` is the only package that links OpenSSL. Web ADR 0004's layering (checked by `tools/check_layers.py`)
+  keeps every other package OpenSSL-free.
+- TLS tests are native only (no C in the interpreter). Protocol tests above TLS run over plain `MockTransport` in the
+  interpreter.
+- Upstream dependency: U8 (manifest links) before M4 merges.
+
+## 5. Tests (M4 exit)
+
+- Interop: OpenSSL `s_client`/`s_server`, curl, Go `crypto/tls`, and `testssl.sh` (no weak protocols or suites).
+- Negative tests, all failing closed: expired, not yet valid, wrong host, unknown CA, bad signature, truncated
+  handshake, oversized record, renegotiation attempt, and a client certificate missing under `require`.
+- Limits: a handshake flood stays within the caps; a slow handshake hits its deadline.
+- The shim under ASan + UBSan; a libFuzzer harness feeding arbitrary ciphertext through `wt_feed`/`wt_read`.
+
+## 6. Questions for the owner (answered 2026-11-02: each as recommended)
+
+1. Route OpenSSL's allocations through CeeSafe's allocator in test builds (§3.5)? Recommended: yes. **Yes.**
+2. Require OpenSSL ≥ 3.5 from M4 instead of M10, to test one version range only? Recommended: no. 3.0 LTS is what
+   Debian 12 and Ubuntu 22.04 ship; raise the floor at M10. **No: 3.0 for M4, 3.5 from M10.**

@@ -1,0 +1,101 @@
+interface Transport {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError>;
+}
+
+struct Tcp {
+    left: usize;
+    async fn pull(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        await Timer.sleep(1)?;
+        let n = if (this.left < buffer.length) this.left else buffer.length;
+        this.left -= n;
+        return Ok(n);
+    }
+}
+
+impl Transport for Tcp {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> => await this.pull(buffer);
+}
+
+struct Mock {
+    left: usize;
+}
+
+impl Transport for Mock {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        let n = if (this.left < buffer.length) this.left else buffer.length;
+        this.left -= n;
+        return Ok(n);
+    }
+}
+
+enum Plain {
+    Tcp(Tcp),
+    Mock(Mock),
+}
+
+struct PlainStream {
+    plain: Plain;
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        match (borrow mut this.plain) {
+            Plain.Tcp(t) => { return await t.read(buffer); }
+            Plain.Mock(m) => { return await m.read(buffer); }
+        }
+    }
+}
+
+struct Tls {
+    inner: PlainStream;
+    records: usize;
+}
+
+impl Transport for Tls {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        this.records += 1;
+        return await this.inner.read(buffer);
+    }
+}
+
+struct RequestBody<region r> {
+    conn: borrow mut(r) dyn Transport;
+    remaining: usize;
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+        if (this.remaining == 0) {
+            return Ok(0);
+        }
+        let cap = if (this.remaining < buffer.length) this.remaining else buffer.length;
+        let n = await this.conn.read(mut buffer[0..cap])?;
+        this.remaining -= n;
+        return Ok(n);
+    }
+}
+
+async fn drain(conn: borrow mut dyn Transport) -> Result<usize, AsyncError> {
+    var body = RequestBody { conn: conn, remaining: 10 };
+    var buf = [0u8; 3];
+    var total: usize = 0;
+    loop {
+        let n = await body.read(mut buf[..])?;
+        if (n == 0) {
+            return Ok(total);
+        }
+        total += n;
+    }
+}
+
+async fn run() -> Result<usize, AsyncError> {
+    var conns = Vector<Box<dyn Transport>>.create();
+    conns.push(Box.create(Tcp { left: 100 })!)!;
+    conns.push(Box.create(Tls { inner: PlainStream { plain: Plain.Mock(Mock { left: 7 }) }, records: 0 })!)!;
+    var sum: usize = 0;
+    for (i in 0..conns.length) {
+        sum = sum * 100 + await drain(mut conns[i])?;
+    }
+    return Ok(sum);
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(_) => { Console.writeLine("failed"); }
+    }
+}

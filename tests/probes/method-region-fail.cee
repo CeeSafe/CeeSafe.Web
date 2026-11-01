@@ -1,0 +1,15 @@
+// Web ADR 0003 §3: a method cannot declare its own region parameter (expect N0216); elided regions are the fix.
+struct Request<region r> {
+    target: StringView<r>;
+}
+
+interface Handler {
+    async fn handle<region r>(borrow this, request: borrow Request<r>) -> Result<void, AsyncError>;
+}
+
+struct Hello {}
+
+impl Handler for Hello {
+    async fn handle<region r>(borrow this, request: borrow Request<r>) -> Result<void, AsyncError> => Ok();
+}
+fn main() {}

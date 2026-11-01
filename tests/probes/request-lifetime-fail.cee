@@ -1,0 +1,25 @@
+// Web ADR 0003: reusing the buffer while a request still borrows it must be rejected (expect N0240).
+struct Request<region r> {
+    target: StringView<r>;
+}
+
+async fn handle(request: borrow Request) -> Result<usize, AsyncError> {
+    await Timer.sleep(1)?;
+    return Ok(request.target.length);
+}
+
+async fn connection() -> Result<usize, AsyncError> {
+    var buffer = [0u8; 8];
+    buffer[0] = 'a' as u8;
+    let req = Request { target: StringView.fromUtf8(buffer[0..1])! };
+    buffer[1] = 'b' as u8; // N0240: 'buffer' is borrowed by req
+    let n = await handle(req)?;
+    return Ok(n);
+}
+
+fn main() {
+    match (Async.run(connection())) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(_) => { Console.writeLine("failed"); }
+    }
+}
