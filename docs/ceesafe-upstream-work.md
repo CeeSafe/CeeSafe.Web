@@ -107,6 +107,14 @@ So every new socket primitive goes into `lib/std` + `runtime/hosted/` through Ce
 - A slow reader, which forces partial writes across part boundaries. Bytes are checked against a Python oracle.
 - Cancel in flight under ASan: the frame is freed only after completion.
 
+**API constraint found 2026-11-02:** CeeSafe v0 has no slices or arrays of slices (N0246,
+`~/dev/CeeSafe.Web/tests/probes/slice-of-slices-fail.cee`). So `writeVectored(parts: Slice<Slice<u8>>)` cannot be
+written. Options for the ADR:
+- a fixed-slot parts struct, as CeeSafe.Web's `IoParts<region r>` (`packages/web_core/src/transport.cee`, four slots);
+- lifting N0246 for slices of slices as part of U3.
+
+CeeSafe.Web's `Transport.writeVectored` takes `IoParts` and will map onto whichever U3 chooses.
+
 ## U4 — `Async.timeout`   *(M1; 0.6.0)*
 
 **Today:** deadlines need `Async.race(body, async () => { await Timer.sleep(ms)?; return Err(TimedOut); })`. That is verbose, and it requires the body's error type to carry `TimedOut`.
@@ -234,6 +242,36 @@ None of this blocks a milestone. Probes: `~/dev/CeeSafe.Web/tests/probes/impl-ge
 - monomorphisation cost.
 
 **Status:** wanted, not scheduled.
+
+## B1 — Bug: `@effectsOf` async fn called with an async closure   *(found 2026-11-02, ceesafec 0.6.0)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/effectsof-async-bug.cee`:
+
+```ceesafe
+@effectsOf(body)
+async fn viaAsync(body: borrow fn() -> Result<u32, AsyncError>) -> Result<u32, AsyncError> {
+    return body();
+}
+// …
+let a = await viaAsync(async () => await slow(7))?;   // slow sleeps 5 ms, then returns Ok(7)
+```
+
+**Observed:**
+- `ceesafec check` accepts it.
+- `run --interp` gives `a == 0`.
+- The native build crashes with exit 139. ASan reports a SEGV at address 0 (a null function pointer), called from
+  `cee_exec_loop` (`runtime/hosted/ceesafe_rt_async.c:1788`) via `ceesafe_async_run`.
+
+The same call through a **sync** `@effectsOf fn` works (the corpus form, `lib/core`'s `forEach`).
+
+**Expected:** either the program is rejected (if `@effectsOf` on an async fn is not meant to be supported, which
+spec §32.5 / ADR 0037 do not say), or it prints the right value. Safe code must never call a null pointer.
+
+**Why CeeSafe.Web cares:**
+- A generic `withDeadline(d, body)` needs this, or U4's `Async.timeout`.
+- A closure parameter also cannot be awaited inside an `Async.race` child of an `@effectsOf` function: N0342 when
+  awaited, N0295 when called. That is consistent with the spec, but it means U4 is the only way to a generic deadline
+  helper.
 
 ## Tooling (small, any time before M1's exit)
 

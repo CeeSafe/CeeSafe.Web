@@ -1,0 +1,11 @@
+// Web ADR 0001 §3.2 (amended): slices and arrays of slices do not exist in v0 (expect N0246), so a vectored write takes
+// web_core's IoParts (fixed slots) instead of Slice<Slice<u8>>. It constrains upstream U3's API too.
+fn total(parts: Slice<Slice<u8>>) -> usize {
+    var n: usize = 0;
+    for (p in parts) {
+        n += p.length;
+    }
+    return n;
+}
+
+fn main() {}

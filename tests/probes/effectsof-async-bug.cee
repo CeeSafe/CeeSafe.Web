@@ -1,0 +1,31 @@
+// CeeSafe bug (found 2026-11-02, ceesafec 0.6.0): an `async fn` with `@effectsOf`, called with an async closure, passes
+// check, but the interpreter returns 0 for `a` (expected 7, so this should print 70) and the native build calls a null
+// function pointer (ASan: SEGV in cee_exec_loop, ceesafe_rt_async.c:1788). Either the call should be rejected or it
+// should print 70. Reported in docs/ceesafe-upstream-work.md (B1).
+async fn slow(v: u32) -> Result<u32, AsyncError> {
+    await Timer.sleep(5)?;
+    return Ok(v);
+}
+
+@effectsOf(body)
+async fn viaAsync(body: borrow fn() -> Result<u32, AsyncError>) -> Result<u32, AsyncError> {
+    return body();
+}
+
+@effectsOf(body)
+fn viaSync(body: borrow fn() -> Result<u32, AsyncError>) -> Result<u32, AsyncError> {
+    return body();
+}
+
+async fn run() -> Result<u32, AsyncError> {
+    let a = await viaAsync(async () => await slow(7))?;
+    let b: u32 = 0;
+    return Ok(a * 10 + b);
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(_) => { Console.writeLine("failed"); }
+    }
+}

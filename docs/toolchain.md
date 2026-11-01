@@ -21,11 +21,20 @@ that needs an unreleased compiler is not merged to main.
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.3.2** | too old for the policy: **update to the 0.5.1 release** |
-| `~/dev/CeeSafe/out/ceesafec` | 0.6.0-dev (`5fa4316`) | local checks only |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.6.0** (release, tag `v0.6.0` = CeeSafe `5af87ea`) | the toolchain for main |
+| `~/dev/CeeSafe/out/ceesafec` | 0.6.0 + ADR 0044 work in progress | local checks only |
 
-The M0 package manifests and `tests/probes/` were checked with both binaries on 2026-11-02 (`ceesafec fetch`, `ceesafec
-check` in every package; all clean).
+**0.6.0 does not contain U1 or U2.** ADR 0044 (socket addresses, IPv6, options, network `IoError` kinds) landed on
+CeeSafe main after the tag (`a4aee7b`…`f7a7d57`). So `web_core` uses neither `SocketAddress` nor the new `IoError` kinds
+yet (Web ADR 0001, amendment 1). M1 needs the release that ships them.
+
+Runs on 2026-11-02 with 0.6.0:
+- every package: `ceesafec fetch` and `check` clean;
+- `web_core`: `fmt --check` and `doc --missing` clean;
+- `python3 tools/run_tests.py`: 5 passed (interpreter and native, no leaks);
+- the same with `--sanitize` (ASan + UBSan): 5 passed;
+- `--alloc-sweep`: 5 passed, 371 failure points (buffer 6, transport 365), each exiting 0 with `live=0`;
+- `tests/probes/`: as expected, including bug B1 (`docs/ceesafe-upstream-work.md`).
 
 ## External tools (from M2/M4 on)
 

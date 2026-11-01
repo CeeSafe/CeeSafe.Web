@@ -164,3 +164,30 @@ suspension point). It runs in the interpreter, so engine and driver tests are de
    for TLS-free layers and no generic impls? Recommended: yes. **Yes.**
 2. Should the poisoning rule (§3.4) close the connection automatically, or only report `Closed`? Recommended:
    report only, and let the driver decide (an HTTP/1.1 driver closes; a proxy may log first). **Report only.**
+
+## 7. Amendment 1 (2026-11-02, implementing `web_core`)
+
+Found while implementing against the ceesafec 0.6.0 release. The decision's intent is unchanged; these are its
+v0-expressible forms:
+
+1. **`PooledBuffer` is `BufferPool` + `OwnedBuffer`, recycled by move** (§3.1). A CeeSafe `PoolBox` is scoped (it
+   carries a loan of its pool, so it cannot be stored in a field; `spec/type-system.md` §19.6), and a custom allocator
+   must be a struct without fields. Instead:
+   - `BufferPool.take()` hands out an `OwnedBuffer`, and `give(buffer)` takes it back by move;
+   - a buffer still borrowed by an operation cannot be moved, so it cannot return to the pool while in use. That is the
+     same guarantee, enforced by the borrow checker;
+   - a buffer dropped instead of given back is freed;
+   - a pool belongs to one task.
+2. **`writeVectored` takes `borrow IoParts`**, a struct of up to four slices (§3.2). There are no slices of slices in
+   v0 (N0246, `tests/probes/slice-of-slices-fail.cee`). Four parts cover an HTTP/1.1 head and body, and a chunk's
+   size line, data and CRLF.
+3. **`Transport.alpn` is declared `@effects()`** (§3.2). An undeclared sync method called through `dyn` counts as
+   possibly blocking, so async code could not call it (N0295).
+4. **`withDeadline(d, body)` is `deadlineElapsed<T>(d)`** (§3.5), a task that never returns `Ok`, used as the second
+   child of `Async.race`. A generic wrapper over a closure is not expressible today: see CeeSafe bug B1 and upstream
+   U4 (`docs/ceesafe-upstream-work.md`).
+5. **`Transport.peer()` and `PeerInfo` move to M1.** They need CeeSafe's `SocketAddress` (upstream U1), which is on
+   CeeSafe main but not in the 0.6.0 release. For the same reason, `NetErrors.fromIo` cannot yet map
+   `ConnectionReset` to `Reset` (U2).
+6. Methods cannot have type parameters of their own (N0216), so generic helpers are top-level functions
+   (`deadlineElapsed<T>`). Type arguments on a method call (`d.expire<u32>()`) do not parse.

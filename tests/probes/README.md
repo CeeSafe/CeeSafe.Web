@@ -19,6 +19,8 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `impl-generic-fail.cee` | N0105 | `impl<T> I for S<T>` does not exist in v0 | 0001 |
 | `impl-scoped-fail.cee` | N0267 | a type with a region parameter cannot implement an interface | 0003 |
 | `method-region-fail.cee` | N0216 | a method cannot declare its own region; elided regions in method signatures work | 0003 |
+| `slice-of-slices-fail.cee` | N0246 | no slices or arrays of slices, so vectored writes take `IoParts` | 0001 (amended) |
+| `effectsof-async-bug.cee` | **should** print `70` or be rejected; prints `0` (interpreter), SEGV (native) | a CeeSafe 0.6.0 bug, upstream B1; when it prints `70`, a generic `withDeadline` becomes possible | 0001 §3.5 |
 
 ## Runs
 
@@ -26,5 +28,6 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 |---|---|---|
 | 2026-11-02 | `~/dev/CeeSafe/out/ceesafec` 0.6.0-dev (`5fa4316`) | all as expected, interpreter; `transport-dyn`, `handler-hooks` and `handler-boxed` also built natively (clang, macOS arm64), same output |
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.3.2 | `check`: all as expected |
+| 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.6.0 (release) | all as expected; the two new probes as listed (the bug reproduces) |
 
 `impl-generic-fail.cee` does not parse, so `ceesafec fmt --check` reports it; the other probes are formatted.
