@@ -1,0 +1,212 @@
+// The first web_server example (Web ADR 0007 §3.4): typed application state, a router with a parameter, a
+// middleware and a drain, served over HTTP/1.1. Listens on 127.0.0.1:CW_PORT (default 8080).
+//
+//   GET  /              "hello, world"
+//   GET  /hello/:name   "hello, <name>" (percent-decoded)
+//   POST /echo          the request body back
+//   GET  /stats         how many requests the server has seen
+//   POST /stop          starts the drain
+//
+// Every response carries `server: ceesafe-web`, added by the `Branding` middleware.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+/// The application's state, shared by every connection: handlers see it as `ctx.state()`.
+struct App {
+    requests: AtomicU64;
+}
+
+/// Counts every request, and names the server on every response.
+struct Branding {}
+
+impl Middleware<App> for Branding {
+    async fn before(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        ctx.state().requests.fetchAdd(1);
+        return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> {
+        match (head.add("server", "ceesafe-web".bytes())) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+}
+
+struct Index {}
+
+impl Handler<App> for Index {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        exchange.header("content-type", "text/plain".bytes())?;
+        return await exchange.send(Status.ok(), "hello, world".bytes());
+    }
+}
+
+struct Hello {}
+
+impl Handler<App> for Hello {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var name = Vector<u8>.create();
+        if (!ctx.paramDecoded("name", mut name)) {
+            return Err(HandlerError.Internal);
+        }
+        exchange.header("content-type", "text/plain; charset=utf-8".bytes())?;
+        exchange.setContentLength((7 + name.length) as u64);
+        await exchange.write("hello, ".bytes())?;
+        await exchange.write(name.view())?;
+        return Ok();
+    }
+}
+
+struct Echo {}
+
+impl Handler<App> for Echo {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var body = match (OwnedBuffer.create(1048576)) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        await exchange.readToEnd(mut body)?;
+        return await exchange.send(Status.ok(), body.readable());
+    }
+}
+
+struct Stats {}
+
+impl Handler<App> for Stats {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var text = [0u8; 20];
+        let start = decimal(ctx.state().requests.load(), mut text);
+        return await exchange.send(Status.ok(), text[start..]);
+    }
+}
+
+struct Stop {}
+
+impl Handler<App> for Stop {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        ctx.connection().drain().start();
+        return await exchange.send(Status.ok(), "stopping".bytes());
+    }
+}
+
+/// `v` in decimal at the end of `out`; the index of its first digit.
+fn decimal(v: u64, out: borrow mut [u8; 20]) -> usize {
+    var n = v;
+    var i: usize = 20;
+    while (true) {
+        i -= 1;
+        out[i] = truncate<u8>(48 + n % 10);
+        n /= 10;
+        if (n == 0) {
+            return i;
+        }
+    }
+    return i;
+}
+
+/// The server with its routes and middleware.
+fn application() -> Result<Server<App>, RouteError> {
+    var server = Server<App>.create(App { requests: AtomicU64.create(0) }, Limits.defaults())?;
+    server.use(boxed(Box.create(Branding {}))?)?;
+    server.router().get("/", handler(Box.create(Index {}))?)?;
+    server.router().get("/hello/:name", handler(Box.create(Hello {}))?)?;
+    server.router().post("/echo", handler(Box.create(Echo {}))?)?;
+    server.router().get("/stats", handler(Box.create(Stats {}))?)?;
+    server.router().post("/stop", handler(Box.create(Stop {}))?)?;
+    return Ok(server);
+}
+
+/// A boxed handler, or `OutOfMemory`.
+fn handler<H: Handler<App>>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App>>, RouteError> {
+    match (b) {
+        Ok(h) => {
+            let d: Box<dyn Handler<App>> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+/// A boxed middleware, or `OutOfMemory`.
+fn boxed<M: Middleware<App>>(b: Result<Box<M>, AllocError>) -> Result<Box<dyn Middleware<App>>, RouteError> {
+    match (b) {
+        Ok(m) => {
+            let d: Box<dyn Middleware<App>> = m;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn port() -> u16 {
+    let text = match (Environment.variable("CW_PORT")) {
+        Some(t) => t,
+        null => { return 8080; },
+    };
+    return match (Ascii.parseDecimal(text.bytes())) {
+        Some(v) => if (v > 0 && v < 65536) truncate<u16>(v) else 8080,
+        null => 8080,
+    };
+}
+
+async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = Listener.bindWith(SocketAddresses.v4Loopback(port()), options)?;
+    let drain = Drain.create()?;
+    match (await AsyncConsole.writeLine("server: listening")) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    let report = await server.run(listener, PlainAcceptor {}, ConnectionLimits.defaults(), drain)?;
+    match (await AsyncConsole.writeLine("server: drained")) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+fn main() {
+    let server = match (application()) {
+        Ok(s) => s,
+        Err(_) => {
+            Console.writeLine("server: could not build the routes");
+            return;
+        },
+    };
+    match (Async.run(serve(server))) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

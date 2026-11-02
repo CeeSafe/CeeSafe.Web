@@ -164,3 +164,21 @@ await server.listen(SocketAddress.v4([0, 0, 0, 0], 8080), PlainAcceptor {})?;
    (a field) or in its own atomics.
 3. **Responses the driver makes itself** (a malformed request, a handler's `Status` error) do not run `after` hooks in
    M2; that is revisited with CORS (M5's middleware set).
+
+## 8. Amendment 2 (2026-11-02, M2: `web_server` merged on ceesafec 0.9.2)
+
+1. **No delegating impls.** CeeSafe 0.9.0's generic impls (U10, CeeSafe ADR 0054) let `web_server` write
+   `impl<S> Application for Server<S>` and `impl<S> ConnectionHandler for Server<S>` once, so an application writes
+   no glue. This replaces M2.md's interim decision (two delegating impls per application). Using them needed CeeSafe
+   0.9.2's fixes B9–B12 (`docs/ceesafe-upstream-work.md`).
+2. **`run` instead of `listen` and `shutdown`** (§3.4). `server.run(incoming, acceptor, connectionLimits, drain)`
+   serves through M1's `ConnectionServer.run`. The caller binds the `Listener` (or passes a `MockIncoming` in tests)
+   and owns the `Drain`, so a shutdown is `drain.start()`, from a signal handler, a route (`ctx.connection().drain()`)
+   or a test; the server holds no listener or drain of its own.
+3. **Routing answers after the `before` hooks.** The route is found first, then every `before` runs, then the handler
+   or the router's own 404/405/204. So middleware sees, can answer and can edit (through `after`) every routed
+   response, 404 and 405 included. `OPTIONS *` is 204 with no `Allow`.
+4. **`Server<S>.create(state, limits)` takes the HTTP limits** (`web_http.Limits`); the connection limits go to `run`.
+5. Tests: `packages/web_server/tests/server.cee` (middleware order and short-circuit, routing responses byte for byte,
+   pipelining, and six connections through `Server.run` over `MockIncoming`), `examples/server`, and
+   `tests/interop/server.py`.

@@ -7,13 +7,11 @@ import web_http1;
 /// The test application's state: counters the handlers and middleware write.
 struct St {
     hits: AtomicU64;
-    /// Each `before` appends its id as a decimal digit.
+    /// Each `before` appends its id as a decimal digit (the last 18 are kept).
     befores: AtomicU64;
-    /// Each `after` appends its id.
-    afters: AtomicU64;
 }
 
-fn state() -> St => St { hits: AtomicU64.create(0), befores: AtomicU64.create(0), afters: AtomicU64.create(0) };
+fn state() -> St => St { hits: AtomicU64.create(0), befores: AtomicU64.create(0) };
 
 /// `r`, an allocation as the test's failure.
 fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
@@ -101,7 +99,7 @@ impl Middleware<St> for Mark {
         exchange: borrow mut Exchange,
     ) -> Result<Flow, HandlerError> {
         let s = ctx.state();
-        s.befores.store(s.befores.load() * 10 + this.id as u64);
+        s.befores.store(s.befores.load() % 100000000000000000 * 10 + this.id as u64); // the last 18 digits
         var digit = [0u8; 1];
         digit[0] = truncate<u8>(48 + this.id % 10);
         let deny = match (request.headers().getNamed("x-deny")) {

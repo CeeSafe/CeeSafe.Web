@@ -2,8 +2,20 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.9.2 (released 2026-11-02, tag `v0.9.2` = CeeSafe `47474db`)
+
+| Item | Status | Checked by |
+|---|---|---|
+| **B9** a generic struct's method cannot pass `this` as `dyn I` under a generic impl | **fixed** (`34bb24f`) | `tests/probes/generic-impl-dyn-in-generic-bug.cee` checks, prints 7 three times, interpreted and native |
+| **B10** async interface boxed as `dyn`, never called through it: C does not compile | **fixed** (`b147ae9`) | `tests/probes/async-dyn-uncalled-bug.cee` builds and prints 1 |
+| **B11** call through a returned `borrow Box<dyn I>` panics the compiler | **fixed** (`b0a9886`) | `tests/probes/borrowed-box-dyn-call-bug.cee` prints 7, interpreted and native |
+| **B12** generic impl passing `this` as `dyn` emits the uninstantiated type | **fixed** (`7be63c6`) | `tests/probes/generic-impl-this-dyn-bug.cee` builds and prints 7 |
+
+M2's task 5 (`web_server`) is unblocked: `Server<S>`, its tests and `examples/server` build and pass on 0.9.2.
+Nothing is open.
 
 ## Status at 0.9.1 (released 2026-11-02, tag `v0.9.1` = CeeSafe `74226b0`)
 
@@ -458,7 +470,7 @@ names of a type are not collected through a `dyn` interface's type arguments, wh
 2026-11-02: typed state `S`; with U10 released in 0.9.0, `web_server` implements `Application` for every `Server<S>`
 itself). `web_server` waits on branch `m2-server`. It is the only CeeSafe item blocking a CeeSafe.Web milestone.
 
-## B9 — Bug: a generic struct's method cannot pass `this` as `dyn I` when the impl is generic   *(found 2026-11-02, 0.9.1)*
+## B9 — Bug: a generic struct's method cannot pass `this` as `dyn I` when the impl is generic   *(found 2026-11-02, 0.9.1; fixed in 0.9.2)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/generic-impl-dyn-in-generic-bug.cee`. With `impl<S> Run for Wrap<S>`, a
 method of `Wrap<S>` calling `runDyn(this)` (`r: borrow dyn Run`) is N0268, "'Wrap<S>' does not implement 'Run'". A
@@ -470,7 +482,7 @@ The impl lookup probably does not see the struct's own type parameter as matchin
 **Blocks:** `Server<S>.run(listener, …)`, which would hand `this` to `ConnectionServer.run` as a `dyn
 ConnectionHandler`. Applications can call `ConnectionServer.run` themselves meanwhile; the method is left out.
 
-## B10 — Bug: an async interface boxed as `dyn` but never called through `dyn` gives C that does not compile   *(found 2026-11-02, 0.9.1; also 0.8.0 and 0.9.0)*
+## B10 — Bug: an async interface boxed as `dyn` but never called through `dyn` gives C that does not compile   *(found 2026-11-02, 0.9.1; also 0.8.0 and 0.9.0; fixed in 0.9.2)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/async-dyn-uncalled-bug.cee`: `interface Job { async fn run(borrow this) ->
 u32; }`, `let b: Box<dyn Job> = Box.create(Seven {})!;` and nothing else. `run --interp` prints 1; `build` fails with
@@ -481,7 +493,7 @@ u32; }`, `let b: Box<dyn Job> = Box.create(Seven {})!;` and nothing else. `run -
 
 **Blocks:** `web_server`'s router tests, which add boxed handlers and route paths without calling the handlers.
 
-## B11 — Bug: a call through a returned `borrow Box<dyn I>` panics the compiler   *(found 2026-11-02, 0.9.1; also 0.8.0 and 0.9.0)*
+## B11 — Bug: a call through a returned `borrow Box<dyn I>` panics the compiler   *(found 2026-11-02, 0.9.1; also 0.8.0 and 0.9.0; fixed in 0.9.2)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/borrowed-box-dyn-call-bug.cee`:
 
@@ -499,7 +511,7 @@ projections (the temporary holding the returned borrow).
 
 **Blocks:** `Server<S>`'s dispatch, `this.routes.handler(index).handle(…)`.
 
-## B12 — Bug: a generic impl's method passing `this` as `dyn` emits the uninstantiated type   *(found 2026-11-02, 0.9.0 and 0.9.1)*
+## B12 — Bug: a generic impl's method passing `this` as `dyn` emits the uninstantiated type   *(found 2026-11-02, 0.9.0 and 0.9.1; fixed in 0.9.2)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/generic-impl-this-dyn-bug.cee`: `impl<S> Run for Wrap<S>`, and `impl<S> Outer
 for Wrap<S> { fn outer(borrow this) -> u32 => runDyn(this); }`. It checks and prints 7 under `--interp`; `build`
@@ -583,7 +595,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.8.0** (released 2026-11-02) | B5, B6 fixed; U8, U5, T2 | M1's overload gate (passed); M4 TLS (OpenSSL), M5 client |
 | **0.9.0** (released 2026-11-02) | U6, U7, U9, U10, U11 | M9 sendfile, M10 HTTP/3; `web_server` without delegating impls |
 | **0.9.1** (released 2026-11-02) | B8 fixed; U12 | the `Date` field |
-| next | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
+| **0.9.2** (released 2026-11-02) | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

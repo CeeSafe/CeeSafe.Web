@@ -1,7 +1,7 @@
 // The server (Web ADR 0007 §3.4, amendment 2): the application's state, its router and its middleware, served over
 // M1's connection server with the HTTP/1.1 driver. `Server<S>` implements `Application` and `ConnectionHandler` for
-// every state type (CeeSafe ADR 0054's generic impls), so an application writes no glue: it passes its server to
-// `ConnectionServer.run(listener, acceptor, server, limits, drain)`.
+// every state type (CeeSafe ADR 0054's generic impls), so an application writes no glue: it calls
+// `server.run(listener, acceptor, limits, drain)` (Web ADR 0007 amendment 2).
 import web_core;
 import web_transport;
 import web_http;
@@ -41,6 +41,17 @@ public struct Server<S> {
 
     /// The HTTP limits each connection's requests are held to.
     public fn limits(borrow this) -> borrow Limits => borrow this.httpLimits;
+
+    /// Serves connections from `incoming` (a `Listener`, or a `MockIncoming` in tests) through `acceptor` with M1's
+    /// connection server, until `drain` finishes or `incoming` ends (`ConnectionServer.run`).
+    public async fn run(
+        borrow this,
+        incoming: borrow dyn Incoming,
+        acceptor: borrow dyn Acceptor,
+        limits: borrow ConnectionLimits,
+        drain: borrow Drain,
+    ) -> Result<ServerReport, NetError> =>
+        await ConnectionServer.run(incoming, acceptor, this, limits, drain);
 }
 
 impl<S> ConnectionHandler for Server<S> {

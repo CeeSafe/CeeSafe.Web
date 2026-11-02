@@ -1,0 +1,140 @@
+// `Server<S>` (Web ADR 0007 §3.2–§3.4): routing responses, middleware order and short-circuit, over web_http1's
+// driver on mock connections, then through M1's connection server. Every expected response is written out by hand
+// from RFC 9110 and the rules of §3.2–§3.3: `before` hooks in the order added, `after` hooks in reverse (so their
+// header fields appear last hook first), 405 and OPTIONS with `Allow` in `Methods.index` order, HEAD through GET.
+import web_core;
+import web_transport;
+import web_http;
+
+/// A server with two middleware (`Mark` 1 then 2) and the routes `GET /users` (h2), `POST /users` (h5),
+/// `GET /users/:id` (`Params2`).
+fn marked() -> Result<Server<St>, TestFailure> {
+    var s = routed(Server<St>.create(state(), quiet()))?;
+    added(s.use(mark(1)?))?;
+    added(s.use(mark(2)?))?;
+    added(s.router().get("/users", named(2)?))?;
+    added(s.router().post("/users", named(5)?))?;
+    added(s.router().get("/users/:id", params2()?))?;
+    return Ok(s);
+}
+
+/// The same routes without middleware.
+fn plain() -> Result<Server<St>, TestFailure> {
+    var s = routed(Server<St>.create(state(), quiet()))?;
+    added(s.router().get("/users", named(2)?))?;
+    added(s.router().post("/users", named(5)?))?;
+    added(s.router().get("/users/:id", params2()?))?;
+    return Ok(s);
+}
+
+@test
+async fn middleware_order_and_short_circuit() -> Result<void, TestFailure> {
+    let s = marked()?;
+    let ok = await exchange(s, "GET /users HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 2\r\n\r\nh2".bytes(), ok.view())?;
+    Check.equalU64(12, s.state().befores.load())?;
+    Check.equalU64(1, s.state().hits.load())?;
+    // `Mark 2` answers 401 itself: `before` 1 and 2 ran, the handler did not, and both `after` hooks still edit the
+    // head it sends.
+    s.state().befores.store(0);
+    let denied = await exchange(s, "GET /users HTTP/1.1\r\nhost: a\r\nx-deny: 2\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 401 Unauthorized\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 0\r\n\r\n".bytes(), denied.view())?;
+    Check.equalU64(12, s.state().befores.load())?;
+    Check.equalU64(1, s.state().hits.load())?;
+    // `Mark 1` answers first: `before` 2 never runs.
+    s.state().befores.store(0);
+    let first = await exchange(s, "GET /users HTTP/1.1\r\nhost: a\r\nx-deny: 1\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 401 Unauthorized\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 0\r\n\r\n".bytes(), first.view())?;
+    Check.equalU64(1, s.state().befores.load())?;
+    // Middleware runs before routing answers: a 404 is edited too.
+    let missing = await exchange(s, "GET /nope HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 404 Not Found\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 0\r\n\r\n".bytes(), missing.view())?;
+    return Ok();
+}
+
+@test
+async fn routing_responses() -> Result<void, TestFailure> {
+    let s = plain()?;
+    let post = await exchange(s, "POST /users HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh5".bytes(), post.view())?;
+    // HEAD through GET: GET's length, no content (RFC 9110 §9.3.2).
+    let head = await exchange(s, "HEAD /users HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n".bytes(), head.view())?;
+    let missing = await exchange(s, "GET /nope HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".bytes(), missing.view())?;
+    // 405 lists the path's methods and OPTIONS (RFC 9110 §15.5.6).
+    let delete = await exchange(s, "DELETE /users HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes(
+        "HTTP/1.1 405 Method Not Allowed\r\nallow: GET, HEAD, POST, OPTIONS\r\ncontent-length: 0\r\n\r\n".bytes(),
+        delete.view(),
+    )?;
+    // OPTIONS on a routed path: 204 with `Allow`, and no length field (RFC 9110 §9.3.7, §8.6).
+    let options = await exchange(s, "OPTIONS /users/7 HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 204 No Content\r\nallow: GET, HEAD, OPTIONS\r\n\r\n".bytes(), options.view())?;
+    let star = await exchange(s, "OPTIONS * HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 204 No Content\r\n\r\n".bytes(), star.view())?;
+    let unknown = await exchange(s, "OPTIONS /nope HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".bytes(), unknown.view())?;
+    // A parameter reaches the handler decoded on request; the wildcard is absent.
+    let param = await exchange(s, "GET /users/a%2Fb HTTP/1.1\r\nhost: a\r\n\r\n")?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\na/b|".bytes(), param.view())?;
+    return Ok();
+}
+
+@test
+async fn pipelined_on_one_connection() -> Result<void, TestFailure> {
+    let s = marked()?;
+    let out = await exchange(
+        s,
+        "GET /users HTTP/1.1\r\nhost: a\r\n\r\nGET /users/7 HTTP/1.1\r\nhost: a\r\n\r\nPUT /users HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n",
+    )?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 2\r\n\r\nh2HTTP/1.1 200 OK\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 2\r\n\r\n7|HTTP/1.1 405 Method Not Allowed\r\nallow: GET, HEAD, POST, OPTIONS\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 0\r\n\r\n".bytes(),
+        out.view(),
+    )?;
+    Check.equalU64(121212, s.state().befores.load())?;
+    return Ok();
+}
+
+/// Six connections of two requests each, through `Server.run` over a `MockIncoming` with 3 workers: every
+/// connection is served and every request reaches its handler.
+@test
+async fn through_the_connection_server() -> Result<void, TestFailure> {
+    let s = marked()?;
+    let incoming = net(MockIncoming.create(8))?;
+    let text = "GET /users HTTP/1.1\r\nhost: a\r\n\r\nPOST /users HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n";
+    for (k in 0..6u64) {
+        let m = match (MockTransport.create(text.bytes())) {
+            Ok(m) => m,
+            Err(_) => { return Err(TestFailure.create("a mock")); },
+        };
+        netDone(incoming.push(m.withSeededSplits(k + 1, 7)))?;
+    }
+    incoming.close();
+    var limits = ConnectionLimits.defaults();
+    limits.workers = 3;
+    let drain = net(Drain.create())?;
+    let report = net(await s.run(incoming, PlainAcceptor {}, limits, drain))?;
+    Check.equalU64(6, report.accepted)?;
+    Check.equalU64(6, report.served)?;
+    Check.equalU64(0, report.failed)?;
+    Check.isTrue(!report.forced, "not forced")?;
+    Check.equalU64(12, s.state().hits.load())?;
+    return Ok();
+}
+
+/// `r`, a network error as the test's failure.
+fn net<T>(r: Result<T, NetError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+}
+
+/// The same for a step with no value.
+fn netDone(r: Result<void, NetError>) -> Result<void, TestFailure> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+}
