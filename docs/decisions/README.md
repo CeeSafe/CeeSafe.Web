@@ -14,6 +14,7 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0006](0006-upstream-dependencies-and-toolchain.md) | Upstream dependencies and toolchain | Accepted 2026-11-02 | all |
 | [0007](0007-handler-model.md) | Handler model: handlers, middleware, routing and application state | Accepted 2026-11-02 (§6.2 pending M2's spike) | M2 on |
 | [0008](0008-streaming-and-sse.md) | Streaming responses and Server-Sent Events | Accepted 2026-11-02 | M3 on |
+| [0009](0009-http-client.md) | The HTTP client: engine, pool, Happy Eyeballs, redirects, retries | Accepted 2026-11-02 | M5 on |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 

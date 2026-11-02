@@ -7,6 +7,8 @@ public enum ProtocolError {
     RequestLineTooLong,
     /// The request line is not `method SP target SP version` (400).
     BadRequestLine,
+    /// A response's status line is malformed (RFC 9112 §4): the client's side.
+    BadStatusLine,
     /// The version is not HTTP/1.0 or HTTP/1.1 (505).
     UnsupportedVersion,
     /// The head is longer than `Limits.maxHeadBytes`, or one field than the buffer (431).
@@ -57,6 +59,7 @@ public struct ProtocolErrors {
     public fn describe(e: ProtocolError) -> StringView => match (e) {
         ProtocolError.RequestLineTooLong => "request line too long",
         ProtocolError.BadRequestLine => "malformed request line",
+        ProtocolError.BadStatusLine => "malformed status line",
         ProtocolError.UnsupportedVersion => "unsupported HTTP version",
         ProtocolError.HeadTooLarge => "request head too large",
         ProtocolError.TooManyHeaders => "too many header fields",

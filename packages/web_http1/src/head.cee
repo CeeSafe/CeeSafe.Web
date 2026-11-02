@@ -136,44 +136,7 @@ public fn parseHead<region r>(
         null => { return Err(ProtocolError.BadRequestLine); },
     };
 
-    // Field lines: field-name ":" OWS field-value OWS CRLF (RFC 9112 §5).
-    var headers = HeaderList.create(input);
-    var at = lineEnd + 2;
-    while (at < end - 2) {
-        var eol = at;
-        while (eol < end && input[eol] != 13) {
-            eol += 1;
-        }
-        if (eol + 1 >= end || input[eol + 1] != 10) {
-            return Err(ProtocolError.BadHeader); // a bare CR
-        }
-        let first = input[at];
-        if (first == 32 || first == 9) {
-            return Err(ProtocolError.ObsoleteFold);
-        }
-        var colon = at;
-        while (colon < eol && input[colon] != 58) {
-            colon += 1;
-        }
-        if (colon >= eol || !Ascii.isToken(input[at..colon])) {
-            return Err(ProtocolError.BadHeader); // no colon, an empty name, or whitespace before the colon
-        }
-        var vs = colon + 1;
-        var ve = eol;
-        while (vs < ve && Ascii.isWhitespace(input[vs])) {
-            vs += 1;
-        }
-        while (ve > vs && Ascii.isWhitespace(input[ve - 1])) {
-            ve -= 1;
-        }
-        for (i in vs..ve) {
-            if (!Ascii.isFieldValueChar(input[i])) {
-                return Err(ProtocolError.BadHeader); // NUL, CR or another control byte
-            }
-        }
-        headers.push(at, colon, vs, ve, limits.maxHeaders)?;
-        at = eol + 2;
-    }
+    let headers = parseFields(input, lineEnd + 2, end, limits)?;
 
     let framing = bodyFraming(borrow headers, version, limits)?;
     let hosts = headers.countOf(HeaderName.Host);
@@ -212,6 +175,54 @@ public fn parseHead<region r>(
         keepAlive: keepAlive,
         expectContinue: expectContinue,
     });
+}
+
+/// The field lines of a head, `input[at..end]` (ending with the head's empty line): field-name ":" OWS field-value OWS
+/// CRLF each (RFC 9112 §5), strict as the module comment says. Shared by requests and responses.
+fn parseFields<region r>(
+    input: Slice<r, u8>,
+    from: usize,
+    end: usize,
+    limits: borrow Limits,
+) -> Result<HeaderList<r>, ProtocolError> {
+    var headers = HeaderList.create(input);
+    var at = from;
+    while (at < end - 2) {
+        var eol = at;
+        while (eol < end && input[eol] != 13) {
+            eol += 1;
+        }
+        if (eol + 1 >= end || input[eol + 1] != 10) {
+            return Err(ProtocolError.BadHeader); // a bare CR
+        }
+        let first = input[at];
+        if (first == 32 || first == 9) {
+            return Err(ProtocolError.ObsoleteFold);
+        }
+        var colon = at;
+        while (colon < eol && input[colon] != 58) {
+            colon += 1;
+        }
+        if (colon >= eol || !Ascii.isToken(input[at..colon])) {
+            return Err(ProtocolError.BadHeader); // no colon, an empty name, or whitespace before the colon
+        }
+        var vs = colon + 1;
+        var ve = eol;
+        while (vs < ve && Ascii.isWhitespace(input[vs])) {
+            vs += 1;
+        }
+        while (ve > vs && Ascii.isWhitespace(input[ve - 1])) {
+            ve -= 1;
+        }
+        for (i in vs..ve) {
+            if (!Ascii.isFieldValueChar(input[i])) {
+                return Err(ProtocolError.BadHeader); // NUL, CR or another control byte
+            }
+        }
+        headers.push(at, colon, vs, ve, limits.maxHeaders)?;
+        at = eol + 2;
+    }
+    return Ok(headers);
 }
 
 /// `HTTP/1.0`, or `HTTP/1.1` for 1.1 and later 1.x; another major version is `UnsupportedVersion`, anything else

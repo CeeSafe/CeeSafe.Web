@@ -1,0 +1,216 @@
+// The client's half of HTTP/1.1 (Web ADR 0009 §3.1), sans-I/O: writing a request head, and parsing a response head
+// found by `HeadScanner`. Responses are parsed as strictly as requests (the same field rules, `parseFields`).
+import web_http;
+
+/// How a response's body is framed (RFC 9112 §6.3).
+public enum ResponseBody {
+    /// No body: a response to HEAD, a 1xx, 204 or 304.
+    Empty,
+    /// Exactly this many bytes.
+    Length(u64),
+    /// Chunked.
+    Chunked,
+    /// Until the server closes the connection.
+    UntilClose,
+}
+
+/// A parsed response head; its views borrow the input.
+public struct ParsedResponse<region r> {
+    /// The status code, 100 to 999.
+    public status: u16;
+    /// The reason phrase (possibly empty).
+    public reason: Slice<r, u8>;
+    public version: Version;
+    public headers: HeaderList<r>;
+    /// How the body is framed.
+    public body: ResponseBody;
+    /// Whether the connection may carry another request after this response: HTTP/1.1 unless `Connection: close`,
+    /// HTTP/1.0 only with `Connection: keep-alive`, and never for a body framed by the close.
+    public keepAlive: bool;
+}
+
+/// Parses the complete response head `input[start..end]` (from a `HeadScanner`), the response to a `method` request.
+/// Errors: `BadStatusLine`; a version other than HTTP/1.x (`UnsupportedVersion`); the field errors of `parseFields`;
+/// both Content-Length and Transfer-Encoding (`LengthAndEncoding`), differing Content-Lengths (`BadContentLength`), or
+/// a Transfer-Encoding other than `chunked` (`BadTransferEncoding`: this client decodes no other).
+public fn parseResponseHead<region r>(
+    input: Slice<r, u8>,
+    start: usize,
+    end: usize,
+    method: Method,
+    limits: borrow Limits,
+) -> Result<ParsedResponse<r>, ProtocolError> {
+    if (start >= end || end > input.length || end - start < 4) {
+        return Err(ProtocolError.BadStatusLine);
+    }
+    var lineEnd = start;
+    while (lineEnd < end && input[lineEnd] != 13) {
+        lineEnd += 1;
+    }
+    if (lineEnd + 1 >= end || input[lineEnd + 1] != 10) {
+        return Err(ProtocolError.BadStatusLine);
+    }
+    // status-line = HTTP-version SP 3DIGIT SP [ reason-phrase ] (RFC 9112 §4); a missing final SP is accepted.
+    let line = input[start..lineEnd];
+    if (line.length < 12 || line[8] != 32 || (line.length > 12 && line[12] != 32)) {
+        return Err(ProtocolError.BadStatusLine);
+    }
+    let version = match (parseVersion(line[0..8])) {
+        Ok(v) => v,
+        Err(ProtocolError.UnsupportedVersion) => { return Err(ProtocolError.UnsupportedVersion); },
+        Err(_) => { return Err(ProtocolError.BadStatusLine); },
+    };
+    var status: u16 = 0;
+    for (k in 0..3u32) {
+        let d = line[9 + k as usize];
+        if (d < 48 || d > 57) {
+            return Err(ProtocolError.BadStatusLine);
+        }
+        status = status * 10 + (d - 48) as u16;
+    }
+    if (status < 100) {
+        return Err(ProtocolError.BadStatusLine);
+    }
+    let reason = if (line.length > 13) line[13..] else line[0..0];
+    for (b in reason) {
+        if (b != 9 && (b < 32 || b == 127)) { // HTAB, SP, VCHAR, obs-text
+            return Err(ProtocolError.BadStatusLine);
+        }
+    }
+    let headers = parseFields(input, lineEnd + 2, end, limits)?;
+    let body = responseBody(borrow headers, method, status)?;
+    let close = headers.hasToken(HeaderName.Connection, "close");
+    let reusable = match (body) {
+        ResponseBody.UntilClose => false,
+        _ => true,
+    };
+    let keepAlive = reusable && match (version) {
+        Version.Http10 => !close && headers.hasToken(HeaderName.Connection, "keep-alive"),
+        _ => !close,
+    };
+    return Ok(ParsedResponse {
+        status: status,
+        reason: reason,
+        version: version,
+        headers: headers,
+        body: body,
+        keepAlive: keepAlive,
+    });
+}
+
+/// The response body's framing (RFC 9112 §6.3), strict as `parseResponseHead` says.
+fn responseBody(headers: borrow HeaderList, method: Method, status: u16) -> Result<ResponseBody, ProtocolError> {
+    if (Methods.same(method, Method.Head) || status < 200 || status == 204 || status == 304) {
+        return Ok(ResponseBody.Empty);
+    }
+    var unlimited = Limits.defaults();
+    unlimited.maxBodyBytes = 0xFFFFFFFFFFFFFFFF; // the client streams a body of any length; the caller limits it
+    // The request rules (`bodyFraming`) are the response rules too, but for the end: a request without framing has
+    // no body, a response without framing runs until the close.
+    let framing = bodyFraming(headers, Version.Http11, unlimited)?;
+    let encodings = headers.countOf(HeaderName.TransferEncoding);
+    let lengths = headers.countOf(HeaderName.ContentLength);
+    return match (framing) {
+        BodyFraming.Chunked => Ok(ResponseBody.Chunked),
+        BodyFraming.Length(n) => Ok(ResponseBody.Length(n)),
+        BodyFraming.None => Ok(if (encodings == 0 && lengths == 0) ResponseBody.UntilClose else ResponseBody.Length(0)),
+    };
+}
+
+/// Writes a request head into `out`, checking every part as it goes, so no caller's text can end a line early or
+/// smuggle a field: `start`, then `field` for each field, then `finish`.
+public struct RequestWriter {
+    private failed: bool;
+
+    /// The request line and `host` (RFC 9112 §3, §3.2): `method` a token, `target` an origin-form target (visible
+    /// ASCII, starting with `/`), `host` the authority.
+    public fn start(
+        out: borrow mut Vector<u8>,
+        method: Slice<u8>,
+        target: Slice<u8>,
+        host: Slice<u8>,
+    ) -> RequestWriter {
+        var w = RequestWriter { failed: false };
+        var targetOk = target.length > 0 && (target[0] == 47 || (target.length == 1 && target[0] == 42));
+        for (b in target) {
+            if (b <= 32 || b >= 127) {
+                targetOk = false;
+            }
+        }
+        if (!Ascii.isToken(method) || !targetOk || host.length == 0 || !validHost(host)) {
+            w.failed = true;
+            return w;
+        }
+        w.put(out, method);
+        w.put(out, " ".bytes());
+        w.put(out, target);
+        w.put(out, " HTTP/1.1\r\nhost: ".bytes());
+        w.put(out, host);
+        w.put(out, "\r\n".bytes());
+        return w;
+    }
+
+    /// A field: `name` a token, `value` field-value characters only (no CR, LF or NUL). Framing fields belong to
+    /// `finish`, and `host` to `start`: those names are refused here.
+    public fn field(borrow mut this, out: borrow mut Vector<u8>, name: Slice<u8>, value: Slice<u8>) {
+        if (!Ascii.isToken(name) || Ascii.equalsIgnoringCase(name, "host") ||
+            Ascii.equalsIgnoringCase(name, "content-length") || Ascii.equalsIgnoringCase(name, "transfer-encoding")) {
+            this.failed = true;
+            return;
+        }
+        for (b in value) {
+            if (!Ascii.isFieldValueChar(b)) {
+                this.failed = true;
+                return;
+            }
+        }
+        this.put(out, name);
+        this.put(out, ": ".bytes());
+        this.put(out, value);
+        this.put(out, "\r\n".bytes());
+    }
+
+    /// The framing and the empty line: `length` for a body of known length (0 writes `content-length: 0` only if
+    /// `declareZero`, as for POST and PUT), null for a chunked body. False if any part was refused or `out` could not
+    /// grow: then `out` holds no usable head.
+    public fn finish(borrow mut this, out: borrow mut Vector<u8>, length: u64?, declareZero: bool) -> bool {
+        match (length) {
+            Some(n) => {
+                if (n > 0 || declareZero) {
+                    var digits = [0u8; 20];
+                    var v = n;
+                    var i: usize = 20;
+                    loop {
+                        i -= 1;
+                        digits[i] = truncate<u8>(48 + v % 10);
+                        v /= 10;
+                        if (v == 0) {
+                            break;
+                        }
+                    }
+                    this.put(out, "content-length: ".bytes());
+                    this.put(out, digits[i..]);
+                    this.put(out, "\r\n".bytes());
+                }
+            }
+            null => { this.put(out, "transfer-encoding: chunked\r\n".bytes()); }
+        }
+        this.put(out, "\r\n".bytes());
+        return !this.failed;
+    }
+
+    fn put(borrow mut this, out: borrow mut Vector<u8>, bytes: Slice<u8>) {
+        if (this.failed) {
+            return;
+        }
+        for (b in bytes) {
+            match (out.push(b)) {
+                Ok() => {}
+                Err(_) => {
+                    this.failed = true;
+                    return;
+                }
+            }
+        }
+    }
+}
