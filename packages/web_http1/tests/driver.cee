@@ -1,0 +1,226 @@
+// The HTTP/1.1 driver over a scripted transport (implementation plan §7, M2 task 4 and its exit tests). Every
+// expected byte string is written out by hand from RFC 9112 and the test application's rules (driver_support.cee).
+import web_core;
+import web_http;
+
+/// The response the test application gives a request for `path` with `body`: `<path>:<body>`.
+fn echoed(path: StringView, body: StringView, out: borrow mut Vector<u8>) -> Result<void, TestFailure> {
+    let n = path.bytes().length + 1 + body.bytes().length;
+    var digits = [0u8; 8];
+    var k: usize = 8;
+    var v = n;
+    loop {
+        k -= 1;
+        digits[k] = truncate<u8>(48 + v % 10);
+        v /= 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    let ok = pushText(out, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: ") && pushBytes(out, digits[k..]) &&
+        pushText(out, "\r\n\r\n") && pushText(out, path) && pushText(out, ":") && pushText(out, body);
+    return if (ok) Ok() else Err(TestFailure.create("expected bytes"));
+}
+
+fn pushText(out: borrow mut Vector<u8>, s: StringView) -> bool => pushBytes(out, s.bytes());
+
+fn pushBytes(out: borrow mut Vector<u8>, s: Slice<u8>) -> bool {
+    for (b in s) {
+        match (out.push(b)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    return true;
+}
+
+@test
+async fn one_get() -> Result<void, TestFailure> {
+    let s = await run("GET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, Limits.defaults())?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\n\r\n/a:", s.output)?;
+    Check.equalU64(1, s.writes.length as u64)?;
+    return Ok();
+}
+
+@test
+async fn pipelined_requests_coalesce_and_keep_their_own_heads() -> Result<void, TestFailure> {
+    let text = "GET /a HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n\r\nPOST /b HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nxyzGET /c HTTP/1.1\r\nHost: x\r\n\r\n";
+    var expected = Vector<u8>.create();
+    echoed("/a", "", mut expected)?;
+    echoed("/b", "xyz", mut expected)?;
+    echoed("/c", "", mut expected)?;
+    let whole = await run(text, 4096, Limits.defaults())?;
+    Check.equalBytes(expected.view(), whole.output.view())?;
+    Check.equalU64(1, whole.writes.length as u64)?; // all three in one write
+    let trickle = await run(text, 1, Limits.defaults())?;
+    Check.equalBytes(expected.view(), trickle.output.view())?; // one byte per read: the same bytes
+    return Ok();
+}
+
+@test
+async fn a_hundred_pipelined_in_order() -> Result<void, TestFailure> {
+    var input = Vector<u8>.create();
+    var expected = Vector<u8>.create();
+    for (i in 0..100) {
+        var name = [47u8, 48, 48];
+        name[1] = truncate<u8>(48 + i / 10);
+        name[2] = truncate<u8>(48 + i % 10);
+        let path = match (StringView.fromUtf8(name[..])) {
+            Some(p) => p,
+            null => { return Err(TestFailure.create("path")); },
+        };
+        Check.isTrue(pushText(mut input, "GET ") && pushText(mut input, path) &&
+            pushText(mut input, " HTTP/1.1\r\nHost: x\r\n\r\n"), "input")?;
+        echoed(path, "", mut expected)?;
+    }
+    let text = match (StringView.fromUtf8(input.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let s = await run(text, 65536, Limits.defaults())?;
+    Check.equalBytes(expected.view(), s.output.view())?;
+    Check.equalU64(1, s.writes.length as u64)?; // 100 responses of 50 bytes fit one 16 KiB write
+    return Ok();
+}
+
+@test
+async fn sixteen_coalesce_and_a_stream_flushes_first() -> Result<void, TestFailure> {
+    var input = Vector<u8>.create();
+    for (i in 0..16) {
+        Check.isTrue(pushText(mut input, "GET /p HTTP/1.1\r\nHost: x\r\n\r\n"), "input")?;
+    }
+    let plain = match (StringView.fromUtf8(input.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let s = await run(plain, 65536, Limits.defaults())?;
+    Check.equalU64(1, s.writes.length as u64)?; // 16 pipelined requests, one flush
+
+    // The 8th request streams: everything before it and its first chunk go at its flush; the rest of it when it
+    // ends, before the 9th is handled; the last 8 together at the end.
+    var mixed = Vector<u8>.create();
+    var expected = Vector<u8>.create();
+    for (i in 0..16) {
+        if (i == 7) {
+            Check.isTrue(pushText(mut mixed, "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n"), "input")?;
+            Check.isTrue(pushText(mut expected,
+                "HTTP/1.1 200 OK\r\nx-hook: 1\r\ntransfer-encoding: chunked\r\n\r\n5\r\npart1\r\n5\r\npart2\r\n0\r\n\r\n"), "e")?;
+        } else {
+            Check.isTrue(pushText(mut mixed, "GET /p HTTP/1.1\r\nHost: x\r\n\r\n"), "input")?;
+            echoed("/p", "", mut expected)?;
+        }
+    }
+    let text = match (StringView.fromUtf8(mixed.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let m = await run(text, 65536, Limits.defaults())?;
+    Check.equalBytes(expected.view(), m.output.view())?;
+    Check.equalU64(3, m.writes.length as u64)?;
+    // Write 2 is the stream's remainder: "5\r\npart2\r\n0\r\n\r\n", 15 bytes, ending the response.
+    Check.equalU64(15, m.writes[1] as u64)?;
+    return Ok();
+}
+
+@test
+async fn bodies_by_length_and_chunked_at_every_read_size() -> Result<void, TestFailure> {
+    let text = "POST /l HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloPOST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;e=1\r\nde\r\n0\r\nT: 1\r\n\r\n";
+    var expected = Vector<u8>.create();
+    echoed("/l", "hello", mut expected)?;
+    echoed("/c", "abcde", mut expected)?;
+    for (step in 1..12usize) {
+        let s = await run(text, step, Limits.defaults())?;
+        Check.equalBytes(expected.view(), s.output.view())?;
+    }
+    return Ok();
+}
+
+@test
+async fn expect_100_continue() -> Result<void, TestFailure> {
+    let read = await run("POST /e HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", 4096,
+        Limits.defaults())?;
+    same("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 5\r\n\r\n/e:hi", read.output)?;
+    // A handler that never reads: no 100, and the connection closes (the client may or may not send the body).
+    let unread = await run(
+        "POST /ignore HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhiGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
+        4096,
+        Limits.defaults(),
+    )?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok", unread.output)?;
+    return Ok();
+}
+
+@test
+async fn unread_bodies_are_drained_or_close() -> Result<void, TestFailure> {
+    let text = "POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    var expected = Vector<u8>.create();
+    Check.isTrue(pushText(mut expected, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 2\r\n\r\nok"), "e")?;
+    echoed("/a", "", mut expected)?;
+    let drained = await run(text, 4096, Limits.defaults())?;
+    Check.equalBytes(expected.view(), drained.output.view())?; // 10 bytes drained, the next request served
+    var small = Limits.defaults();
+    small.drainBytes = 4;
+    let closed = await run(text, 4096, small)?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 2\r\n\r\nok", closed.output)?; // past 4 bytes: closed
+    return Ok();
+}
+
+@test
+async fn rejected_requests_close() -> Result<void, TestFailure> {
+    let two = await run("GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096,
+        Limits.defaults())?;
+    same("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", two.output)?;
+    let smuggle = await run(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
+        4096,
+        Limits.defaults(),
+    )?;
+    same("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", smuggle.output)?;
+    let bad = await run("POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 4096, Limits.defaults())?;
+    same("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", bad.output)?;
+    var tiny = Limits.defaults();
+    tiny.maxRequestLineBytes = 16;
+    let long = await run("GET /aaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: x\r\n\r\n", 4096, tiny)?;
+    same("HTTP/1.1 414 URI Too Long\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", long.output)?;
+    return Ok();
+}
+
+@test
+async fn head_version_and_errors() -> Result<void, TestFailure> {
+    let head = await run("HEAD /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, Limits.defaults())?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\n\r\n", head.output)?; // GET's length, no content
+    let old = await run("GET /a HTTP/1.0\r\n\r\nGET /b HTTP/1.0\r\n\r\n", 4096, Limits.defaults())?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\nconnection: close\r\n\r\n/a:", old.output)?;
+    let failed = await run("GET /fail HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096,
+        Limits.defaults())?;
+    var expected = Vector<u8>.create();
+    Check.isTrue(pushText(mut expected, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"), "e")?;
+    echoed("/a", "", mut expected)?;
+    Check.equalBytes(expected.view(), failed.output.view())?; // a handler's status keeps the connection
+    return Ok();
+}
+
+@test
+async fn large_responses() -> Result<void, TestFailure> {
+    var x = Vector<u8>.create();
+    for (i in 0..20000) {
+        match (x.push(120)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("x")); }
+        }
+    }
+    // Undeclared: the 16 KiB buffer fills, so it is chunked: 0x4000 bytes, then 0xe20 (3616) at the end.
+    let xs = x.view();
+    var chunked = Vector<u8>.create();
+    Check.isTrue(pushText(mut chunked, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ntransfer-encoding: chunked\r\n\r\n4000\r\n") &&
+        pushBytes(mut chunked, xs[0..16384]) && pushText(mut chunked, "\r\ne20\r\n") &&
+        pushBytes(mut chunked, xs[16384..]) && pushText(mut chunked, "\r\n0\r\n\r\n"), "e")?;
+    let big = await run("GET /big HTTP/1.1\r\nHost: x\r\n\r\n", 4096, Limits.defaults())?;
+    Check.equalBytes(chunked.view(), big.output.view())?;
+    var known = Vector<u8>.create();
+    Check.isTrue(pushText(mut known, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 20000\r\n\r\n") &&
+        pushBytes(mut known, x.view()), "e")?;
+    let declared = await run("GET /bigknown HTTP/1.1\r\nHost: x\r\n\r\n", 4096, Limits.defaults())?;
+    Check.equalBytes(known.view(), declared.output.view())?;
+    return Ok();
+}

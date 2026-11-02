@@ -147,3 +147,20 @@ await server.listen(SocketAddress.v4([0, 0, 0, 0], 8080), PlainAcceptor {})?;
    chosen by the framework? Recommended: application-declared, as a second type parameter
    (`Handler<S, X>`) if M2's spike shows it reads well; otherwise a fixed set. **As recommended: M2's spike decides,
    and its result is recorded here as an amendment.**
+
+## 7. Amendment 1 (2026-11-02, M2)
+
+1. **The handler takes one `Exchange`** (Web ADR 0003 amendment 3):
+
+   ```ceesafe
+   async fn handle(borrow this, ctx: borrow mut RequestContext<S>, request: borrow Request,
+                   exchange: borrow mut Exchange) -> Result<void, HandlerError>;
+   ```
+
+2. **`after` hooks get the request and the head, not the context.** A head is sent when the handler returns or when
+   its body outgrows the response buffer, which can happen inside `exchange.write` while the handler holds
+   `borrow mut ctx`. So the exchange calls `Application.beforeHead(request, head)`, and `Middleware.after(request,
+   head)` has no `ctx`. A middleware that must carry data from `before` to `after` keeps it in the response head
+   (a field) or in its own atomics.
+3. **Responses the driver makes itself** (a malformed request, a handler's `Status` error) do not run `after` hooks in
+   M2; that is revisited with CORS (M5's middleware set).

@@ -1,0 +1,161 @@
+// A scripted transport and a test application for the driver's tests.
+import web_core;
+import web_http;
+
+/// Delivers `input` in reads of at most `step` bytes, then the end of the stream; records every write.
+struct Script {
+    input: Vector<u8>;
+    at: usize;
+    step: usize;
+    output: Vector<u8>;
+    /// The length of each write, in order.
+    writes: Vector<usize>;
+}
+
+fn script(text: StringView, step: usize) -> Result<Script, TestFailure> {
+    var input = Vector<u8>.create();
+    for (b in text.bytes()) {
+        match (input.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("input")); }
+        }
+    }
+    return Ok(Script { input: input, at: 0, step: step, output: Vector<u8>.create(), writes: Vector<usize>.create() });
+}
+
+impl Transport for Script {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        let left = this.input.length - this.at;
+        var n = if (left < this.step) left else this.step;
+        if (n > buffer.length) {
+            n = buffer.length;
+        }
+        for (i in 0..n) {
+            buffer[i] = this.input[this.at + i];
+        }
+        this.at += n;
+        return Ok(n);
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        for (b in bytes) {
+            match (this.output.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+        match (this.writes.push(bytes.length)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        var total: usize = 0;
+        for (i in 0..parts.count()) {
+            let p = parts.part(i);
+            for (b in p) {
+                match (this.output.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(NetError.OutOfMemory); }
+                }
+            }
+            total += p.length;
+        }
+        match (this.writes.push(total)) {
+            Ok() => { return Ok(total); }
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => Ok();
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => Alpn.None;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => null;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => null;
+}
+
+/// Routes on the path:
+/// - `/stream`: writes "part1", flushes, writes "part2" (a streamed, chunked response);
+/// - `/ignore`: answers "ok" without reading the body;
+/// - `/fail`: fails with 404;
+/// - `/big`: 20000 bytes of `x`, length not declared; `/bigknown`: the same, declared;
+/// - anything else: reads the body and answers `<path>:<body>`.
+/// Its hook adds `x-hook: 1` to every response.
+struct App {
+    handled: AtomicU64;
+}
+
+impl Application for App {
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> {
+        let n = this.handled.fetchAdd(1);
+        let path = request.path();
+        let p = path.bytes();
+        if (Ascii.equals(p, "/stream")) {
+            await exchange.write("part1".bytes())?;
+            await exchange.flush()?;
+            await exchange.write("part2".bytes())?;
+            return Ok();
+        }
+        if (Ascii.equals(p, "/ignore")) {
+            return await exchange.send(Status.ok(), "ok".bytes());
+        }
+        if (Ascii.equals(p, "/fail")) {
+            return Err(HandlerError.Status(Status.notFound()));
+        }
+        if (Ascii.equals(p, "/big") || Ascii.equals(p, "/bigknown")) {
+            if (Ascii.equals(p, "/bigknown")) {
+                exchange.setContentLength(20000);
+            }
+            let block = [120u8; 1000];
+            for (i in 0..20) {
+                await exchange.write(block[..])?;
+            }
+            return Ok();
+        }
+        var body = match (OwnedBuffer.create(256)) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        await exchange.readToEnd(mut body)?;
+        await exchange.write(p)?;
+        await exchange.write(":".bytes())?;
+        await exchange.write(body.readable())?;
+        return Ok();
+    }
+
+    async fn beforeHead(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> {
+        match (head.add("x-hook", "1".bytes())) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+}
+
+/// Serves `text`, delivered `step` bytes per read, and returns the script with what was written.
+async fn run(text: StringView, step: usize, limits: borrow Limits) -> Result<Script, TestFailure> {
+    var s = script(text, step)?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    let app = App { handled: AtomicU64.create(0) };
+    match (await serve(mut s, ctx, app, limits)) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    return Ok(s);
+}
+
+fn same(expected: StringView, got: borrow Vector<u8>) -> Result<void, TestFailure> => Check.equalBytes(expected.bytes(), got.view());

@@ -163,3 +163,23 @@ before the head is sent:
    header injection), and the framing fields `Content-Length`, `Transfer-Encoding` and `Connection`, which the writer
    derives from `setContentLength`, the body and `closeConnection()`.
 3. **No `Date` until CeeSafe has a wall clock** (upstream U12); `HttpDate.format` is ready for it.
+
+## 9. Amendment 3 (2026-11-02, the driver in M2): one `Exchange`, not a body and a writer
+
+§3.3's `RequestBody` and §3.5's `ResponseWriter` would both hold `borrow mut` of the same transport, and CeeSafe lends
+a value mutably once at a time. Neither can be `dyn` and share it either (§1: a type with a region cannot implement an
+interface, N0267). So they are one concrete type, **`web_http.Exchange<r>`**, and the handler gets one
+`borrow mut Exchange`:
+
+1. **Body methods:** `read(buffer)` (0 at the end), `readToEnd(into)`, `remaining()`. Length and chunked framing are
+   decoded in place from the connection's carry buffer; the first read sends `100 Continue`; the minimum rate
+   (`web_core.MinRate`) bounds every read; a malformed body is `Status(400)`, too slow `Status(408)`, and either
+   closes the connection.
+2. **Response methods:** `setStatus`, `header`, `setContentLength`, `closeConnection`, `write`, `flush` (streaming),
+   `send(status, body)`. Bytes wait in a per-connection response buffer. A response that ends within it gets an exact
+   `Content-Length`; one that outgrows it, or is flushed, gets the declared length, else chunked (HTTP/1.1) or close
+   (HTTP/1.0). HEAD, 204 and 304 count their bytes and send none.
+3. **For the driver:** `finish()`, `finishBody()` (drain up to `drainBytes`, else close), `respondError(status,
+   close)`, `keepAlive()`, `streamed()`.
+4. A handler that answers without reading a body sent with `Expect: 100-continue` gets `Connection: close`: the client
+   may or may not send that body.

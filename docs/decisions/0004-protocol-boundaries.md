@@ -118,3 +118,16 @@ script.
 
 1. Should `web_http3` depend on `web_tls`, or on OpenSSL directly through its own shim? Recommended: `web_tls`, for
    shared certificate configuration (`CertResolver`). **`web_tls`.**
+
+## 7. Amendment 1 (2026-11-02, M2): the body's wire framing is in `web_http`
+
+`Exchange` (Web ADR 0003 amendment 3) decodes and encodes bodies in place, and `Handler` (in `web_http`) names it, so
+the code it calls must be in `web_http` too:
+
+1. `ChunkDecoder`, `ChunkStep`, `Encoder`, `ResponseFraming` and `BodyFraming` are in `web_http`. They stay sans-I/O
+   engines in §3.1's sense: no `await`, no clock, bytes in and out of the caller's buffers.
+2. `web_http1` keeps the request head (`HeadScanner`, `parseHead`) and the connection driver (`serve`).
+3. **`Application`** (`web_http`) is the non-generic interface a driver calls per request, with `handle` and
+   `beforeHead`. `web_server`'s generic `Server<S>` implements it, so drivers need no type parameter.
+4. HTTP/2 and HTTP/3 add their framing to `Exchange` as variants when they arrive (M6, M10), as §3.3's `RequestBody`
+   intended for `Stream`.

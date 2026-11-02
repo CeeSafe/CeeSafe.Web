@@ -1,0 +1,590 @@
+// One request's exchange with its connection (Web ADR 0003 §3.3, §3.5, amendment 3): the request body to read and the
+// response to write, over one transport. A handler gets one `borrow mut Exchange`, not a body and a writer, because
+// both use the transport mutably and CeeSafe lends a value mutably once at a time; and neither can be `dyn`, since a
+// type with a region cannot implement an interface (N0267). So it is one concrete type with both sets of methods.
+//
+// Writing: body bytes collect in `pending` (the connection's response buffer). A response that ends before `pending`
+// fills is sent with an exact Content-Length; one that outgrows it, or is flushed, is sent with the length the handler
+// declared, or chunked (HTTP/1.1), or until close (HTTP/1.0). Finished responses collect in `out`, so the driver can
+// send several pipelined responses in one write (implementation plan §7, M2 task 4).
+import web_core;
+
+/// How a handler failed (Web ADR 0007 §3.1).
+public enum HandlerError {
+    /// Respond with this status, if no head was sent yet.
+    Status(StatusCode),
+    /// The connection failed: close it.
+    Io(NetError),
+    /// A bug or an unexpected state: 500 if no head was sent, else close the connection.
+    Internal,
+}
+
+/// What a connection's driver runs for each request: `web_server`'s server, or a test. Not generic, so a driver
+/// needs no type parameter.
+public interface Application {
+    /// Handles one request: read its body and write its response through `exchange`.
+    async fn handle(borrow this, request: borrow Request, exchange: borrow mut Exchange, connection: borrow ConnectionContext,) -> Result<void, HandlerError>;
+
+    /// Runs just before a response head is sent, when the handler writes past the buffer or returns: middleware's
+    /// `after` hooks add their fields here (Web ADR 0007 §3.2, amendment 1).
+    async fn beforeHead(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
+}
+
+/// The state of the request body.
+enum BodyState {
+    Done,
+    Length,
+    Chunked,
+}
+
+/// One request's body and response, over its connection.
+public struct Exchange<region r> {
+    private conn: borrow mut(r) dyn Transport;
+    private carry: borrow mut(r) OwnedBuffer;
+    private out: borrow mut(r) OwnedBuffer;
+    private pending: borrow mut(r) OwnedBuffer;
+    private response: borrow mut(r) ResponseHead;
+    private app: borrow(r) dyn Application;
+    private request: borrow(r) Request<r>;
+    private limits: borrow(r) Limits;
+
+    private body: BodyState;
+    private left: u64;
+    private decoder: ChunkDecoder;
+    private rate: MinRate;
+    private continuePending: bool;
+    private bodyBroken: bool;
+
+    private sent: bool;
+    private framing: ResponseFraming;
+    private streaming: bool;
+    private written: u64;
+    private keep: bool;
+    private done: bool;
+
+    /// An exchange for `request`, whose body is framed by `framing`. `carry` holds the bytes received after the head;
+    /// `out` the responses not yet sent; `pending` and `response` are reset here. `keepAlive` is the request's own
+    /// verdict (version and Connection).
+    public fn create(
+        conn: borrow mut(r) dyn Transport,
+        carry: borrow mut(r) OwnedBuffer,
+        out: borrow mut(r) OwnedBuffer,
+        pending: borrow mut(r) OwnedBuffer,
+        response: borrow mut(r) ResponseHead,
+        app: borrow(r) dyn Application,
+        request: borrow(r) Request<r>,
+        limits: borrow(r) Limits,
+        framing: BodyFraming,
+        expectContinue: bool,
+        keepAlive: bool,
+    ) -> Exchange<r> {
+        pending.clear();
+        response.reset();
+        let state = match (framing) {
+            BodyFraming.None => BodyState.Done,
+            BodyFraming.Length(_) => BodyState.Length,
+            BodyFraming.Chunked => BodyState.Chunked,
+        };
+        let length = match (framing) {
+            BodyFraming.Length(n) => n,
+            _ => 0,
+        };
+        let rate = if (limits.minBodyRate == 0) MinRate.off() else MinRate.startingNow(
+            limits.minBodyRate,
+            limits.minBodyRateGraceMs,
+        );
+        let decoder = ChunkDecoder.create(limits);
+        let hasBody = match (state) {
+            BodyState.Done => false,
+            _ => true,
+        };
+        return Exchange {
+            conn: conn,
+            carry: carry,
+            out: out,
+            pending: pending,
+            response: response,
+            app: app,
+            request: request,
+            limits: limits,
+            body: state,
+            left: length,
+            decoder: decoder,
+            rate: rate,
+            continuePending: expectContinue && hasBody,
+            bodyBroken: false,
+            sent: false,
+            framing: ResponseFraming.NoContent,
+            streaming: false,
+            written: 0,
+            keep: keepAlive,
+            done: false,
+        };
+    }
+
+    // ---- The request body ----
+
+    /// Reads body bytes into `buffer`: at least one, or 0 at the end of the body. The first read sends `100
+    /// Continue` if the client asked for it (RFC 9110 §10.1.1). A malformed or too large body is
+    /// `Status(400 or 413)`, a client too slow `Status(408)`; either closes the connection afterwards.
+    public async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, HandlerError> {
+        if (buffer.length == 0) {
+            return Err(HandlerError.Internal);
+        }
+        if (this.bodyBroken) {
+            return Err(HandlerError.Status(Status.badRequest()));
+        }
+        match (this.body) {
+            BodyState.Done => { return Ok(0); }
+            _ => {}
+        }
+        if (this.continuePending) {
+            this.continuePending = false;
+            if (!this.sent) {
+                await this.flushOut()?;
+                await this.writeBytes("HTTP/1.1 100 Continue\r\n\r\n".bytes())?;
+            }
+        }
+        loop {
+            if (this.carry.isEmpty()) {
+                await this.receive()?;
+            }
+            match (this.body) {
+                BodyState.Length => {
+                    let available = this.carry.readable();
+                    var n = if (buffer.length < available.length) buffer.length else available.length;
+                    if (n as u64 > this.left) {
+                        n = truncate<usize>(this.left);
+                    }
+                    for (i in 0..n) {
+                        buffer[i] = available[i];
+                    }
+                    this.consumeCarry(n)?;
+                    this.left -= n as u64;
+                    if (this.left == 0) {
+                        this.body = BodyState.Done;
+                    }
+                    return Ok(n);
+                }
+                BodyState.Chunked => {
+                    let input = this.carry.readable();
+                    let step = match (this.decoder.decode(input, buffer.length)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            this.bodyBroken = true;
+                            this.keep = false;
+                            return Err(HandlerError.Status(ProtocolErrors.status(e)));
+                        },
+                    };
+                    for (i in 0..step.dataLength) {
+                        buffer[i] = input[step.dataStart + i];
+                    }
+                    this.consumeCarry(step.consumed)?;
+                    if (step.finished) {
+                        this.body = BodyState.Done;
+                    }
+                    if (step.dataLength > 0) {
+                        return Ok(step.dataLength);
+                    }
+                    if (step.finished) {
+                        return Ok(0);
+                    }
+                }
+                BodyState.Done => { return Ok(0); }
+            }
+        }
+    }
+
+    /// Reads the rest of the body into `into`. `Status(413)` if it would exceed `into`'s room.
+    public async fn readToEnd(borrow mut this, into: borrow mut OwnedBuffer) -> Result<void, HandlerError> {
+        loop {
+            into.compact();
+            if (into.spareLength() == 0) {
+                var probe = [0u8; 1];
+                let n = await this.read(mut probe[..])?;
+                if (n == 0) {
+                    return Ok();
+                }
+                return Err(HandlerError.Status(Status.contentTooLarge()));
+            }
+            let n = await this.read(into.spare())?;
+            if (n == 0) {
+                return Ok();
+            }
+            match (into.commit(n)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+        }
+    }
+
+    /// The body bytes not yet read, if the body has a length; 0 once it is read; null for a chunked body.
+    public fn remaining(borrow this) -> u64? => match (this.body) {
+        BodyState.Done => Some(0u64),
+        BodyState.Length => Some(this.left),
+        BodyState.Chunked => null,
+    };
+
+    /// Reads more of the connection into `carry`, bounded by the minimum-rate deadline.
+    async fn receive(borrow mut this) -> Result<void, HandlerError> {
+        this.carry.compact();
+        let n = match (await Transports.readWithin(this.conn, this.carry.spare(), this.rate.deadline())) {
+            Ok(n) => n,
+            Err(NetError.TimedOut) => {
+                this.bodyBroken = true;
+                this.keep = false;
+                return Err(HandlerError.Status(Status.requestTimeout()));
+            },
+            Err(e) => {
+                this.bodyBroken = true;
+                this.keep = false;
+                return Err(HandlerError.Io(e));
+            },
+        };
+        if (n == 0) {
+            this.bodyBroken = true; // the client ended before its body did
+            this.keep = false;
+            return Err(HandlerError.Io(NetError.Closed));
+        }
+        this.rate.record(n);
+        match (this.carry.commit(n)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+
+    fn consumeCarry(borrow mut this, n: usize) -> Result<void, HandlerError> {
+        match (this.carry.consume(n)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+
+    // ---- The response ----
+
+    /// Sets the status; ignored once the head was sent.
+    public fn setStatus(borrow mut this, status: StatusCode) {
+        if (!this.sent) {
+            this.response.setStatus(status);
+        }
+    }
+
+    /// Adds a response field. `Internal` for a bad name or value, a framing field, or no room; after the head was
+    /// sent, `Internal` too.
+    public fn header(borrow mut this, name: StringView, value: Slice<u8>) -> Result<void, HandlerError> {
+        if (this.sent) {
+            return Err(HandlerError.Internal);
+        }
+        match (this.response.add(name, value)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+
+    /// Declares the body's length, so it is sent with Content-Length even when it outgrows the buffer.
+    public fn setContentLength(borrow mut this, n: u64) {
+        if (!this.sent) {
+            this.response.setContentLength(n);
+        }
+    }
+
+    /// Asks for the connection to close after this response.
+    public fn closeConnection(borrow mut this) {
+        this.keep = false;
+    }
+
+    /// Whether the head has been sent (or queued to send).
+    public fn headSent(borrow this) -> bool => this.sent;
+
+    /// Writes body bytes. They wait in the response buffer; a full buffer sends the head and the bytes so far.
+    public async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError> {
+        if (this.done) {
+            return Err(HandlerError.Internal);
+        }
+        var at: usize = 0;
+        while (at < bytes.length) {
+            if (this.pending.spareLength() == 0) {
+                this.pending.compact();
+            }
+            if (this.pending.spareLength() == 0) {
+                await this.sendPending()?;
+                continue;
+            }
+            let room = this.pending.spareLength();
+            let n = if (bytes.length - at < room) bytes.length - at else room;
+            match (this.pending.append(bytes[at..at + n])) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+            at += n;
+        }
+        return Ok();
+    }
+
+    /// Sends everything written so far now: the head, and the body as it stands (a streaming response). The rest
+    /// of the response follows chunked unless a length was declared.
+    public async fn flush(borrow mut this) -> Result<void, HandlerError> {
+        this.streaming = true;
+        await this.sendPending()?;
+        await this.flushOut()?;
+        return Ok();
+    }
+
+    /// Sets `status`, the length of `body`, writes it: a whole small response in one call.
+    public async fn send(borrow mut this, status: StatusCode, body: Slice<u8>) -> Result<void, HandlerError> {
+        this.setStatus(status);
+        this.setContentLength(body.length as u64);
+        return await this.write(body);
+    }
+
+    /// Sends the head if it was not sent, then moves `pending` to the wire: into `out` if it fits, else written with
+    /// `out` in one vectored step.
+    async fn sendPending(borrow mut this) -> Result<void, HandlerError> {
+        if (!this.sent) {
+            await this.sendHead(this.response.contentLength())?;
+        }
+        let n = this.pending.length();
+        if (n == 0) {
+            return Ok();
+        }
+        this.written += n as u64;
+        if (Methods.same(this.request.method(), Method.Head)) {
+            this.pending.clear(); // HEAD: the length GET would send, and no content (RFC 9110 §9.3.2)
+            return Ok();
+        }
+        match (this.framing) {
+            ResponseFraming.NoContent => {
+                this.pending.clear(); // 204, 304: counted, not sent
+                return Ok();
+            }
+            ResponseFraming.Length(total) => {
+                if (this.written > total) {
+                    this.keep = false; // more than declared: the framing would be wrong
+                    return Err(HandlerError.Internal);
+                }
+            }
+            ResponseFraming.Chunked => {
+                if (this.out.spareLength() < 18) {
+                    await this.flushOut()?;
+                }
+                match (Encoder.chunkHeader(n, this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            ResponseFraming.UntilClose => {}
+        }
+        let chunked = match (this.framing) {
+            ResponseFraming.Chunked => true,
+            _ => false,
+        };
+        if (this.out.spareLength() >= n + 2) {
+            match (this.out.append(this.pending.readable())) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+            if (chunked) {
+                match (Encoder.chunkEnd(this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            this.pending.clear();
+            return Ok();
+        }
+        // Too big to copy: send `out`, the body and the chunk's CRLF together.
+        let crlf = "\r\n";
+        let crlfBytes = crlf.bytes();
+        let tail = if (chunked) crlfBytes else crlfBytes[0..0];
+        let first = match (IoParts.of(this.out.readable()).then(this.pending.readable())) {
+            Some(p) => p,
+            null => { return Err(HandlerError.Internal); },
+        };
+        let parts = match (first.then(tail)) {
+            Some(p) => p,
+            null => { return Err(HandlerError.Internal); },
+        };
+        match (await Transports.writeAllVectoredWithin(this.conn, parts, Deadline.after(this.limits.writeTimeoutMs))) {
+            Ok() => {}
+            Err(e) => {
+                this.keep = false;
+                return Err(HandlerError.Io(e));
+            }
+        }
+        this.out.clear();
+        this.pending.clear();
+        return Ok();
+    }
+
+    /// Runs the application's hook, chooses the framing, and queues the head in `out`.
+    async fn sendHead(borrow mut this, length: u64?) -> Result<void, HandlerError> {
+        await this.app.beforeHead(this.request, this.response)?;
+        let status = this.response.status();
+        this.framing = Encoder.framing(status, this.request.method(), this.request.version(), length);
+        match (this.framing) {
+            ResponseFraming.UntilClose => { this.keep = false; }
+            _ => {}
+        }
+        if (this.response.closes()) {
+            this.keep = false;
+        }
+        if (this.continuePending) {
+            // The handler answers without reading a body the client is waiting to be asked for: the client may send
+            // it or not, so the connection cannot carry another request (and says so).
+            this.keep = false;
+        }
+        match (Encoder.head(this.response, this.framing, this.keep, null, this.out)) {
+            Ok() => {}
+            Err(_) => {
+                await this.flushOut()?;
+                match (Encoder.head(this.response, this.framing, this.keep, null, this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); } // the head alone is larger than the buffer
+                }
+            }
+        }
+        this.sent = true;
+        // A body must not follow a response without content; an interim status is not a final response.
+        return Ok();
+    }
+
+    /// Writes `out` to the connection and empties it.
+    async fn flushOut(borrow mut this) -> Result<void, HandlerError> {
+        if (this.out.isEmpty()) {
+            return Ok();
+        }
+        match (await Transports.writeWithin(
+            this.conn,
+            this.out.readable(),
+            Deadline.after(this.limits.writeTimeoutMs),
+        )) {
+            Ok() => {}
+            Err(e) => {
+                this.keep = false;
+                return Err(HandlerError.Io(e));
+            }
+        }
+        this.out.clear();
+        return Ok();
+    }
+
+    async fn writeBytes(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError> {
+        match (await Transports.writeWithin(this.conn, bytes, Deadline.after(this.limits.writeTimeoutMs))) {
+            Ok() => { return Ok(); }
+            Err(e) => {
+                this.keep = false;
+                return Err(HandlerError.Io(e));
+            }
+        }
+    }
+
+    // ---- For the driver ----
+
+    /// Ends the response after the handler returned `Ok`: a response that was never sent goes out whole with an
+    /// exact Content-Length; a chunked one gets its last chunk. A response shorter than its declared length closes
+    /// the connection. Streaming responses are flushed now.
+    public async fn finish(borrow mut this) -> Result<void, HandlerError> {
+        if (this.done) {
+            return Ok();
+        }
+        this.done = true;
+        if (!this.sent) {
+            let length = match (this.response.contentLength()) {
+                Some(n) => Some(n),
+                null => Some(this.pending.length() as u64),
+            };
+            await this.sendHead(length)?;
+        }
+        await this.sendPending()?;
+        match (this.framing) {
+            ResponseFraming.Chunked => {
+                if (this.out.spareLength() < 5) {
+                    await this.flushOut()?;
+                }
+                match (Encoder.lastChunk(this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            ResponseFraming.Length(total) => {
+                if (this.written != total && !Methods.same(this.request.method(), Method.Head)) {
+                    this.keep = false; // fewer bytes than declared: the client would wait for the rest
+                }
+            }
+            ResponseFraming.UntilClose => { this.keep = false; }
+            ResponseFraming.NoContent => {}
+        }
+        if (this.streaming) {
+            await this.flushOut()?;
+        }
+        return Ok();
+    }
+
+    /// Replaces an unsent response with an error response of `status` and no content, closing the connection if
+    /// `close`. False if a head was already sent: the connection must close instead.
+    public fn respondError(borrow mut this, status: StatusCode, close: bool) -> bool {
+        if (this.sent) {
+            this.keep = false;
+            return false;
+        }
+        if (close) {
+            this.keep = false;
+        }
+        this.response.reset();
+        this.response.setStatus(status);
+        this.pending.clear();
+        let framing = if (status.allowsContent()) ResponseFraming.Length(0) else ResponseFraming.NoContent;
+        match (Encoder.head(this.response, framing, this.keep, null, this.out)) {
+            Ok() => {}
+            Err(_) => {
+                this.keep = false;
+                return false;
+            }
+        }
+        this.sent = true;
+        this.done = true;
+        this.framing = framing;
+        return true;
+    }
+
+    /// After the response: reads and discards what the handler left of the body, up to `Limits.drainBytes`, so the
+    /// next request can be read; past that, or on an error, the connection closes instead (Web ADR 0003 §3.3).
+    public async fn finishBody(borrow mut this) {
+        if (this.bodyBroken) {
+            this.keep = false;
+            return;
+        }
+        if (!this.keep) {
+            return; // closing anyway: no need to read what is left
+        }
+        match (this.body) {
+            BodyState.Done => { return; }
+            _ => {}
+        }
+        if (this.continuePending) {
+            // The client waits for 100 Continue that will never come; it may send the body or not, so the
+            // connection cannot be reused safely.
+            this.keep = false;
+            return;
+        }
+        var drained: u64 = 0;
+        var scratch = [0u8; 512];
+        while (drained <= this.limits.drainBytes) {
+            match (await this.read(mut scratch[..])) {
+                Ok(0) => { return; }
+                Ok(n) => { drained += n as u64; }
+                Err(_) => {
+                    this.keep = false;
+                    return;
+                }
+            }
+        }
+        this.keep = false;
+    }
+
+    /// Whether the connection may carry another request.
+    public fn keepAlive(borrow this) -> bool => this.keep;
+
+    /// Whether this response was streamed (flushed by the handler): the driver sends it before reading on.
+    public fn streamed(borrow this) -> bool => this.streaming;
+}

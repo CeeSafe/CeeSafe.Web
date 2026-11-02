@@ -1,6 +1,5 @@
 // Writing HTTP/1.1 responses (RFC 9112 §4, §6, §7.1), sans-I/O: into the caller's buffer, never allocating.
 import web_core;
-import web_http;
 
 /// How a response's content is delimited on the wire.
 public enum ResponseFraming {

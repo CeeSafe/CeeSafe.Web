@@ -61,3 +61,13 @@ public struct Request<region r> {
     /// The fields.
     public fn headers(borrow this) -> borrow HeaderList<r> => borrow this.fields;
 }
+
+/// How a request's body is delimited (RFC 9112 §6.3).
+public enum BodyFraming {
+    /// No body.
+    None,
+    /// Exactly this many bytes.
+    Length(u64),
+    /// Chunked transfer coding.
+    Chunked,
+}

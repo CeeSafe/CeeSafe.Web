@@ -1,0 +1,240 @@
+// The HTTP/1.1 connection driver (Web ADR 0004 §3.2; implementation plan §7, M2 task 4): read a head, parse it in
+// place, run the application, finish the response and the body, and go on while the connection is kept alive.
+//
+// Buffers, allocated once per connection: two head buffers that swap roles (the request's views borrow one while the
+// bytes after its head, a body prefix or pipelined requests, wait in the other), the write buffer `out` and the
+// response buffer `pending`.
+//
+// Pipelining is sequential with coalescing: a finished response stays in `out` while another complete request is
+// already buffered, so a burst of pipelined requests is answered with one write. `out` is sent when no complete
+// request is buffered, when it is full, before waiting to read, and after a streamed response.
+import web_core;
+import web_http;
+
+/// Serves HTTP/1.1 on `conn` until the client closes or asks to, a protocol error, a timeout, or the server's drain
+/// (an idle connection closes at once; one in a request finishes it first). A peer's reset or a failed write is
+/// `Err`; every other end is `Ok`.
+public async fn serve(
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    app: borrow dyn Application,
+    limits: borrow Limits,
+) -> Result<void, NetError> {
+    var a = buffer(limits.maxHeadBytes)?;
+    var b = buffer(limits.maxHeadBytes)?;
+    var out = buffer(limits.writeBufferBytes)?;
+    var pending = buffer(limits.writeBufferBytes)?;
+    var response = match (ResponseHead.create(4096)) {
+        Ok(h) => h,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    loop {
+        // A complete head in `a`.
+        var scanner = HeadScanner.create();
+        var headDeadline = Deadline.never();
+        loop {
+            match (scanner.scan(a.readable(), limits)) {
+                Ok(true) => { break; }
+                Ok(false) => {}
+                Err(e) => {
+                    await reject(conn, mut out, mut response, ProtocolErrors.status(e), limits);
+                    return Ok();
+                }
+            }
+            // Nothing complete is buffered: send what is waiting before waiting for more.
+            await flush(conn, mut out, limits)?;
+            a.compact();
+            if (a.spareLength() == 0) {
+                await reject(conn, mut out, mut response, Status.headerFieldsTooLarge(), limits);
+                return Ok();
+            }
+            let idle = a.isEmpty();
+            if (idle && connection.isDraining()) {
+                return Ok();
+            }
+            var n: usize = 0;
+            if (idle) {
+                let d = Deadline.after(limits.idleTimeoutMs);
+                let r: Result<Raced<usize>, NetError> = await Async.race(
+                    async () => await Transports.readWithin(conn, a.spare(), d),
+                    async () => await drainStarted<usize>(connection.drain()),
+                );
+                match (r) {
+                    Ok(raced) => { n = raced.value; }
+                    Err(NetError.TimedOut) => { return Ok(); } // idle too long
+                    Err(NetError.Cancelled) => {
+                        if (connection.isDraining()) {
+                            return Ok();
+                        }
+                        return Err(NetError.Cancelled);
+                    }
+                    Err(e) => { return Err(e); }
+                }
+            } else {
+                match (await Transports.readWithin(conn, a.spare(), headDeadline)) {
+                    Ok(v) => { n = v; }
+                    Err(NetError.TimedOut) => {
+                        await reject(conn, mut out, mut response, Status.requestTimeout(), limits);
+                        return Ok();
+                    }
+                    Err(e) => { return Err(e); }
+                }
+            }
+            if (n == 0) {
+                return Ok(); // the client closed, between requests or within a head
+            }
+            if (idle) {
+                headDeadline = Deadline.after(limits.headerTimeoutMs);
+            }
+            match (a.commit(n)) {
+                Ok() => {}
+                Err(e) => { return Err(e); }
+            }
+        }
+        let keep = await exchangeOne(
+            conn,
+            connection,
+            app,
+            limits,
+            a,
+            scanner.start(),
+            scanner.end(),
+            mut b,
+            mut out,
+            mut pending,
+            mut response,
+        )?;
+        if (!keep) {
+            match (await flush(conn, mut out, limits)) {
+                Ok() => {}
+                Err(_) => {} // closing anyway
+            }
+            return Ok();
+        }
+        // The bytes after this head, in `b`, start the next request.
+        a.clear();
+        let t = a;
+        a = b;
+        b = t;
+    }
+}
+
+/// One request: parse the head `a[start..end]`, run the application, finish. True to keep the connection.
+async fn exchangeOne(
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    app: borrow dyn Application,
+    limits: borrow Limits,
+    a: borrow OwnedBuffer,
+    start: usize,
+    end: usize,
+    b: borrow mut OwnedBuffer,
+    out: borrow mut OwnedBuffer,
+    pending: borrow mut OwnedBuffer,
+    response: borrow mut ResponseHead,
+) -> Result<bool, NetError> {
+    let input = a.readable();
+    let head = match (parseHead(input, start, end, limits)) {
+        Ok(h) => h,
+        Err(e) => {
+            await reject(conn, out, response, ProtocolErrors.status(e), limits);
+            return Ok(false);
+        },
+    };
+    b.clear();
+    b.append(input[end..])?;
+    var ex = Exchange.create(
+        conn,
+        b,
+        out,
+        pending,
+        response,
+        app,
+        head.request,
+        limits,
+        head.framing,
+        head.expectContinue,
+        head.keepAlive && !connection.isDraining(),
+    );
+    var failed: HandlerError? = null;
+    match (await app.handle(head.request, mut ex, connection)) {
+        Ok() => {
+            match (await ex.finish()) {
+                Ok() => {}
+                Err(e) => { failed = Some(e); }
+            }
+        }
+        Err(e) => { failed = Some(e); }
+    }
+    match (failed) {
+        Some(HandlerError.Status(s)) => {
+            if (!ex.respondError(s, false)) {
+                return Ok(false);
+            }
+        }
+        Some(HandlerError.Internal) => {
+            if (!ex.respondError(Status.internalServerError(), true)) {
+                return Ok(false);
+            }
+        }
+        Some(HandlerError.Io(_)) => { return Ok(false); } // the connection is broken: nothing more can be sent
+        null => {}
+    }
+    await ex.finishBody();
+    let keep = ex.keepAlive();
+    let streamed = ex.streamed();
+    // Coalescing: keep `out` while a complete request waits in `b`; send it otherwise.
+    var nextReady = false;
+    if (keep && !streamed) {
+        var s = HeadScanner.create();
+        nextReady = match (s.scan(b.readable(), limits)) {
+            Ok(true) => true,
+            _ => false,
+        };
+    }
+    if (!nextReady) {
+        await flush(conn, out, limits)?;
+    }
+    return Ok(keep);
+}
+
+/// Sends `status` with no content and `Connection: close`, for a request that cannot be read.
+async fn reject(
+    conn: borrow mut dyn Transport,
+    out: borrow mut OwnedBuffer,
+    response: borrow mut ResponseHead,
+    status: StatusCode,
+    limits: borrow Limits,
+) {
+    response.reset();
+    response.setStatus(status);
+    match (Encoder.head(response, ResponseFraming.Length(0), false, null, out)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    match (await flush(conn, out, limits)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+/// Writes `out` and empties it.
+async fn flush(
+    conn: borrow mut dyn Transport,
+    out: borrow mut OwnedBuffer,
+    limits: borrow Limits,
+) -> Result<void, NetError> {
+    if (out.isEmpty()) {
+        return Ok();
+    }
+    await Transports.writeWithin(conn, out.readable(), Deadline.after(limits.writeTimeoutMs))?;
+    out.clear();
+    return Ok();
+}
+
+fn buffer(n: usize) -> Result<OwnedBuffer, NetError> {
+    match (OwnedBuffer.create(n)) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}

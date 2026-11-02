@@ -67,6 +67,23 @@ public struct Transports {
         return Ok();
     }
 
+    /// Writes every byte of `parts` as `writeAllVectored`, bounded by `deadline`: `Err(TimedOut)` once it passes,
+    /// and the transport is then poisoned (§3.4).
+    public async fn writeAllVectoredWithin(
+        t: borrow mut dyn Transport,
+        parts: borrow IoParts,
+        deadline: Deadline,
+    ) -> Result<void, NetError> {
+        if (deadline.isNever()) {
+            return await Transports.writeAllVectored(t, parts);
+        }
+        if (deadline.isExpired()) {
+            return Err(NetError.TimedOut);
+        }
+        return await Async.deadline(deadline.instant(), NetError.TimedOut, async () =>
+            await Transports.writeAllVectored(t, parts));
+    }
+
     /// Reads as `read`, bounded by `deadline` (CeeSafe's `Async.deadline`, ADR 0046): `Err(TimedOut)` once it passes.
     /// A read cancelled by the deadline after the kernel completed it is not lost: its bytes come with the next read
     /// (Web ADR 0001 §3.4).

@@ -1,5 +1,5 @@
 // The chunked decoder against RFC 9112 §7.1: data, extensions, trailers, every split, and each malformed shape.
-import web_http;
+
 
 /// Decodes all of `input` (fed from `split` on: first `input[0..split]`, then the rest), appending data to `out`.
 /// Returns the bytes consumed and whether the body finished, or the error.
@@ -8,7 +8,7 @@ fn decodeAll(input: Slice<u8>, split: usize, limits: borrow Limits, out: borrow 
     var at: usize = 0;
     var available = if (split < input.length) split else input.length;
     loop {
-        let step = d.decode(input[at..available])?;
+        let step = d.decode(input[at..available], 3)?; // at most 3 data bytes a step: a small reader
         for (i in 0..step.dataLength) {
             match (out.push(input[at + step.dataStart + i])) {
                 Ok() => {}

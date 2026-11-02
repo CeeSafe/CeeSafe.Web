@@ -1,6 +1,6 @@
 // The response encoder against RFC 9112 §4, §6.3 and §7.1; the expected bytes are written out by hand.
 import web_core;
-import web_http;
+
 
 fn buffer(n: usize) -> Result<OwnedBuffer, TestFailure> {
     match (OwnedBuffer.create(n)) {

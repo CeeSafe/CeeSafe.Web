@@ -5,16 +5,6 @@
 // any Transfer-Encoding but `chunked` are each rejected.
 import web_http;
 
-/// How a request's body is delimited (RFC 9112 §6.3).
-public enum BodyFraming {
-    /// No body.
-    None,
-    /// Exactly this many bytes.
-    Length(u64),
-    /// Chunked transfer coding.
-    Chunked,
-}
-
 /// Finds the end of a request head as its bytes arrive, without scanning any byte twice. A connection keeps one
 /// per request and calls `scan` with the whole buffered input each time more arrives.
 public struct HeadScanner {

@@ -2,7 +2,6 @@
 // back as a range of the caller's input. Limits: chunk sizes past 15 hex digits, extensions (every byte between the
 // size and its CRLF) past `maxChunkExtensionBytes`, trailers past `maxTrailerBytes` and a body past `maxBodyBytes` are errors. Trailer fields
 // are checked and discarded.
-import web_http;
 
 /// What one `ChunkDecoder.decode` call found.
 public struct ChunkStep {
@@ -66,9 +65,10 @@ public struct ChunkDecoder {
     /// The body bytes decoded so far.
     public fn bodyBytes(borrow this) -> u64 => this.total;
 
-    /// Decodes from the start of `input` until it finds data (returned at once), finishes the body, or uses all of
-    /// `input`. Call again with the bytes after `consumed`, and more as they arrive.
-    public fn decode(borrow mut this, input: Slice<u8>) -> Result<ChunkStep, ProtocolError> {
+    /// Decodes from the start of `input` until it finds data (returned at once, at most `room` bytes of it),
+    /// finishes the body, or uses all of `input`. Call again with the bytes after `consumed`, and more as they
+    /// arrive. A `room` of 0 decodes framing only and stops at data.
+    public fn decode(borrow mut this, input: Slice<u8>, room: usize) -> Result<ChunkStep, ProtocolError> {
         var i: usize = 0;
         while (i < input.length) {
             let b = input[i];
@@ -128,7 +128,11 @@ public struct ChunkDecoder {
                     this.digits = 0;
                 }
                 ChunkState.Data => {
-                    let available = (input.length - i) as u64;
+                    let fits = if (input.length - i < room) input.length - i else room;
+                    if (fits == 0) {
+                        return Ok(ChunkStep { consumed: i, dataStart: i, dataLength: 0, finished: false });
+                    }
+                    let available = fits as u64;
                     let n = if (this.left < available) this.left else available;
                     this.left -= n;
                     if (this.left == 0) {
