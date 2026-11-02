@@ -1,0 +1,67 @@
+// An echo server on 127.0.0.1:7007 with web_transport: a fixed set of connection workers, each looping accept → echo
+// on one shared listener (the M0 connection pattern: a CeeSafe scope spawns only in its body). Each idle connection
+// costs one worker frame (about 1 KiB; `ceesafec build --explain-frames`) and its socket.
+//
+//   ceesafec build -o out/echo && out/echo      then, in another terminal:   nc 127.0.0.1 7007
+import web_core;
+import web_transport;
+
+/// One connection: echo until the peer ends its side; an idle peer is dropped after 30 seconds.
+async fn echo(conn: borrow mut dyn Transport) -> Result<void, NetError> {
+    var buf = [0u8; 4096];
+    loop {
+        let r: Result<Raced<usize>, NetError> = await Async.race(
+            async () => await conn.read(mut buf[..]),
+            async () => await deadlineElapsed<usize>(Deadline.after(30000)),
+        );
+        let read = match (r) {
+            Ok(raced) => raced.value,
+            Err(e) => { return Err(e); },
+        };
+        if (read == 0) {
+            return await conn.shutdownWrite();
+        }
+        await conn.write(buf[0..read])?;
+    }
+}
+
+/// A worker: serves connections one after another. A connection's failure ends that connection, not the worker.
+async fn worker(listener: borrow Listener) -> Result<void, NetError> {
+    let acceptor = PlainAcceptor {};
+    loop {
+        let stream = await listener.accept()?;
+        match (await acceptor.accept(stream)) {
+            Ok(conn) => {
+                var c = conn;
+                match (await echo(mut c)) {
+                    Ok() => {}
+                    Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+                    Err(_) => {} // this connection failed; the next one is served
+                }
+            }
+            Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+            Err(_) => {}
+        }
+    }
+}
+
+async fn serve() -> Result<void, NetError> {
+    let listener = Listener.bind("127.0.0.1", 7007)?;
+    match (await AsyncConsole.writeLine("echo: listening on 127.0.0.1:7007 with 64 workers")) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        for (k in 0..64) {
+            s.spawn(async () => await worker(listener));
+        }
+    })?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(serve())) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}
