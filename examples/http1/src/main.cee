@@ -1,0 +1,111 @@
+// An HTTP/1.1 server with web_http1's driver under M1's ConnectionServer, without web_server's router: an
+// `Application` written by hand. For interop (curl, wrk, h2load --h1) and the conformance driver
+// (tests/conformance/http1). Listens on 127.0.0.1:CW_PORT (default 8080) with CW_WORKERS workers (default 64).
+//
+//   GET  /, /hello   "hello, world"
+//   POST /echo       the request body back
+//   GET  /stream     three chunks, flushed one by one
+//   any other        404
+//   request "/stop"  starts the drain (for scripts)
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+struct App {}
+
+impl Application for App {
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> {
+        let p = request.path().bytes();
+        if (Ascii.equals(p, "/") || Ascii.equals(p, "/hello")) {
+            exchange.header("content-type", "text/plain".bytes())?;
+            return await exchange.send(Status.ok(), "hello, world".bytes());
+        }
+        if (Ascii.equals(p, "/echo")) {
+            var body = match (OwnedBuffer.create(1048576)) {
+                Ok(b) => b,
+                Err(_) => { return Err(HandlerError.Internal); },
+            };
+            await exchange.readToEnd(mut body)?;
+            return await exchange.send(Status.ok(), body.readable());
+        }
+        if (Ascii.equals(p, "/stream")) {
+            for (i in 0..3) {
+                await exchange.write("chunk\n".bytes())?;
+                await exchange.flush()?;
+            }
+            return Ok();
+        }
+        if (Ascii.equals(p, "/stop")) {
+            connection.drain().start();
+            return await exchange.send(Status.ok(), "stopping".bytes());
+        }
+        return Err(HandlerError.Status(Status.notFound()));
+    }
+
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// Runs the HTTP/1.1 driver on each connection.
+struct Http {
+    app: App;
+    limits: Limits;
+}
+
+impl ConnectionHandler for Http {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> =>
+        await web_http1.serve(conn, ctx, this.app, this.limits);
+}
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    var v: u64 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57) {
+            return otherwise;
+        }
+        v = v * 10 + (b - 48) as u64;
+    }
+    return v;
+}
+
+async fn run() -> Result<void, NetError> {
+    let port = truncate<u16>(setting("CW_PORT", 8080));
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = Listener.bindWith(SocketAddresses.v4Loopback(port), options)?;
+    var limits = ConnectionLimits.defaults();
+    limits.workers = truncate<u32>(setting("CW_WORKERS", 64));
+    let http = Http { app: App {}, limits: Limits.defaults() };
+    let drain = Drain.create()?;
+    let acceptor = PlainAcceptor {};
+    match (await AsyncConsole.writeLine("http1: listening")) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    let report = await ConnectionServer.run(listener, acceptor, http, limits, drain)?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

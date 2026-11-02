@@ -1,0 +1,10 @@
+[package]
+name = "http1"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+web_core = { path = "../../packages/web_core" }
+web_transport = { path = "../../packages/web_transport" }
+web_http = { path = "../../packages/web_http" }
+web_http1 = { path = "../../packages/web_http1" }
