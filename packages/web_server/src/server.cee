@@ -1,0 +1,140 @@
+// The server (Web ADR 0007 §3.4, amendment 2): the application's state, its router and its middleware, served over
+// M1's connection server with the HTTP/1.1 driver. `Server<S>` implements `Application` and `ConnectionHandler` for
+// every state type (CeeSafe ADR 0054's generic impls), so an application writes no glue: it passes its server to
+// `ConnectionServer.run(listener, acceptor, server, limits, drain)`.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+/// An HTTP server for an application whose state is `S`.
+public struct Server<S> {
+    private appState: S;
+    private routes: Router<S>;
+    private hooks: Vector<Box<dyn Middleware<S>>>;
+    private httpLimits: Limits;
+
+    /// A server owning `state`, with no routes and no middleware; `limits` bound each connection's requests.
+    public fn create(state: S, limits: Limits) -> Result<Server<S>, RouteError> {
+        let routes = Router<S>.create()?;
+        return Ok(Server {
+            appState: state,
+            routes: routes,
+            hooks: Vector<Box<dyn Middleware<S>>>.create(),
+            httpLimits: limits,
+        });
+    }
+
+    /// Adds `m` after the middleware already added: its `before` runs after theirs, its `after` before theirs.
+    public fn use(borrow mut this, m: Box<dyn Middleware<S>>) -> Result<void, RouteError> {
+        match (this.hooks.push(m)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+    }
+
+    /// The router, to add routes.
+    public fn router(borrow mut this) -> borrow mut Router<S> => borrow mut this.routes;
+
+    /// The application's state.
+    public fn state(borrow this) -> borrow S => borrow this.appState;
+
+    /// The HTTP limits each connection's requests are held to.
+    public fn limits(borrow this) -> borrow Limits => borrow this.httpLimits;
+}
+
+impl<S> ConnectionHandler for Server<S> {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> =>
+        await web_http1.serve(conn, ctx, this, this.httpLimits);
+}
+
+impl<S> Application for Server<S> {
+    /// Routes the request, runs every middleware's `before` in order, then the route's handler. A path with no
+    /// route is 404; a path with routes but none for the method is 405 with `Allow`, or 204 with `Allow` for OPTIONS
+    /// (RFC 9110 §9.3.7, §15.5.6). `OPTIONS *` is 204.
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> {
+        var params = Params.empty();
+        let path = request.path();
+        let found = this.routes.find(request.method(), path.bytes(), mut params);
+        var ctx = RequestContext<S>.create(this.appState, connection, this.routes, path, params);
+        for (i in 0..this.hooks.length) {
+            match (await this.hooks[i].before(mut ctx, request, exchange)?) {
+                Flow.Continue => {}
+                Flow.Responded => { return Ok(); }
+            }
+        }
+        let options = Methods.same(request.method(), Method.Options);
+        match (found) {
+            RouteMatch.Found(index) => { return await this.routes.handler(index).handle(mut ctx, request, exchange); }
+            RouteMatch.MethodNotAllowed(mask) => {
+                var text = [0u8; 96];
+                let n = allowText(mask | (1u32 << Methods.index(Method.Options)), mut text);
+                exchange.header("allow", text[0..n])?;
+                let status = if (options) Status.noContent() else Status.methodNotAllowed();
+                return await exchange.send(status, "".bytes());
+            }
+            RouteMatch.NotFound => {
+                let asterisk = Ascii.equals(path.bytes(), "*");
+                let status = if (options && asterisk) Status.noContent() else Status.notFound();
+                return await exchange.send(status, "".bytes());
+            }
+        }
+    }
+
+    /// Every middleware's `after`, in reverse order.
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError> {
+        var i = this.hooks.length;
+        while (i > 0) {
+            i -= 1;
+            await this.hooks[i].after(request, head)?;
+        }
+        return Ok();
+    }
+}
+
+/// The methods in `mask` (over `Methods.index`), as an `Allow` value ("GET, HEAD, OPTIONS") in `out`; its length.
+fn allowText(mask: u32, out: borrow mut [u8; 96]) -> usize {
+    var n: usize = 0;
+    for (i in 0..9u32) {
+        if ((mask & (1u32 << i)) == 0) {
+            continue;
+        }
+        let name = Methods.text(methodAt(i)).bytes();
+        if (n > 0) {
+            out[n] = 44;
+            out[n + 1] = 32;
+            n += 2;
+        }
+        for (b in name) {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// The method at `Methods.index` value `i` (0 to 8).
+fn methodAt(i: u32) -> Method => match (i) {
+    0 => Method.Get,
+    1 => Method.Head,
+    2 => Method.Post,
+    3 => Method.Put,
+    4 => Method.Delete,
+    5 => Method.Connect,
+    6 => Method.Options,
+    7 => Method.Trace,
+    _ => Method.Patch,
+};

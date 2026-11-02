@@ -1,0 +1,133 @@
+// The router (Web ADR 0007 §3.3). Every expected outcome is worked out by hand from §3.3's rules: literals before a
+// parameter before the wildcard, with backtracking; HEAD through GET; 405 lists the path's methods.
+import web_http;
+
+/// A router with the routes the tests below share. Handler ids: 1 `/`, 2 `GET /users`, 3 `GET /users/:id`,
+/// 4 `GET /users/me`, 5 `POST /users`, 6 `GET /files/*rest`, 7 `GET /users/:id/posts`, 8 `GET /a b` (decoded literal),
+/// 9 `PUT /users/:id`.
+fn sample() -> Result<Router<St>, TestFailure> {
+    var r = routed(Router<St>.create())?;
+    added(r.get("/", named(1)?))?;
+    added(r.get("/users", named(2)?))?;
+    added(r.get("/users/:id", named(3)?))?;
+    added(r.get("/users/me", named(4)?))?;
+    added(r.post("/users", named(5)?))?;
+    added(r.get("/files/*rest", named(6)?))?;
+    added(r.get("/users/:id/posts", named(7)?))?;
+    added(r.get("/a b", named(8)?))?;
+    added(r.put("/users/:id", named(9)?))?;
+    return Ok(r);
+}
+
+/// The handler index `method path` finds (0-based: the order routes were added), or 100 + the 405 mask, or 999.
+fn outcome(r: borrow Router<St>, method: Method, path: StringView) -> u64 {
+    var p = Params.empty();
+    return match (r.find(method, path.bytes(), mut p)) {
+        RouteMatch.Found(i) => i as u64,
+        RouteMatch.MethodNotAllowed(mask) => 100 + mask as u64,
+        RouteMatch.NotFound => 999,
+    };
+}
+
+@test
+fn literals_before_parameters_before_wildcards() -> Result<void, TestFailure> {
+    let r = sample()?;
+    Check.equalU64(0, outcome(r, Method.Get, "/"))?;
+    Check.equalU64(1, outcome(r, Method.Get, "/users"))?;
+    Check.equalU64(3, outcome(r, Method.Get, "/users/me"))?; // the literal wins
+    Check.equalU64(2, outcome(r, Method.Get, "/users/42"))?;
+    Check.equalU64(6, outcome(r, Method.Get, "/users/me/posts"))?; // backtracks from the literal `me` to `:id`
+    Check.equalU64(5, outcome(r, Method.Get, "/files/a/b/c"))?;
+    Check.equalU64(5, outcome(r, Method.Get, "/files/"))?; // the wildcard may be empty
+    Check.equalU64(999, outcome(r, Method.Get, "/files"))?; // but its `/` is needed
+    Check.equalU64(999, outcome(r, Method.Get, "/users/42/comments"))?;
+    Check.equalU64(999, outcome(r, Method.Get, "/nope"))?;
+    Check.equalU64(999, outcome(r, Method.Get, "/users/"))?; // a parameter is never empty
+    Check.equalU64(999, outcome(r, Method.Get, "*"))?;
+    return Ok();
+}
+
+@test
+fn methods_head_and_405() -> Result<void, TestFailure> {
+    let r = sample()?;
+    Check.equalU64(4, outcome(r, Method.Post, "/users"))?;
+    Check.equalU64(1, outcome(r, Method.Head, "/users"))?; // HEAD through GET (RFC 9110 §9.3.2)
+    Check.equalU64(8, outcome(r, Method.Put, "/users/7"))?;
+    // DELETE /users: GET (bit 0), HEAD (1), POST (2): 0b111.
+    Check.equalU64(100 + 7, outcome(r, Method.Delete, "/users"))?;
+    // POST /users/7: GET, HEAD, PUT (bit 3): 0b1011.
+    Check.equalU64(100 + 11, outcome(r, Method.Post, "/users/7"))?;
+    Check.equalU64(100 + 3, outcome(r, Method.Options, "/"))?;
+    return Ok();
+}
+
+@test
+fn parameters_and_decoding() -> Result<void, TestFailure> {
+    let r = sample()?;
+    // A literal segment is compared after percent-decoding the request's segment.
+    Check.equalU64(7, outcome(r, Method.Get, "/a%20b"))?;
+    Check.equalU64(3, outcome(r, Method.Get, "/users/m%65"))?; // "me"
+    Check.equalU64(999, outcome(r, Method.Get, "/a%2"))?; // a bare `%` is itself
+    // Parameter ranges are views of the path, still encoded.
+    var p = Params.empty();
+    let path = "/users/a%2Fb/posts";
+    match (r.find(Method.Get, path.bytes(), mut p)) {
+        RouteMatch.Found(i) => { Check.equalU64(6, i as u64)?; }
+        _ => { return Check.fail("found"); }
+    }
+    match (r.paramRange(p, "id")) {
+        Some(range) => {
+            Check.equalU64(7, range.start as u64)?;
+            Check.equalU64(12, range.end as u64)?;
+        }
+        null => { return Check.fail("an id"); }
+    }
+    let none = match (r.paramRange(p, "rest")) {
+        Some(_) => false,
+        null => true,
+    };
+    Check.isTrue(none, "no rest")?;
+    var out = Vector<u8>.create();
+    Check.isTrue(percentDecode("a%2Fb%zz%4".bytes(), mut out), "decoded")?;
+    Check.equalBytes("a/b%zz%4".bytes(), out.view())?;
+    return Ok();
+}
+
+@test
+fn bad_and_conflicting_routes() -> Result<void, TestFailure> {
+    var r = routed(Router<St>.create())?;
+    added(r.get("/x/:id", named(1)?))?;
+    Check.isTrue(isError(r.get("x", named(1)?), RouteError.BadPattern), "no leading slash")?;
+    Check.isTrue(isError(r.get("/x/:", named(1)?), RouteError.BadPattern), "an empty name")?;
+    Check.isTrue(isError(r.get("/*rest/x", named(1)?), RouteError.BadPattern), "a wildcard before the end")?;
+    Check.isTrue(isError(r.get("/x/:id", named(2)?), RouteError.Conflict), "the same route twice")?;
+    Check.isTrue(isError(r.get("/x/:other", named(2)?), RouteError.Conflict), "two parameter names at one place")?;
+    Check.isTrue(isError(r.add(Method.Extension, "/y", named(2)?), RouteError.UnsupportedMethod), "an extension")?;
+    added(r.post("/x/:id", named(3)?))?; // another method at the same place is fine
+    return Ok();
+}
+
+fn isError(r: Result<void, RouteError>, e: RouteError) -> bool {
+    let got = match (r) {
+        Ok() => { return false; },
+        Err(x) => x,
+    };
+    return match (got) {
+        RouteError.BadPattern => match (e) {
+            RouteError.BadPattern => true,
+            _ => false,
+        },
+        RouteError.Conflict => match (e) {
+            RouteError.Conflict => true,
+            _ => false,
+        },
+        RouteError.UnsupportedMethod => match (e) {
+            RouteError.UnsupportedMethod => true,
+            _ => false,
+        },
+        RouteError.OutOfMemory => match (e) {
+            RouteError.OutOfMemory => true,
+            _ => false,
+        },
+    };
+}

@@ -1,0 +1,179 @@
+// Helpers for web_server's tests: a test state, handlers that name themselves, and middleware that records its order.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+/// The test application's state: counters the handlers and middleware write.
+struct St {
+    hits: AtomicU64;
+    /// Each `before` appends its id as a decimal digit.
+    befores: AtomicU64;
+    /// Each `after` appends its id.
+    afters: AtomicU64;
+}
+
+fn state() -> St => St { hits: AtomicU64.create(0), befores: AtomicU64.create(0), afters: AtomicU64.create(0) };
+
+/// `r`, an allocation as the test's failure.
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+/// `r`, a route error as the test's failure.
+fn routed<T>(r: Result<T, RouteError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("a route error")); }
+    }
+}
+
+/// Answers `h<id>`.
+struct Named {
+    id: u32;
+}
+
+impl Handler<St> for Named {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        ctx.state().hits.fetchAdd(1);
+        var b = [104u8, 0u8];
+        b[1] = truncate<u8>(48 + this.id % 10);
+        return await exchange.send(Status.ok(), b[..]);
+    }
+}
+
+/// A boxed `Named`.
+fn named(id: u32) -> Result<Box<dyn Handler<St>>, TestFailure> {
+    let h: Box<dyn Handler<St>> = alloc(Box.create(Named { id: id }))?;
+    return Ok(h);
+}
+
+/// Answers `<id>|<rest>`: the parameters `id` (decoded) and `rest` (as sent), each empty if absent.
+struct Params2 {}
+
+impl Handler<St> for Params2 {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var id = Vector<u8>.create();
+        if (!ctx.paramDecoded("id", mut id)) {
+            id.clear();
+        }
+        let rest = match (ctx.param("rest")) {
+            Some(v) => v.bytes(),
+            null => "".bytes(),
+        };
+        exchange.setContentLength((id.length + 1 + rest.length) as u64);
+        await exchange.write(id.view())?;
+        await exchange.write("|".bytes())?;
+        await exchange.write(rest)?;
+        return Ok();
+    }
+}
+
+fn params2() -> Result<Box<dyn Handler<St>>, TestFailure> {
+    let h: Box<dyn Handler<St>> = alloc(Box.create(Params2 {}))?;
+    return Ok(h);
+}
+
+/// Records its `before` and `after` in the state, adds `x-m<id>: 1` to every head, and answers 401 itself when the
+/// request has `x-deny: <id>`.
+struct Mark {
+    id: u32;
+}
+
+impl Middleware<St> for Mark {
+    async fn before(
+        borrow this,
+        ctx: borrow mut RequestContext<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> {
+        let s = ctx.state();
+        s.befores.store(s.befores.load() * 10 + this.id as u64);
+        var digit = [0u8; 1];
+        digit[0] = truncate<u8>(48 + this.id % 10);
+        let deny = match (request.headers().getNamed("x-deny")) {
+            Some(v) => v.length == 1 && v[0] == digit[0],
+            null => false,
+        };
+        if (deny) {
+            let status = match (StatusCode.of(401)) {
+                Some(c) => c,
+                null => { return Err(HandlerError.Internal); },
+            };
+            await exchange.send(status, "".bytes())?;
+            return Ok(Flow.Responded);
+        }
+        return Ok(Flow.Continue);
+    }
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> {
+        var name = [120u8, 45u8, 109u8, 0u8]; // "x-m?"
+        name[3] = truncate<u8>(48 + this.id % 10);
+        let text = match (StringView.fromUtf8(name[..])) {
+            Some(t) => t,
+            null => { return Err(HandlerError.Internal); },
+        };
+        match (head.add(text, "1".bytes())) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+}
+
+fn mark(id: u32) -> Result<Box<dyn Middleware<St>>, TestFailure> {
+    let m: Box<dyn Middleware<St>> = alloc(Box.create(Mark { id: id }))?;
+    return Ok(m);
+}
+
+/// HTTP limits without `Date`, so responses can be compared byte for byte.
+fn quiet() -> Limits {
+    var l = Limits.defaults();
+    l.sendDate = false;
+    return l;
+}
+
+/// Serves `text` on one mock connection with `server` and returns what was written.
+async fn exchange(server: borrow Server<St>, text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var conn = match (MockTransport.create(text.bytes())) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    match (await web_http1.serve(mut conn, ctx, server, server.limits())) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    var out = Vector<u8>.create();
+    for (b in conn.written()) {
+        match (out.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("out of memory")); }
+        }
+    }
+    return Ok(out);
+}
+
+/// The same for a route added.
+fn added(r: Result<void, RouteError>) -> Result<void, TestFailure> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TestFailure.create("a route error")); }
+    }
+}
