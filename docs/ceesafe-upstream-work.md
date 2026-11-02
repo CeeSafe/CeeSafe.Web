@@ -2,8 +2,26 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.9.0 (released 2026-11-02, tag `v0.9.0` = CeeSafe `b361e63`)
+
+Checked from CeeSafe.Web on 2026-11-02, macOS arm64: every package checks and is formatted; `python3
+tools/run_tests.py --sanitize --alloc-sweep --cancel-sweep` passes all 16 runs with no change to CeeSafe.Web.
+
+| Item | Status | Checked by |
+|---|---|---|
+| U6 UDP (ADR 0050) | **released** | not used yet (M10) |
+| U7 sending files (ADR 0051) | **released** | not used yet (M9) |
+| U9 `HashMap` (ADR 0052) | **released** | not used yet |
+| U10 generic impls, impls for types with region parameters (ADR 0054) | **released** | probe: `impl<S> App for Server<S>` with an async method, called through `borrow dyn App`, prints 42 in the interpreter and natively. `web_server` provides `impl<S> Application for Server<S>` itself, so applications no longer write the two delegating impls |
+| U11 task sets (ADR 0053) | **released** | not used yet (M1's workers stay until a milestone needs per-connection tasks) |
+| **B8** `Box<dyn I<S>>` parameter not storable when `S` is a type parameter | **open** | `tests/probes/generic-dyn-box-flow-bug.cee` still fails with N0272 on 0.9.0 |
+| **U12** wall-clock time | **open** | — |
+
+**Numbering:** this bug was B7 here until 0.9.0. CeeSafe's commit `96503b1` ("B7: closure environment names never
+clash with captures") fixed a different bug of CeeSafe's own list, so this one is renumbered B8 to keep them apart.
 
 ## Status at 0.8.0 (released 2026-11-02, tag `v0.8.0` = CeeSafe `2c32172`)
 
@@ -16,7 +34,7 @@ re-check them before editing.
 | U5 DNS for tasks (ADR 0048) | **released** | not used yet (M5) |
 | U6, U7, U9, U10, U11 | not in 0.8.0 | — |
 
-No open CeeSafe bug blocked CeeSafe.Web at 0.8.0's release. Found since: **B7** (blocks `web_server`), **U12** (no
+No open CeeSafe bug blocked CeeSafe.Web at 0.8.0's release. Found since: **B8** (blocks `web_server`), **U12** (no
 wall clock: no `Date` field yet).
 
 ## Status at 0.7.0 (released 2026-11-02, tag `v0.7.0` = CeeSafe `b2bef17`)
@@ -172,7 +190,7 @@ CeeSafe.Web's `Transport.writeVectored` takes `IoParts` and will map onto whiche
 
 Phase B, a native stub resolver over UDP (U6), is CeeSafe.Web's job later, not upstream.
 
-## U6 — UDP   *(M10 HTTP/3, DNS phase B; target 0.7.0)*
+## U6 — UDP   *(M10 HTTP/3, DNS phase B; target 0.7.0; released in 0.9.0)*
 
 **Add:**
 - `AsyncUdpSocket.bind(SocketAddress, UdpOptions)`, with options for reuse, buffer sizes, `v6Only`, ECN on (`IP_RECVTOS`/`IPV6_RECVTCLASS`), and `IP_PKTINFO`/`IPV6_RECVPKTINFO`.
@@ -194,7 +212,7 @@ The `msghdr` and control buffer live in the op record, so the size question of U
 - A truncated datagram flagged.
 - Cancellation while a receive is in flight.
 
-## U7 — Zero-copy file send   *(M9; 0.7.0)*
+## U7 — Zero-copy file send   *(M9; 0.7.0; released in 0.9.0)*
 
 **Add:** `AsyncTcpStream.sendFile(file: borrow File, offset: u64, length: u64) -> Result<u64, AsyncError>` (partial count; plus a looping form).
 
@@ -244,7 +262,7 @@ lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
 - Windows with `cl` and clang.
 - Contract test: the hash changes when `links` changes.
 
-## U9 — `HashMap` in std   *(optional; 0.7.0)*
+## U9 — `HashMap` in std   *(optional; 0.7.0; released in 0.9.0)*
 
 **Today:** collections are `Vector`, `SlotMap` and `StableVector` (`guide/collections.md`); `src/support` has a `Map` for the compiler only.
 
@@ -252,7 +270,7 @@ lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
 
 **Tests:** the support-library oracle approach (`tools/oracles/support_models.py`), the allocation-failure sweep, and a property test against a Python dict.
 
-## U10 — Generic impls and impls for scoped types   *(optional; found while drafting M0, 2026-11-02)*
+## U10 — Generic impls and impls for scoped types   *(optional; found while drafting M0, 2026-11-02; released in 0.9.0)*
 
 **Today:** `impl I for T` requires `T` to be concrete and unscoped (`spec/type-system.md:1133`: "`impl<T> I for
 Pair<T>` is future work"). `impl<T: Transport> Transport for Wrap<T>` does not parse (N0105). `impl Body for
@@ -404,7 +422,7 @@ The program runs correctly (prints 7), but `--cflag -Werror` fails.
 
 **Expected:** no warning: the capture is mutable, so its C type should not be const.
 
-## B7 — Bug: a `Box<dyn I<S>>` parameter cannot be stored when `S` is a type parameter   *(found 2026-11-02, 0.8.0)*
+## B8 — Bug: a `Box<dyn I<S>>` parameter cannot be stored when `S` is a type parameter   *(found 2026-11-02, 0.8.0; still open in 0.9.0; was B7 here)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/generic-dyn-box-flow-bug.cee`:
 
@@ -427,7 +445,8 @@ makes `S` a flow name of both `this` and `h`, so the flow is allowed (as it is f
 names of a type are not collected through a `dyn` interface's type arguments, while rule 5 still sees `S` there.
 
 **Blocks:** `web_server`'s `Router<S>.add` and `Server<S>`'s middleware list (Web ADR 0007 as the owner chose on
-2026-11-02: typed state `S`, two delegating impls per application until U10). `web_server` waits on branch `m2-server`.
+2026-11-02: typed state `S`; with U10 released in 0.9.0, `web_server` implements `Application` for every `Server<S>`
+itself). `web_server` waits on branch `m2-server`. It is the only CeeSafe item blocking a CeeSafe.Web milestone.
 
 ## U12 — Wall-clock time   *(found 2026-11-02 while writing M2's serializer; needed for `Date`)*
 
@@ -465,7 +484,7 @@ source. `--diagnostics-format=json` panics too, at `src/diagnostics/diagnostic.c
 **Effect on CeeSafe.Web:** `Transports.writeWithin` and `closeGracefully` (both `Result<void, NetError>`) keep their
 race against `deadlineElapsed` (Web ADR 0001 amendment 3.4); `readWithin` uses `Async.deadline`.
 
-## U11 — Spawning into a running scope   *(design question; found while drafting M1, 2026-11-02)*
+## U11 — Spawning into a running scope   *(design question; found while drafting M1, 2026-11-02; released in 0.9.0 as ADR 0053)*
 
 **Today:** `s.spawn` exists only in a scope's synchronous body (spec §40.5: "`s` is not a local, and names the scope
 only in `s.spawn(…)`"), and there are no detached tasks. A server therefore cannot start a task per accepted
@@ -498,8 +517,8 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 |---|---|---|
 | **0.7.0** (released 2026-11-02) | U1, U2, U3, U4, T1; B1–B4 fixed | M1 transport/lifecycle (merged), M2 HTTP/1.1 fast path |
 | **0.8.0** (released 2026-11-02) | B5, B6 fixed; U8, U5, T2 | M1's overload gate (passed); M4 TLS (OpenSSL), M5 client |
-| later | U6, U7, U9 | M9 sendfile, M10 HTTP/3 |
-| unscheduled | U10 | simplifications only |
+| **0.9.0** (released 2026-11-02) | U6, U7, U9, U10, U11 | M9 sendfile, M10 HTTP/3; `web_server` without delegating impls |
+| next | B8 fixed; U12 | `web_server` (M2 task 5); the `Date` field |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

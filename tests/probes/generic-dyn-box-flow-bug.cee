@@ -1,4 +1,4 @@
-// CeeSafe bug B7 (CeeSafe.Web docs/ceesafe-upstream-work.md): storing a `Box<dyn I<S>>` parameter into a container of
+// CeeSafe bug B8 (CeeSafe.Web docs/ceesafe-upstream-work.md): storing a `Box<dyn I<S>>` parameter into a container of
 // the same type through `borrow mut` is N0272 when `S` is a type parameter. Spec §37.2: a `Box<dyn I>` carries no
 // loans; and §25.6: `S` is a flow name both parameters share. Should check and print 2.
 interface Handler<S> {

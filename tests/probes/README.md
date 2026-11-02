@@ -26,7 +26,7 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `wake-waiters-livelock-bug.cee` | prints `1`, natively too (fixed in 0.7.0; 0.6.0 hung on macOS/kqueue at 100 % CPU, 20 of 20 runs) | CeeSafe bug B4 | 0001 |
 | `effectsof-async-bug.cee` | prints `70` (fixed in 0.7.0; 0.6.0 printed `0` in the interpreter and crashed natively) | CeeSafe bug B1 | 0001 §3.5 |
 | `async-deadline-void-bug.cee` | prints `ok` (fixed in 0.8.0; 0.7.0's `ceesafec check` panicked, "index out of bounds at src/main.cee:687:41") | CeeSafe bug B6: `Async.deadline` over `Result<void, E>` | 0001 amendment 3 |
-| `generic-dyn-box-flow-bug.cee` | **should** check and print `2`; N0272 on `Generic<S>.add` storing a `Box<dyn Handler<S>>` (the non-generic twin is accepted) | CeeSafe bug B7; blocks `web_server`'s `Router<S>` (branch `m2-server`) | 0007 |
+| `generic-dyn-box-flow-bug.cee` | **should** check and print `2`; N0272 on `Generic<S>.add` storing a `Box<dyn Handler<S>>` (the non-generic twin is accepted) | CeeSafe bug B8; blocks `web_server`'s `Router<S>` (branch `m2-server`) | 0007 |
 
 ## Runs
 
