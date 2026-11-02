@@ -16,7 +16,8 @@ re-check them before editing.
 | U5 DNS for tasks (ADR 0048) | **released** | not used yet (M5) |
 | U6, U7, U9, U10, U11 | not in 0.8.0 | — |
 
-No open CeeSafe bug blocks CeeSafe.Web.
+No open CeeSafe bug blocked CeeSafe.Web at 0.8.0's release. Found since: **B7** (blocks `web_server`), **U12** (no
+wall clock: no `Date` field yet).
 
 ## Status at 0.7.0 (released 2026-11-02, tag `v0.7.0` = CeeSafe `b2bef17`)
 
@@ -402,6 +403,31 @@ local array as `mut buf[..]`.
 The program runs correctly (prints 7), but `--cflag -Werror` fails.
 
 **Expected:** no warning: the capture is mutable, so its C type should not be const.
+
+## B7 — Bug: a `Box<dyn I<S>>` parameter cannot be stored when `S` is a type parameter   *(found 2026-11-02, 0.8.0)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/generic-dyn-box-flow-bug.cee`:
+
+```ceesafe
+struct Generic<S> {
+    handlers: Vector<Box<dyn Handler<S>>>;
+    fn add(borrow mut this, h: Box<dyn Handler<S>>) -> bool {
+        match (this.handlers.push(h)) { … }   // N0272
+    }
+}
+```
+
+**Observed:** N0272, "this stores a value borrowed from parameter 'h' into what 'this' refers to". The same method
+on a non-generic struct with `Box<dyn Handler<St>>` is accepted, and so is `Holder<T>.add(t: T)` storing a plain `T`.
+A free function `fn addFree<S>(r: borrow mut Generic<S>, h: Box<dyn Handler<S>>)` is rejected the same way.
+
+**Expected:** it checks and prints 2. Two rules say so: §37.2, "`Box<dyn I>` carries none" (no loans: what
+implements an interface is unscoped); and, where §25.7 rule 5 treats a type mentioning `S` as carrying loans, §25.6
+makes `S` a flow name of both `this` and `h`, so the flow is allowed (as it is for `Holder<T>`). Probably the flow
+names of a type are not collected through a `dyn` interface's type arguments, while rule 5 still sees `S` there.
+
+**Blocks:** `web_server`'s `Router<S>.add` and `Server<S>`'s middleware list (Web ADR 0007 as the owner chose on
+2026-11-02: typed state `S`, two delegating impls per application until U10). `web_server` waits on branch `m2-server`.
 
 ## U12 — Wall-clock time   *(found 2026-11-02 while writing M2's serializer; needed for `Date`)*
 

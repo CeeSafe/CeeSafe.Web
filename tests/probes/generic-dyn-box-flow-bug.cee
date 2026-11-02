@@ -1,0 +1,54 @@
+// CeeSafe bug B7 (CeeSafe.Web docs/ceesafe-upstream-work.md): storing a `Box<dyn I<S>>` parameter into a container of
+// the same type through `borrow mut` is N0272 when `S` is a type parameter. Spec §37.2: a `Box<dyn I>` carries no
+// loans; and §25.6: `S` is a flow name both parameters share. Should check and print 2.
+interface Handler<S> {
+    fn run(borrow this, state: borrow S) -> u32;
+}
+
+struct Generic<S> {
+    handlers: Vector<Box<dyn Handler<S>>>;
+    fn add(borrow mut this, h: Box<dyn Handler<S>>) -> bool { // N0272 here: the bug
+        match (this.handlers.push(h)) {
+            Ok() => { return true; }
+            Err(_) => { return false; }
+        }
+    }
+}
+
+struct St {
+    n: u32;
+}
+
+struct Concrete {
+    handlers: Vector<Box<dyn Handler<St>>>;
+    fn add(borrow mut this, h: Box<dyn Handler<St>>) -> bool { // the same with S = St: accepted
+        match (this.handlers.push(h)) {
+            Ok() => { return true; }
+            Err(_) => { return false; }
+        }
+    }
+}
+
+struct C {}
+
+impl Handler<St> for C {
+    fn run(borrow this, state: borrow St) -> u32 => state.n;
+}
+
+fn main() {
+    var g = Generic<St> { handlers: Vector<Box<dyn Handler<St>>>.create() };
+    var c = Concrete { handlers: Vector<Box<dyn Handler<St>>>.create() };
+    match (Box.create(C {})) {
+        Ok(b) => {
+            let ok = g.add(b);
+        }
+        Err(_) => {}
+    }
+    match (Box.create(C {})) {
+        Ok(b) => {
+            let ok = c.add(b);
+        }
+        Err(_) => {}
+    }
+    Console.writeLine(g.handlers.length + c.handlers.length);
+}
