@@ -273,6 +273,63 @@ spec §32.5 / ADR 0037 do not say), or it prints the right value. Safe code must
   awaited, N0295 when called. That is consistent with the spec, but it means U4 is the only way to a generic deadline
   helper.
 
+## B2 — Bug: undefined drop function for an unused socket type   *(found 2026-11-02, 0.6.0 and main)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/unused-socket-drop-bug.cee` (eight lines):
+
+```ceesafe
+public struct Holder {
+    private stream: AsyncTcpStream;
+}
+
+fn main() {
+    Console.writeLine(1);
+}
+```
+
+**Observed:**
+- `check` and `run --interp` pass.
+- `build` fails in the C compiler with `call to undeclared function 'ceeD_14AsyncTcpStream'`. With
+  `AsyncTcpListener` the missing function is `ceeD_16AsyncTcpListener`, or `ceeM_16AsyncTcpListener_drop` once a
+  function constructs one.
+
+It looks like a struct's drop glue is emitted, but the drop of a lib/std type with a `drop` block is emitted only when
+the program reaches that type's other operations.
+
+**Effect:** every program that depends on `web_transport` but never makes a real socket (tests that use only
+`MockTransport`) fails to build natively. `tests/web_transport/{mock,acceptor}` carry a `native-xfail` marker until
+this is fixed; the runner reports XPASS when it is.
+
+## B3 — Bug: generated C discards `const` for a race child's captured array   *(found 2026-11-02, 0.6.0)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/race-capture-const-warning.cee`: an `Async.race` child that lends a captured
+local array as `mut buf[..]`.
+
+**Observed:** the C initialises a `uint8_t *` from a `const uint8_t *` (`-Wincompatible-pointer-types-discards-qualifiers`).
+The program runs correctly (prints 7), but `--cflag -Werror` fails.
+
+**Expected:** no warning: the capture is mutable, so its C type should not be const.
+
+## U11 — Spawning into a running scope   *(design question; found while drafting M1, 2026-11-02)*
+
+**Today:** `s.spawn` exists only in a scope's synchronous body (spec §40.5: "`s` is not a local, and names the scope
+only in `s.spawn(…)`"), and there are no detached tasks. A server therefore cannot start a task per accepted
+connection, and an HTTP/2 connection cannot start a task per stream as streams open.
+
+**What works now** (`~/dev/CeeSafe.Web/tests/web_transport/workers`): a fixed set of worker children, each looping
+`accept → serve` on one shared listener. Concurrent accepts on one listener work on kqueue, in the interpreter and
+natively. The worker count is the connection limit, and each idle connection costs one worker frame (920 bytes in the
+probe). It is bounded by construction, but every worker's frame is allocated up front.
+
+**If taken up:** an ADR for a spawn handle that children may hold, for example a `TaskSet<E>` or a scope handle passed
+by borrow. It would need:
+- the scope-loan rule for what dynamically spawned children capture;
+- a bound on how many are live (admission), with a spawn that waits or fails when full;
+- allocation from the scope's allocator;
+- cancellation and error propagation as for static children.
+
+Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner decides (`docs/milestones/M0.md`).
+
 ## Tooling (small, any time before M1's exit)
 
 - **T1 Sweeps on any package.** CeeSafe.Web's M1 gate reuses `tools/cancel_sweep.py` and `tools/fault_sweep.py`. Check that both accept a package directory, not only corpus files. If they don't, add a `--package <dir>` mode.

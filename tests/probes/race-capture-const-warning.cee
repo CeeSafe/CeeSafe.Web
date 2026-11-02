@@ -1,0 +1,29 @@
+// CeeSafe bug B3 (found 2026-11-02, ceesafec 0.6.0): an Async.race child that lends a captured array as `mut buf[..]`
+// compiles to C that initialises a uint8_t * from a const uint8_t * (-Wincompatible-pointer-types-discards-qualifiers).
+// It runs correctly (prints 7) but fails under --cflag -Werror. Expected: no warning.
+async fn fill(buffer: SliceMut<u8>) -> Result<usize, AsyncError> {
+    buffer[0] = 7;
+    return Ok(1);
+}
+
+async fn later() -> Result<usize, AsyncError> {
+    await Timer.sleep(1000)?;
+    return Ok(0);
+}
+
+async fn run() -> Result<u8, AsyncError> {
+    var buf = [0u8; 4];
+    let r: Result<Raced<usize>, AsyncError> = await Async.race(
+        async () => await fill(mut buf[..]),
+        async () => await later(),
+    );
+    let ignored = r?;
+    return Ok(buf[0]);
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(_) => { Console.writeLine("failed"); }
+    }
+}

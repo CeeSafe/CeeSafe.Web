@@ -1,0 +1,12 @@
+// CeeSafe bug B2 (found 2026-11-02, ceesafec 0.6.0 and main): a struct holding a lib/std socket type whose operations
+// the program never reaches compiles to C that calls an undefined drop function ('ceeD_14AsyncTcpStream'; with
+// AsyncTcpListener, 'ceeD_16AsyncTcpListener' or 'ceeM_16AsyncTcpListener_drop'). `check` and `run --interp` pass;
+// `build` fails in the C compiler. Expected: builds and prints 1.
+/// Holds a stream.
+public struct Holder {
+    private stream: AsyncTcpStream;
+}
+
+fn main() {
+    Console.writeLine(1);
+}

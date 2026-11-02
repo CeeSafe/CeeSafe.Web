@@ -20,6 +20,8 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `impl-scoped-fail.cee` | N0267 | a type with a region parameter cannot implement an interface | 0003 |
 | `method-region-fail.cee` | N0216 | a method cannot declare its own region; elided regions in method signatures work | 0003 |
 | `slice-of-slices-fail.cee` | N0246 | no slices or arrays of slices, so vectored writes take `IoParts` | 0001 (amended) |
+| `unused-socket-drop-bug.cee` | **should** build and print `1`; `check` and interpreter pass, `build` fails in C (undefined `ceeD_14AsyncTcpStream`) | CeeSafe bug B2; `tests/web_transport/{mock,acceptor}` carry `native-xfail` until it is fixed | 0001 |
+| `race-capture-const-warning.cee` | **should** build without warnings; prints `7` but warns (const discarded), failing `-Werror` | CeeSafe bug B3 | — |
 | `effectsof-async-bug.cee` | **should** print `70` or be rejected; prints `0` (interpreter), SEGV (native) | a CeeSafe 0.6.0 bug, upstream B1; when it prints `70`, a generic `withDeadline` becomes possible | 0001 §3.5 |
 
 ## Runs
