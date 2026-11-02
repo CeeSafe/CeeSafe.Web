@@ -123,6 +123,9 @@ impl Transport for TcpTransport {
 
     @effects()
     fn localAddress(borrow this) -> SocketAddress? => this.local;
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
 }
 
 /// A TCP listener producing PlainStreams, for `ConnectionServer` (its `Incoming`). Accepted connections have

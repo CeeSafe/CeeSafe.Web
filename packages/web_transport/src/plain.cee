@@ -72,6 +72,9 @@ impl Transport for PlainStream {
         Plain.Tcp(t) => t.localAddress(),
         Plain.Mock(m) => m.localAddress(),
     };
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
 }
 
 /// Turns an accepted plain stream into the connection's transport: as it is, or after a TLS handshake (web_tls's

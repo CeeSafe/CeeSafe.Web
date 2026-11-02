@@ -8,10 +8,18 @@ public struct ConnectionContext<region r> {
     private drainSignal: borrow(r) Drain;
     private peer: SocketAddress?;
     private local: SocketAddress?;
+    private identity: PeerIdentity;
 
     /// The context of connection `id`, accepted at `acceptedAt` on `Timer.now()`'s clock, served under `drain`.
     public fn create(id: u64, acceptedAt: u64, drain: borrow(r) Drain) -> ConnectionContext<r> =>
-        ConnectionContext { number: id, acceptedAt: acceptedAt, drainSignal: drain, peer: null, local: null };
+        ConnectionContext {
+            number: id,
+            acceptedAt: acceptedAt,
+            drainSignal: drain,
+            peer: null,
+            local: null,
+            identity: PeerIdentity.empty(),
+        };
 
     /// The context of connection `id`, accepted now.
     public fn acceptedNow(id: u64, drain: borrow(r) Drain) -> ConnectionContext<r> =>
@@ -25,7 +33,22 @@ public struct ConnectionContext<region r> {
             drainSignal: this.drainSignal,
             peer: peer,
             local: local,
+            identity: this.identity,
         };
+
+    /// The same context with the peer's verified identity (`Transport.peerIdentity`).
+    public fn withPeerIdentity(this, identity: PeerIdentity) -> ConnectionContext<r> =>
+        ConnectionContext {
+            number: this.number,
+            acceptedAt: this.acceptedAt,
+            drainSignal: this.drainSignal,
+            peer: this.peer,
+            local: this.local,
+            identity: identity,
+        };
+
+    /// The peer's verified identity: a TLS client certificate under client authentication; empty otherwise.
+    public fn peerIdentity(borrow this) -> borrow PeerIdentity => borrow this.identity;
 
     /// The peer's address; null if unknown (a mock).
     public fn peerAddress(borrow this) -> SocketAddress? => this.peer;

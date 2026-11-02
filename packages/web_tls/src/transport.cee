@@ -49,6 +49,42 @@ public struct TlsTransport {
         return Ok(t);
     }
 
+    /// A client connection as `connect`, offering `session` for resumption; the server may decline it, and the
+    /// handshake is then a full one.
+    /// Safety: wt_ctx_offer_session takes its own reference to the session.
+    public async fn connectResuming(
+        stream: PlainStream,
+        config: borrow TlsConfig,
+        host: StringView,
+        session: borrow TlsSession,
+        deadline: Deadline,
+    ) -> Result<TlsTransport, NetError> {
+        if (host.length == 0) {
+            return Err(NetError.Tls(TlsReason.Certificate));
+        }
+        var t = TlsTransport.wrap(stream, config, host)?;
+        if (unsafe { wt_ctx_offer_session(t.conn, session.handle()) } != 1) {
+            return Err(NetError.Tls(TlsReason.Internal));
+        }
+        await t.handshake(deadline)?;
+        return Ok(t);
+    }
+
+    /// This client connection's session, to resume a later connection with; null if it cannot be resumed (TLS 1.3
+    /// sends its tickets after the handshake: read from the connection first).
+    /// Safety: wt_ctx_session returns a new reference or null; TlsSession frees it.
+    public fn session(borrow this) -> TlsSession? {
+        let s = unsafe { wt_ctx_session(this.conn) };
+        if (s.isNull()) {
+            return null;
+        }
+        return Some(TlsSession { raw: s });
+    }
+
+    /// Whether the handshake resumed a session.
+    /// Safety: `conn` is this transport's live context.
+    public fn resumed(borrow this) -> bool => unsafe { wt_ctx_resumed(this.conn) } == 1;
+
     /// The TLS version agreed: 0x0303 (1.2) or 0x0304 (1.3).
     /// Safety: `conn` is this transport's live context.
     public fn version(borrow this) -> u32 => truncate<u32>(unsafe { wt_version(this.conn) }); // 0, 0x0303 or 0x0304
@@ -263,6 +299,41 @@ impl Transport for TlsTransport {
 
     @effects()
     fn localAddress(borrow this) -> SocketAddress? => this.plain.localAddress();
+
+    /// The verified certificate the peer presented: a client's under client authentication, a server's always.
+    /// Safety: each shim call copies at most the local buffer's length into it.
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool {
+        var buf = [0u8; 16384];
+        let n = unsafe { wt_peer_cert_der(this.conn, borrow mut buf[0] as *mut u8, buf.length) };
+        if (n <= 0) {
+            return false; // none, not verified, or larger than 16 KiB
+        }
+        if (!fill(into.certificateBuffer(), buf[0..truncate<usize>(n)])) {
+            return false;
+        }
+        let s = unsafe { wt_peer_subject(this.conn, borrow mut buf[0] as *mut u8, buf.length) };
+        if (s > 0 && !fill(into.subjectBuffer(), buf[0..truncate<usize>(s)])) {
+            return false;
+        }
+        let m = unsafe { wt_peer_names(this.conn, borrow mut buf[0] as *mut u8, buf.length) };
+        if (m > 0 && !fill(into.namesBuffer(), buf[0..truncate<usize>(m)])) {
+            return false;
+        }
+        return true;
+    }
+}
+
+/// Appends `bytes` to `to`; false if it could not grow.
+@effects(alloc)
+fn fill(to: borrow mut Vector<u8>, bytes: Slice<u8>) -> bool {
+    for (b in bytes) {
+        match (to.push(b)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    return true;
 }
 
 /// Reads from the plain stream by `deadline`. It calls `PlainStream` directly, not through `dyn Transport`
@@ -300,6 +371,9 @@ fn buffer(n: usize) -> Result<OwnedBuffer, NetError> {
 @noncopy
 public struct TlsAcceptor {
     private config: TlsConfig;
+
+    /// Its configuration, for `reload`, `addName` and `rotateTicketKeys` while it serves.
+    public fn configuration(borrow this) -> borrow TlsConfig => borrow this.config;
 
     /// An acceptor presenting `config` (a server configuration).
     public fn create(config: TlsConfig) -> Result<TlsAcceptor, TlsSetupError> {
@@ -352,5 +426,19 @@ impl Connector for TlsConnector {
             }
             Err(_) => { return Err(NetError.OutOfMemory); }
         }
+    }
+}
+
+/// A client's TLS session, kept to resume a later connection to the same server (`TlsTransport.connectResuming`): a
+/// shorter handshake without the certificate exchange.
+@noncopy
+public struct TlsSession {
+    private raw: *mut void;
+
+    fn handle(borrow this) -> *mut void => this.raw;
+
+    /// Safety: `raw` is this session's own reference, freed once, here.
+    drop {
+        unsafe { wt_session_free(this.raw); }
     }
 }

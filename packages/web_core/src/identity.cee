@@ -1,0 +1,49 @@
+// The peer's verified identity (Web ADR 0002 §3.3, amendment 3; Web ADR 0001 amendment 4): a TLS client's certificate
+// under client authentication, copied out of the transport when the connection starts, so handlers can read it from
+// their ConnectionContext.
+
+/// A verified certificate: its DER bytes, its subject (RFC 2253: "CN=test client,O=Example") and its subject
+/// alternative names ("DNS:a.example, IP Address:127.0.0.1, email:x@example"). Empty when the peer presented none.
+@noncopy
+public struct PeerIdentity {
+    private der: Vector<u8>;
+    private subjectText: Vector<u8>;
+    private namesText: Vector<u8>;
+
+    /// No identity.
+    public fn empty() -> PeerIdentity => PeerIdentity {
+        der: Vector<u8>.create(),
+        subjectText: Vector<u8>.create(),
+        namesText: Vector<u8>.create(),
+    };
+
+    /// Whether there is none.
+    public fn isEmpty(borrow this) -> bool => this.der.length == 0;
+
+    /// The certificate, DER.
+    public fn certificate(borrow this) -> Slice<u8> => this.der.view();
+
+    /// The subject, RFC 2253.
+    public fn subject(borrow this) -> Slice<u8> => this.subjectText.view();
+
+    /// The subject alternative names, comma-separated as OpenSSL prints them.
+    public fn names(borrow this) -> Slice<u8> => this.namesText.view();
+
+    /// Where a transport writes the certificate (cleared first).
+    public fn certificateBuffer(borrow mut this) -> borrow mut Vector<u8> {
+        this.der.clear();
+        return borrow mut this.der;
+    }
+
+    /// Where a transport writes the subject (cleared first).
+    public fn subjectBuffer(borrow mut this) -> borrow mut Vector<u8> {
+        this.subjectText.clear();
+        return borrow mut this.subjectText;
+    }
+
+    /// Where a transport writes the names (cleared first).
+    public fn namesBuffer(borrow mut this) -> borrow mut Vector<u8> {
+        this.namesText.clear();
+        return borrow mut this.namesText;
+    }
+}

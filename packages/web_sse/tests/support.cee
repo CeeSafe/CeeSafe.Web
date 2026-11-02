@@ -66,6 +66,9 @@ impl Transport for Peer {
 
     @effects()
     fn localAddress(borrow this) -> SocketAddress? => null;
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
 }
 
 fn peer(closeAtMs: u64?) -> Peer => Peer { closeAtMs: closeAtMs, output: Vector<u8>.create() };

@@ -282,4 +282,7 @@ impl Transport for MockTransport {
 
     @effects()
     fn localAddress(borrow this) -> SocketAddress? => null;
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
 }

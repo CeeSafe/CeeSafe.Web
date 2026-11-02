@@ -44,6 +44,11 @@ public interface Transport {
     /// through `dyn Transport` (an undeclared method there counts as possibly blocking, N0295).
     @effects()
     fn alpn(borrow this) -> Alpn;
+
+    /// Copies the peer's verified identity into `into` (a TLS client certificate under client authentication):
+    /// true if there is one. Plain transports have none. It only allocates, so async code may call it.
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool;
 }
 
 /// Helpers over any transport.

@@ -8,8 +8,10 @@
  *   - no I/O, and no allocation beyond OpenSSL's.
  * Every exported function is in the ADR's table.
  */
+#include <openssl/core_names.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <stdint.h>
@@ -45,14 +47,43 @@ enum {
 #define WT_ALPN_MAX 64
 /* The longest certificate list a peer may send (SSL_CTX_set_max_cert_list). */
 #define WT_MAX_CERT_LIST (64 * 1024)
+/* The most names a server's SNI table holds. */
+#define WT_NAMES_MAX 64
 
 typedef struct wt_alpn_list {
     unsigned char bytes[WT_ALPN_MAX];
     unsigned int length;
 } wt_alpn_list;
 
+/* A ticket key: its name (sent in the ticket) and the AES-256 and HMAC-SHA256 keys. */
+typedef struct wt_ticket_key {
+    unsigned char name[16];
+    unsigned char aes[32];
+    unsigned char hmac[32];
+    int set;
+} wt_ticket_key;
+
+/* A server name and the configuration holding its certificate. */
+typedef struct wt_name {
+    char name[256];
+    SSL_CTX *ctx;
+} wt_name;
+
+/* A server configuration's state beyond OpenSSL's (Web ADR 0002 amendment 3): the SNI table, the default certificate
+   swapped by a reload, the ticket keys, and the roots for client certificates. Guarded by `lock`. */
+typedef struct wt_front {
+    CRYPTO_RWLOCK *lock;
+    SSL_CTX *current; /* the default certificate after a reload; NULL: the front configuration's own */
+    wt_name names[WT_NAMES_MAX];
+    int count;
+    wt_ticket_key keys[2]; /* [0] issues and accepts; [1], the previous, only accepts */
+    X509_STORE *client_roots;
+    STACK_OF(X509_NAME) *client_names;
+} wt_front;
+
 typedef struct wt_ctx {
     SSL *ssl;
+    SSL_CTX *front; /* a server's configuration, as given to wt_ctx_new; NULL for a client */
     BIO *in;  /* ciphertext from the peer, fed by CeeSafe */
     BIO *out; /* ciphertext for the peer, taken by CeeSafe */
     int reason;
@@ -73,6 +104,150 @@ static int alpn_slot(void) {
         alpn_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, alpn_free);
     }
     return alpn_index;
+}
+
+static int front_index = -1;
+
+static void front_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp) {
+    (void)parent; (void)ad; (void)idx; (void)argl; (void)argp;
+    wt_front *f = ptr;
+    if (f == NULL) {
+        return;
+    }
+    for (int i = 0; i < f->count; i++) {
+        SSL_CTX_free(f->names[i].ctx);
+    }
+    SSL_CTX_free(f->current);
+    X509_STORE_free(f->client_roots);
+    sk_X509_NAME_pop_free(f->client_names, X509_NAME_free);
+    CRYPTO_THREAD_lock_free(f->lock);
+    OPENSSL_cleanse(f->keys, sizeof f->keys);
+    OPENSSL_free(f);
+}
+
+static int front_slot(void) {
+    if (front_index < 0) {
+        front_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, front_free);
+    }
+    return front_index;
+}
+
+static wt_front *front_of(SSL_CTX *ctx) {
+    return ctx == NULL ? NULL : SSL_CTX_get_ex_data(ctx, front_slot());
+}
+
+static int new_ticket_key(wt_ticket_key *k) {
+    k->set = RAND_bytes(k->name, sizeof k->name) > 0 && RAND_bytes(k->aes, sizeof k->aes) > 0 &&
+             RAND_bytes(k->hmac, sizeof k->hmac) > 0;
+    return k->set;
+}
+
+/* Lower-cases `in` into `out` (NUL-terminated); 0 if it is empty, too long, or not a host name or `*.` pattern. */
+static int host_name(const uint8_t *in, size_t len, char *out, size_t cap) {
+    if (len == 0 || len >= cap) {
+        return 0;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char b = in[i];
+        int ok = (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '-' || b == '.' || (b == '*' && i == 0);
+        if (b >= 'A' && b <= 'Z') {
+            b = (unsigned char)(b - 'A' + 'a');
+            ok = 1;
+        }
+        if (!ok) {
+            return 0;
+        }
+        out[i] = (char)b;
+    }
+    out[len] = '\0';
+    return out[0] != '*' || (len > 2 && out[1] == '.');
+}
+
+/* Whether `pattern` ("api.example.com", or "*.example.com" for one more label) names `host`. */
+static int name_matches(const char *pattern, const char *host) {
+    if (pattern[0] != '*') {
+        return OPENSSL_strcasecmp(pattern, host) == 0;
+    }
+    const char *dot = strchr(host, '.');
+    return dot != NULL && dot != host && OPENSSL_strcasecmp(pattern + 1, dot) == 0;
+}
+
+/* The server's certificate for this handshake: the SNI table's entry for the name the client asked for (an exact
+   name before a wildcard), else the default (a reloaded one, or the front configuration's own). OpenSSL calls this
+   for every ClientHello, with or without SNI. */
+static int pick_certificate(SSL *ssl, int *alert, void *arg) {
+    (void)alert;
+    wt_front *f = front_of(arg);
+    if (f == NULL) {
+        return SSL_TLSEXT_ERR_OK;
+    }
+    const char *host = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    SSL_CTX *chosen = NULL;
+    if (!CRYPTO_THREAD_read_lock(f->lock)) {
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    if (host != NULL) {
+        for (int i = 0; i < f->count && chosen == NULL; i++) {
+            if (f->names[i].name[0] != '*' && name_matches(f->names[i].name, host)) {
+                chosen = f->names[i].ctx;
+            }
+        }
+        for (int i = 0; i < f->count && chosen == NULL; i++) {
+            if (f->names[i].name[0] == '*' && name_matches(f->names[i].name, host)) {
+                chosen = f->names[i].ctx;
+            }
+        }
+    }
+    if (chosen == NULL) {
+        chosen = f->current;
+    }
+    if (chosen != NULL) {
+        SSL_set_SSL_CTX(ssl, chosen); /* takes its own reference */
+    }
+    CRYPTO_THREAD_unlock(f->lock);
+    return SSL_TLSEXT_ERR_OK;
+}
+
+/* Session tickets with the configuration's keys (OpenSSL 3's EVP callback): issued with the current key, accepted
+   with the current or the previous one (then renewed: 2). */
+static int ticket_key(SSL *ssl, unsigned char key_name[16], unsigned char *iv, EVP_CIPHER_CTX *cipher,
+                      EVP_MAC_CTX *mac, int enc) {
+    wt_ctx *c = SSL_get_app_data(ssl);
+    wt_front *f = c == NULL ? NULL : front_of(c->front);
+    if (f == NULL || !CRYPTO_THREAD_read_lock(f->lock)) {
+        return -1;
+    }
+    wt_ticket_key keys[2];
+    memcpy(keys, f->keys, sizeof keys);
+    CRYPTO_THREAD_unlock(f->lock);
+    int result = -1;
+    wt_ticket_key *k = NULL;
+    if (enc) {
+        k = &keys[0];
+        if (k->set && RAND_bytes(iv, 16) > 0) {
+            memcpy(key_name, k->name, 16);
+            result = EVP_EncryptInit_ex(cipher, EVP_aes_256_cbc(), NULL, k->aes, iv) ? 1 : -1;
+        }
+    } else {
+        result = 0; /* an unknown key: a full handshake */
+        for (int i = 0; i < 2; i++) {
+            if (keys[i].set && memcmp(key_name, keys[i].name, 16) == 0) {
+                k = &keys[i];
+                result = !EVP_DecryptInit_ex(cipher, EVP_aes_256_cbc(), NULL, k->aes, iv) ? -1 : (i == 0 ? 1 : 2);
+            }
+        }
+    }
+    if (result > 0) {
+        OSSL_PARAM params[3];
+        params[0] = OSSL_PARAM_construct_octet_string(OSSL_MAC_PARAM_KEY, k->hmac, sizeof k->hmac);
+        params[1] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, (char *)"SHA256", 0);
+        params[2] = OSSL_PARAM_construct_end();
+        if (!EVP_MAC_CTX_set_params(mac, params)) {
+            result = -1;
+        }
+    }
+    OPENSSL_cleanse(keys, sizeof keys);
+    return result;
 }
 
 /* The server's ALPN choice: its own first protocol the client also offers. No overlap: no ALPN, and the
@@ -118,13 +293,35 @@ SSL_CTX *wt_cfg_new(int32_t server) {
         SSL_CTX_free(ctx);
         return NULL;
     }
-    if (server) {
-        SSL_CTX_set_alpn_select_cb(ctx, alpn_select, NULL);
-    } else {
+    if (!server) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        return ctx;
     }
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select, NULL);
+    /* Resumption and client certificates need a session id context; a context switch copies the new one's. */
+    static const unsigned char sid[] = "web_tls";
+    wt_front *f = OPENSSL_zalloc(sizeof *f);
+    if (!SSL_CTX_set_session_id_context(ctx, sid, sizeof sid - 1) || f == NULL ||
+        (f->lock = CRYPTO_THREAD_lock_new()) == NULL || !new_ticket_key(&f->keys[0]) ||
+        !SSL_CTX_set_ex_data(ctx, front_slot(), f)) {
+        if (f != NULL) {
+            CRYPTO_THREAD_lock_free(f->lock);
+        }
+        OPENSSL_free(f);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    SSL_CTX_set_tlsext_servername_callback(ctx, pick_certificate);
+    SSL_CTX_set_tlsext_servername_arg(ctx, ctx);
+    SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx, ticket_key);
     return ctx;
 }
+
+/* A configuration holding one certificate, for a server's SNI table or a reload: the front's ALPN list, no table of
+   its own. NULL on failure. */
+static SSL_CTX *certificate_ctx(SSL_CTX *front, const uint8_t *chain, size_t chain_len, const uint8_t *key,
+                                size_t key_len);
+static void copy_alpn(SSL_CTX *to, SSL_CTX *from);
 
 /* Drops this handle; connections made from it keep the configuration alive (SSL_CTX is reference counted). */
 void wt_cfg_free(SSL_CTX *ctx) {
@@ -217,8 +414,179 @@ int32_t wt_cfg_set_alpn(SSL_CTX *ctx, const uint8_t *wire, size_t len) {
     }
     memcpy(alpn->bytes, wire, len);
     alpn->length = (unsigned int)len;
+    wt_front *f = front_of(ctx);
+    if (f != NULL && CRYPTO_THREAD_write_lock(f->lock)) { /* the certificates already added choose the same way */
+        for (int i = 0; i < f->count; i++) {
+            copy_alpn(f->names[i].ctx, ctx);
+        }
+        if (f->current != NULL) {
+            copy_alpn(f->current, ctx);
+        }
+        CRYPTO_THREAD_unlock(f->lock);
+    }
     /* The client offers them; SSL_CTX_set_alpn_protos returns 0 on success. */
     return SSL_CTX_set_alpn_protos(ctx, wire, (unsigned int)len) == 0 ? 1 : 0;
+}
+
+/* The certificate a server presents to clients that ask for `name` by SNI ("api.example.com", or "*.example.com"
+   for any one label before it); a name already in the table is replaced. 1 on success. */
+int32_t wt_cfg_add_name(SSL_CTX *front, const uint8_t *name, size_t name_len, const uint8_t *chain, size_t chain_len,
+                        const uint8_t *key, size_t key_len) {
+    wt_front *f = front_of(front);
+    char host[256];
+    if (f == NULL || !host_name(name, name_len, host, sizeof host)) {
+        return 0;
+    }
+    SSL_CTX *ctx = certificate_ctx(front, chain, chain_len, key, key_len);
+    if (ctx == NULL || !CRYPTO_THREAD_write_lock(f->lock)) {
+        SSL_CTX_free(ctx);
+        return 0;
+    }
+    int at = f->count;
+    for (int i = 0; i < f->count; i++) {
+        if (OPENSSL_strcasecmp(f->names[i].name, host) == 0) {
+            at = i;
+        }
+    }
+    int ok = at < WT_NAMES_MAX;
+    SSL_CTX *old = NULL;
+    if (ok) {
+        old = at < f->count ? f->names[at].ctx : NULL;
+        memcpy(f->names[at].name, host, strlen(host) + 1);
+        f->names[at].ctx = ctx;
+        if (at == f->count) {
+            f->count++;
+        }
+    }
+    CRYPTO_THREAD_unlock(f->lock);
+    SSL_CTX_free(ok ? old : ctx);
+    return ok;
+}
+
+/* Replaces the default certificate: handshakes from now on present it; connections already made keep theirs. 1 on
+   success; on failure the old one stays. */
+int32_t wt_cfg_reload(SSL_CTX *front, const uint8_t *chain, size_t chain_len, const uint8_t *key, size_t key_len) {
+    wt_front *f = front_of(front);
+    if (f == NULL) {
+        return 0;
+    }
+    SSL_CTX *ctx = certificate_ctx(front, chain, chain_len, key, key_len);
+    if (ctx == NULL || !CRYPTO_THREAD_write_lock(f->lock)) {
+        SSL_CTX_free(ctx);
+        return 0;
+    }
+    SSL_CTX *old = f->current;
+    f->current = ctx;
+    CRYPTO_THREAD_unlock(f->lock);
+    SSL_CTX_free(old);
+    return 1;
+}
+
+/* A new ticket key: tickets are issued with it from now on; the one it replaces still opens tickets (they are
+   renewed), the one before that no longer does. 1 on success. */
+int32_t wt_cfg_rotate_tickets(SSL_CTX *front) {
+    wt_front *f = front_of(front);
+    wt_ticket_key next;
+    if (f == NULL || !new_ticket_key(&next) || !CRYPTO_THREAD_write_lock(f->lock)) {
+        return 0;
+    }
+    f->keys[1] = f->keys[0];
+    f->keys[0] = next;
+    CRYPTO_THREAD_unlock(f->lock);
+    OPENSSL_cleanse(&next, sizeof next);
+    return 1;
+}
+
+/* Asks clients for a certificate verified against the roots in `pem`: required (`required` != 0: a client without
+   one fails the handshake) or optional (a client may send none; one it sends must verify). 1 on success. */
+int32_t wt_cfg_client_auth(SSL_CTX *front, int32_t required, const uint8_t *pem, size_t len) {
+    wt_front *f = front_of(front);
+    if (f == NULL || len > INT32_MAX) {
+        return 0;
+    }
+    BIO *b = BIO_new_mem_buf(pem, (int)len);
+    X509_STORE *roots = X509_STORE_new();
+    STACK_OF(X509_NAME) *names = sk_X509_NAME_new_null();
+    int added = 0;
+    if (b != NULL && roots != NULL && names != NULL) {
+        for (;;) {
+            X509 *cert = PEM_read_bio_X509(b, NULL, NULL, NULL);
+            if (cert == NULL) {
+                break;
+            }
+            X509_NAME *n = X509_NAME_dup(X509_get_subject_name(cert));
+            if (X509_STORE_add_cert(roots, cert) && n != NULL && sk_X509_NAME_push(names, n)) {
+                added++;
+            } else {
+                X509_NAME_free(n);
+            }
+            X509_free(cert);
+        }
+    }
+    ERR_clear_error();
+    BIO_free(b);
+    if (added == 0 || !CRYPTO_THREAD_write_lock(f->lock)) {
+        X509_STORE_free(roots);
+        sk_X509_NAME_pop_free(names, X509_NAME_free);
+        return 0;
+    }
+    X509_STORE_free(f->client_roots);
+    sk_X509_NAME_pop_free(f->client_names, X509_NAME_free);
+    f->client_roots = roots;
+    f->client_names = names;
+    CRYPTO_THREAD_unlock(f->lock);
+    int mode = SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE | (required ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
+    SSL_CTX_set_verify(front, mode, NULL);
+    return 1;
+}
+
+static void copy_alpn(SSL_CTX *to, SSL_CTX *from) {
+    wt_alpn_list *src = SSL_CTX_get_ex_data(from, alpn_slot());
+    wt_alpn_list *dst = SSL_CTX_get_ex_data(to, alpn_slot());
+    if (src != NULL && dst != NULL) {
+        *dst = *src;
+    }
+}
+
+static SSL_CTX *certificate_ctx(SSL_CTX *front, const uint8_t *chain, size_t chain_len, const uint8_t *key,
+                                size_t key_len) {
+    SSL_CTX *ctx = wt_cfg_new(1);
+    if (ctx == NULL) {
+        return NULL;
+    }
+    copy_alpn(ctx, front);
+    if (!wt_cfg_use_pem(ctx, chain, chain_len, key, key_len)) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+/* ---- Client sessions (resumption) ---- */
+
+/* The connection's session, if a later connection can resume it (TLS 1.3: once a ticket has arrived, after the
+   handshake); NULL otherwise. The caller frees it with wt_session_free. */
+SSL_SESSION *wt_ctx_session(wt_ctx *c) {
+    SSL_SESSION *s = SSL_get1_session(c->ssl);
+    if (s != NULL && !SSL_SESSION_is_resumable(s)) {
+        SSL_SESSION_free(s);
+        return NULL;
+    }
+    return s;
+}
+
+void wt_session_free(SSL_SESSION *s) {
+    SSL_SESSION_free(s);
+}
+
+/* Offers `s` for resumption in this client connection's handshake. 1 on success. */
+int32_t wt_ctx_offer_session(wt_ctx *c, SSL_SESSION *s) {
+    return SSL_set_session(c->ssl, s) ? 1 : 0;
+}
+
+/* Whether the handshake resumed a session. */
+int32_t wt_ctx_resumed(wt_ctx *c) {
+    return SSL_session_reused(c->ssl) ? 1 : 0;
 }
 
 /* ---- Connections ---- */
@@ -242,7 +610,28 @@ wt_ctx *wt_ctx_new(SSL_CTX *cfg, int32_t server, const uint8_t *host, size_t hos
     }
     BIO_set_mem_eof_return(c->in, -1); /* an empty read BIO means "want more", not the end */
     SSL_set_bio(c->ssl, c->in, c->out); /* the SSL owns both BIOs now */
+    SSL_set_app_data(c->ssl, c);
     if (server) {
+        c->front = cfg;
+        wt_front *f = front_of(cfg);
+        /* The client-certificate roots and the names sent in CertificateRequest belong to this connection, so a
+           switch to an SNI entry's configuration (pick_certificate) keeps them. */
+        if (f != NULL && CRYPTO_THREAD_read_lock(f->lock)) {
+            int ok = 1;
+            if (f->client_roots != NULL) {
+                STACK_OF(X509_NAME) *names = SSL_dup_CA_list(f->client_names);
+                ok = SSL_set1_verify_cert_store(c->ssl, f->client_roots) && names != NULL;
+                if (ok) {
+                    SSL_set_client_CA_list(c->ssl, names);
+                } else {
+                    sk_X509_NAME_pop_free(names, X509_NAME_free);
+                }
+            }
+            CRYPTO_THREAD_unlock(f->lock);
+            if (!ok) {
+                goto fail_ssl;
+            }
+        }
         SSL_set_accept_state(c->ssl);
         return c;
     }
@@ -447,9 +836,10 @@ int64_t wt_sni(wt_ctx *c, uint8_t *out, size_t cap) {
     return (int64_t)n;
 }
 
-/* The peer's certificate, DER, copied into `out`: its length, 0 if none, or -needed. */
+/* The verified peer's certificate, DER, copied into `out`: its length, 0 if none, or -needed. */
+static X509 *verified_peer(wt_ctx *c);
 int64_t wt_peer_cert_der(wt_ctx *c, uint8_t *out, size_t cap) {
-    X509 *cert = SSL_get1_peer_certificate(c->ssl);
+    X509 *cert = verified_peer(c);
     if (cert == NULL) {
         return 0;
     }
@@ -463,6 +853,69 @@ int64_t wt_peer_cert_der(wt_ctx *c, uint8_t *out, size_t cap) {
         unsigned char *p = out;
         result = i2d_X509(cert, &p);
     }
+    X509_free(cert);
+    return result;
+}
+
+/* The peer's certificate, if it was sent and verified (a client's under client authentication; a server's always). */
+static X509 *verified_peer(wt_ctx *c) {
+    if (!c->handshaken || SSL_get_verify_result(c->ssl) != X509_V_OK) {
+        return NULL;
+    }
+    return SSL_get1_peer_certificate(c->ssl);
+}
+
+/* Copies `n` bytes of `text` into `out`: n, or -n if `cap` is too small. */
+static int64_t copy_out(const char *text, size_t n, uint8_t *out, size_t cap) {
+    if (n > cap) {
+        return -(int64_t)n;
+    }
+    memcpy(out, text, n);
+    return (int64_t)n;
+}
+
+/* The verified peer's subject, RFC 2253 ("CN=test client"): its length, 0 if none, or -needed. */
+int64_t wt_peer_subject(wt_ctx *c, uint8_t *out, size_t cap) {
+    X509 *cert = verified_peer(c);
+    if (cert == NULL) {
+        return 0;
+    }
+    BIO *b = BIO_new(BIO_s_mem());
+    int64_t result = 0;
+    if (b != NULL && X509_NAME_print_ex(b, X509_get_subject_name(cert), 0, XN_FLAG_RFC2253) >= 0) {
+        char *text = NULL;
+        long n = BIO_get_mem_data(b, &text);
+        result = n > 0 ? copy_out(text, (size_t)n, out, cap) : 0;
+    }
+    BIO_free(b);
+    X509_free(cert);
+    return result;
+}
+
+/* The verified peer's subject alternative names, "DNS:a.example, IP:127.0.0.1, email:x@example": their length, 0 if
+   none, or -needed. */
+int64_t wt_peer_names(wt_ctx *c, uint8_t *out, size_t cap) {
+    X509 *cert = verified_peer(c);
+    if (cert == NULL) {
+        return 0;
+    }
+    GENERAL_NAMES *names = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+    BIO *b = BIO_new(BIO_s_mem());
+    int64_t result = 0;
+    if (names != NULL && b != NULL) {
+        for (int i = 0; i < sk_GENERAL_NAME_num(names); i++) {
+            const GENERAL_NAME *g = sk_GENERAL_NAME_value(names, i);
+            if (i > 0) {
+                BIO_puts(b, ", ");
+            }
+            GENERAL_NAME_print(b, (GENERAL_NAME *)g); /* "DNS:…", "IP Address:…", "email:…", "URI:…" */
+        }
+        char *text = NULL;
+        long n = BIO_get_mem_data(b, &text);
+        result = n > 0 ? copy_out(text, (size_t)n, out, cap) : 0;
+    }
+    GENERAL_NAMES_free(names);
+    BIO_free(b);
     X509_free(cert);
     return result;
 }

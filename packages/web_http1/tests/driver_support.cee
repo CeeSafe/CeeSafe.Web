@@ -78,6 +78,9 @@ impl Transport for Script {
 
     @effects()
     fn localAddress(borrow this) -> SocketAddress? => null;
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
 }
 
 /// Routes on the path:

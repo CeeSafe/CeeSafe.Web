@@ -97,6 +97,99 @@ public struct TlsConfig {
         return Ok();
     }
 
+    /// A server's certificate for clients asking for `name` by SNI: "api.example.com", or "*.example.com" for any one
+    /// label before it (an exact name wins over a wildcard). Clients asking for another name, or none, get the
+    /// default certificate. Adding a name already present replaces its certificate, for new handshakes only.
+    /// Safety: the shim copies the bytes and changes its table under OpenSSL's lock, so `borrow this` is enough while
+    /// connections are being made from this configuration.
+    public fn addName(
+        borrow this,
+        name: StringView,
+        chainPem: Slice<u8>,
+        keyPem: Slice<u8>,
+    ) -> Result<void, TlsSetupError> {
+        if (!this.serverSide) {
+            return Err(TlsSetupError.Internal);
+        }
+        let ok = unsafe { wt_cfg_add_name(
+            this.raw,
+            name.ptr,
+            name.length,
+            chainPem.ptr,
+            chainPem.length,
+            keyPem.ptr,
+            keyPem.length,
+        ) };
+        if (ok != 1) {
+            return Err(TlsSetupError.BadCertificate);
+        }
+        return Ok();
+    }
+
+    /// Replaces a server's default certificate (hot reload): handshakes from now on present it, connections already
+    /// made keep theirs. On failure the old one stays.
+    /// Safety: as `addName`.
+    public fn reload(borrow this, chainPem: Slice<u8>, keyPem: Slice<u8>) -> Result<void, TlsSetupError> {
+        if (!this.serverSide) {
+            return Err(TlsSetupError.Internal);
+        }
+        if (unsafe { wt_cfg_reload(this.raw, chainPem.ptr, chainPem.length, keyPem.ptr, keyPem.length) } != 1) {
+            return Err(TlsSetupError.BadCertificate);
+        }
+        return Ok();
+    }
+
+    /// Starts a new session-ticket key: tickets are issued with it from now on; tickets from the key it replaces still
+    /// resume (and are renewed), older ones do not. A server rotates on a timer, at most every ticket lifetime.
+    /// Safety: as `addName`; the keys are made and kept in the shim, never in CeeSafe memory.
+    public fn rotateTicketKeys(borrow this) -> Result<void, TlsSetupError> {
+        if (!this.serverSide || unsafe { wt_cfg_rotate_tickets(this.raw) } != 1) {
+            return Err(TlsSetupError.Internal);
+        }
+        return Ok();
+    }
+
+    /// Requires every client to present a certificate that verifies to a root in `rootsPem` (mTLS). A client without
+    /// one, or with one that does not verify, fails its handshake.
+    /// Safety: as `trustPem`.
+    public fn requireClientCertificates(borrow mut this, rootsPem: Slice<u8>) -> Result<void, TlsSetupError> {
+        return this.clientAuth(1, rootsPem);
+    }
+
+    /// Asks clients for a certificate that verifies to a root in `rootsPem`, but lets a client without one in (its
+    /// connection has an empty `peerIdentity`). A certificate that does not verify still fails the handshake.
+    /// Safety: as `trustPem`.
+    public fn requestClientCertificates(borrow mut this, rootsPem: Slice<u8>) -> Result<void, TlsSetupError> {
+        return this.clientAuth(0, rootsPem);
+    }
+
+    /// Safety: as `trustPem`.
+    fn clientAuth(borrow mut this, required: i32, rootsPem: Slice<u8>) -> Result<void, TlsSetupError> {
+        if (!this.serverSide) {
+            return Err(TlsSetupError.Internal);
+        }
+        if (unsafe { wt_cfg_client_auth(this.raw, required, rootsPem.ptr, rootsPem.length) } != 1) {
+            return Err(TlsSetupError.BadTrust);
+        }
+        return Ok();
+    }
+
+    /// The certificate a client presents when a server asks for one.
+    /// Safety: as `trustPem`.
+    public fn clientCertificate(
+        borrow mut this,
+        chainPem: Slice<u8>,
+        keyPem: Slice<u8>,
+    ) -> Result<void, TlsSetupError> {
+        if (this.serverSide) {
+            return Err(TlsSetupError.Internal);
+        }
+        if (unsafe { wt_cfg_use_pem(this.raw, chainPem.ptr, chainPem.length, keyPem.ptr, keyPem.length) } != 1) {
+            return Err(TlsSetupError.BadCertificate);
+        }
+        return Ok();
+    }
+
     /// Whether this is a server's configuration.
     public fn isServer(borrow this) -> bool => this.serverSide;
 

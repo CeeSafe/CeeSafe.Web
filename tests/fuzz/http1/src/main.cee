@@ -315,6 +315,9 @@ impl Transport for Script {
 
     @effects()
     fn localAddress(borrow this) -> SocketAddress? => null;
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
 }
 
 /// Echoes the path and body; `/s` streams; `/f` fails with 404; `/i` ignores the body.

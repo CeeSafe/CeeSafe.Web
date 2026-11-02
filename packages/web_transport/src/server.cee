@@ -188,7 +188,11 @@ async fn worker(
                 continue;
             }
         };
-        let ctx = ConnectionContext.acceptedNow(id, drain).withAddresses(conn.peerAddress(), conn.localAddress());
+        var identity = PeerIdentity.empty();
+        let verified = conn.peerIdentity(mut identity); // a TLS client certificate, copied before `conn` is lent out
+        let ctx = ConnectionContext.acceptedNow(id, drain)
+            .withAddresses(conn.peerAddress(), conn.localAddress())
+            .withPeerIdentity(identity);
         match (await handler.serve(mut conn, ctx)) {
             Ok() => {
                 let done = counters.served.fetchAdd(1);

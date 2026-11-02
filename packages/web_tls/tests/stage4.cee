@@ -1,0 +1,349 @@
+// M4 stage 4 (Web ADR 0002 amendment 3): SNI, hot reload, session tickets with rotating keys, and client
+// certificates, through to a ConnectionHandler's context. Expected outcomes follow from the rules, not from a run:
+//   - SNI: an exact name wins over a wildcard; a wildcard covers one label; any other name gets the default;
+//   - reload: handshakes after it present the new certificate;
+//   - tickets: a ticket from the current or the previous key resumes; from the one before, a full handshake;
+//   - client certificates: required: none or an untrusted one fails; optional: none is let in, an untrusted one
+//     still fails; a verified one is the connection's identity.
+import web_core;
+import web_transport;
+
+/// A session to offer, or none.
+struct Offer {
+    session: TlsSession?;
+}
+
+/// Whether `a` is the bytes of `b`.
+fn same(a: Slice<u8>, b: StringView) -> bool {
+    let bb = b.bytes();
+    if (a.length != bb.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != bb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// What one connection saw.
+struct Seen {
+    server: NetError?;
+    client: NetError?;
+    /// The server's certificate subject, as the client verified it.
+    serverSubject: Vector<u8>;
+    /// The client's certificate subject and names, as the server verified them; empty if it sent none.
+    clientSubject: Vector<u8>;
+    clientNames: Vector<u8>;
+    resumed: bool;
+    session: TlsSession?;
+    echoed: bool;
+}
+
+/// One connection from `client` to `server` for `host`, offering `offer` for resumption if given: the client sends
+/// "ping", the server echoes it.
+async fn connectOnce(
+    server: borrow TlsConfig,
+    client: borrow TlsConfig,
+    host: StringView,
+    session: TlsSession?,
+) -> Result<Seen, TestFailure> {
+    let offer = Offer { session: session };
+    let listener = net(Listener.bind("127.0.0.1", 0))?;
+    let port = net(listener.port())?;
+    var serverError: NetError? = null;
+    var clientError: NetError? = null;
+    var serverSubject = Vector<u8>.create();
+    var clientSubject = Vector<u8>.create();
+    var clientNames = Vector<u8>.create();
+    var resumed = false;
+    var next: TlsSession? = null;
+    var echoed = false;
+    let r: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (sc) => {
+        sc.spawn(async () => {
+            match (await serveOnce(listener, server, mut clientSubject, mut clientNames)) {
+                Ok() => {}
+                Err(e) => { serverError = Some(e); }
+            }
+            return Ok();
+        });
+        sc.spawn(async () => {
+            match (await clientOnce(port, client, host, offer, mut serverSubject, mut resumed, mut echoed)) {
+                Ok(s) => { next = s; }
+                Err(e) => { clientError = Some(e); }
+            }
+            return Ok();
+        });
+    });
+    match (r) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    return Ok(Seen {
+        server: serverError,
+        client: clientError,
+        serverSubject: serverSubject,
+        clientSubject: clientSubject,
+        clientNames: clientNames,
+        resumed: resumed,
+        session: next,
+        echoed: echoed,
+    });
+}
+
+async fn serveOnce(
+    listener: borrow Listener,
+    config: borrow TlsConfig,
+    subject: borrow mut Vector<u8>,
+    names: borrow mut Vector<u8>,
+) -> Result<void, NetError> {
+    let stream = await listener.accept()?;
+    var t = await TlsTransport.accept(stream, config, Deadline.after(5000))?;
+    var id = PeerIdentity.empty();
+    if (t.peerIdentity(mut id)) {
+        copyInto(subject, id.subject())?;
+        copyInto(names, id.names())?;
+    }
+    var buf = [0u8; 256];
+    loop {
+        let n = await t.read(mut buf[..])?;
+        if (n == 0) {
+            return Ok();
+        }
+        await t.write(buf[0..n])?;
+    }
+}
+
+async fn clientOnce(
+    port: u16,
+    config: borrow TlsConfig,
+    host: StringView,
+    offer: borrow Offer,
+    subject: borrow mut Vector<u8>,
+    resumed: borrow mut bool,
+    echoed: borrow mut bool,
+) -> Result<TlsSession?, NetError> {
+    let tcp = PlainStream.tcp(await TcpTransport.connect("127.0.0.1", port)?);
+    var t = match (borrow offer.session) {
+        Some(s) => await TlsTransport.connectResuming(tcp, config, host, s, Deadline.after(5000))?,
+        null => await TlsTransport.connect(tcp, config, host, Deadline.after(5000))?,
+    };
+    resumed = t.resumed();
+    var id = PeerIdentity.empty();
+    if (t.peerIdentity(mut id)) {
+        copyInto(subject, id.subject())?;
+    }
+    await t.write("ping".bytes())?;
+    var buf = [0u8; 16];
+    var got: usize = 0;
+    while (got < 4) {
+        let n = await t.read(mut buf[got..])?;
+        if (n == 0) {
+            return Err(NetError.Closed);
+        }
+        got += n;
+    }
+    echoed = same(buf[0..4], "ping");
+    let session = t.session(); // TLS 1.3's tickets came with the echo
+    await t.shutdownWrite()?;
+    let last = await t.read(mut buf[..])?;
+    return Ok(session);
+}
+
+fn copyInto(to: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, NetError> {
+    to.clear();
+    for (b in bytes) {
+        match (to.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+    return Ok();
+}
+
+fn serverConfig() -> Result<TlsConfig, TestFailure> => setupOk(TlsConfig.server(serverPem().bytes(), serverKey().bytes()));
+
+fn clientConfig() -> Result<TlsConfig, TestFailure> {
+    var c = setupOk(TlsConfig.client())?;
+    setupDone(c.trustPem(caPem().bytes()))?;
+    return Ok(c);
+}
+
+fn subjectIs(seen: borrow Seen, expected: StringView) -> bool => same(seen.serverSubject.view(), expected);
+
+fn ok(seen: borrow Seen) -> bool => isNone(seen.server) && isNone(seen.client) && seen.echoed;
+
+@test
+async fn sni_picks_the_certificate() -> Result<void, TestFailure> {
+    let server = serverConfig()?;
+    setupDone(server.addName("api.test", apiPem().bytes(), apiKey().bytes()))?;
+    setupDone(server.addName("*.wild.test", wildPem().bytes(), wildKey().bytes()))?;
+    let client = clientConfig()?;
+    let api = await connectOnce(server, client, "api.test", null)?;
+    Check.isTrue(ok(api) && subjectIs(api, "CN=api.test"), "api.test: its own certificate")?;
+    let wild = await connectOnce(server, client, "x.wild.test", null)?;
+    Check.isTrue(ok(wild) && subjectIs(wild, "CN=*.wild.test"), "x.wild.test: the wildcard")?;
+    let upper = await connectOnce(server, client, "API.TEST", null)?;
+    Check.isTrue(ok(upper) && subjectIs(upper, "CN=api.test"), "names are case-insensitive")?;
+    let local = await connectOnce(server, client, "localhost", null)?;
+    Check.isTrue(ok(local) && subjectIs(local, "CN=localhost"), "another name: the default")?;
+    // A wildcard covers one label: a.b.wild.test gets the default, which is not valid for it.
+    let deep = await connectOnce(server, client, "a.b.wild.test", null)?;
+    Check.isTrue(isTls(deep.client, TlsReason.Certificate), "two labels: not the wildcard")?;
+    let bad = match (server.addName("bad name!", apiPem().bytes(), apiKey().bytes())) {
+        Err(TlsSetupError.BadCertificate) => true,
+        _ => false,
+    };
+    Check.isTrue(bad, "a name that is not a host name is refused")?;
+    return Ok();
+}
+
+@test
+async fn reload_swaps_the_default_certificate() -> Result<void, TestFailure> {
+    let server = serverConfig()?;
+    let client = clientConfig()?;
+    let before = await connectOnce(server, client, "localhost", null)?;
+    Check.isTrue(ok(before) && subjectIs(before, "CN=localhost"), "the first certificate")?;
+    setupDone(server.reload(reloadedPem().bytes(), reloadedKey().bytes()))?;
+    let after = await connectOnce(server, client, "localhost", null)?;
+    Check.isTrue(ok(after) && subjectIs(after, "CN=localhost reloaded"), "the reloaded one")?;
+    let refused = match (server.reload(serverPem().bytes(), clientKey().bytes())) {
+        Err(TlsSetupError.BadCertificate) => true,
+        _ => false,
+    };
+    Check.isTrue(refused, "a mismatched key is refused")?;
+    let still = await connectOnce(server, client, "localhost", null)?;
+    Check.isTrue(ok(still) && subjectIs(still, "CN=localhost reloaded"), "and the reloaded one stays")?;
+    return Ok();
+}
+
+@test
+async fn tickets_resume_across_one_rotation() -> Result<void, TestFailure> {
+    let server = serverConfig()?;
+    let client = clientConfig()?;
+    var first = await connectOnce(server, client, "localhost", null)?;
+    Check.isTrue(ok(first) && !first.resumed, "a full handshake first")?;
+    let s1 = match (first.session) {
+        Some(s) => s,
+        null => { return Check.fail("a resumable session"); },
+    };
+    var second = await connectOnce(server, client, "localhost", Some(s1))?;
+    Check.isTrue(ok(second) && second.resumed, "resumed with the current key")?;
+    let s2 = match (second.session) {
+        Some(s) => s,
+        null => { return Check.fail("a session from the resumed connection"); },
+    };
+    setupDone(server.rotateTicketKeys())?;
+    var third = await connectOnce(server, client, "localhost", Some(s2))?;
+    Check.isTrue(ok(third) && third.resumed, "resumed with the previous key")?;
+    let s3 = match (third.session) {
+        Some(s) => s,
+        null => { return Check.fail("a renewed session"); },
+    };
+    setupDone(server.rotateTicketKeys())?;
+    setupDone(server.rotateTicketKeys())?;
+    let fourth = await connectOnce(server, client, "localhost", Some(s3))?;
+    Check.isTrue(ok(fourth) && !fourth.resumed, "two rotations later: a full handshake")?;
+    return Ok();
+}
+
+@test
+async fn client_certificates() -> Result<void, TestFailure> {
+    var required = serverConfig()?;
+    setupDone(required.requireClientCertificates(caPem().bytes()))?;
+    var withCert = clientConfig()?;
+    setupDone(withCert.clientCertificate(clientPem().bytes(), clientKey().bytes()))?;
+    let anonymous = clientConfig()?;
+    var untrusted = clientConfig()?;
+    setupDone(untrusted.clientCertificate(strangerClientPem().bytes(), strangerClientKey().bytes()))?;
+
+    let good = await connectOnce(required, withCert, "localhost", null)?;
+    Check.isTrue(ok(good), "required: a verified certificate is let in")?;
+    Check.isTrue(same(good.clientSubject.view(), "CN=test client"), "and is the connection's identity")?;
+    Check.isTrue(good.clientNames.length == 0, "it has no SAN")?;
+    let none = await connectOnce(required, anonymous, "localhost", null)?;
+    Check.isTrue(isTls(none.server, TlsReason.Handshake) && !none.echoed, "required: none fails")?;
+    let stranger = await connectOnce(required, untrusted, "localhost", null)?;
+    Check.isTrue(isTls(stranger.server, TlsReason.Certificate) && !stranger.echoed, "required: untrusted fails")?;
+
+    var optional = serverConfig()?;
+    setupDone(optional.requestClientCertificates(caPem().bytes()))?;
+    let free = await connectOnce(optional, anonymous, "localhost", null)?;
+    Check.isTrue(ok(free) && free.clientSubject.length == 0, "optional: none is let in, with no identity")?;
+    let known = await connectOnce(optional, withCert, "localhost", null)?;
+    Check.isTrue(ok(known) && same(known.clientSubject.view(), "CN=test client"), "optional: identified")?;
+    let refused = await connectOnce(optional, untrusted, "localhost", null)?;
+    Check.isTrue(isTls(refused.server, TlsReason.Certificate) && !refused.echoed, "optional: untrusted still fails")?;
+    return Ok();
+}
+
+/// Writes the subject of the client's certificate from its ConnectionContext ("anonymous" without one), then ends.
+struct WhoAmI {}
+
+impl ConnectionHandler for WhoAmI {
+    async fn serve(borrow this, conn: borrow mut dyn Transport, ctx: borrow ConnectionContext) -> Result<void, NetError> {
+        let id = ctx.peerIdentity();
+        if (id.isEmpty()) {
+            return await conn.write("anonymous".bytes());
+        }
+        return await conn.write(id.subject());
+    }
+}
+
+/// The identity reaches a handler: TlsAcceptor under M1's ConnectionServer, client certificates requested.
+@test
+async fn the_identity_reaches_the_handler() -> Result<void, TestFailure> {
+    var config = serverConfig()?;
+    setupDone(config.requestClientCertificates(caPem().bytes()))?;
+    let acceptor = setupOk(TlsAcceptor.create(config))?;
+    var withCert = clientConfig()?;
+    setupDone(withCert.clientCertificate(clientPem().bytes(), clientKey().bytes()))?;
+    let anonymous = clientConfig()?;
+    let listener = net(Listener.bind("127.0.0.1", 0))?;
+    let port = net(listener.port())?;
+    var limits = ConnectionLimits.defaults();
+    limits.workers = 2;
+    limits.graceMs = 200;
+    let drain = net(Drain.create())?;
+    var named = Vector<u8>.create();
+    var plain = Vector<u8>.create();
+    var report: ServerReport? = null;
+    let r: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (sc) => {
+        sc.spawn(async () => {
+            report = Some(await ConnectionServer.run(listener, acceptor, WhoAmI {}, limits, drain)?);
+            return Ok();
+        });
+        sc.spawn(async () => {
+            await askWho(port, withCert, mut named)?;
+            await askWho(port, anonymous, mut plain)?;
+            drain.start();
+            return Ok();
+        });
+    });
+    match (r) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    Check.isTrue(same(named.view(), "CN=test client"), "the handler saw the client's subject")?;
+    Check.isTrue(same(plain.view(), "anonymous"), "and no identity without a certificate")?;
+    return Ok();
+}
+
+async fn askWho(port: u16, config: borrow TlsConfig, into: borrow mut Vector<u8>) -> Result<void, NetError> {
+    let tcp = PlainStream.tcp(await TcpTransport.connect("127.0.0.1", port)?);
+    var t = await TlsTransport.connect(tcp, config, "localhost", Deadline.after(5000))?;
+    var buf = [0u8; 256];
+    loop {
+        let n = await t.read(mut buf[..])?;
+        if (n == 0) {
+            return Ok();
+        }
+        for (i in 0..n) {
+            match (into.push(buf[i])) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+    }
+}

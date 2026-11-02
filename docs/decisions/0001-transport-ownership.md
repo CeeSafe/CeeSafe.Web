@@ -237,3 +237,16 @@ Found while building M1's connection server against the 0.6.0 release. The decis
    0, so the peer gets a reset), for a connection that broke the protocol and for tests of a peer's reset.
    `Listener.bindWith(SocketAddress, ListenOptions)` sets the backlog, address and port reuse, and dual stack;
    `Listener.localAddress()`. Accepted connections have TCP_NODELAY on unless `withNoDelay(false)`.
+
+## 10. Amendment 4 (2026-11-02, M4: the peer's identity)
+
+1. **`Transport.peerIdentity(into: borrow mut PeerIdentity) -> bool`**, declared `@effects(alloc)`, copies the peer's
+   verified identity out of the transport. For TLS that is the client's certificate under client authentication (or
+   the server's, on a client). Plain transports return false. CeeSafe interfaces have no default bodies, so every
+   `Transport` implements it.
+2. **`PeerIdentity`** (web_core) owns its bytes: the certificate (DER), the subject (RFC 2253) and the subject
+   alternative names, as OpenSSL prints them.
+3. **`ConnectionContext.peerIdentity()`**: the connection server copies the identity into the context, next to the
+   addresses, before it lends the transport to the handler. A copy, not a borrow, because the handler then borrows
+   the transport mutably. `withPeerIdentity` makes a context with one (the owner's choice, 2026-11-02: through to
+   handlers, so `web_server` handlers read `ctx.connection().peerIdentity()`).

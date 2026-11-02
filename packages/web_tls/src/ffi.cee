@@ -16,6 +16,36 @@ extern "C" {
     @effects()
     fn wt_cfg_set_alpn(cfg: *mut void, wire: *u8, length: usize) -> i32;
     @effects()
+    fn wt_cfg_add_name(
+        cfg: *mut void,
+        name: *u8,
+        nameLength: usize,
+        chain: *u8,
+        chainLength: usize,
+        key: *u8,
+        keyLength: usize,
+    ) -> i32;
+    @effects()
+    fn wt_cfg_reload(cfg: *mut void, chain: *u8, chainLength: usize, key: *u8, keyLength: usize) -> i32;
+    @effects()
+    fn wt_cfg_rotate_tickets(cfg: *mut void) -> i32;
+    @effects()
+    fn wt_cfg_client_auth(cfg: *mut void, required: i32, pem: *u8, length: usize) -> i32;
+    @effects()
+    fn wt_ctx_session(c: *mut void) -> *mut void;
+    @effects()
+    fn wt_session_free(s: *mut void);
+    @effects()
+    fn wt_ctx_offer_session(c: *mut void, s: *mut void) -> i32;
+    @effects()
+    fn wt_ctx_resumed(c: *mut void) -> i32;
+    @effects()
+    fn wt_peer_cert_der(c: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn wt_peer_subject(c: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn wt_peer_names(c: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
     fn wt_ctx_new(cfg: *mut void, server: i32, host: *u8, hostLength: usize) -> *mut void;
     @effects()
     fn wt_ctx_free(c: *mut void);

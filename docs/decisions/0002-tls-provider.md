@@ -187,3 +187,37 @@ Exceeding any limit closes the connection with an alert where possible.
 5. **The fuzz harness** (`tests/fuzz/tls/fuzz_shim.c`) is guided by the shim's own coverage: the system OpenSSL is not
    instrumented. That suits its purpose, the shim's handling of whatever OpenSSL returns for arbitrary input.
    OpenSSL itself is fuzzed continuously by OSS-Fuzz.
+
+## 9. Amendment 3 (2026-11-02, M4 stage 4; the owner's choices of 2026-11-02)
+
+1. **SNI is a table of names in the shim**, not a `CertResolver` interface called back from C (§3.3).
+   `TlsConfig.addName(name, chain, key)`: an exact name ("api.example.com") or a wildcard for one label
+   ("*.example.com"), case-insensitive, with an exact name winning over a wildcard. Any other name, or none, gets the
+   default certificate. The shim's servername callback (`pick_certificate`) switches the connection to the entry's
+   `SSL_CTX`. A dynamic resolver (ACME) may come later, as an addition.
+2. **Hot reload swaps inside the shim**, not through `Arc<CertSet>`. `TlsConfig.reload(chain, key)` builds a new
+   `SSL_CTX` and swaps it in under OpenSSL's own lock (`CRYPTO_THREAD_lock`). New handshakes present it; connections
+   already made keep theirs (OpenSSL counts references). This needs no Send/Share from CeeSafe, and it works across
+   threads. `reload`, `addName` and `rotateTicketKeys` take `borrow this`, so they can be called while a
+   `TlsAcceptor` serves (`acceptor.configuration()`).
+3. **Session tickets** use the shim's keys (`SSL_CTX_set_tlsext_ticket_key_evp_cb`: AES-256-CBC with HMAC-SHA256,
+   OpenSSL 3's EVP callback):
+   - `rotateTicketKeys` makes a new current key;
+   - a ticket from the previous key still resumes and is renewed;
+   - an older ticket gets a full handshake;
+   - the keys are made with `RAND_bytes` and kept in the shim, never in CeeSafe memory.
+
+   A client keeps a `TlsSession` (`TlsTransport.session()`, after reading, since TLS 1.3 sends its tickets after
+   the handshake) and offers it with `TlsTransport.connectResuming`.
+4. **Client certificates.** `requireClientCertificates(roots)` or `requestClientCertificates(roots)` (optional).
+   - A certificate that does not verify fails the handshake in both modes (fail closed). Without one, `require`
+     fails and `request` lets the client in with an empty identity.
+   - The roots and the names sent in CertificateRequest are set on each connection, so a switch to an SNI entry's
+     configuration keeps them.
+   - The verified identity reaches handlers through `ConnectionContext` (Web ADR 0001 amendment 4).
+   - A client presents one with `TlsConfig.clientCertificate(chain, key)`.
+5. **Every server configuration has a session id context** ("web_tls"). Resumption and client certificates need one,
+   and a context switch copies the new configuration's.
+6. **New shim functions**, added to §3.2's table: `wt_cfg_add_name`, `wt_cfg_reload`, `wt_cfg_rotate_tickets`,
+   `wt_cfg_client_auth`, `wt_ctx_session`, `wt_session_free`, `wt_ctx_offer_session`, `wt_ctx_resumed`,
+   `wt_peer_subject` and `wt_peer_names`. `wt_peer_cert_der` now returns only a verified certificate.
