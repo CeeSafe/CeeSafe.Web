@@ -1,3 +1,4 @@
 echo over loopback ok
+IPv6 listener with options, and both addresses ok
 cancelled read loses nothing ok
 cancelled blocked write poisons ok

@@ -37,6 +37,22 @@ fn main() {
         NetError.OutOfMemory => true,
         _ => false,
     });
+    show("reset is Reset", match (NetErrors.fromIo(IoError.ConnectionReset)) {
+        NetError.Reset => true,
+        _ => false,
+    });
+    show("aborted is Reset", match (NetErrors.fromAsync(AsyncError.Io(IoError.ConnectionAborted))) {
+        NetError.Reset => true,
+        _ => false,
+    });
+    show("kernel timeout is TimedOut", match (NetErrors.fromIo(IoError.TimedOut)) {
+        NetError.TimedOut => true,
+        _ => false,
+    });
+    show("not connected stays io", match (NetErrors.fromIo(IoError.NotConnected)) {
+        NetError.Io(IoError.NotConnected) => true,
+        _ => false,
+    });
     show("refused stays io", match (NetErrors.fromIo(IoError.ConnectionRefused)) {
         NetError.Io(IoError.ConnectionRefused) => true,
         _ => false,

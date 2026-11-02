@@ -35,6 +35,10 @@ struct EchoHandler {
     matched: AtomicU64;
     active: AtomicU64;
     peak: AtomicU64;
+    /// Connections whose context had a loopback peer address.
+    loopbackPeers: AtomicU64;
+    /// The local port of the last connection with a local address.
+    localPort: AtomicU64;
 }
 
 impl ConnectionHandler for EchoHandler {
@@ -43,6 +47,18 @@ impl ConnectionHandler for EchoHandler {
         conn: borrow mut dyn Transport,
         ctx: borrow ConnectionContext,
     ) -> Result<void, NetError> {
+        match (ctx.peerAddress()) {
+            Some(a) => {
+                if (a.isLoopback()) {
+                    let n = this.loopbackPeers.fetchAdd(1);
+                }
+            }
+            null => {}
+        }
+        match (ctx.localAddress()) {
+            Some(a) => { this.localPort.store(a.port() as u64); }
+            null => {}
+        }
         let now = this.active.fetchAdd(1) + 1;
         loop {
             let seen = this.peak.load();
@@ -91,7 +107,36 @@ fn echoHandler() -> EchoHandler => EchoHandler {
     matched: AtomicU64.create(0),
     active: AtomicU64.create(0),
     peak: AtomicU64.create(0),
+    loopbackPeers: AtomicU64.create(0),
+    localPort: AtomicU64.create(0),
 };
+
+/// Reads once and records whether the read failed with `Reset`; `reading` is set first, so a client knows when to
+/// reset the connection.
+struct ResetHandler {
+    reading: AtomicBool;
+    resets: AtomicU64;
+}
+
+impl ConnectionHandler for ResetHandler {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        var buf = [0u8; 8];
+        this.reading.store(true);
+        let r = await Transports.readWithin(conn, mut buf[..], Deadline.after(2000));
+        match (r) {
+            Err(NetError.Reset) => {
+                let n = this.resets.fetchAdd(1);
+            }
+            _ => {}
+        }
+        let done = r?;
+        return Ok();
+    }
+}
 
 /// Works for `ms` milliseconds (a request in flight), whatever the drain, then returns.
 struct SlowHandler {
@@ -397,6 +442,57 @@ async fn overTcp() -> Result<void, NetError> {
     await show("8 TCP clients echoed through 4 workers", good == 8 && h.matched.load() == 8)?;
     await show("TCP report: 8 accepted, 8 served", r.accepted == 8 && r.served == 8 && r.failed == 0)?;
     await show("the TCP server drains at once when idle", !r.forced && stopped < 500)?;
+    await show(
+        "each TCP context has the loopback peer and the listener's port",
+        h.loopbackPeers.load() == 8 && h.localPort.load() == port as u64,
+    )?;
+    return Ok();
+}
+
+/// A real RST (SO_LINGER 0, `TcpTransport.abort`) while the handler reads: its read is `Err(Reset)`, the connection
+/// counts as failed, and the server serves on.
+async fn resetOverTcp() -> Result<void, NetError> {
+    let listener = Listener.bind("127.0.0.1", 0)?;
+    let port = listener.port()?;
+    let drain = Drain.create()?;
+    let h = ResetHandler { reading: AtomicBool.create(false), resets: AtomicU64.create(0) };
+    let a = PlainAcceptor {};
+    let l = limits(2, 1000);
+    var r = emptyReport();
+    var sawReading = false;
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            r = await ConnectionServer.run(listener, a, h, l, drain)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            let c = await TcpTransport.connect("127.0.0.1", port)?;
+            for (i in 0..200) {
+                if (h.reading.load()) {
+                    break;
+                }
+                match (await Timer.sleep(5)) {
+                    Ok() => {}
+                    Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                }
+            }
+            sawReading = h.reading.load();
+            c.abort();
+            for (i in 0..200) {
+                if (h.resets.load() > 0) {
+                    break;
+                }
+                match (await Timer.sleep(5)) {
+                    Ok() => {}
+                    Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                }
+            }
+            drain.start();
+            return Ok();
+        });
+    })?;
+    await show("a peer's RST fails the read with Reset", sawReading && h.resets.load() == 1)?;
+    await show("the reset connection counts as failed", r.accepted == 1 && r.failed == 1 && r.served == 0)?;
     return Ok();
 }
 
@@ -409,6 +505,7 @@ async fn checks() -> Result<void, NetError> {
     await drainClosesIdleConnections()?;
     await graceRunsOut()?;
     await overTcp()?;
+    await resetOverTcp()?;
     return Ok();
 }
 

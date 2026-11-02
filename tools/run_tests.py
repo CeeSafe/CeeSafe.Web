@@ -2,7 +2,7 @@
 """Run CeeSafe.Web's test packages (Web ADR 0005 §2.1).
 
 usage: python3 tools/run_tests.py [--ceesafec PATH] [--sanitize] [--no-native] [--filter TEXT] [--update-lock]
-                                  [--alloc-sweep]
+                                  [--alloc-sweep] [--cancel-sweep PATH]
 
 A file named native-xfail holds the reason a test's native build is known to fail because of a CeeSafe bug (for
 example "B2", docs/ceesafe-upstream-work.md). The test still runs in the interpreter and must pass there; the native
@@ -18,6 +18,11 @@ A run that does not finish in time is a failure ("timed out"), not a crash of th
 --alloc-sweep (Web ADR 0005 §2.2): after a test passes natively, run it again once per allocation attempt with
 that attempt failing (CEESAFE_FAIL_ALLOC_AT). Each run must exit 0 (no panic, no crash) with live=0. Its output
 may differ: a test reports the failure as a value.
+
+--cancel-sweep PATH (Web ADR 0005 §2.2; CeeSafe T1): after the tests, run CeeSafe's cancellation sweep, PATH being
+tools/cancel_sweep.py of a CeeSafe checkout at the release in use, over every test that calls Async.run (a package
+without it has nothing to cancel; the sweep's corpus mode has the same rule). Each test is cancelled at every
+suspension (sampled past 200) under ASan and UBSan, and must exit 0 with live=0. It fails the run if the sweep does.
 
 A test is a directory under tests/ (not tests/probes) holding an executable package (ceesafe.toml, src/main.cee)
 and expected.txt, its exact standard output. Each test is checked, then run twice, in the interpreter and natively,
@@ -79,6 +84,7 @@ def main() -> int:
     ap.add_argument("--filter", default="")
     ap.add_argument("--update-lock", action="store_true", help="run ceesafec fetch in each test first")
     ap.add_argument("--alloc-sweep", action="store_true", help="fail each allocation in turn (native)")
+    ap.add_argument("--cancel-sweep", metavar="PATH", help="CeeSafe's tools/cancel_sweep.py: cancel at each suspension")
     args = ap.parse_args()
 
     tests = sorted(p.parent for p in (ROOT / "tests").glob("**/expected.txt")
@@ -172,7 +178,18 @@ def main() -> int:
 
     shutil.rmtree(work, ignore_errors=True)
     print(f"run_tests: {len(tests) - failures} passed, {failures} failed")
-    return 1 if failures else 0
+
+    swept_ok = True
+    if args.cancel_sweep:
+        packages = [t for t in tests
+                    if any("Async.run" in f.read_text(encoding="utf-8") for f in (t / "src").glob("*.cee"))]
+        command = [sys.executable, args.cancel_sweep, "--compiler", args.ceesafec]
+        for t in packages:
+            command += ["--package", str(t)]
+        r = run(command, ROOT, timeout=3600)
+        print((r.stdout + r.stderr).rstrip())
+        swept_ok = r.returncode == 0
+    return 1 if failures or not swept_ok else 0
 
 
 if __name__ == "__main__":

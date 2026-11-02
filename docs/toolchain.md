@@ -10,31 +10,26 @@ that needs an unreleased compiler is not merged to main.
 | Milestone | Minimum | Needs | Status |
 |---|---|---|---|
 | M0 contracts, engines, MockTransport | **0.5.1** | async interfaces, `dyn` async methods (ADR 0036), regions, completion I/O (ADR 0035) | released |
-| M1 transport lifecycle | the release after 0.6.0 | **a fix for B2 (general form)** to merge at all; then U1 socket options/IPv6, U2 error kinds (ADR 0044, on CeeSafe main); U4 `Async.timeout` optional (ADR 0046 drafted); B4 and B5 for the overload gate | on branch `m1` with 0.6.0 (`docs/milestones/M1.md`) |
-| M2 HTTP/1.1 fast path | 0.6.0 (expected) | U3 vectored send | upstream, not started |
-| M4 TLS | 0.6.x | U8 manifest `links` (OpenSSL) | upstream, not started |
-| M5 client | 0.6.x | U5 DNS | upstream, not started |
-| M9 sendfile | 0.7.0 | U7 | upstream, not started |
-| M10 HTTP/3 | 0.7.0 | U6 UDP | upstream, not started |
+| M1 transport lifecycle | **0.7.0** | B2 fixed; U1 addresses, IPv6, options and U2 error kinds (ADR 0044); U3 `IoParts` (ADR 0045); U4 `Async.deadline` (ADR 0046); B4 fixed; T1 for the cancel sweep. B5 for the overload gate | merged to main (`docs/milestones/M1.md`) |
+| M2 HTTP/1.1 fast path | 0.7.0 | U3 vectored send | released |
+| M4 TLS | 0.7.x | U8 manifest `links` (OpenSSL) | upstream, not started |
+| M5 client | 0.7.x | U5 DNS | upstream, not started |
+| M9 sendfile | later | U7 | upstream, not started |
+| M10 HTTP/3 | later | U6 UDP | upstream, not started |
 
 ## Current machine (2026-11-02)
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.6.0** (release, tag `v0.6.0` = CeeSafe `5af87ea`) | the toolchain for main |
-| `~/dev/CeeSafe/out/ceesafec` | 0.6.0 + ADR 0044 work in progress | local checks only |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.7.0** (release, tag `v0.7.0` = CeeSafe `b2bef17`) | the toolchain for main |
+| `~/dev/CeeSafe/tools/cancel_sweep.py` | same as at `v0.7.0` | `tools/run_tests.py --cancel-sweep` (the release does not install it) |
 
-**0.6.0 does not contain U1 or U2.** ADR 0044 (socket addresses, IPv6, options, network `IoError` kinds) landed on
-CeeSafe main after the tag (`a4aee7b`…`f7a7d57`). So `web_core` uses neither `SocketAddress` nor the new `IoError` kinds
-yet (Web ADR 0001, amendment 1). M1 needs the release that ships them.
+0.7.0 breaks source in two ways that touched CeeSafe.Web: lib/std's new `IoParts` collided with `web_core`'s (Web ADR
+0001 amendment 3.1), and `IoError` gained eight variants (a `match` without `_` stops compiling; `web_core`'s have
+one).
 
-Runs on 2026-11-02 with 0.6.0:
-- every package: `ceesafec fetch` and `check` clean;
-- `web_core`: `fmt --check` and `doc --missing` clean;
-- `python3 tools/run_tests.py`: 5 passed (interpreter and native, no leaks);
-- the same with `--sanitize` (ASan + UBSan): 5 passed;
-- `--alloc-sweep`: 5 passed, 371 failure points (buffer 6, transport 365), each exiting 0 with `live=0`;
-- `tests/probes/`: as expected, including bug B1 (`docs/ceesafe-upstream-work.md`).
+Runs on 2026-11-02 with 0.7.0 (macOS arm64): see `docs/milestones/M1.md`, "Runs". Earlier, with 0.6.0: M0's five
+tests passed (interpreter, native, sanitizers, 371 allocation-failure points).
 
 ## External tools (from M2/M4 on)
 

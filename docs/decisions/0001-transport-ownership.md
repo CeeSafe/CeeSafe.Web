@@ -211,3 +211,28 @@ Found while building M1's connection server against the 0.6.0 release. The decis
    poisons the transport, as §3.4 requires.
 5. **`MinRate`** (`web_core`) computes the slow-sender deadline, sans-I/O: start, plus grace, plus the time the bytes
    received so far buy at the minimum rate.
+
+## 9. Amendment 3 (2026-11-02, moving to ceesafec 0.7.0)
+
+0.7.0 ships CeeSafe ADRs 0044 (addresses, IPv6, socket options, network `IoError` kinds), 0045 (vectored send) and
+0046 (`Async.timeout`, `Async.deadline`). The decision's intent is unchanged:
+
+1. **`IoParts` is lib/std's** (CeeSafe ADR 0045 §3.1), which took this ADR's shape: up to eight parts, built by
+   value (`IoParts.of(head).then(body)`, null past eight), with `count`, `part`, `totalLength` and `after`.
+   `web_core`'s own four-slot `IoParts` is gone, since the two names collided. `Transports.writeAllVectored` loops
+   on `writeVectored` over `parts.after(sent)`, and `TcpTransport.writeVectored` is one real vectored send
+   (`AsyncTcpStream.writeVectored`) instead of the first part's write.
+2. **`Transport` gains `peerAddress()` and `localAddress()`** (`SocketAddress?`, `@effects()`, as `alpn`), which
+   replace amendment 1.5's `peer()`/`PeerInfo`. `TcpTransport` reads both once, when the connection is made: null if
+   the kernel no longer knows them. The mock has none. `ConnectionContext.withAddresses` carries them to handlers.
+3. **`NetErrors.fromIo`** maps `ConnectionReset` and `ConnectionAborted` to `Reset`, and `IoError.TimedOut` (the
+   kernel's) to `TimedOut` (amendment 1.5).
+4. **`Transports.readWithin` is `Async.deadline`** (§3.5, amendment 2.4). `writeWithin` and `closeGracefully` keep
+   their race against `deadlineElapsed` while CeeSafe bug B6 is open: `Async.deadline` over a body of
+   `Result<void, E>` crashes `ceesafec check` (`tests/probes/async-deadline-void-bug.cee`). `deadlineElapsed<T>`
+   stays for races with more than an operation and a deadline. The frame is about the same: `Async.deadline` is
+   lowered as a race (CeeSafe ADR 0046 §3), and `readWithin` went from 1296 to 1168 bytes.
+5. **TCP** (§3.3): `TcpTransport.connectTo(SocketAddress)`, `setNoDelay`, and `abort()`, an abortive close (SO_LINGER
+   0, so the peer gets a reset), for a connection that broke the protocol and for tests of a peer's reset.
+   `Listener.bindWith(SocketAddress, ListenOptions)` sets the backlog, address and port reuse, and dual stack;
+   `Listener.localAddress()`. Accepted connections have TCP_NODELAY on unless `withNoDelay(false)`.

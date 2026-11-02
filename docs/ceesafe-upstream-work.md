@@ -2,7 +2,27 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** proposed work, not started. File references were checked against `5fa4316`; re-check them before editing.
+**Status:** see "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+re-check them before editing.
+
+## Status at 0.7.0 (released 2026-11-02, tag `v0.7.0` = CeeSafe `b2bef17`)
+
+Checked from CeeSafe.Web on 2026-11-02, macOS arm64 (`docs/milestones/M1.md`, runs):
+
+| Item | Status | Checked by |
+|---|---|---|
+| U1 addresses, IPv6, socket options (ADR 0044) | **released** | `tests/web_transport/tcp` (IPv6 listener with options, both ends' addresses), `server` (addresses in the context, a real RST) |
+| U2 network `IoError` kinds (ADR 0044) | **released** | `tests/web_core/errors`; `server`'s RST read is `Reset` |
+| U3 vectored send (ADR 0045) | **released**; CeeSafe.Web uses lib/std's `IoParts` | `tests/web_core/transport`, `tcp` |
+| U4 `Async.timeout`/`Async.deadline` (ADR 0046) | **released**, but see B6 | `Transports.readWithin` |
+| T1 sweeps take a package | **released** (`--package`) | `tools/run_tests.py --cancel-sweep`: 9 packages, 305 points, 0 fail |
+| B1 `@effectsOf` with an async closure | **fixed** | probe prints `70` |
+| B2 drop body missing for an unused type | **fixed** | every test builds natively; probe prints `1` |
+| B3 race child's captured array loses `const` | **fixed** | probe builds with `-Werror` |
+| B4 kqueue livelock in `cee_wake_waiters` | **fixed** | probe 20/20, `server` 25/25 natively on kqueue |
+| B5 every cancel wakes every socket waiter | **open** (performance) | read in `ceesafe_rt_async.c` at `v0.7.0`: the filter is unchanged |
+| **B6** `Async.deadline` over `Result<void, E>` crashes `check` | **open** (new, below) | `tests/probes/async-deadline-void-bug.cee` |
+| U5–U11 | not in 0.7.0 | — |
 
 ## Why this has to happen in CeeSafe
 
@@ -243,7 +263,7 @@ None of this blocks a milestone. Probes: `~/dev/CeeSafe.Web/tests/probes/impl-ge
 
 **Status:** wanted, not scheduled.
 
-## B1 — Bug: `@effectsOf` async fn called with an async closure   *(found 2026-11-02, ceesafec 0.6.0)*
+## B1 — Bug: `@effectsOf` async fn called with an async closure   *(found 2026-11-02, ceesafec 0.6.0; fixed in 0.7.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/effectsof-async-bug.cee`:
 
@@ -273,7 +293,7 @@ spec §32.5 / ADR 0037 do not say), or it prints the right value. Safe code must
   awaited, N0295 when called. That is consistent with the spec, but it means U4 is the only way to a generic deadline
   helper.
 
-## B2 — Bug: undefined drop function for an unused socket type   *(found 2026-11-02, 0.6.0 and main)*
+## B2 — Bug: undefined drop function for an unused socket type   *(found 2026-11-02, 0.6.0 and main; fixed in 0.7.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/unused-socket-drop-bug.cee` (eight lines):
 
@@ -320,7 +340,7 @@ reachable (or emit drop glue only for the types that are reached).
 **Effect on CeeSafe.Web:** M1 waits on a branch (`m1`) until a release fixes this. On it, six tests carry
 `native-xfail` (B2), and the runner reports XPASS once they build.
 
-## B4 — Bug: kqueue livelock in `cee_wake_waiters` when a cancel unparks socket waiters   *(found 2026-11-02, 0.6.0)*
+## B4 — Bug: kqueue livelock in `cee_wake_waiters` when a cancel unparks socket waiters   *(found 2026-11-02, 0.6.0; fixed in 0.7.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/wake-waiters-livelock-bug.cee`. 40 (or 10) connected sockets with a reader
 task each, while another task writes a byte to each in turn and resolves an `Async.race` after each write (the loser
@@ -360,7 +380,7 @@ server is O(*n*²) overall. **Wanted:** wake only the tasks of the cancelled sco
 walking the scope's own children instead of the executor's parked list. This blocks M1's overload benchmark, but not
 M1's correctness.
 
-## B3 — Bug: generated C discards `const` for a race child's captured array   *(found 2026-11-02, 0.6.0)*
+## B3 — Bug: generated C discards `const` for a race child's captured array   *(found 2026-11-02, 0.6.0; fixed in 0.7.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/race-capture-const-warning.cee`: an `Async.race` child that lends a captured
 local array as `mut buf[..]`.
@@ -369,6 +389,28 @@ local array as `mut buf[..]`.
 The program runs correctly (prints 7), but `--cflag -Werror` fails.
 
 **Expected:** no warning: the capture is mutable, so its C type should not be const.
+
+## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/async-deadline-void-bug.cee`:
+
+```ceesafe
+async fn work() -> Result<void, E> => Ok();
+async fn within(at: u64) -> Result<void, E> {
+    return await Async.deadline(at, E.TimedOut, async () => await work());
+}
+```
+
+**Observed:** `ceesafec check` panics with `index out of bounds at src/main.cee:687:41`, in `report`, while it renders
+a diagnostic: `sources[d.file as usize]` is out of range, so some diagnostic carries a file index that is not a
+source. `--diagnostics-format=json` panics too, at `src/diagnostics/diagnostic.cee:303:37`. The same with
+`Async.timeout(1000, …)`. With `Result<u32, E>` (body and function) it checks, builds and runs.
+
+**Expected:** it checks, and prints `ok`. So two things are probably wrong: the checker reports something for a
+`void` body (perhaps from the synthesized `Raced`/join over `void`), and that diagnostic's span points at no file.
+
+**Effect on CeeSafe.Web:** `Transports.writeWithin` and `closeGracefully` (both `Result<void, NetError>`) keep their
+race against `deadlineElapsed` (Web ADR 0001 amendment 3.4); `readWithin` uses `Async.deadline`.
 
 ## U11 — Spawning into a running scope   *(design question; found while drafting M1, 2026-11-02)*
 
@@ -401,9 +443,10 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 
 | Release | Items | Unblocks in CeeSafe.Web |
 |---|---|---|
-| **0.6.0** | U1, U2, U3, U4 (+ T1) | M1 transport/lifecycle, M2 HTTP/1.1 fast path |
-| **0.6.x** | U8 (by CeeSafe.Web week 9), U5 | M4 TLS (OpenSSL), M5 client |
-| **0.7.0** | U6, U7, U9 | M9 sendfile, M10 HTTP/3 |
+| **0.7.0** (released 2026-11-02) | U1, U2, U3, U4, T1; B1–B4 fixed | M1 transport/lifecycle (merged), M2 HTTP/1.1 fast path |
+| next | B5, B6 | M1's overload gate and benchmarks (B5); `void` deadlines (B6) |
+| 0.7.x | U8 (by CeeSafe.Web week 9), U5 | M4 TLS (OpenSSL), M5 client |
+| later | U6, U7, U9 | M9 sendfile, M10 HTTP/3 |
 | unscheduled | U10 | simplifications only |
 
 Suggested ADR batching:

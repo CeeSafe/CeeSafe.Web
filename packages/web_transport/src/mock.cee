@@ -245,8 +245,8 @@ impl Transport for MockTransport {
             }
         }
         var n: usize = 0;
-        for (i in 0..parts.parts()) {
-            let p = parts.part(truncate<u32>(i));
+        for (i in 0..parts.count()) {
+            let p = parts.part(i);
             for (b in p) {
                 if (this.step != 0 && n == this.step) {
                     return Ok(n);
@@ -276,4 +276,10 @@ impl Transport for MockTransport {
 
     @effects()
     fn alpn(borrow this) -> Alpn => this.protocol;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => null;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => null;
 }

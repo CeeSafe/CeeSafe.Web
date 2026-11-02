@@ -20,11 +20,12 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `impl-scoped-fail.cee` | N0267 | a type with a region parameter cannot implement an interface | 0003 |
 | `method-region-fail.cee` | N0216 | a method cannot declare its own region; elided regions in method signatures work | 0003 |
 | `slice-of-slices-fail.cee` | N0246 | no slices or arrays of slices, so vectored writes take `IoParts` | 0001 (amended) |
-| `unused-socket-drop-bug.cee` | **should** build and print `1`; `check` and interpreter pass, `build` fails in C (undefined `ceeD_14AsyncTcpStream`) | CeeSafe bug B2; `tests/web_transport/{mock,acceptor}` carry `native-xfail` until it is fixed | 0001 |
-| `race-capture-const-warning.cee` | **should** build without warnings; prints `7` but warns (const discarded), failing `-Werror` | CeeSafe bug B3 | — |
+| `unused-socket-drop-bug.cee` | builds and prints `1` (fixed in 0.7.0; 0.6.0 failed in C, undefined `ceeD_14AsyncTcpStream`) | CeeSafe bug B2, which kept M1 off main until 0.7.0 | 0001 |
+| `race-capture-const-warning.cee` | builds with `-Werror` and prints `7` (fixed in 0.7.0; 0.6.0 warned that const was discarded) | CeeSafe bug B3 | — |
 | `drain-broadcast.cee` | prints `1005` | a closed `Channel` wakes every waiting task (a drain broadcast; `AsyncSignal` wakes one); a context with a region parameter lends it through a `dyn` method | 0001 amendment 2 |
-| `wake-waiters-livelock-bug.cee` | **should** print `1`; natively on macOS (kqueue) it hangs at 100 % CPU, 20 of 20 runs; `1` in the interpreter and with `CEESAFE_REACTOR_POLL=1` | CeeSafe bug B4; `tests/web_transport/server` carries `native-env` until it is fixed | 0001 |
-| `effectsof-async-bug.cee` | **should** print `70` or be rejected; prints `0` (interpreter), SEGV (native) | a CeeSafe 0.6.0 bug, upstream B1; when it prints `70`, a generic `withDeadline` becomes possible | 0001 §3.5 |
+| `wake-waiters-livelock-bug.cee` | prints `1`, natively too (fixed in 0.7.0; 0.6.0 hung on macOS/kqueue at 100 % CPU, 20 of 20 runs) | CeeSafe bug B4 | 0001 |
+| `effectsof-async-bug.cee` | prints `70` (fixed in 0.7.0; 0.6.0 printed `0` in the interpreter and crashed natively) | CeeSafe bug B1 | 0001 §3.5 |
+| `async-deadline-void-bug.cee` | **should** check and print `ok`; `ceesafec check` panics ("index out of bounds at src/main.cee:687:41") | CeeSafe bug B6: `Async.deadline` over `Result<void, E>`; `Transports.writeWithin` and `closeGracefully` keep a race until it is fixed | 0001 amendment 3 |
 
 ## Runs
 
@@ -34,5 +35,7 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.3.2 | `check`: all as expected |
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.6.0 (release) | all as expected; the two new probes as listed (the bug reproduces) |
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.6.0 (release) | `drain-broadcast` prints `1005` (interpreter and native); `wake-waiters-livelock-bug` reproduces B4 (native, 20/20 hang; 10 sockets 10/10; poll reactor 0/10) |
+
+| 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.7.0 (release) | B1–B4 probes fixed: each gives its intended result in the interpreter and natively with `-Werror`; `wake-waiters-livelock-bug` 20/20 natively (kqueue). The `-fail` probes still fail with the same codes. New `async-deadline-void-bug` reproduces B6 |
 
 `impl-generic-fail.cee` does not parse, so `ceesafec fmt --check` reports it; the other probes are formatted.

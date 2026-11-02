@@ -1,6 +1,6 @@
-// TcpTransport and Listener over loopback (Web ADR 0001 §3.4): an echo through PlainStream, a read cancelled while
-// the kernel holds it losing nothing, and a write blocked on a full socket buffer cancelled by a deadline and then
-// poisoned.
+// TcpTransport and Listener over loopback (Web ADR 0001 §3.4): an echo through PlainStream, the same over IPv6 with
+// listen options and both ends' addresses (CeeSafe ADR 0044), a read cancelled while the kernel holds it losing
+// nothing, and a write blocked on a full socket buffer cancelled by a deadline and then poisoned.
 import web_core;
 import web_transport;
 
@@ -55,7 +55,10 @@ async fn echo() -> Result<bool, NetError> {
         s.spawn(async () => {
             var c = await TcpTransport.connect("127.0.0.1", port)?;
             let bytes = message.bytes();
-            let parts = IoParts.two(bytes[0..10], bytes[10..]);
+            let parts = match (IoParts.of(bytes[0..10]).then(bytes[10..])) {
+                Some(p) => p,
+                null => { return Err(NetError.LimitExceeded); },
+            };
             await Transports.writeAllVectored(mut c, parts)?;
             await c.shutdownWrite()?;
             var buf = [0u8; 16];
@@ -148,8 +151,58 @@ async fn poisoned() -> Result<bool, NetError> {
     return Ok(timedOut && poisonedAfter && closedAfter);
 }
 
+/// Whether `a` is ::1 at `port`.
+fn isV6Loopback(a: SocketAddress?, port: u16) -> bool => match (a) {
+    Some(SocketAddress.V6(bytes, p, _)) => SocketAddress.V6(bytes, p, 0).isLoopback() && p == port,
+    _ => false,
+};
+
+/// An IPv6-only listener on ::1 with a backlog of 64: a client connects to its local address, and each end sees the
+/// other's IPv6 loopback address; the client's port is the listener's.
+async fn ipv6() -> Result<bool, NetError> {
+    let options = ListenOptions { backlog: 64, reuseAddress: true, reusePort: false, v6Only: true };
+    let listener = Listener.bindWith(SocketAddresses.v6Loopback(0), options)?;
+    let at = listener.localAddress()?;
+    let port = at.port();
+    var serverSaw = false;
+    var clientSaw = false;
+    var echoed = false;
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            var conn = await listener.accept()?;
+            let peer = conn.peerAddress();
+            serverSaw = isV6Loopback(conn.localAddress(), port) && match (peer) {
+                Some(p) => p.isLoopback() && p.port() != port,
+                null => false,
+            };
+            var buf = [0u8; 8];
+            let n = await conn.read(mut buf[..])?;
+            await conn.write(buf[0..n])?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            var c = await TcpTransport.connectTo(at)?;
+            clientSaw = isV6Loopback(c.peerAddress(), port);
+            await c.write("ping".bytes())?;
+            var buf = [0u8; 8];
+            var got: usize = 0;
+            while (got < 4) {
+                let n = await c.read(mut buf[got..])?;
+                if (n == 0) {
+                    break;
+                }
+                got += n;
+            }
+            echoed = equals(buf[0..got], "ping".bytes());
+            return Ok();
+        });
+    })?;
+    return Ok(port != 0 && serverSaw && clientSaw && echoed);
+}
+
 async fn checks() -> Result<void, NetError> {
     await show("echo over loopback", await echo()?)?;
+    await show("IPv6 listener with options, and both addresses", await ipv6()?)?;
     await show("cancelled read loses nothing", await noLoss()?)?;
     await show("cancelled blocked write poisons", await poisoned()?)?;
     return Ok();

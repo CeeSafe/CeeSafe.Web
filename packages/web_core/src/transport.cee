@@ -12,67 +12,6 @@ public enum Alpn {
     Other,
 }
 
-/// Up to four byte ranges written as one vectored step (Web ADR 0001 §3.2). A struct of slots, because CeeSafe v0
-/// has no slices of slices (N0246). Unused slots are empty.
-public struct IoParts<region r> {
-    private a: Slice<r, u8>;
-    private b: Slice<r, u8>;
-    private c: Slice<r, u8>;
-    private d: Slice<r, u8>;
-    private count: u32;
-
-    /// One part.
-    public fn one(a: Slice<r, u8>) -> IoParts<r> {
-        let e = a[0..0];
-        return IoParts { a: a, b: e, c: e, d: e, count: 1 };
-    }
-
-    /// Two parts, in order.
-    public fn two(a: Slice<r, u8>, b: Slice<r, u8>) -> IoParts<r> {
-        let e = a[0..0];
-        return IoParts { a: a, b: b, c: e, d: e, count: 2 };
-    }
-
-    /// Three parts, in order.
-    public fn three(a: Slice<r, u8>, b: Slice<r, u8>, c: Slice<r, u8>) -> IoParts<r> {
-        let e = a[0..0];
-        return IoParts { a: a, b: b, c: c, d: e, count: 3 };
-    }
-
-    /// Four parts, in order.
-    public fn four(a: Slice<r, u8>, b: Slice<r, u8>, c: Slice<r, u8>, d: Slice<r, u8>) -> IoParts<r> =>
-        IoParts { a: a, b: b, c: c, d: d, count: 4 };
-
-    /// How many parts it has (1 to 4).
-    public fn parts(borrow this) -> u32 => this.count;
-
-    /// Part `i` (0-based); empty past the last part.
-    public fn part(borrow this, i: u32) -> Slice<r, u8> {
-        if (i == 0) {
-            return this.a;
-        }
-        if (i == 1 && this.count > 1) {
-            return this.b;
-        }
-        if (i == 2 && this.count > 2) {
-            return this.c;
-        }
-        if (i == 3 && this.count > 3) {
-            return this.d;
-        }
-        return this.a[0..0];
-    }
-
-    /// The total number of bytes.
-    public fn totalLength(borrow this) -> usize {
-        var n: usize = 0;
-        for (i in 0..this.count) {
-            n += this.part(truncate<u32>(i)).length;
-        }
-        return n;
-    }
-}
-
 /// An async byte stream with explicit close semantics (Web ADR 0001 §3.2). The transport owns its socket: dropping it
 /// closes at once. Implementations are concrete types (TCP, TLS, mock); drivers use them as `borrow mut dyn
 /// Transport`, and a connection holds one as `Box<dyn Transport>` (§3.3).
@@ -92,6 +31,15 @@ public interface Transport {
     /// Ends this side's writing (TCP FIN; TLS close_notify, then FIN). Reading still works.
     async fn shutdownWrite(borrow mut this) -> Result<void, NetError>;
 
+    /// The peer's address (CeeSafe ADR 0044), read when the connection was made; null for a transport without one,
+    /// such as a mock, or when the kernel no longer knew it.
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress?;
+
+    /// This end's address, as `peerAddress`.
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress?;
+
     /// The application protocol agreed for this connection. Declared without effects, so async code may call it
     /// through `dyn Transport` (an undeclared method there counts as possibly blocking, N0295).
     @effects()
@@ -100,52 +48,40 @@ public interface Transport {
 
 /// Helpers over any transport.
 public struct Transports {
-    /// Writes every byte of `parts`, looping over `writeVectored`'s partial steps. A part left half written is
-    /// finished with `write`, so each step starts at a part's boundary.
+    /// Writes every byte of `parts` (lib/std's `IoParts`, ADR 0045 §3.1), looping over `writeVectored`'s partial
+    /// steps: each step sends what is left, `parts.after(sent)`.
     public async fn writeAllVectored(t: borrow mut dyn Transport, parts: borrow IoParts) -> Result<void, NetError> {
         let total = parts.totalLength();
-        if (total == 0) {
-            return Ok();
-        }
-        let wrote = await t.writeVectored(parts)?;
-        if (wrote == 0) {
-            return Err(NetError.Closed); // a step that writes nothing would loop for ever
-        }
-        if (wrote > total) {
-            return Err(NetError.LimitExceeded); // the transport broke its contract
-        }
-        // Finish the rest with whole writes, from where the step stopped.
-        var skip = wrote;
-        for (i in 0..parts.parts()) {
-            let p = parts.part(truncate<u32>(i));
-            if (skip >= p.length) {
-                skip -= p.length;
-            } else {
-                await t.write(p[skip..])?;
-                skip = 0;
+        var sent: usize = 0;
+        while (sent < total) {
+            let rest = parts.after(sent);
+            let wrote = await t.writeVectored(borrow rest)?;
+            if (wrote == 0) {
+                return Err(NetError.Closed); // a step that writes nothing would loop for ever
             }
+            if (wrote > total - sent) {
+                return Err(NetError.LimitExceeded); // the transport broke its contract
+            }
+            sent += wrote;
         }
         return Ok();
     }
 
-    /// Reads as `read`, bounded by `deadline`: `Err(TimedOut)` once it passes. A read cancelled by the deadline after
-    /// the kernel completed it is not lost: its bytes come with the next read (Web ADR 0001 §3.4).
+    /// Reads as `read`, bounded by `deadline` (CeeSafe's `Async.deadline`, ADR 0046): `Err(TimedOut)` once it passes.
+    /// A read cancelled by the deadline after the kernel completed it is not lost: its bytes come with the next read
+    /// (Web ADR 0001 §3.4).
     public async fn readWithin(
         t: borrow mut dyn Transport,
         buffer: SliceMut<u8>,
         deadline: Deadline,
     ) -> Result<usize, NetError> {
+        if (deadline.isNever()) {
+            return await t.read(buffer);
+        }
         if (deadline.isExpired()) {
             return Err(NetError.TimedOut);
         }
-        let r: Result<Raced<usize>, NetError> = await Async.race(
-            async () => await t.read(buffer),
-            async () => await deadlineElapsed<usize>(deadline),
-        );
-        match (r) {
-            Ok(raced) => { return Ok(raced.value); }
-            Err(e) => { return Err(e); }
-        }
+        return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await t.read(buffer));
     }
 
     /// Writes as `write`, bounded by `deadline`: `Err(TimedOut)` once it passes. A write stopped by the deadline may
@@ -159,6 +95,8 @@ public struct Transports {
         if (deadline.isExpired()) {
             return Err(NetError.TimedOut);
         }
+        // A race, not `Async.deadline`, while a body of `Result<void, E>` crashes ceesafec 0.7.0 (bug B6,
+        // tests/probes/async-deadline-void-bug.cee); so is closeGracefully's.
         let r: Result<Raced<u32>, NetError> = await Async.race(
             async () => {
                 await t.write(bytes)?;

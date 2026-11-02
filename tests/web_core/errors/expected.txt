@@ -2,6 +2,10 @@ cancelled ok
 timed out ok
 broken pipe is closed ok
 io out of memory ok
+reset is Reset ok
+aborted is Reset ok
+kernel timeout is TimedOut ok
+not connected stays io ok
 refused stays io ok
 other errno kept ok
 alloc ok

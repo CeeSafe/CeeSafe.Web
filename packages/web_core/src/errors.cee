@@ -43,11 +43,14 @@ public struct NetErrors {
         AsyncError.Io(io) => NetErrors.fromIo(io),
     };
 
-    /// The NetError for a platform I/O error. A broken pipe means the peer is gone, so the stream is closed.
-    /// (With CeeSafe's network error kinds, upstream U2, ConnectionReset and ConnectionAborted become Reset and
-    /// TimedOut becomes TimedOut; the 0.6.0 release does not have them yet, docs/toolchain.md.)
+    /// The NetError for a platform I/O error (CeeSafe ADR 0044 §3.4). A broken pipe means the peer is gone, so the
+    /// stream is closed; a reset or an abort is `Reset`; the kernel giving up (a connect, a keep-alive probe) is
+    /// `TimedOut`. Every other kind stays `Io`.
     public fn fromIo(e: IoError) -> NetError => match (e) {
         IoError.BrokenPipe => NetError.Closed,
+        IoError.ConnectionReset => NetError.Reset,
+        IoError.ConnectionAborted => NetError.Reset,
+        IoError.TimedOut => NetError.TimedOut,
         IoError.OutOfMemory => NetError.OutOfMemory,
         _ => NetError.Io(e),
     };

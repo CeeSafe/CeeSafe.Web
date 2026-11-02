@@ -188,7 +188,7 @@ async fn worker(
                 continue;
             }
         };
-        let ctx = ConnectionContext.acceptedNow(id, drain);
+        let ctx = ConnectionContext.acceptedNow(id, drain).withAddresses(conn.peerAddress(), conn.localAddress());
         match (await handler.serve(mut conn, ctx)) {
             Ok() => {
                 let done = counters.served.fetchAdd(1);

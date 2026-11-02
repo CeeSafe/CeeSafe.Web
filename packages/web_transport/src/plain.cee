@@ -60,6 +60,18 @@ impl Transport for PlainStream {
         Plain.Tcp(t) => t.alpn(),
         Plain.Mock(m) => m.alpn(),
     };
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => match (borrow this.plain) {
+        Plain.Tcp(t) => t.peerAddress(),
+        Plain.Mock(m) => m.peerAddress(),
+    };
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => match (borrow this.plain) {
+        Plain.Tcp(t) => t.localAddress(),
+        Plain.Mock(m) => m.localAddress(),
+    };
 }
 
 /// Turns an accepted plain stream into the connection's transport: as it is, or after a TLS handshake (web_tls's

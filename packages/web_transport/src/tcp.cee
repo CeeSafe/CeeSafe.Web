@@ -1,5 +1,5 @@
-// TCP (Web ADR 0001 §3.3): lib/std's async TCP stream as a Transport, and a listener that produces them. IPv4 text
-// addresses only until CeeSafe's SocketAddress (upstream U1) is released; M1 adds admission control and draining.
+// TCP (Web ADR 0001 §3.3): lib/std's async TCP stream as a Transport, and a listener that produces them. Addresses,
+// IPv6 and the socket options are CeeSafe's ADR 0044 (upstream U1).
 import web_core;
 
 /// A TCP connection as a Transport. It owns its socket; dropping it closes the socket.
@@ -7,16 +7,53 @@ public struct TcpTransport {
     private stream: AsyncTcpStream;
     private poisoned: bool;
     private shut: bool;
+    private peer: SocketAddress?;
+    private local: SocketAddress?;
 
-    /// The transport over an accepted or connected stream.
-    public fn fromStream(stream: AsyncTcpStream) -> TcpTransport =>
-        TcpTransport { stream: stream, poisoned: false, shut: false };
+    /// The transport over an accepted or connected stream. Its addresses are read now, once: null if the kernel no
+    /// longer knows them (the peer already reset).
+    public fn fromStream(stream: AsyncTcpStream) -> TcpTransport {
+        let peer = match (stream.peerAddress()) {
+            Ok(a) => Some(a),
+            Err(_) => null,
+        };
+        let local = match (stream.localAddress()) {
+            Ok(a) => Some(a),
+            Err(_) => null,
+        };
+        return TcpTransport { stream: stream, poisoned: false, shut: false, peer: peer, local: local };
+    }
 
-    /// Connects to `address` (dotted IPv4) and `port`.
+    /// Connects to `address` (IPv4 or IPv6 text) and `port`.
     public async fn connect(address: StringView, port: u16) -> Result<TcpTransport, NetError> {
         match (await AsyncTcpStream.connect(address, port)) {
             Ok(s) => { return Ok(TcpTransport.fromStream(s)); }
             Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+
+    /// Connects to `address`.
+    public async fn connectTo(address: SocketAddress) -> Result<TcpTransport, NetError> {
+        match (await AsyncTcpStream.connectTo(address)) {
+            Ok(s) => { return Ok(TcpTransport.fromStream(s)); }
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+
+    /// TCP_NODELAY: small writes go out at once (Nagle's algorithm off).
+    public fn setNoDelay(borrow this, on: bool) -> Result<void, NetError> {
+        match (this.stream.setNoDelay(on)) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(NetErrors.fromIo(e)); }
+        }
+    }
+
+    /// Closes abortively: the peer gets a reset (RST) instead of the end of the stream, and unsent bytes are
+    /// discarded (SO_LINGER 0). For a connection that broke the protocol, and for tests of a peer's reset.
+    public fn abort(this) {
+        match (this.stream.setLinger(Some(0u32))) {
+            Ok() => {}
+            Err(_) => {} // the socket is closing anyway; a plain close is the next best thing
         }
     }
 
@@ -51,19 +88,18 @@ impl Transport for TcpTransport {
 
     async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> => await this.writeBytes(bytes);
 
-    /// Until CeeSafe has a vectored send (upstream U3), one step writes the first non-empty part whole.
+    /// One `sendmsg`-style step (lib/std `AsyncTcpStream.writeVectored`, ADR 0045 §3.2), poisoning on failure.
     async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
-        for (i in 0..parts.parts()) {
-            let p = parts.part(truncate<u32>(i));
-            if (p.length > 0) {
-                await this.writeBytes(p)?;
-                return Ok(p.length);
-            }
-        }
         if (this.poisoned || this.shut) {
             return Err(NetError.Closed);
         }
-        return Ok(0);
+        match (await this.stream.writeVectored(parts)) {
+            Ok(n) => { return Ok(n); }
+            Err(e) => {
+                this.poisoned = true;
+                return Err(NetErrors.fromAsync(e));
+            }
+        }
     }
 
     async fn shutdownWrite(borrow mut this) -> Result<void, NetError> {
@@ -81,17 +117,44 @@ impl Transport for TcpTransport {
 
     @effects()
     fn alpn(borrow this) -> Alpn => Alpn.None;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => this.peer;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => this.local;
 }
 
-/// A TCP listener producing PlainStreams. M1 adds the bounded accept loop, admission control and draining
-/// (implementation plan §7, M1).
+/// A TCP listener producing PlainStreams, for `ConnectionServer` (its `Incoming`). Accepted connections have
+/// TCP_NODELAY on: a server writes whole responses, and Nagle's algorithm would hold back their last segment.
 public struct Listener {
     private listener: AsyncTcpListener;
+    private noDelay: bool;
 
-    /// Listens on `address` (dotted IPv4) and `port` (0: any free port).
+    /// Listens on `address` (IPv4 or IPv6 text) and `port` (0: any free port), with `ListenOptions.defaults()`.
     public fn bind(address: StringView, port: u16) -> Result<Listener, NetError> {
         match (AsyncTcpListener.bind(address, port)) {
-            Ok(l) => { return Ok(Listener { listener: l }); }
+            Ok(l) => { return Ok(Listener { listener: l, noDelay: true }); }
+            Err(e) => { return Err(NetErrors.fromIo(e)); }
+        }
+    }
+
+    /// Listens on `address` with `options`: the backlog, address and port reuse, and dual stack (CeeSafe ADR 0044
+    /// §3.2).
+    public fn bindWith(address: SocketAddress, options: ListenOptions) -> Result<Listener, NetError> {
+        match (AsyncTcpListener.bindWith(address, options)) {
+            Ok(l) => { return Ok(Listener { listener: l, noDelay: true }); }
+            Err(e) => { return Err(NetErrors.fromIo(e)); }
+        }
+    }
+
+    /// The same listener, accepting with TCP_NODELAY `on` (the default) or off.
+    public fn withNoDelay(this, on: bool) -> Listener => Listener { listener: this.listener, noDelay: on };
+
+    /// The address it listens on.
+    public fn localAddress(borrow this) -> Result<SocketAddress, NetError> {
+        match (this.listener.localAddress()) {
+            Ok(a) => { return Ok(a); }
             Err(e) => { return Err(NetErrors.fromIo(e)); }
         }
     }
@@ -107,7 +170,16 @@ public struct Listener {
     /// The next connection; the task waits until one arrives.
     public async fn accept(borrow this) -> Result<PlainStream, NetError> {
         match (await this.listener.accept()) {
-            Ok(s) => { return Ok(PlainStream.tcp(TcpTransport.fromStream(s))); }
+            Ok(s) => {
+                let t = TcpTransport.fromStream(s);
+                if (this.noDelay) {
+                    match (t.setNoDelay(true)) {
+                        Ok() => {}
+                        Err(_) => {} // the peer already left: the connection's first read or write says so
+                    }
+                }
+                return Ok(PlainStream.tcp(t));
+            }
             Err(e) => { return Err(NetErrors.fromAsync(e)); }
         }
     }

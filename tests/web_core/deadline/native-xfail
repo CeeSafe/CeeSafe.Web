@@ -1,1 +1,0 @@
-B2 (general form): a drop body of a type the program never uses is missing from the C; here Channel<u8> (web_core's Drain) or Channel<MockTransport> (docs/ceesafe-upstream-work.md)

@@ -61,8 +61,8 @@ impl Transport for Script {
 
     async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
         var n: usize = 0;
-        for (i in 0..parts.parts()) {
-            let p = parts.part(truncate<u32>(i));
+        for (i in 0..parts.count()) {
+            let p = parts.part(i);
             for (b in p) {
                 if (n == this.step) {
                     return Ok(n);
@@ -83,6 +83,12 @@ impl Transport for Script {
     }
 
     fn alpn(borrow this) -> Alpn => Alpn.None;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => null;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => null;
 }
 
 fn script(input: StringView, chunk: usize, step: usize, hang: bool) -> Result<Script, AllocError> {
@@ -144,7 +150,14 @@ async fn vectored() -> Result<bool, NetError> {
             Ok(v) => v,
             Err(e) => { return Err(NetErrors.fromAlloc(e)); },
         };
-        let parts = IoParts.three(head.bytes(), fields.bytes(), body.bytes());
+        let two = match (IoParts.of(head.bytes()).then(fields.bytes())) {
+            Some(p) => p,
+            null => { return Err(NetError.LimitExceeded); },
+        };
+        let parts = match (two.then(body.bytes())) {
+            Some(p) => p,
+            null => { return Err(NetError.LimitExceeded); },
+        };
         await Transports.writeAllVectored(mut s, parts)?;
         all = all && equals(s.out.view(), whole.bytes());
     }
@@ -157,19 +170,25 @@ async fn zeroStep() -> Result<bool, NetError> {
         Err(e) => { return Err(NetErrors.fromAlloc(e)); },
     };
     let x = "x";
-    let parts = IoParts.one(x.bytes());
+    let parts = IoParts.of(x.bytes());
     return Ok(match (await Transports.writeAllVectored(mut s, parts)) {
         Err(NetError.Closed) => true,
         _ => false,
     });
 }
 
+// What web_core relies on from lib/std's IoParts (ADR 0045 §3.1); values counted by hand.
 async fn parts() -> bool {
     let a = "ab";
     let b = "cde";
-    let p = IoParts.two(a.bytes(), b.bytes());
-    return p.parts() == 2 && p.totalLength() == 5 && p.part(1).length == 3 && p.part(2).length == 0 &&
-        p.part(7).length == 0;
+    let p = match (IoParts.of(a.bytes()).then(b.bytes())) {
+        Some(v) => v,
+        null => { return false; },
+    };
+    let rest = p.after(3); // "ab" whole and "c": "de" is left
+    return p.count() == 2 && p.totalLength() == 5 && p.part(1).length == 3 && p.part(2).length == 0 &&
+        p.part(7).length == 0 && rest.count() == 1 && rest.totalLength() == 2 && rest.part(0)[0] == 100 &&
+        p.after(5).totalLength() == 0;
 }
 
 async fn graceful() -> Result<bool, NetError> {

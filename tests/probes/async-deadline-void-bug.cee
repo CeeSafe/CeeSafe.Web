@@ -1,0 +1,18 @@
+// CeeSafe bug B6 (docs/ceesafe-upstream-work.md): `Async.deadline` (or `Async.timeout`) over a body of type
+// `Result<void, E>` makes `ceesafec check` panic while it prints a diagnostic ("index out of bounds at src/main.cee:687:41";
+// with --diagnostics-format=json, at src/diagnostics/diagnostic.cee:303:37). With `Result<u32, E>` it checks.
+// Should check, build and print `ok`.
+enum E { TimedOut, Other }
+
+async fn work() -> Result<void, E> => Ok();
+
+async fn within(at: u64) -> Result<void, E> {
+    return await Async.deadline(at, E.TimedOut, async () => await work());
+}
+
+fn main() {
+    match (Async.run(within(Timer.now() + 1000))) {
+        Ok() => { Console.writeLine("ok"); }
+        Err(_) => { Console.writeLine("err"); }
+    }
+}

@@ -89,15 +89,14 @@ public struct MinRate {
 }
 
 /// Waits until `deadline` passes, then returns `Err(NetError.TimedOut)`; a cancelled task returns
-/// `Err(NetError.Cancelled)`. It never returns `Ok`, so it is the second child of an `Async.race` that bounds an
-/// operation by a deadline (Web ADR 0001 §3.5):
+/// `Err(NetError.Cancelled)`. It never returns `Ok`. To bound one operation, use CeeSafe's `Async.deadline` (ADR 0046),
+/// as `Transports.readWithin` does; this is for a race with more than the operation and the deadline in it
+/// (Web ADR 0001 §3.5):
 ///
 /// ```ceesafe
 /// let r: Result<Raced<usize>, NetError> =
 ///     await Async.race(async () => await t.read(buffer), async () => await deadlineElapsed<usize>(d));
 /// ```
-///
-/// A generic `withDeadline(d, body)` helper waits for CeeSafe's `Async.timeout` (upstream U4).
 public async fn deadlineElapsed<T>(deadline: Deadline) -> Result<T, NetError> {
     loop {
         let wait = if (deadline.isNever()) 86400000u64 else deadline.remaining();

@@ -119,7 +119,10 @@ async fn failures() -> Result<void, NetError> {
     var v = mock("")?.withWriteStep(2);
     let hello = "hello";
     let world = " world";
-    let parts = IoParts.two(hello.bytes(), world.bytes());
+    let parts = match (IoParts.of(hello.bytes()).then(world.bytes())) {
+        Some(p) => p,
+        null => { return Err(NetError.LimitExceeded); },
+    };
     let step = await v.writeVectored(parts)?;
     await Transports.writeAllVectored(mut v, parts)?;
     await show("write step 2, then writeAllVectored", step == 2 && equals(v.written(), "hehello world".bytes()))?;
