@@ -1,0 +1,26 @@
+// CeeSafe bug B11 (CeeSafe.Web docs/ceesafe-upstream-work.md): calling a method through a returned `borrow Box<dyn I>`
+// panics the compiler, natively and under --interp: "integer overflow at src/backend/c_body.cee:1741:91"
+// (`p.projections.count - 1` with no projections, in the `dyn` branch of `NirRvalue.Ref`). Since 0.8.0 at least.
+// Should print 7.
+interface Run {
+    fn run(borrow this) -> u32;
+}
+
+struct Seven {}
+
+impl Run for Seven {
+    fn run(borrow this) -> u32 => 7;
+}
+
+struct Holder {
+    items: Vector<Box<dyn Run>>;
+
+    fn item(borrow this, i: usize) -> borrow Box<dyn Run> => borrow this.items[i];
+}
+
+fn main() {
+    var h = Holder { items: Vector<Box<dyn Run>>.create() };
+    let b: Box<dyn Run> = Box.create(Seven {})!;
+    h.items.push(b)!;
+    Console.writeLine(h.item(0).run());
+}

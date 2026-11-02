@@ -1,0 +1,34 @@
+// CeeSafe bug B12 (CeeSafe.Web docs/ceesafe-upstream-work.md): a method of a generic impl (`impl<S> Outer for Wrap<S>`)
+// that passes `this` as `dyn Run` (another generic impl) checks and runs under --interp (prints 7), but the C names
+// the uninstantiated type (`ceeT_4Wrap1S`, `ceeD_S4Wrap1S`) and does not compile. With concrete impls it builds.
+// 0.9.0 and 0.9.1 (ADR 0054). Should build natively and print 7.
+interface Run {
+    fn run(borrow this) -> u32;
+}
+
+interface Outer {
+    fn outer(borrow this) -> u32;
+}
+
+struct Wrap<S> {
+    state: S;
+}
+
+impl<S> Run for Wrap<S> {
+    fn run(borrow this) -> u32 => 7;
+}
+
+impl<S> Outer for Wrap<S> {
+    fn outer(borrow this) -> u32 => runDyn(this);
+}
+
+struct St {
+    k: u32;
+}
+
+fn runDyn(r: borrow dyn Run) -> u32 => r.run();
+
+fn main() {
+    let w = Wrap<St> { state: St { k: 1 } };
+    Console.writeLine(w.outer());
+}

@@ -1,0 +1,32 @@
+// CeeSafe bug B9 (CeeSafe.Web docs/ceesafe-upstream-work.md): with `impl<S> Run for Wrap<S>`, a method of the
+// generic struct `Wrap<S>` cannot coerce `this` to `dyn Run` (N0268), though a generic free function can coerce a
+// `borrow Wrap<S>` and `main` a `Wrap<St>`. CeeSafe ADR 0054 §3.1: a generic impl's instance serves `dyn` tables.
+// Should check and print 7 three times.
+interface Run {
+    fn run(borrow this) -> u32;
+}
+
+struct Wrap<S> {
+    state: S;
+
+    fn viaDyn(borrow this) -> u32 => runDyn(this); // N0268 here: the bug
+}
+
+impl<S> Run for Wrap<S> {
+    fn run(borrow this) -> u32 => 7;
+}
+
+fn runDyn(r: borrow dyn Run) -> u32 => r.run();
+
+fn generic<S>(w: borrow Wrap<S>) -> u32 => runDyn(w); // accepted
+
+struct St {
+    k: u32;
+}
+
+fn main() {
+    let w = Wrap<St> { state: St { k: 1 } };
+    Console.writeLine(runDyn(w)); // accepted: a concrete argument
+    Console.writeLine(w.viaDyn());
+    Console.writeLine(generic(w));
+}

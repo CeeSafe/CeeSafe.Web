@@ -26,6 +26,10 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `wake-waiters-livelock-bug.cee` | prints `1`, natively too (fixed in 0.7.0; 0.6.0 hung on macOS/kqueue at 100 % CPU, 20 of 20 runs) | CeeSafe bug B4 | 0001 |
 | `effectsof-async-bug.cee` | prints `70` (fixed in 0.7.0; 0.6.0 printed `0` in the interpreter and crashed natively) | CeeSafe bug B1 | 0001 §3.5 |
 | `async-deadline-void-bug.cee` | prints `ok` (fixed in 0.8.0; 0.7.0's `ceesafec check` panicked, "index out of bounds at src/main.cee:687:41") | CeeSafe bug B6: `Async.deadline` over `Result<void, E>` | 0001 amendment 3 |
+| `generic-impl-dyn-in-generic-bug.cee` | **should** check and print `7` three times; N0268 on `runDyn(this)` in a method of `Wrap<S>` | CeeSafe bug B9; `Server<S>.run` | 0007 |
+| `async-dyn-uncalled-bug.cee` | **should** build and print `1`; the C does not compile (an undefined `dyn` call frame) | CeeSafe bug B10; `web_server`'s router tests | 0007 |
+| `borrowed-box-dyn-call-bug.cee` | **should** print `7`; the compiler panics (c_body.cee:1741) | CeeSafe bug B11; `Server<S>`'s dispatch | 0007 |
+| `generic-impl-this-dyn-bug.cee` | **should** build and print `7`; the C names `Wrap<S>` uninstantiated | CeeSafe bug B12; `impl<S> ConnectionHandler for Server<S>` | 0007 |
 | `generic-dyn-box-flow-bug.cee` | prints `2` since 0.9.1; with 0.8.0 and 0.9.0, N0272 on `Generic<S>.add` storing a `Box<dyn Handler<S>>` (the non-generic twin was accepted) | CeeSafe bug B8, fixed in 0.9.1 | 0007 |
 
 ## Runs

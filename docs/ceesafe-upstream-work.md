@@ -12,7 +12,8 @@ re-check them before editing.
 | **B8** `Box<dyn I<S>>` parameter not storable when `S` is a type parameter | **fixed** (`1a124ec`: a `dyn` type's interface arguments bring no loans) | `tests/probes/generic-dyn-box-flow-bug.cee` prints 2 |
 | **U12** wall-clock time (ADR 0055: `Clock.now() -> UnixTime`) | **released** | every response carries `Date` (Web ADR 0003 amendment 4); interop checks it against Python's clock |
 
-No open CeeSafe item blocks a CeeSafe.Web milestone.
+Found since, while finishing `web_server` on 0.9.1: **B9**, **B10**, **B11**, **B12** (below). Together they block M2's
+task 5 again (`Server<S>`, its router tests).
 
 ## Status at 0.9.0 (released 2026-11-02, tag `v0.9.0` = CeeSafe `b361e63`)
 
@@ -457,6 +458,60 @@ names of a type are not collected through a `dyn` interface's type arguments, wh
 2026-11-02: typed state `S`; with U10 released in 0.9.0, `web_server` implements `Application` for every `Server<S>`
 itself). `web_server` waits on branch `m2-server`. It is the only CeeSafe item blocking a CeeSafe.Web milestone.
 
+## B9 — Bug: a generic struct's method cannot pass `this` as `dyn I` when the impl is generic   *(found 2026-11-02, 0.9.1)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/generic-impl-dyn-in-generic-bug.cee`. With `impl<S> Run for Wrap<S>`, a
+method of `Wrap<S>` calling `runDyn(this)` (`r: borrow dyn Run`) is N0268, "'Wrap<S>' does not implement 'Run'". A
+generic free function `fn generic<S>(w: borrow Wrap<S>) => runDyn(w)` is accepted, and so is `main` with a `Wrap<St>`.
+
+**Expected:** it checks and prints 7 three times (ADR 0054 §3.1: the generic impl applies to `Wrap<S>` for every `S`).
+The impl lookup probably does not see the struct's own type parameter as matching the impl's.
+
+**Blocks:** `Server<S>.run(listener, …)`, which would hand `this` to `ConnectionServer.run` as a `dyn
+ConnectionHandler`. Applications can call `ConnectionServer.run` themselves meanwhile; the method is left out.
+
+## B10 — Bug: an async interface boxed as `dyn` but never called through `dyn` gives C that does not compile   *(found 2026-11-02, 0.9.1; also 0.8.0 and 0.9.0)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/async-dyn-uncalled-bug.cee`: `interface Job { async fn run(borrow this) ->
+u32; }`, `let b: Box<dyn Job> = Box.create(Seven {})!;` and nothing else. `run --interp` prints 1; `build` fails with
+`incomplete definition of type 'struct ceeAF_dyn_D3Job_m0'` (9 errors): the `dyn` table's resume function uses the
+`dyn` call's frame struct, which is emitted only when some call goes through `dyn`.
+
+**Expected:** it builds and prints 1.
+
+**Blocks:** `web_server`'s router tests, which add boxed handlers and route paths without calling the handlers.
+
+## B11 — Bug: a call through a returned `borrow Box<dyn I>` panics the compiler   *(found 2026-11-02, 0.9.1; also 0.8.0 and 0.9.0)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/borrowed-box-dyn-call-bug.cee`:
+
+```ceesafe
+fn item(borrow this, i: usize) -> borrow Box<dyn Run> => borrow this.items[i];
+…
+Console.writeLine(h.item(0).run());
+```
+
+**Observed:** `ceesafe panic: integer overflow at src/backend/c_body.cee:1741:91`, natively and under `--interp`. The
+line is the `dyn` branch of `NirRvalue.Ref`: `appendPlaceParts(…, p.projections.count - 1)`, with a place that has no
+projections (the temporary holding the returned borrow).
+
+**Expected:** it prints 7.
+
+**Blocks:** `Server<S>`'s dispatch, `this.routes.handler(index).handle(…)`.
+
+## B12 — Bug: a generic impl's method passing `this` as `dyn` emits the uninstantiated type   *(found 2026-11-02, 0.9.0 and 0.9.1)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/generic-impl-this-dyn-bug.cee`: `impl<S> Run for Wrap<S>`, and `impl<S> Outer
+for Wrap<S> { fn outer(borrow this) -> u32 => runDyn(this); }`. It checks and prints 7 under `--interp`; `build`
+fails: the C calls `ceeD_S4Wrap1S((ceeT_4Wrap1S *)…)`, the type with `S` itself, not `Wrap<St>`. With both impls
+concrete it builds and prints 7.
+
+**Expected:** it builds and prints 7: the `dyn` table recorded inside an instance of a generic impl is for the
+instantiated type.
+
+**Blocks:** `impl<S> ConnectionHandler for Server<S>`, which runs the HTTP/1.1 driver with `this` as the `dyn
+Application`.
+
 ## U12 — Wall-clock time   *(found 2026-11-02 while writing M2's serializer; needed for `Date`; released in 0.9.1 as ADR 0055)*
 
 **Gap:** lib/std has only the monotonic clock (`Timer.now()`, `lib/core/async.cee:37`); nothing reads the system's
@@ -527,7 +582,8 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.7.0** (released 2026-11-02) | U1, U2, U3, U4, T1; B1–B4 fixed | M1 transport/lifecycle (merged), M2 HTTP/1.1 fast path |
 | **0.8.0** (released 2026-11-02) | B5, B6 fixed; U8, U5, T2 | M1's overload gate (passed); M4 TLS (OpenSSL), M5 client |
 | **0.9.0** (released 2026-11-02) | U6, U7, U9, U10, U11 | M9 sendfile, M10 HTTP/3; `web_server` without delegating impls |
-| **0.9.1** (released 2026-11-02) | B8 fixed; U12 | `web_server` (M2 task 5); the `Date` field |
+| **0.9.1** (released 2026-11-02) | B8 fixed; U12 | the `Date` field |
+| next | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

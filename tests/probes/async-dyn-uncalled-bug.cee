@@ -1,0 +1,17 @@
+// CeeSafe bug B10 (CeeSafe.Web docs/ceesafe-upstream-work.md): a type boxed as `dyn I`, where `I` has an async method
+// that is never called through `dyn`, gives C that does not compile: the dyn call frame `ceeAF_dyn_..._m0` is used by
+// the table but never defined. `run --interp` prints 1. Since 0.8.0 at least. Should build natively and print 1.
+interface Job {
+    async fn run(borrow this) -> u32;
+}
+
+struct Seven {}
+
+impl Job for Seven {
+    async fn run(borrow this) -> u32 => 7;
+}
+
+fn main() {
+    let b: Box<dyn Job> = Box.create(Seven {})!;
+    Console.writeLine(1);
+}
