@@ -1,0 +1,569 @@
+// A mutational fuzzer for HTTP/1.1 parsing and the driver (implementation plan §7, M2 exit: "parser fuzzed 24 h with
+// no crash or leak"). Built natively with ASan and UBSan; CEESAFE_ALLOC_REPORT=1 checks that nothing leaks.
+//
+//   CW_FUZZ_SECONDS (default 60), CW_FUZZ_SEED (default 1)
+//
+// Each input is a seed request with 1 to 8 random mutations. The invariants need no outside oracle:
+//  1. the head scanner gives the same result fed whole or in random pieces;
+//  2. parseHead gives the same result twice;
+//  3. a chunked body decodes to the same data (or the same error) whole and in random pieces, with random room;
+//  4. the driver, over a scripted transport, writes byte-identical output whether the input arrives in one read or
+//     in random small reads.
+// A broken invariant prints the input in hex and exits 1; a panic or a sanitizer report ends the run by itself.
+import web_core;
+import web_http;
+import web_http1;
+
+/// xorshift64*.
+struct Rng {
+    s: u64;
+    fn next(borrow mut this) -> u64 {
+        this.s = this.s ^ (this.s >> 12);
+        this.s = this.s ^ (this.s << 25);
+        this.s = this.s ^ (this.s >> 27);
+        return this.s.wrappingMul(2685821657736338717);
+    }
+    fn below(borrow mut this, n: u64) -> u64 => if (n == 0) 0 else this.next() % n;
+}
+
+/// Seed `i` (0 to 11).
+fn seed(i: u64) -> StringView => match (i) {
+    0 => "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+    1 => "GET /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nUser-Agent: x\r\nAccept: */*\r\n\r\n",
+    2 => "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello",
+    3 =>
+        "POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;e=1\r\nhello\r\n3\r\nabc\r\n0\r\nT: 1\r\n\r\n",
+    4 => "GET /x HTTP/1.1\r\nHost: a\r\n\r\nGET /y HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+    5 => "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET / HTTP/1.0\r\n\r\n",
+    6 => "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc",
+    7 => "OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n",
+    8 => "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\n",
+    9 => "HEAD /h HTTP/1.1\r\nHost: a\r\n\r\nPOST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n",
+    10 => "GET http://a/b HTTP/1.1\r\nHost: a\r\nX-A: 1\r\nX-B: 2, 3\r\nCookie: k=v\r\n\r\n",
+    _ =>
+        "\r\nPOST /e HTTP/1.1\r\nHost: a\r\nContent-Length: 2, 2\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n",
+};
+
+fn interesting() -> [u8; 16] => [0, 9, 10, 13, 32, 44, 48, 57, 58, 59, 70, 97, 127, 128, 255, 45];
+
+/// One mutated input in `out`.
+fn mutate(rng: borrow mut Rng, out: borrow mut Vector<u8>) -> bool {
+    out.clear();
+    let first = seed(rng.below(12));
+    let start = first.bytes();
+    for (b in start) {
+        if (!push(out, b)) {
+            return false;
+        }
+    }
+    let count = 1 + rng.below(8);
+    for (m in 0..count) {
+        let len = out.length as u64;
+        let at = truncate<usize>(rng.below(len + 1));
+        match (rng.below(7)) {
+            0 => {
+                if (at < out.length) {
+                    out[at] = out[at] ^ truncate<u8>(1u64 << rng.below(8));
+                }
+            }
+            1 => {
+                if (at < out.length) {
+                    let picks = interesting();
+                    out[at] = picks[truncate<usize>(rng.below(16))];
+                }
+            }
+            2 => {
+                let picks = interesting();
+                if (!insert(out, at, picks[truncate<usize>(rng.below(16))])) {
+                    return false;
+                }
+            }
+            3 => {
+                if (at < out.length) {
+                    remove(out, at);
+                }
+            }
+            4 => {
+                // Duplicate a short run.
+                let n = truncate<usize>(rng.below(16));
+                if (at + n <= out.length) {
+                    for (i in 0..n) {
+                        let b = out[at + i];
+                        if (!insert(out, at + n + i, b)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            5 => {
+                // Splice in part of another seed.
+                let otherSeed = seed(rng.below(12));
+                let other = otherSeed.bytes();
+                let from = truncate<usize>(rng.below(other.length as u64));
+                let n = truncate<usize>(rng.below(24));
+                var k: usize = 0;
+                while (k < n && from + k < other.length) {
+                    if (!insert(out, at + k, other[from + k])) {
+                        return false;
+                    }
+                    k += 1;
+                }
+            }
+            _ => {
+                // A long run of one byte: limits.
+                let picks = interesting();
+                let b = picks[truncate<usize>(rng.below(16))];
+                let n = truncate<usize>(rng.below(300));
+                for (i in 0..n) {
+                    if (out.length >= 8192 || !insert(out, at, b)) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (out.length > 8192) {
+            return true;
+        }
+    }
+    return true;
+}
+
+fn push(v: borrow mut Vector<u8>, b: u8) -> bool {
+    match (v.push(b)) {
+        Ok() => { return true; }
+        Err(_) => { return false; }
+    }
+}
+
+fn insert(v: borrow mut Vector<u8>, at: usize, b: u8) -> bool {
+    if (!push(v, 0)) {
+        return false;
+    }
+    var i = v.length - 1;
+    while (i > at) {
+        v[i] = v[i - 1];
+        i -= 1;
+    }
+    v[at] = b;
+    return true;
+}
+
+fn remove(v: borrow mut Vector<u8>, at: usize) {
+    for (i in at..v.length - 1) {
+        v[i] = v[i + 1];
+    }
+    match (v.pop()) {
+        Some(_) => {}
+        null => {}
+    }
+}
+
+/// A scan's result as a number: the head's end + 1, 0 for incomplete, or 100000 + the error's position in
+/// ProtocolErrors.describe (compared as text).
+fn scanWhole(input: Slice<u8>, limits: borrow Limits) -> Result<usize, ProtocolError> {
+    var s = HeadScanner.create();
+    return match (s.scan(input, limits)) {
+        Ok(true) => Ok(s.end() + 1),
+        Ok(false) => Ok(0),
+        Err(e) => Err(e),
+    };
+}
+
+fn scanPieces(input: Slice<u8>, limits: borrow Limits, rng: borrow mut Rng) -> Result<usize, ProtocolError> {
+    var s = HeadScanner.create();
+    var n: usize = 0;
+    loop {
+        n += 1 + truncate<usize>(rng.below(16));
+        if (n > input.length) {
+            n = input.length;
+        }
+        match (s.scan(input[0..n], limits)) {
+            Ok(true) => { return Ok(s.end() + 1); }
+            Ok(false) => {}
+            Err(e) => { return Err(e); }
+        }
+        if (n == input.length) {
+            return Ok(0);
+        }
+    }
+}
+
+fn sameResult(a: borrow Result<usize, ProtocolError>, b: borrow Result<usize, ProtocolError>) -> bool => match (a) {
+    Ok(x) => match (b) {
+        Ok(y) => x == y,
+        Err(_) => false,
+    },
+    Err(x) => match (b) {
+        Ok(_) => false,
+        Err(y) => sameError(x, y),
+    },
+};
+
+fn sameError(a: ProtocolError, b: ProtocolError) -> bool =>
+    Ascii.equals(ProtocolErrors.describe(a).bytes(), ProtocolErrors.describe(b));
+
+/// How a decode ended.
+enum DecodeEnd {
+    Done,
+    Incomplete,
+    Failed(ProtocolError),
+    OutOfMemory,
+}
+
+fn sameEnd(a: DecodeEnd, b: DecodeEnd) -> bool => match (a) {
+    DecodeEnd.Done => match (b) {
+        DecodeEnd.Done => true,
+        _ => false,
+    },
+    DecodeEnd.Incomplete => match (b) {
+        DecodeEnd.Incomplete => true,
+        _ => false,
+    },
+    DecodeEnd.OutOfMemory => match (b) {
+        DecodeEnd.OutOfMemory => true,
+        _ => false,
+    },
+    DecodeEnd.Failed(x) => match (b) {
+        DecodeEnd.Failed(y) => sameError(x, y),
+        _ => false,
+    },
+};
+
+/// Decodes `body` as chunked, in pieces of `piece` (0: whole) with `room` bytes of data per step, appending the data
+/// to `out`.
+fn decode(body: Slice<u8>, limits: borrow Limits, piece: usize, room: usize, out: borrow mut Vector<u8>) -> DecodeEnd {
+    var d = ChunkDecoder.create(limits);
+    var at: usize = 0;
+    var available = if (piece == 0 || piece > body.length) body.length else piece;
+    loop {
+        let step = match (d.decode(body[at..available], room)) {
+            Ok(s) => s,
+            Err(e) => { return DecodeEnd.Failed(e); },
+        };
+        for (i in 0..step.dataLength) {
+            if (!push(out, body[at + step.dataStart + i])) {
+                return DecodeEnd.OutOfMemory;
+            }
+        }
+        at += step.consumed;
+        if (step.finished) {
+            return DecodeEnd.Done;
+        }
+        if (at == available) {
+            if (available == body.length) {
+                return DecodeEnd.Incomplete;
+            }
+            available =
+                if (piece == 0) body.length else (if (available + piece >
+                    body.length) body.length else available + piece);
+        }
+    }
+}
+
+/// A transport that plays `input` in reads of `step` bytes and records what is written.
+struct Script {
+    input: Vector<u8>;
+    at: usize;
+    step: usize;
+    output: Vector<u8>;
+}
+
+impl Transport for Script {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        let left = this.input.length - this.at;
+        var n = if (left < this.step) left else this.step;
+        if (n > buffer.length) {
+            n = buffer.length;
+        }
+        for (i in 0..n) {
+            buffer[i] = this.input[this.at + i];
+        }
+        this.at += n;
+        return Ok(n);
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        for (b in bytes) {
+            if (!push(mut this.output, b)) {
+                return Err(NetError.OutOfMemory);
+            }
+        }
+        return Ok();
+    }
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        var total: usize = 0;
+        for (i in 0..parts.count()) {
+            let p = parts.part(i);
+            for (b in p) {
+                if (!push(mut this.output, b)) {
+                    return Err(NetError.OutOfMemory);
+                }
+            }
+            total += p.length;
+        }
+        return Ok(total);
+    }
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => Ok();
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => Alpn.None;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => null;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => null;
+}
+
+/// Echoes the path and body; `/s` streams; `/f` fails with 404; `/i` ignores the body.
+struct App {}
+
+impl Application for App {
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> {
+        let p = request.path().bytes();
+        if (Ascii.equals(p, "/s")) {
+            await exchange.write("a".bytes())?;
+            await exchange.flush()?;
+            await exchange.write("b".bytes())?;
+            return Ok();
+        }
+        if (Ascii.equals(p, "/f")) {
+            return Err(HandlerError.Status(Status.notFound()));
+        }
+        if (Ascii.equals(p, "/i")) {
+            return await exchange.send(Status.ok(), "i".bytes());
+        }
+        var buf = [0u8; 64];
+        loop {
+            let n = await exchange.read(mut buf[..])?;
+            if (n == 0) {
+                break;
+            }
+            await exchange.write(buf[0..n])?;
+        }
+        await exchange.write(p)?;
+        return Ok();
+    }
+
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+async fn driverOutput(
+    input: Slice<u8>,
+    step: usize,
+    limits: borrow Limits,
+    drain: borrow Drain,
+) -> Result<Vector<u8>, NetError> {
+    var copy = Vector<u8>.create();
+    for (b in input) {
+        if (!push(mut copy, b)) {
+            return Err(NetError.OutOfMemory);
+        }
+    }
+    var s = Script { input: copy, at: 0, step: step, output: Vector<u8>.create() };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    let app = App {};
+    match (await serve(mut s, ctx, app, limits)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return Ok(s.output);
+}
+
+fn equalBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+async fn report(failure: StringView, input: Slice<u8>) -> Result<void, NetError> {
+    var line = [0u8; 2048];
+    var w = TextWriter.create(mut line[..]);
+    w.text("INVARIANT BROKEN: ");
+    w.text(failure);
+    w.text("\ninput (hex): ");
+    for (b in input) {
+        w.hex(b as u64, 2);
+    }
+    match (await AsyncConsole.writeLine(textOf(w.written()))) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return Ok();
+}
+
+/// `b` as text, or "?" if it is not UTF-8.
+fn textOf(b: Slice<u8>) -> StringView => match (StringView.fromUtf8(b)) {
+    Some(t) => t,
+    null => "?",
+};
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    return match (Ascii.parseDecimal(text.bytes())) {
+        Some(v) => v,
+        null => otherwise,
+    };
+}
+
+async fn fuzz() -> Result<bool, NetError> {
+    let seconds = setting("CW_FUZZ_SECONDS", 60);
+    var rng = Rng { s: setting("CW_FUZZ_SEED", 1).wrappingMul(2654435761).wrappingAdd(1) };
+    let drain = Drain.create()?;
+    var input = Vector<u8>.create();
+    let started = Timer.now();
+    var lastReport = started;
+    var runs: u64 = 0;
+    var parsed: u64 = 0;
+    var chunked: u64 = 0;
+    loop {
+        if (Timer.now() - started >= seconds * 1000) {
+            break;
+        }
+        if (!mutate(mut rng, mut input)) {
+            return Err(NetError.OutOfMemory);
+        }
+        runs += 1;
+        var limits = Limits.defaults();
+        if (rng.below(4) == 0) {
+            limits.maxHeadBytes = 64 + truncate<usize>(rng.below(512));
+            limits.maxRequestLineBytes = 16 + truncate<usize>(rng.below(128));
+            limits.maxHeaders = truncate<u32>(1 + rng.below(8));
+            limits.maxBodyBytes = rng.below(64);
+            limits.maxChunkExtensionBytes = truncate<usize>(rng.below(8));
+            limits.maxTrailerBytes = truncate<usize>(rng.below(16));
+            limits.writeBufferBytes = 32 + truncate<usize>(rng.below(256));
+            limits.drainBytes = rng.below(16);
+        }
+        let bytes = input.view();
+
+        // 1. Whole versus pieces.
+        let whole = scanWhole(bytes, limits);
+        let pieces = scanPieces(bytes, limits, mut rng);
+        if (!sameResult(whole, pieces)) {
+            await report("scanner: whole and pieces differ", bytes)?;
+            return Ok(false);
+        }
+        // 2. Determinism of the parse.
+        var s = HeadScanner.create();
+        match (s.scan(bytes, limits)) {
+            Ok(true) => {
+                let first = parseHead(bytes, s.start(), s.end(), limits);
+                let second = parseHead(bytes, s.start(), s.end(), limits);
+                let same = match (first) {
+                    Ok(a) => match (second) {
+                        Ok(b) => a.keepAlive == b.keepAlive && a.expectContinue == b.expectContinue &&
+                            a.request.headers().count() == b.request.headers().count(),
+                        Err(_) => false,
+                    },
+                    Err(x) => match (second) {
+                        Ok(_) => false,
+                        Err(y) => sameError(x, y),
+                    },
+                };
+                if (!same) {
+                    await report("parseHead: two parses differ", bytes)?;
+                    return Ok(false);
+                }
+                match (first) {
+                    Ok(h) => {
+                        parsed += 1;
+                        // 3. Chunked decoding, whole versus pieces.
+                        match (h.framing) {
+                            BodyFraming.Chunked => {
+                                chunked += 1;
+                                let body = bytes[s.end()..];
+                                var a = Vector<u8>.create();
+                                var b = Vector<u8>.create();
+                                let ea = decode(body, limits, 0, 1 << 20, mut a);
+                                let eb = decode(
+                                    body, limits, 1 + truncate<usize>(rng.below(7)),
+                                    1 + truncate<usize>(rng.below(5)), mut b,
+                                );
+                                if (!sameEnd(ea, eb) || !equalBytes(a.view(), b.view())) {
+                                    await report("chunked: whole and pieces differ", bytes)?;
+                                    return Ok(false);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            _ => {}
+        }
+        // 4. The driver: one read versus small reads.
+        let one = await driverOutput(bytes, 1 << 20, limits, drain)?;
+        let small = await driverOutput(bytes, 1 + truncate<usize>(rng.below(9)), limits, drain)?;
+        if (!equalBytes(one.view(), small.view())) {
+            await report("driver: output depends on how the input was split", bytes)?;
+            return Ok(false);
+        }
+
+        if (Timer.now() - lastReport >= 60000) {
+            lastReport = Timer.now();
+            var line = [0u8; 160];
+            var w = TextWriter.create(mut line[..]);
+            w.text("fuzz: ");
+            w.decimal((Timer.now() - started) / 1000);
+            w.text(" s, ");
+            w.decimal(runs);
+            w.text(" inputs, ");
+            w.decimal(parsed);
+            w.text(" parsed, ");
+            w.decimal(chunked);
+            w.text(" chunked");
+            match (await AsyncConsole.writeLine(textOf(w.written()))) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+    }
+    var line = [0u8; 160];
+    var w = TextWriter.create(mut line[..]);
+    w.text("fuzz done: ");
+    w.decimal(runs);
+    w.text(" inputs, ");
+    w.decimal(parsed);
+    w.text(" parsed, ");
+    w.decimal(chunked);
+    w.text(" chunked, no invariant broken");
+    match (await AsyncConsole.writeLine(textOf(w.written()))) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return Ok(true);
+}
+
+fn main() {
+    match (Async.run(fuzz())) {
+        Ok(true) => {}
+        Ok(false) => { Process.exit(1); }
+        Err(e) => {
+            Console.writeLine(NetErrors.describe(e));
+            Process.exit(1);
+        }
+    }
+}

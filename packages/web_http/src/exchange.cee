@@ -522,7 +522,7 @@ public struct Exchange<region r> {
 
     /// Replaces an unsent response with an error response of `status` and no content, closing the connection if
     /// `close`. False if a head was already sent: the connection must close instead.
-    public fn respondError(borrow mut this, status: StatusCode, close: bool) -> bool {
+    public async fn respondError(borrow mut this, status: StatusCode, close: bool) -> bool {
         if (this.sent) {
             this.keep = false;
             return false;
@@ -537,8 +537,18 @@ public struct Exchange<region r> {
         match (Encoder.head(this.response, framing, this.keep, null, this.out)) {
             Ok() => {}
             Err(_) => {
-                this.keep = false;
-                return false;
+                // No room beside the responses waiting in `out`: send them, then try again.
+                match (await this.flushOut()) {
+                    Ok() => {}
+                    Err(_) => { return false; }
+                }
+                match (Encoder.head(this.response, framing, this.keep, null, this.out)) {
+                    Ok() => {}
+                    Err(_) => {
+                        this.keep = false;
+                        return false;
+                    }
+                }
             }
         }
         this.sent = true;

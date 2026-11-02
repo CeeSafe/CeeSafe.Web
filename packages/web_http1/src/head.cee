@@ -26,43 +26,43 @@ public struct HeadScanner {
         if (this.headEnd > 0) {
             return Ok(true);
         }
+        // Every check is made at the byte that breaks it, so the result does not depend on how the input was
+        // split into calls (the fuzzer's first invariant).
         while (this.scanned < input.length) {
             let k = this.scanned;
             this.scanned += 1;
-            if (input[k] != 10) {
-                continue;
-            }
-            if (k == 0 || input[k - 1] != 13) {
-                return Err(ProtocolError.BareLineFeed);
-            }
-            let lineLength = k + 1 - this.lineStart; // CRLF included
-            if (lineLength == 2) {
+            if (input[k] == 10) {
+                if (k == 0 || input[k - 1] != 13) {
+                    return Err(ProtocolError.BareLineFeed);
+                }
+                let lineLength = k + 1 - this.lineStart; // CRLF included
+                if (lineLength == 2) {
+                    if (this.firstLineEnd == 0) {
+                        // An empty line before the request line: skip it.
+                        this.headStart = k + 1;
+                        this.lineStart = k + 1;
+                        continue;
+                    }
+                    if (k + 1 - this.headStart > limits.maxHeadBytes) {
+                        return Err(ProtocolError.HeadTooLarge);
+                    }
+                    this.headEnd = k + 1;
+                    return Ok(true);
+                }
                 if (this.firstLineEnd == 0) {
-                    // An empty line before the request line: skip it.
-                    this.headStart = k + 1;
-                    this.lineStart = k + 1;
-                    continue;
+                    if (lineLength > limits.maxRequestLineBytes) {
+                        return Err(ProtocolError.RequestLineTooLong);
+                    }
+                    this.firstLineEnd = k + 1;
                 }
-                this.headEnd = k + 1;
-                if (this.headEnd - this.headStart > limits.maxHeadBytes) {
-                    return Err(ProtocolError.HeadTooLarge);
-                }
-                return Ok(true);
+                this.lineStart = k + 1;
             }
-            if (this.firstLineEnd == 0) {
-                if (lineLength > limits.maxRequestLineBytes) {
-                    return Err(ProtocolError.RequestLineTooLong);
-                }
-                this.firstLineEnd = k + 1;
+            if (this.firstLineEnd == 0 && k + 1 - this.lineStart > limits.maxRequestLineBytes) {
+                return Err(ProtocolError.RequestLineTooLong);
             }
-            this.lineStart = k + 1;
-        }
-        let pending = input.length - this.headStart;
-        if (this.firstLineEnd == 0 && input.length - this.lineStart > limits.maxRequestLineBytes) {
-            return Err(ProtocolError.RequestLineTooLong);
-        }
-        if (pending > limits.maxHeadBytes) {
-            return Err(ProtocolError.HeadTooLarge);
+            if (k + 1 - this.headStart > limits.maxHeadBytes) {
+                return Err(ProtocolError.HeadTooLarge);
+            }
         }
         return Ok(false);
     }
