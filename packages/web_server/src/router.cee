@@ -1,0 +1,395 @@
+// The router (Web ADR 0007 §3.3): a radix tree over path segments. A node has literal children, at most one `:param`
+// child and at most one `*rest` child, and a handler per method. Matching tries literals first, then the parameter,
+// then the wildcard, backtracking when a branch dead-ends. Literal segments are compared after percent-decoding the
+// request's segment; parameters are views of the request's path, still encoded (`RequestContext.paramDecoded`
+// decodes one).
+import web_http;
+
+/// Why a route could not be added.
+public enum RouteError {
+    /// The pattern does not start with `/`, has an empty `:` or `*` name, or a `*` before its last segment.
+    BadPattern,
+    /// The same method and pattern twice, or two parameter or wildcard names at one place.
+    Conflict,
+    /// `Method.Extension`: a route needs a standard method.
+    UnsupportedMethod,
+    /// Out of memory.
+    OutOfMemory,
+}
+
+/// One segment's node.
+struct Node {
+    literal: Vector<u8>;
+    children: Vector<u32>;
+    param: u32;        // 0: none, else node index + 1
+    wildcard: u32;     // 0: none, else node index + 1
+    name: Vector<u8>;  // this node's parameter or wildcard name
+    routes: [u32; 10]; // per Methods.index: 0 none, else handler index + 1
+}
+
+/// The most parameters one route may have.
+public fn maxParams() -> u32 => 8;
+
+/// A matched parameter: its node (for the name) and its value's place in the path.
+struct ParamSpan {
+    node: u32;
+    start: u32;
+    end: u32;
+}
+
+/// The parameters of a match.
+public struct Params {
+    private spans: [ParamSpan; 8];
+    private n: u32;
+
+    /// No parameters.
+    public fn empty() -> Params =>
+        Params { spans: [ParamSpan { node: 0, start: 0, end: 0 }; 8], n: 0 };
+
+    /// How many.
+    public fn count(borrow this) -> u32 => this.n;
+
+    fn push(borrow mut this, node: u32, start: usize, end: usize) -> bool {
+        if (this.n >= 8) {
+            return false;
+        }
+        this.spans[this.n as usize] = ParamSpan { node: node, start: truncate<u32>(start), end: truncate<u32>(end) };
+        this.n += 1;
+        return true;
+    }
+
+    fn pop(borrow mut this) {
+        if (this.n > 0) {
+            this.n -= 1;
+        }
+    }
+}
+
+/// The outcome of routing a path.
+public enum RouteMatch {
+    /// A handler for the method: its index.
+    Found(u32),
+    /// The path has routes, but none for the method; the methods it has, as a mask over `Methods.index`.
+    MethodNotAllowed(u32),
+    /// No route has this path.
+    NotFound,
+}
+
+/// Routes requests to handlers of application state `S`.
+public struct Router<S> {
+    private nodes: Vector<Node>;
+    private handlers: Vector<Box<dyn Handler<S>>>;
+
+    /// An empty router.
+    public fn create() -> Result<Router<S>, RouteError> {
+        var nodes = Vector<Node>.create();
+        match (nodes.push(newNode())) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+        return Ok(Router { nodes: nodes, handlers: Vector<Box<dyn Handler<S>>>.create() });
+    }
+
+    /// Routes `method` requests for `pattern` to `handler`. A pattern is `/`, or `/`-separated segments: literal
+    /// text, `:name` (one segment) or, last, `*name` (the rest of the path, possibly empty).
+    public fn add(
+        borrow mut this,
+        method: Method,
+        pattern: StringView,
+        handler: Box<dyn Handler<S>>,
+    ) -> Result<void, RouteError> {
+        let m = Methods.index(method);
+        if (m == 9) {
+            return Err(RouteError.UnsupportedMethod);
+        }
+        let p = pattern.bytes();
+        if (p.length == 0 || p[0] != 47) {
+            return Err(RouteError.BadPattern);
+        }
+        var node: u32 = 0;
+        if (p.length > 1) {
+            var at: usize = 1;
+            loop {
+                var end = at;
+                while (end < p.length && p[end] != 47) {
+                    end += 1;
+                }
+                let seg = p[at..end];
+                let last = end >= p.length;
+                node = this.child(node, seg, last)?;
+                if (last) {
+                    break;
+                }
+                at = end + 1;
+            }
+        }
+        let slot = this.nodes[node as usize].routes[m as usize];
+        if (slot != 0) {
+            return Err(RouteError.Conflict);
+        }
+        match (this.handlers.push(handler)) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+        this.nodes[node as usize].routes[m as usize] = truncate<u32>(this.handlers.length);
+        return Ok();
+    }
+
+    /// GET (and so HEAD) `pattern`.
+    public fn get(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+        this.add(Method.Get, pattern, handler);
+
+    /// POST `pattern`.
+    public fn post(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+        this.add(Method.Post, pattern, handler);
+
+    /// PUT `pattern`.
+    public fn put(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+        this.add(Method.Put, pattern, handler);
+
+    /// DELETE `pattern`.
+    public fn delete(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+        this.add(Method.Delete, pattern, handler);
+
+    /// PATCH `pattern`.
+    public fn patch(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+        this.add(Method.Patch, pattern, handler);
+
+    /// The child of `node` for pattern segment `seg`, created if new.
+    fn child(borrow mut this, node: u32, seg: Slice<u8>, last: bool) -> Result<u32, RouteError> {
+        if (seg.length > 0 && (seg[0] == 58 || seg[0] == 42)) {
+            let wild = seg[0] == 42;
+            let name = seg[1..];
+            if (name.length == 0 || (wild && !last)) {
+                return Err(RouteError.BadPattern);
+            }
+            let existing = if (wild) this.nodes[node as usize].wildcard else this.nodes[node as usize].param;
+            if (existing != 0) {
+                if (!sameBytes(this.nodes[(existing - 1) as usize].name.view(), name)) {
+                    return Err(RouteError.Conflict);
+                }
+                return Ok(existing - 1);
+            }
+            var n = newNode();
+            for (b in name) {
+                match (n.name.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(RouteError.OutOfMemory); }
+                }
+            }
+            let index = this.append(n)?;
+            if (wild) {
+                this.nodes[node as usize].wildcard = index + 1;
+            } else {
+                this.nodes[node as usize].param = index + 1;
+            }
+            return Ok(index);
+        }
+        let count = this.nodes[node as usize].children.length;
+        for (i in 0..count) {
+            let c = this.nodes[node as usize].children[i];
+            if (sameBytes(this.nodes[c as usize].literal.view(), seg)) {
+                return Ok(c);
+            }
+        }
+        var n = newNode();
+        for (b in seg) {
+            match (n.literal.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(RouteError.OutOfMemory); }
+            }
+        }
+        let index = this.append(n)?;
+        match (this.nodes[node as usize].children.push(index)) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+        return Ok(index);
+    }
+
+    fn append(borrow mut this, n: Node) -> Result<u32, RouteError> {
+        match (this.nodes.push(n)) {
+            Ok() => { return Ok(truncate<u32>(this.nodes.length - 1)); }
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+    }
+
+    /// Routes `method` and `path` (starting with `/`), filling `params`. HEAD falls back to GET (RFC 9110 §9.3.2).
+    public fn find(borrow this, method: Method, path: Slice<u8>, params: borrow mut Params) -> RouteMatch {
+        if (path.length == 0 || path[0] != 47) {
+            return RouteMatch.NotFound;
+        }
+        let node = if (path.length == 1) Some(0u32) else this.walk(0, path, 0, params);
+        let n = match (node) {
+            Some(v) => v,
+            null => { return RouteMatch.NotFound; },
+        };
+        let routes = this.nodes[n as usize].routes;
+        let m = Methods.index(method);
+        if (m < 9 && routes[m as usize] != 0) {
+            return RouteMatch.Found(routes[m as usize] - 1);
+        }
+        if (Methods.same(method, Method.Head) && routes[0] != 0) {
+            return RouteMatch.Found(routes[0] - 1);
+        }
+        var mask: u32 = 0;
+        for (i in 0..9usize) {
+            if (routes[i] != 0) {
+                mask = mask | (1u32 << truncate<u32>(i));
+            }
+        }
+        if (routes[0] != 0) {
+            mask = mask | 2; // HEAD, through GET
+        }
+        return RouteMatch.MethodNotAllowed(mask);
+    }
+
+    /// The node under `node` that matches `path` from `at` (a `/`), with a route; parameters pushed on the way.
+    fn walk(borrow this, node: u32, path: Slice<u8>, at: usize, params: borrow mut Params) -> u32? {
+        if (at >= path.length) {
+            return if (hasRoutes(this.nodes[node as usize])) Some(node) else null;
+        }
+        let start = at + 1;
+        var end = start;
+        while (end < path.length && path[end] != 47) {
+            end += 1;
+        }
+        let seg = path[start..end];
+        let count = this.nodes[node as usize].children.length;
+        for (i in 0..count) {
+            let c = this.nodes[node as usize].children[i];
+            if (decodedEquals(seg, this.nodes[c as usize].literal.view())) {
+                match (this.walk(c, path, end, params)) {
+                    Some(found) => { return Some(found); }
+                    null => {}
+                }
+            }
+        }
+        let p = this.nodes[node as usize].param;
+        if (p != 0 && seg.length > 0) {
+            if (params.push(p - 1, start, end)) {
+                match (this.walk(p - 1, path, end, params)) {
+                    Some(found) => { return Some(found); }
+                    null => {}
+                }
+                params.pop();
+            }
+        }
+        let w = this.nodes[node as usize].wildcard;
+        if (w != 0 && hasRoutes(this.nodes[(w - 1) as usize])) {
+            if (params.push(w - 1, start, path.length)) {
+                return Some(w - 1);
+            }
+        }
+        return null;
+    }
+
+    /// The handler at `index` (from `RouteMatch.Found`).
+    public fn handler(borrow this, index: u32) -> borrow Box<dyn Handler<S>> => borrow this.handlers[index as usize];
+
+    /// The name of the parameter matched at `node`.
+    fn paramName(borrow this, node: u32) -> Slice<u8> => this.nodes[node as usize].name.view();
+
+    /// The value of the parameter `name` among `params`, as a range of the path, or null.
+    public fn paramRange(borrow this, params: borrow Params, name: StringView) -> Range? {
+        for (i in 0..params.n) {
+            let s = params.spans[i as usize];
+            if (sameBytes(this.paramName(s.node), name.bytes())) {
+                return Some(Range { start: s.start as usize, end: s.end as usize });
+            }
+        }
+        return null;
+    }
+}
+
+/// A range of a path.
+public struct Range {
+    public start: usize;
+    public end: usize;
+}
+
+fn newNode() -> Node => Node {
+    literal: Vector<u8>.create(),
+    children: Vector<u32>.create(),
+    param: 0,
+    wildcard: 0,
+    name: Vector<u8>.create(),
+    routes: [0u32; 10],
+};
+
+fn hasRoutes(n: borrow Node) -> bool {
+    for (r in n.routes) {
+        if (r != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether `seg`, percent-decoded, equals `literal`. A `%` not followed by two hex digits is a literal `%`.
+fn decodedEquals(seg: Slice<u8>, literal: Slice<u8>) -> bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < seg.length) {
+        if (j >= literal.length) {
+            return false;
+        }
+        var b = seg[i];
+        if (b == 37 && i + 2 < seg.length && hex(seg[i + 1]) < 16 && hex(seg[i + 2]) < 16) {
+            b = truncate<u8>(hex(seg[i + 1]) * 16 + hex(seg[i + 2]));
+            i += 3;
+        } else {
+            i += 1;
+        }
+        if (b != literal[j]) {
+            return false;
+        }
+        j += 1;
+    }
+    return j == literal.length;
+}
+
+/// A hex digit's value, or 16.
+fn hex(b: u8) -> u32 {
+    if (b >= 48 && b <= 57) {
+        return (b - 48) as u32;
+    }
+    if (b >= 97 && b <= 102) {
+        return (b - 87) as u32;
+    }
+    if (b >= 65 && b <= 70) {
+        return (b - 55) as u32;
+    }
+    return 16;
+}
+
+/// Percent-decodes `s` into `out`; `false` if `out` is full.
+public fn percentDecode(s: Slice<u8>, out: borrow mut Vector<u8>) -> bool {
+    var i: usize = 0;
+    while (i < s.length) {
+        var b = s[i];
+        if (b == 37 && i + 2 < s.length && hex(s[i + 1]) < 16 && hex(s[i + 2]) < 16) {
+            b = truncate<u8>(hex(s[i + 1]) * 16 + hex(s[i + 2]));
+            i += 3;
+        } else {
+            i += 1;
+        }
+        match (out.push(b)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    return true;
+}

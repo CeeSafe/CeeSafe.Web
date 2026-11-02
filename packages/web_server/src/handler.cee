@@ -1,0 +1,28 @@
+// Handlers and middleware (Web ADR 0007 §3.1-3.2, amendment 1).
+import web_core;
+import web_http;
+
+/// Handles requests for an application whose state is `S`. A handler is a struct with its own fields
+/// (configuration, `Arc`s to services); the state is lent per request as `ctx.state()`.
+public interface Handler<S> {
+    /// Reads the request's body and writes its response through `exchange`.
+    async fn handle(borrow this, ctx: borrow mut RequestContext<S>, request: borrow Request, exchange: borrow mut Exchange,) -> Result<void, HandlerError>;
+}
+
+/// Whether a middleware's `before` let the request through.
+public enum Flow {
+    /// Go on to the next middleware and the handler.
+    Continue,
+    /// The middleware answered (401, a CORS preflight): skip the rest and the handler.
+    Responded,
+}
+
+/// Hooks around every handler (Web ADR 0007 §3.2). `before` hooks run in order; `after` hooks run in reverse order
+/// just before the response head is sent, and may add fields.
+public interface Middleware<S> {
+    /// Before the handler.
+    async fn before(borrow this, ctx: borrow mut RequestContext<S>, request: borrow Request, exchange: borrow mut Exchange,) -> Result<Flow, HandlerError>;
+
+    /// Just before the head is sent (amendment 1: no context, since the handler may still hold it).
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
+}

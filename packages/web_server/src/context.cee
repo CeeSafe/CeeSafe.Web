@@ -1,0 +1,46 @@
+// The per-request context (Web ADR 0007 §3.1): the application's state, the connection, and the route's parameters.
+import web_core;
+import web_http;
+
+/// What a handler knows besides the request.
+public struct RequestContext<region r, S> {
+    private appState: borrow(r) S;
+    private conn: borrow(r) ConnectionContext<r>;
+    private routes: borrow(r) Router<S>;
+    private routePath: StringView<r>;
+    private matched: Params;
+
+    /// A context for one request.
+    public fn create(
+        state: borrow(r) S,
+        connection: borrow(r) ConnectionContext<r>,
+        router: borrow(r) Router<S>,
+        path: StringView<r>,
+        params: Params,
+    ) -> RequestContext<r, S> =>
+        RequestContext { appState: state, conn: connection, routes: router, routePath: path, matched: params };
+
+    /// The application's state.
+    public fn state(borrow this) -> borrow(r) S => this.appState;
+
+    /// The connection: its id, addresses, age, and whether the server is draining.
+    public fn connection(borrow this) -> borrow(r) ConnectionContext<r> => this.conn;
+
+    /// The route parameter `name` (`:name` or `*name` in the pattern), as sent (percent-encoded), or null.
+    public fn param(borrow this, name: StringView) -> StringView<r>? {
+        return match (this.routes.paramRange(this.matched, name)) {
+            Some(range) => Some(this.routePath[range.start..range.end]),
+            null => null,
+        };
+    }
+
+    /// The route parameter `name`, percent-decoded into `out` (cleared first); false if there is none, or `out`
+    /// could not grow.
+    public fn paramDecoded(borrow this, name: StringView, out: borrow mut Vector<u8>) -> bool {
+        out.clear();
+        return match (this.param(name)) {
+            Some(v) => percentDecode(v.bytes(), out),
+            null => false,
+        };
+    }
+}
