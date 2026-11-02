@@ -328,26 +328,40 @@ fn bodyFraming(
         return Ok(BodyFraming.Chunked);
     }
     if (lengths > 0) {
-        // Every Content-Length field, and every element of a list in one, must be the same number (RFC 9112 §6.3
-        // item 5 lets a list of equal values stand for one).
+        // Every Content-Length field, and every element of a list in one, must be the same text: RFC 9112 §6.3 item 5
+        // lets duplicated values stand for one.
         var value: u64? = null;
+        var firstField: u32 = 0; // where the first element is: field, start and end in its value
+        var firstStart: usize = 0;
+        var firstEnd: usize = 0;
         for (i in 0..headers.count()) {
             if (HeaderNames.same(headers.name(i), HeaderName.ContentLength)) {
                 let v = headers.value(i);
                 var s: usize = 0;
                 for (k in 0..v.length + 1) {
                     if (k == v.length || v[k] == 44) {
-                        let n = match (Ascii.parseDecimal(trimWhitespace(v[s..k]))) {
+                        let raw = v[s..k];
+                        let element = trimWhitespace(raw);
+                        let n = match (Ascii.parseDecimal(element)) {
                             Some(x) => x,
                             null => { return Err(ProtocolError.BadContentLength); },
                         };
                         match (value) {
-                            Some(prev) => {
-                                if (prev != n) {
+                            Some(_) => {
+                                // Only exact duplicates collapse: "005" and "5" are the same number but not the
+                                // same field value, and two parsers may disagree on such a pair (RFC 9112 §6.3).
+                                let firstValue = headers.value(firstField);
+                                let first = trimWhitespace(firstValue[firstStart..firstEnd]);
+                                if (!Ascii.sameIgnoringCase(element, first)) {
                                     return Err(ProtocolError.BadContentLength);
                                 }
                             }
-                            null => { value = Some(n); }
+                            null => {
+                                value = Some(n);
+                                firstField = i;
+                                firstStart = s;
+                                firstEnd = k;
+                            }
                         }
                         s = k + 1;
                     }

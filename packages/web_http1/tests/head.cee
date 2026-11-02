@@ -183,6 +183,8 @@ fn smuggling_shapes() -> Result<void, TestFailure> {
         ProtocolError.BadContentLength, "two different lengths")?;
     rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 6\r\n\r\n", ProtocolError.BadContentLength,
         "a list of different lengths")?;
+    rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 005\r\nContent-Length: 5\r\n\r\n",
+        ProtocolError.BadContentLength, "the same number written differently is not a duplicate")?;
     rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: +5\r\n\r\n", ProtocolError.BadContentLength, "a sign")?;
     rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n", ProtocolError.BadContentLength, "negative")?;
     rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5x\r\n\r\n", ProtocolError.BadContentLength, "5x")?;
