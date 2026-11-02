@@ -4,6 +4,10 @@
 usage: python3 tools/run_tests.py [--ceesafec PATH] [--sanitize] [--no-native] [--filter TEXT] [--update-lock]
                                   [--alloc-sweep]
 
+A file named native-xfail holds the reason a test's native build is known to fail because of a CeeSafe bug (for
+example "B2", docs/ceesafe-upstream-work.md). The test still runs in the interpreter and must pass there; the native
+build must still fail, and the runner says XPASS (a failure) once it no longer does, so the marker cannot go stale.
+
 --alloc-sweep (Web ADR 0005 §2.2): after a test passes natively, run it again once per allocation attempt with
 that attempt failing (CEESAFE_FAIL_ALLOC_AT). Each run must exit 0 (no panic, no crash) with live=0. Its output
 may differ: a test reports the failure as a value.
@@ -73,6 +77,8 @@ def main() -> int:
                 problems.append("check failed:\n" + r.stderr)
 
         modes = []
+        xfail = (t / "native-xfail").read_text(encoding="utf-8").strip() if (t / "native-xfail").exists() else None
+        notes = []
         if not problems:
             if not (t / "native-only").exists():
                 modes.append(("interp", [args.ceesafec, "run", "--interp"]))
@@ -82,7 +88,12 @@ def main() -> int:
                 if args.sanitize:
                     build += ["--cflag", "-fsanitize=address,undefined", "--cflag", "-g"]
                 r = run(build, t)
-                if r.returncode != 0:
+                if xfail is not None:
+                    if r.returncode == 0:
+                        problems.append(f"XPASS: the native build succeeds now; remove native-xfail ({xfail})")
+                    else:
+                        notes.append(f"native xfail: {xfail}")
+                elif r.returncode != 0:
                     problems.append("build failed:\n" + r.stderr)
                 else:
                     modes.append(("native", [str(exe)]))
@@ -124,8 +135,9 @@ def main() -> int:
             for p in problems:
                 print("  " + p.replace("\n", "\n  ").rstrip())
         else:
-            sweep = f", alloc-sweep {swept}" if args.alloc_sweep else ""
-            print(f"ok   {name} ({', '.join(m for m, _ in modes)}{sweep})")
+            sweep = f", alloc-sweep {swept}" if args.alloc_sweep and swept else ""
+            extra = "".join(f"; {n}" for n in notes)
+            print(f"ok   {name} ({', '.join(m for m, _ in modes)}{sweep}{extra})")
 
     shutil.rmtree(work, ignore_errors=True)
     print(f"run_tests: {len(tests) - failures} passed, {failures} failed")
