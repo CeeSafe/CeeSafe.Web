@@ -1,0 +1,82 @@
+// Request methods (RFC 9110 §9). A method token is case-sensitive.
+
+/// A request method: the standard ones, or `Extension` for any other token (its text is `Request.methodToken()`).
+public enum Method {
+    Get,
+    Head,
+    Post,
+    Put,
+    Delete,
+    Connect,
+    Options,
+    Trace,
+    Patch,
+    Extension,
+}
+
+/// Parsing and naming methods.
+public struct Methods {
+    /// The method for `token`, which the parser has checked is a token (RFC 9110 §5.6.2). Case-sensitive: `get` is an
+    /// extension method, not GET.
+    public fn parse(token: Slice<u8>) -> Method {
+        if (Ascii.equals(token, "GET")) {
+            return Method.Get;
+        }
+        if (Ascii.equals(token, "POST")) {
+            return Method.Post;
+        }
+        if (Ascii.equals(token, "HEAD")) {
+            return Method.Head;
+        }
+        if (Ascii.equals(token, "PUT")) {
+            return Method.Put;
+        }
+        if (Ascii.equals(token, "DELETE")) {
+            return Method.Delete;
+        }
+        if (Ascii.equals(token, "OPTIONS")) {
+            return Method.Options;
+        }
+        if (Ascii.equals(token, "PATCH")) {
+            return Method.Patch;
+        }
+        if (Ascii.equals(token, "CONNECT")) {
+            return Method.Connect;
+        }
+        if (Ascii.equals(token, "TRACE")) {
+            return Method.Trace;
+        }
+        return Method.Extension;
+    }
+
+    /// The method's token; "" for `Extension`.
+    public fn text(m: Method) -> StringView => match (m) {
+        Method.Get => "GET",
+        Method.Head => "HEAD",
+        Method.Post => "POST",
+        Method.Put => "PUT",
+        Method.Delete => "DELETE",
+        Method.Connect => "CONNECT",
+        Method.Options => "OPTIONS",
+        Method.Trace => "TRACE",
+        Method.Patch => "PATCH",
+        Method.Extension => "",
+    };
+
+    /// Whether two methods are the same (an enum has no `==`).
+    public fn same(a: Method, b: Method) -> bool => Methods.index(a) == Methods.index(b);
+
+    /// The method's number, 0 to 9, in declaration order: for tables indexed by method.
+    public fn index(m: Method) -> u32 => match (m) {
+        Method.Get => 0,
+        Method.Head => 1,
+        Method.Post => 2,
+        Method.Put => 3,
+        Method.Delete => 4,
+        Method.Connect => 5,
+        Method.Options => 6,
+        Method.Trace => 7,
+        Method.Patch => 8,
+        Method.Extension => 9,
+    };
+}

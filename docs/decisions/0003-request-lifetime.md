@@ -135,3 +135,18 @@ A connection task runs as a `spawnSend` child (CeeSafe ADR 0038), so everything 
    overflow area? Recommended: fixed. More than 64 headers gets 431, as most servers do. **Fixed, 431 past it.**
 2. Should handlers be able to opt into an owned request automatically (a `Handler` flag), or must they call
    `toOwned` explicitly? Recommended: explicitly. **Explicitly.**
+
+## 7. Amendment 1 (2026-11-02, implementing `web_http` in M2)
+
+The decision (option A, views into the head buffer with no allocation) is unchanged. Its storage changes:
+
+1. **`HeaderList<r>` keeps offsets, not views.** CeeSafe v0 has no arrays whose elements hold views (N0246), even
+   inside a struct (`[Header<r>; 64]` is rejected). CeeSafe ADR 0045 §2 weighed lifting that rule (option E: element
+   loans in the borrow checker and both backends) and declined. So the list borrows the head buffer as
+   `Slice<r, u8>` and keeps a fixed `[HeaderSpan; 64]` of offsets. `name(i)`, `nameBytes(i)`, `value(i)`, `get`,
+   `getNamed`, `countOf` and `hasToken` make the views on access. The region still ties every view to the buffer, so
+   §3.2's lifetime holds as before, and nothing is allocated.
+2. **A field value is `Slice<r, u8>`, not `StringView<r>`:** a value may hold obs-text (RFC 9110 §5.5), which need
+   not be UTF-8. Names and the target are ASCII (the parser checks them); the target is a `StringView<r>`.
+3. **`Method` has no payload.** `Extension` carries no view; the token is `Request.methodToken()`. So `Method` has
+   no region, and the router can store methods.

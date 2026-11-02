@@ -1,0 +1,49 @@
+// HTTP limits (Web ADR 0003 §3.1, §3.3; Web ADR 0004 §3.1: every limit is a constructor parameter with a test).
+
+/// What one connection's requests may cost. `defaults()` gives a server's usual values.
+public struct Limits {
+    /// The request line, CRLF included; longer is 414.
+    public maxRequestLineBytes: usize;
+    /// The whole head (request line, fields, final CRLF); larger is 431. It is also the head buffer's size.
+    public maxHeadBytes: usize;
+    /// Field lines; more is 431. At most `HeaderList.capacity()` (64).
+    public maxHeaders: u32;
+    /// A request body; longer is 413.
+    public maxBodyBytes: u64;
+    /// Chunk extensions on one chunk's size line, in bytes; more is 400.
+    public maxChunkExtensionBytes: usize;
+    /// Trailer fields after a chunked body, in bytes; more is 400.
+    public maxTrailerBytes: usize;
+    /// An unread body drained after the handler, before the connection is closed instead (Web ADR 0003 §3.3).
+    public drainBytes: u64;
+    /// Milliseconds to receive a whole head once its first byte arrived (408 and close).
+    public headerTimeoutMs: u64;
+    /// Milliseconds a keep-alive connection may wait for its next request.
+    public idleTimeoutMs: u64;
+    /// Milliseconds to write a response's bytes before the connection is dropped.
+    public writeTimeoutMs: u64;
+    /// The slowest body a client may send, in bytes per second after `minBodyRateGraceMs` (0: off); 408 and close.
+    public minBodyRate: u64;
+    public minBodyRateGraceMs: u64;
+    /// The write buffer, which also bounds how many pipelined responses are coalesced into one flush.
+    public writeBufferBytes: usize;
+
+    /// 8 KiB request line, 16 KiB head, 64 fields, 8 MiB body, 256-byte chunk extensions, 4 KiB trailers, 64 KiB
+    /// drain; 10 s for a head, 60 s idle, 30 s per write; 240 B/s after 5 s (Kestrel's minimum rate); 16 KiB of
+    /// output per flush.
+    public fn defaults() -> Limits => Limits {
+        maxRequestLineBytes: 8192,
+        maxHeadBytes: 16384,
+        maxHeaders: 64,
+        maxBodyBytes: 8388608,
+        maxChunkExtensionBytes: 256,
+        maxTrailerBytes: 4096,
+        drainBytes: 65536,
+        headerTimeoutMs: 10000,
+        idleTimeoutMs: 60000,
+        writeTimeoutMs: 30000,
+        minBodyRate: 240,
+        minBodyRateGraceMs: 5000,
+        writeBufferBytes: 16384,
+    };
+}

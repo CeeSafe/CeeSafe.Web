@@ -1,0 +1,113 @@
+// Versions and status codes (RFC 9110 §6.2, §15).
+
+/// An HTTP version.
+public enum Version {
+    Http10,
+    Http11,
+    Http2,
+    Http3,
+}
+
+/// A response status code, 100 to 999 (RFC 9110 §15).
+public struct StatusCode {
+    private value: u16;
+
+    /// The status `code`, or null outside 100..999.
+    public fn of(code: u16) -> StatusCode? {
+        if (code < 100 || code > 999) {
+            return null;
+        }
+        return Some(StatusCode { value: code });
+    }
+
+    /// The number.
+    public fn code(this) -> u16 => this.value;
+
+    /// Whether this is the same status as `other`.
+    public fn same(this, other: StatusCode) -> bool => this.value == other.value;
+
+    /// 1xx.
+    public fn isInformational(this) -> bool => this.value < 200;
+
+    /// Whether a response with this status may have content: not 1xx, 204 or 304 (RFC 9110 §6.4.1).
+    public fn allowsContent(this) -> bool => this.value >= 200 && this.value != 204 && this.value != 304;
+
+    /// The reason phrase RFC 9110 §15 gives the code; "" for codes it does not name.
+    public fn reason(this) -> StringView => match (this.value) {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        411 => "Length Required",
+        413 => "Content Too Large",
+        414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        417 => "Expectation Failed",
+        426 => "Upgrade Required",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        _ => "",
+    };
+}
+
+/// The status codes a server writes itself.
+public struct Status {
+    /// 100 Continue.
+    public fn continue100() -> StatusCode => StatusCode { value: 100 };
+    /// 200 OK.
+    public fn ok() -> StatusCode => StatusCode { value: 200 };
+    /// 201 Created.
+    public fn created() -> StatusCode => StatusCode { value: 201 };
+    /// 204 No Content.
+    public fn noContent() -> StatusCode => StatusCode { value: 204 };
+    /// 304 Not Modified.
+    public fn notModified() -> StatusCode => StatusCode { value: 304 };
+    /// 400 Bad Request.
+    public fn badRequest() -> StatusCode => StatusCode { value: 400 };
+    /// 404 Not Found.
+    public fn notFound() -> StatusCode => StatusCode { value: 404 };
+    /// 405 Method Not Allowed.
+    public fn methodNotAllowed() -> StatusCode => StatusCode { value: 405 };
+    /// 408 Request Timeout.
+    public fn requestTimeout() -> StatusCode => StatusCode { value: 408 };
+    /// 411 Length Required.
+    public fn lengthRequired() -> StatusCode => StatusCode { value: 411 };
+    /// 413 Content Too Large.
+    public fn contentTooLarge() -> StatusCode => StatusCode { value: 413 };
+    /// 414 URI Too Long.
+    public fn uriTooLong() -> StatusCode => StatusCode { value: 414 };
+    /// 417 Expectation Failed.
+    public fn expectationFailed() -> StatusCode => StatusCode { value: 417 };
+    /// 431 Request Header Fields Too Large.
+    public fn headerFieldsTooLarge() -> StatusCode => StatusCode { value: 431 };
+    /// 500 Internal Server Error.
+    public fn internalServerError() -> StatusCode => StatusCode { value: 500 };
+    /// 501 Not Implemented.
+    public fn notImplemented() -> StatusCode => StatusCode { value: 501 };
+    /// 503 Service Unavailable.
+    public fn serviceUnavailable() -> StatusCode => StatusCode { value: 503 };
+    /// 505 HTTP Version Not Supported.
+    public fn versionNotSupported() -> StatusCode => StatusCode { value: 505 };
+}

@@ -1,2 +1,0 @@
-// web_http: Protocol-neutral HTTP semantics: Method, StatusCode, headers, Request, ResponseHead, RequestBody, ResponseWriter, Handler, Middleware.
-// Milestone M2 (docs/implementation-plan.md). Empty until then.

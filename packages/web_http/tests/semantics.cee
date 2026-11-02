@@ -1,0 +1,123 @@
+// web_http's types (Web ADR 0003 §3.1, Web ADR 0004 §3.3): methods, statuses, field names, the span-based HeaderList,
+// and Request's parts. Expected values are from RFC 9110, worked by hand.
+
+@test
+fn methods_are_case_sensitive_tokens() -> Result<void, TestFailure> {
+    Check.isTrue(Methods.same(Methods.parse("GET".bytes()), Method.Get), "GET")?;
+    Check.isTrue(Methods.same(Methods.parse("PATCH".bytes()), Method.Patch), "PATCH")?;
+    Check.isTrue(Methods.same(Methods.parse("get".bytes()), Method.Extension), "get is an extension (RFC 9110 §9.1)")?;
+    Check.isTrue(Methods.same(Methods.parse("PROPFIND".bytes()), Method.Extension), "PROPFIND is an extension")?;
+    Check.equalText("DELETE", Methods.text(Method.Delete))?;
+    return Ok();
+}
+
+@test
+fn status_codes() -> Result<void, TestFailure> {
+    Check.isTrue(StatusCode.of(99) == null && StatusCode.of(1000) == null, "outside 100..999 is null")?;
+    let teapot = match (StatusCode.of(418)) {
+        Some(s) => s,
+        null => { return Err(TestFailure.create("418 is a status code")); },
+    };
+    Check.equalText("", teapot.reason())?;
+    Check.equalText("Request Header Fields Too Large", Status.headerFieldsTooLarge().reason())?;
+    Check.isFalse(Status.noContent().allowsContent(), "204 has no content")?;
+    Check.isFalse(Status.notModified().allowsContent(), "304 has no content")?;
+    Check.isFalse(Status.continue100().allowsContent(), "1xx has no content")?;
+    Check.isTrue(Status.ok().allowsContent(), "200 has content")?;
+    Check.equalU64(431, ProtocolErrors.status(ProtocolError.TooManyHeaders).code() as u64)?;
+    Check.equalU64(501, ProtocolErrors.status(ProtocolError.BadTransferEncoding).code() as u64)?;
+    Check.equalU64(400, ProtocolErrors.status(ProtocolError.LengthAndEncoding).code() as u64)?;
+    return Ok();
+}
+
+@test
+fn header_names_ignore_case() -> Result<void, TestFailure> {
+    Check.isTrue(HeaderNames.same(HeaderNames.classify("Content-Length".bytes()), HeaderName.ContentLength), "Content-Length")?;
+    Check.isTrue(HeaderNames.same(HeaderNames.classify("TRANSFER-ENCODING".bytes()), HeaderName.TransferEncoding), "TE upper")?;
+    Check.isTrue(HeaderNames.same(HeaderNames.classify("hOsT".bytes()), HeaderName.Host), "hOsT")?;
+    Check.isTrue(HeaderNames.same(HeaderNames.classify("Content-Lengths".bytes()), HeaderName.Other), "one byte more is Other")?;
+    Check.isTrue(HeaderNames.same(HeaderNames.classify("".bytes()), HeaderName.Other), "empty is Other")?;
+    return Ok();
+}
+
+@test
+fn header_list_over_a_buffer() -> Result<void, TestFailure> {
+    // Offsets counted by hand: "Host" 0..4, "a.test" 6..12, "X-Id" 13..17, "7" 19..20, "Connection" 21..31,
+    // "keep-alive, Close" 33..50.
+    let head = "Host: a.test\nX-Id: 7\nConnection: keep-alive, Close";
+    var list = HeaderList.create(head.bytes());
+    match (list.push(0, 4, 6, 12, 64)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("push Host")); }
+    }
+    match (list.push(13, 17, 19, 20, 64)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("push X-Id")); }
+    }
+    match (list.push(21, 31, 33, 50, 64)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("push Connection")); }
+    }
+    Check.equalU64(3, list.count() as u64)?;
+    let host = match (list.get(HeaderName.Host)) {
+        Some(v) => v,
+        null => { return Err(TestFailure.create("Host is found")); },
+    };
+    Check.equalBytes("a.test".bytes(), host)?;
+    let id = match (list.getNamed("x-id")) {
+        Some(v) => v,
+        null => { return Err(TestFailure.create("x-id is found by name")); },
+    };
+    Check.equalBytes("7".bytes(), id)?;
+    Check.isTrue(list.get(HeaderName.ContentLength) == null, "no Content-Length")?;
+    Check.isTrue(list.hasToken(HeaderName.Connection, "close"), "Connection lists close, any case")?;
+    Check.isTrue(list.hasToken(HeaderName.Connection, "keep-alive"), "and keep-alive")?;
+    Check.isFalse(list.hasToken(HeaderName.Connection, "upgrade"), "but not upgrade")?;
+    Check.equalU64(0, list.value(9).length as u64)?;
+    Check.isTrue(match (list.push(0, 4, 6, 99, 64)) {
+        Err(ProtocolError.BadHeader) => true,
+        _ => false,
+    }, "a range outside the buffer is refused")?;
+    Check.isTrue(match (list.push(0, 4, 6, 12, 3)) {
+        Err(ProtocolError.TooManyHeaders) => true,
+        _ => false,
+    }, "a fourth field past a limit of 3 is TooManyHeaders")?;
+    return Ok();
+}
+
+@test
+fn header_list_capacity_is_64() -> Result<void, TestFailure> {
+    let head = "a: b";
+    var list = HeaderList.create(head.bytes());
+    for (i in 0..64) {
+        match (list.push(0, 1, 3, 4, 1000)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("64 fields fit")); }
+        }
+    }
+    Check.isTrue(match (list.push(0, 1, 3, 4, 1000)) {
+        Err(ProtocolError.TooManyHeaders) => true,
+        _ => false,
+    }, "the 65th field does not")?;
+    Check.equalU64(64, list.countOf(HeaderName.Other) as u64)?;
+    return Ok();
+}
+
+@test
+fn request_path_and_query() -> Result<void, TestFailure> {
+    let text = "GET /a/b?x=1&y HTTP/1.1";
+    let bytes = text.bytes();
+    let r = Request.create(Method.Get, bytes[0..3], text[4..14], Version.Http11, HeaderList.create(bytes));
+    Check.equalText("/a/b?x=1&y", r.target())?;
+    Check.equalText("/a/b", r.path())?;
+    let q = match (r.query()) {
+        Some(v) => v,
+        null => { return Err(TestFailure.create("a query")); },
+    };
+    Check.equalText("x=1&y", q)?;
+    let plain = Request.create(Method.Get, bytes[0..3], text[4..8], Version.Http11, HeaderList.create(bytes));
+    Check.isTrue(plain.query() == null, "no ? means no query")?;
+    Check.equalText("/a/b", plain.path())?;
+    Check.equalBytes("GET".bytes(), r.methodToken())?;
+    return Ok();
+}

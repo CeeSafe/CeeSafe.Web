@@ -1,0 +1,75 @@
+// Protocol errors (Web ADR 0004 §3.3): one status per reason. Every one closes an HTTP/1.1 connection, since the
+// framing of what follows can no longer be trusted.
+
+/// Why a request was rejected by the protocol, before or while its handler ran.
+public enum ProtocolError {
+    /// The request line is longer than `Limits.maxRequestLineBytes` (414).
+    RequestLineTooLong,
+    /// The request line is not `method SP target SP version` (400).
+    BadRequestLine,
+    /// The version is not HTTP/1.0 or HTTP/1.1 (505).
+    UnsupportedVersion,
+    /// The head is longer than `Limits.maxHeadBytes`, or one field than the buffer (431).
+    HeadTooLarge,
+    /// More fields than `Limits.maxHeaders` (431).
+    TooManyHeaders,
+    /// A field line is not `token ":" OWS value OWS`: a bad name, a control byte (NUL, a bare CR) in the value, or
+    /// whitespace before the colon (400; RFC 9112 §5.1).
+    BadHeader,
+    /// A line ends in a bare LF (400; RFC 9112 §2.2 lets a server reject it, and this one does).
+    BareLineFeed,
+    /// A field line starts with whitespace: obsolete line folding (400; RFC 9112 §5.2).
+    ObsoleteFold,
+    /// HTTP/1.1 without exactly one Host field (400; RFC 9112 §3.2).
+    BadHost,
+    /// A Content-Length that is not a number, or several that differ (400; RFC 9112 §6.3).
+    BadContentLength,
+    /// Both Transfer-Encoding and Content-Length (400 and close; RFC 9112 §6.1, a smuggling defence).
+    LengthAndEncoding,
+    /// A Transfer-Encoding whose last coding is not chunked, or with a coding this server does not decode (501), or
+    /// Transfer-Encoding in an HTTP/1.0 request (400).
+    BadTransferEncoding,
+    /// A malformed chunk: its size line, an overflowing size, extensions past their limit, or a missing CRLF (400).
+    BadChunk,
+    /// Trailer fields past their limit, or malformed (400).
+    BadTrailer,
+    /// The body is longer than `Limits.maxBodyBytes` (413).
+    BodyTooLarge,
+    /// The client sent too slowly (408).
+    TimedOut,
+}
+
+/// Mapping protocol errors to responses.
+public struct ProtocolErrors {
+    /// The response status for `e`.
+    public fn status(e: ProtocolError) -> StatusCode => match (e) {
+        ProtocolError.RequestLineTooLong => Status.uriTooLong(),
+        ProtocolError.UnsupportedVersion => Status.versionNotSupported(),
+        ProtocolError.HeadTooLarge => Status.headerFieldsTooLarge(),
+        ProtocolError.TooManyHeaders => Status.headerFieldsTooLarge(),
+        ProtocolError.BadTransferEncoding => Status.notImplemented(),
+        ProtocolError.BodyTooLarge => Status.contentTooLarge(),
+        ProtocolError.TimedOut => Status.requestTimeout(),
+        _ => Status.badRequest(),
+    };
+
+    /// A short static description, for logs.
+    public fn describe(e: ProtocolError) -> StringView => match (e) {
+        ProtocolError.RequestLineTooLong => "request line too long",
+        ProtocolError.BadRequestLine => "malformed request line",
+        ProtocolError.UnsupportedVersion => "unsupported HTTP version",
+        ProtocolError.HeadTooLarge => "request head too large",
+        ProtocolError.TooManyHeaders => "too many header fields",
+        ProtocolError.BadHeader => "malformed header field",
+        ProtocolError.BareLineFeed => "bare LF",
+        ProtocolError.ObsoleteFold => "obsolete line folding",
+        ProtocolError.BadHost => "missing or repeated Host",
+        ProtocolError.BadContentLength => "invalid Content-Length",
+        ProtocolError.LengthAndEncoding => "both Content-Length and Transfer-Encoding",
+        ProtocolError.BadTransferEncoding => "unsupported Transfer-Encoding",
+        ProtocolError.BadChunk => "malformed chunk",
+        ProtocolError.BadTrailer => "malformed trailer",
+        ProtocolError.BodyTooLarge => "body too large",
+        ProtocolError.TimedOut => "client too slow",
+    };
+}

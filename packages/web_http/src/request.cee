@@ -1,0 +1,63 @@
+// The request head (Web ADR 0003 §3.1): views into the connection's head buffer, valid while the request is handled.
+
+/// A parsed request head. Every protocol produces this same type.
+public struct Request<region r> {
+    private verb: Method;
+    private verbToken: Slice<r, u8>;
+    private targetText: StringView<r>;
+    private pathEnd: usize;
+    private ver: Version;
+    private fields: HeaderList<r>;
+
+    /// A request; `target` must be ASCII (the parser checks it).
+    public fn create(
+        method: Method,
+        methodToken: Slice<r, u8>,
+        target: StringView<r>,
+        version: Version,
+        headers: HeaderList<r>,
+    ) -> Request<r> {
+        let bytes = target.bytes();
+        var end = bytes.length;
+        for (i in 0..bytes.length) {
+            if (bytes[i] == 63) { // '?'
+                end = i;
+                break;
+            }
+        }
+        return Request {
+            verb: method,
+            verbToken: methodToken,
+            targetText: target,
+            pathEnd: end,
+            ver: version,
+            fields: headers,
+        };
+    }
+
+    /// The method.
+    public fn method(borrow this) -> Method => this.verb;
+
+    /// The method's token as sent (the only way to read an extension method).
+    public fn methodToken(borrow this) -> Slice<r, u8> => this.verbToken;
+
+    /// The request target as sent: `/path?query`, an absolute URI, an authority (CONNECT) or `*`.
+    public fn target(borrow this) -> StringView<r> => this.targetText;
+
+    /// The target up to `?`.
+    public fn path(borrow this) -> StringView<r> => this.targetText[0..this.pathEnd];
+
+    /// The target after `?`, or null without one.
+    public fn query(borrow this) -> StringView<r>? {
+        if (this.pathEnd >= this.targetText.length) {
+            return null;
+        }
+        return Some(this.targetText[this.pathEnd + 1..]);
+    }
+
+    /// The version.
+    public fn version(borrow this) -> Version => this.ver;
+
+    /// The fields.
+    public fn headers(borrow this) -> borrow HeaderList<r> => borrow this.fields;
+}

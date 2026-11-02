@@ -1,0 +1,106 @@
+// ASCII helpers for HTTP's grammar (RFC 9110 §5.6, RFC 5234 core rules).
+
+/// Byte classes and comparisons over ASCII.
+public struct Ascii {
+    /// Whether `a` is exactly `b`'s bytes.
+    public fn equals(a: Slice<u8>, b: StringView) -> bool {
+        let bb = b.bytes();
+        if (a.length != bb.length) {
+            return false;
+        }
+        for (i in 0..a.length) {
+            if (a[i] != bb[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether `a` equals `lower`, ignoring ASCII case; `lower` must be lower case.
+    public fn equalsIgnoringCase(a: Slice<u8>, lower: StringView) -> bool {
+        let bb = lower.bytes();
+        if (a.length != bb.length) {
+            return false;
+        }
+        for (i in 0..a.length) {
+            if (Ascii.lower(a[i]) != bb[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether two byte strings are equal ignoring ASCII case.
+    public fn sameIgnoringCase(a: Slice<u8>, b: Slice<u8>) -> bool {
+        if (a.length != b.length) {
+            return false;
+        }
+        for (i in 0..a.length) {
+            if (Ascii.lower(a[i]) != Ascii.lower(b[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// `b` in lower case if it is an ASCII letter.
+    public fn lower(b: u8) -> u8 => if (b >= 65 && b <= 90) b + 32 else b;
+
+    /// tchar (RFC 9110 §5.6.2): the bytes of a token.
+    public fn isTokenChar(b: u8) -> bool {
+        if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)) {
+            return true;
+        }
+        // ! # $ % & ' * + - . ^ _ ` | ~
+        return b == 33 || b == 35 || b == 36 || b == 37 || b == 38 || b == 39 || b == 42 || b == 43 || b == 45 ||
+            b == 46 || b == 94 || b == 95 || b == 96 || b == 124 || b == 126;
+    }
+
+    /// Whether every byte of `s` is a tchar, and there is at least one.
+    public fn isToken(s: Slice<u8>) -> bool {
+        if (s.length == 0) {
+            return false;
+        }
+        for (b in s) {
+            if (!Ascii.isTokenChar(b)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// field-vchar / obs-text, or SP or HTAB (RFC 9110 §5.5): the bytes allowed inside a field value. NUL, CR, LF and
+    /// the other controls are not.
+    public fn isFieldValueChar(b: u8) -> bool => b == 9 || b == 32 || (b >= 33 && b != 127);
+
+    /// SP or HTAB.
+    public fn isWhitespace(b: u8) -> bool => b == 32 || b == 9;
+
+    /// A decimal number of 1 to 19 digits with nothing else, or null (no sign, no whitespace, no overflow).
+    public fn parseDecimal(s: Slice<u8>) -> u64? {
+        if (s.length == 0 || s.length > 19) {
+            return null;
+        }
+        var v: u64 = 0;
+        for (b in s) {
+            if (b < 48 || b > 57) {
+                return null;
+            }
+            v = v * 10 + (b - 48) as u64;
+        }
+        return Some(v);
+    }
+}
+
+/// `s` without leading and trailing SP and HTAB (optional whitespace, RFC 9110 §5.6.3).
+public fn trimWhitespace<region r>(s: Slice<r, u8>) -> Slice<r, u8> {
+    var start: usize = 0;
+    var end = s.length;
+    while (start < end && Ascii.isWhitespace(s[start])) {
+        start += 1;
+    }
+    while (end > start && Ascii.isWhitespace(s[end - 1])) {
+        end -= 1;
+    }
+    return s[start..end];
+}

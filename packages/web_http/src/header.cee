@@ -1,0 +1,289 @@
+// Header fields (RFC 9110 §5; Web ADR 0003 §3.1, amendment 1): a request's fields are views into the connection's
+// head buffer. CeeSafe v0 has no arrays of views (N0246), so the list keeps each field as offsets into the buffer it
+// borrows, and makes the views on access: no allocation, and the region still ties every view to the buffer.
+
+/// The field names a server or its middleware looks at, recognised without regard to case; any other is `Other`.
+public enum HeaderName {
+    Host,
+    ContentLength,
+    TransferEncoding,
+    Connection,
+    Expect,
+    Te,
+    Trailer,
+    Upgrade,
+    KeepAlive,
+    Date,
+    ContentType,
+    Accept,
+    AcceptEncoding,
+    UserAgent,
+    Cookie,
+    Authorization,
+    Origin,
+    Other,
+}
+
+/// Recognising and naming fields.
+public struct HeaderNames {
+    /// The name for `bytes`, without regard to case.
+    public fn classify(bytes: Slice<u8>) -> HeaderName {
+        match (bytes.length) {
+            2 => { return if (Ascii.equalsIgnoringCase(bytes, "te")) HeaderName.Te else HeaderName.Other; }
+            4 => {
+                if (Ascii.equalsIgnoringCase(bytes, "host")) {
+                    return HeaderName.Host;
+                }
+                if (Ascii.equalsIgnoringCase(bytes, "date")) {
+                    return HeaderName.Date;
+                }
+                return HeaderName.Other;
+            }
+            6 => {
+                if (Ascii.equalsIgnoringCase(bytes, "expect")) {
+                    return HeaderName.Expect;
+                }
+                if (Ascii.equalsIgnoringCase(bytes, "accept")) {
+                    return HeaderName.Accept;
+                }
+                if (Ascii.equalsIgnoringCase(bytes, "cookie")) {
+                    return HeaderName.Cookie;
+                }
+                if (Ascii.equalsIgnoringCase(bytes, "origin")) {
+                    return HeaderName.Origin;
+                }
+                return HeaderName.Other;
+            }
+            7 => {
+                if (Ascii.equalsIgnoringCase(bytes, "trailer")) {
+                    return HeaderName.Trailer;
+                }
+                if (Ascii.equalsIgnoringCase(bytes, "upgrade")) {
+                    return HeaderName.Upgrade;
+                }
+                return HeaderName.Other;
+            }
+            10 => {
+                if (Ascii.equalsIgnoringCase(bytes, "connection")) {
+                    return HeaderName.Connection;
+                }
+                if (Ascii.equalsIgnoringCase(bytes, "keep-alive")) {
+                    return HeaderName.KeepAlive;
+                }
+                if (Ascii.equalsIgnoringCase(bytes, "user-agent")) {
+                    return HeaderName.UserAgent;
+                }
+                return HeaderName.Other;
+            }
+            12 => {
+                return if (Ascii.equalsIgnoringCase(
+                    bytes,
+                    "content-type",
+                )) HeaderName.ContentType else HeaderName.Other;
+            }
+            13 => {
+                return if (Ascii.equalsIgnoringCase(
+                    bytes,
+                    "authorization",
+                )) HeaderName.Authorization else HeaderName.Other;
+            }
+            14 => {
+                return if (Ascii.equalsIgnoringCase(
+                    bytes,
+                    "content-length",
+                )) HeaderName.ContentLength else HeaderName.Other;
+            }
+            15 => {
+                return if (Ascii.equalsIgnoringCase(
+                    bytes,
+                    "accept-encoding",
+                )) HeaderName.AcceptEncoding else HeaderName.Other;
+            }
+            17 => {
+                return if (Ascii.equalsIgnoringCase(
+                    bytes,
+                    "transfer-encoding",
+                )) HeaderName.TransferEncoding else HeaderName.Other;
+            }
+            _ => { return HeaderName.Other; }
+        }
+    }
+
+    /// The name in lower case, as HTTP/2 and HTTP/3 write it; "" for `Other`.
+    public fn text(n: HeaderName) -> StringView => match (n) {
+        HeaderName.Host => "host",
+        HeaderName.ContentLength => "content-length",
+        HeaderName.TransferEncoding => "transfer-encoding",
+        HeaderName.Connection => "connection",
+        HeaderName.Expect => "expect",
+        HeaderName.Te => "te",
+        HeaderName.Trailer => "trailer",
+        HeaderName.Upgrade => "upgrade",
+        HeaderName.KeepAlive => "keep-alive",
+        HeaderName.Date => "date",
+        HeaderName.ContentType => "content-type",
+        HeaderName.Accept => "accept",
+        HeaderName.AcceptEncoding => "accept-encoding",
+        HeaderName.UserAgent => "user-agent",
+        HeaderName.Cookie => "cookie",
+        HeaderName.Authorization => "authorization",
+        HeaderName.Origin => "origin",
+        HeaderName.Other => "",
+    };
+
+    /// Whether two names are the same (an enum has no `==`).
+    public fn same(a: HeaderName, b: HeaderName) -> bool => HeaderNames.number(a) == HeaderNames.number(b);
+
+    fn number(n: HeaderName) -> u32 => match (n) {
+        HeaderName.Host => 0,
+        HeaderName.ContentLength => 1,
+        HeaderName.TransferEncoding => 2,
+        HeaderName.Connection => 3,
+        HeaderName.Expect => 4,
+        HeaderName.Te => 5,
+        HeaderName.Trailer => 6,
+        HeaderName.Upgrade => 7,
+        HeaderName.KeepAlive => 8,
+        HeaderName.Date => 9,
+        HeaderName.ContentType => 10,
+        HeaderName.Accept => 11,
+        HeaderName.AcceptEncoding => 12,
+        HeaderName.UserAgent => 13,
+        HeaderName.Cookie => 14,
+        HeaderName.Authorization => 15,
+        HeaderName.Origin => 16,
+        HeaderName.Other => 17,
+    };
+}
+
+/// One field, as offsets into the head buffer.
+struct HeaderSpan {
+    name: HeaderName;
+    nameStart: u32;
+    nameEnd: u32;
+    valueStart: u32;
+    valueEnd: u32;
+}
+
+/// A request's fields in arrival order: up to 64, each a name and a value that are views of the head buffer
+/// (`Slice<r, u8>`, since a value may hold obs-text and need not be UTF-8). Lookup is linear.
+public struct HeaderList<region r> {
+    private head: Slice<r, u8>;
+    private spans: [HeaderSpan; 64];
+    private n: u32;
+
+    /// The most fields a list holds; `Limits.maxHeaders` may set fewer.
+    public fn capacity() -> u32 => 64;
+
+    /// An empty list over `head`, the buffer its fields will point into.
+    public fn create(head: Slice<r, u8>) -> HeaderList<r> => HeaderList {
+        head: head,
+        spans: [HeaderSpan { name: HeaderName.Other, nameStart: 0, nameEnd: 0, valueStart: 0, valueEnd: 0 }; 64],
+        n: 0,
+    };
+
+    /// Adds the field whose name is `head[nameStart..nameEnd]` and value `head[valueStart..valueEnd]` (already
+    /// checked by the parser). `Err(TooManyHeaders)` past `limit` or the capacity; `Err(BadHeader)` if a range is
+    /// not inside the buffer.
+    public fn push(
+        borrow mut this,
+        nameStart: usize,
+        nameEnd: usize,
+        valueStart: usize,
+        valueEnd: usize,
+        limit: u32,
+    ) -> Result<void, ProtocolError> {
+        if (this.n >= limit || this.n >= 64) {
+            return Err(ProtocolError.TooManyHeaders);
+        }
+        if (nameStart > nameEnd || nameEnd > this.head.length || valueStart > valueEnd || valueEnd > this.head.length) {
+            return Err(ProtocolError.BadHeader);
+        }
+        let name = HeaderNames.classify(this.head[nameStart..nameEnd]);
+        this.spans[this.n as usize] = HeaderSpan {
+            name: name,
+            nameStart: truncate<u32>(nameStart),
+            nameEnd: truncate<u32>(nameEnd),
+            valueStart: truncate<u32>(valueStart),
+            valueEnd: truncate<u32>(valueEnd),
+        };
+        this.n += 1;
+        return Ok();
+    }
+
+    /// How many fields.
+    public fn count(borrow this) -> u32 => this.n;
+
+    /// Field `i`'s name (0-based; `Other` past the end).
+    public fn name(borrow this, i: u32) -> HeaderName =>
+        if (i < this.n) this.spans[i as usize].name else HeaderName.Other;
+
+    /// Field `i`'s name as sent; empty past the end.
+    public fn nameBytes(borrow this, i: u32) -> Slice<r, u8> {
+        if (i >= this.n) {
+            return this.head[0..0];
+        }
+        let s = this.spans[i as usize];
+        return this.head[s.nameStart as usize..s.nameEnd as usize];
+    }
+
+    /// Field `i`'s value, without surrounding whitespace; empty past the end.
+    public fn value(borrow this, i: u32) -> Slice<r, u8> {
+        if (i >= this.n) {
+            return this.head[0..0];
+        }
+        let s = this.spans[i as usize];
+        return this.head[s.valueStart as usize..s.valueEnd as usize];
+    }
+
+    /// The first value of `name` (a recognised name), or null.
+    public fn get(borrow this, name: HeaderName) -> Slice<r, u8>? {
+        for (i in 0..this.n) {
+            if (HeaderNames.same(this.spans[i as usize].name, name)) {
+                return Some(this.value(i));
+            }
+        }
+        return null;
+    }
+
+    /// The first value of the field named `name` (any name, lower case), or null.
+    public fn getNamed(borrow this, name: StringView) -> Slice<r, u8>? {
+        for (i in 0..this.n) {
+            if (Ascii.equalsIgnoringCase(this.nameBytes(i), name)) {
+                return Some(this.value(i));
+            }
+        }
+        return null;
+    }
+
+    /// How many fields are named `name`.
+    public fn countOf(borrow this, name: HeaderName) -> u32 {
+        var c: u32 = 0;
+        for (i in 0..this.n) {
+            if (HeaderNames.same(this.spans[i as usize].name, name)) {
+                c += 1;
+            }
+        }
+        return c;
+    }
+
+    /// Whether a field named `name` lists `token` among its comma-separated elements, ignoring case (for
+    /// `Connection: close`, `Expect: 100-continue`); `token` is lower case.
+    public fn hasToken(borrow this, name: HeaderName, token: StringView) -> bool {
+        for (i in 0..this.n) {
+            if (HeaderNames.same(this.spans[i as usize].name, name)) {
+                let v = this.value(i);
+                var start: usize = 0;
+                for (k in 0..v.length + 1) {
+                    if (k == v.length || v[k] == 44) {
+                        if (Ascii.equalsIgnoringCase(trimWhitespace(v[start..k]), token)) {
+                            return true;
+                        }
+                        start = k + 1;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+}
