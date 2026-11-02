@@ -1,0 +1,53 @@
+// web_core drain signal (Web ADR 0001 §3.5, implementation plan M1 task 4): graceful shutdown, broadcast to every
+// task of a server.
+
+/// A server's drain: once started, every task waiting on it wakes, and every later check sees it. One drain serves any
+/// number of waiters (unlike CeeSafe's `AsyncSignal`, which wakes one task): it is a channel that is never sent to
+/// and is closed to start the drain, so each waiter's `recvAsync` sees the end (`tests/probes/drain-broadcast.cee`).
+/// It is shared by borrow; starting it is idempotent and has no effects, so a signal handler's task may call it.
+@noncopy
+public struct Drain {
+    private channel: Channel<u8>;
+    private started: AtomicBool;
+
+    /// A drain not started. Allocates the channel once.
+    public fn create() -> Result<Drain, NetError> {
+        match (Channel<u8>.create(1)) {
+            Ok(c) => { return Ok(Drain { channel: c, started: AtomicBool.create(false) }); }
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+    }
+
+    /// Starts the drain: wakes every waiter. Calling it again does nothing more.
+    public fn start(borrow this) {
+        this.started.store(true);
+        this.channel.close();
+    }
+
+    /// Whether the drain has started.
+    public fn isDraining(borrow this) -> bool => this.started.load();
+
+    /// Waits until the drain starts (at once if it has). `Err(Cancelled)` if the task is cancelled first.
+    public async fn wait(borrow this) -> Result<void, NetError> {
+        loop {
+            match (await this.channel.recvAsync()) {
+                Ok(null) => { return Ok(); }
+                Ok(_) => {} // never sent to; a value would be ignored
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+        }
+    }
+}
+
+/// Waits until `drain` starts, then returns `Err(NetError.Cancelled)`; it never returns `Ok`. So it is the second
+/// child of an `Async.race` that stops an operation when a drain starts, as `deadlineElapsed` does for a deadline;
+/// the caller tells the two apart with `drain.isDraining()`:
+///
+/// ```ceesafe
+/// let r: Result<Raced<PlainStream>, NetError> =
+///     await Async.race(async () => await listener.accept(), async () => await drainStarted<PlainStream>(drain));
+/// ```
+public async fn drainStarted<T>(drain: borrow Drain) -> Result<T, NetError> {
+    await drain.wait()?;
+    return Err(NetError.Cancelled);
+}

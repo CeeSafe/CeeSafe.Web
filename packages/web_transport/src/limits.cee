@@ -1,0 +1,45 @@
+// Connection limits (implementation plan M1 tasks 1–3): the admission bound and each connection's budget.
+import web_core;
+
+/// What one server admits and how long each step of a connection may take. Times are milliseconds. The defaults are
+/// conservative for a public server; `docs/milestones/M1.md` records where each comes from.
+public struct ConnectionLimits {
+    /// Connection workers: the most connections served at once (admission). The rest wait in the kernel's backlog.
+    public workers: u32;
+    /// The acceptor's step (a TLS handshake): from accept to a transport.
+    public handshakeMs: u64;
+    /// A request head, from its first byte (HTTP/1.1, M2).
+    public headerReadMs: u64;
+    /// An idle keep-alive connection, between requests.
+    public idleMs: u64;
+    /// One write.
+    public writeMs: u64;
+    /// A body's minimum receive rate in bytes per second, after `minRateGraceMs` (0: off).
+    public minBodyRate: u64;
+    /// The time before `minBodyRate` applies.
+    public minRateGraceMs: u64;
+    /// Each connection's read buffer, from the worker's pool (HTTP/1.1 heads fit in it).
+    public readBufferSize: usize;
+    /// A graceful close: how long to read the peer's last bytes after ending writing.
+    public closeLingerMs: u64;
+    /// A drain: how long connections in flight may finish before they are cancelled.
+    public graceMs: u64;
+    /// After a failed accept (out of descriptors, say): the pause before the worker tries again.
+    public acceptBackoffMs: u64;
+
+    /// The defaults: 256 workers, 10 s handshake and head, 60 s idle, 30 s write, 240 B/s after 5 s, 16 KiB buffer,
+    /// 1 s linger, 30 s grace, 50 ms accept backoff.
+    public fn defaults() -> ConnectionLimits => ConnectionLimits {
+        workers: 256,
+        handshakeMs: 10000,
+        headerReadMs: 10000,
+        idleMs: 60000,
+        writeMs: 30000,
+        minBodyRate: 240,
+        minRateGraceMs: 5000,
+        readBufferSize: 16384,
+        closeLingerMs: 1000,
+        graceMs: 30000,
+        acceptBackoffMs: 50,
+    };
+}

@@ -23,7 +23,7 @@ fn stream(text: StringView) -> Result<PlainStream, NetError> {
 
 /// What a server does with any acceptor: accept, then read through dyn Transport.
 async fn serve(acceptor: borrow dyn Acceptor, s: PlainStream) -> Result<usize, NetError> {
-    var t = await acceptor.accept(s)?;
+    var t = await acceptor.accept(s, Deadline.never())?;
     var buf = [0u8; 8];
     var total: usize = 0;
     loop {
@@ -42,7 +42,7 @@ async fn checks() -> Result<void, NetError> {
     await show("accepted through dyn Acceptor", await serve(acceptor, s)? == 5)?;
 
     let connector = PlainConnector {};
-    var c = await connector.connect(stream("ab")?, "example.org")?;
+    var c = await connector.connect(stream("ab")?, "example.org", Deadline.never())?;
     var buf = [0u8; 4];
     let n = await c.read(mut buf[..])?;
     await show("connected through Connector", n == 2 && match (c.alpn()) {

@@ -1,0 +1,210 @@
+// The connection server (implementation plan M1, docs/milestones/M1.md): a fixed set of connection workers, each
+// looping accept → handshake → serve on one shared source. A CeeSafe scope spawns only in its body (spec §40.5), so
+// the workers are the admission limit: when all are busy, nobody accepts and the kernel's backlog holds the rest.
+// A drain stops the accepting workers at once, lets connections in flight finish for a grace period, then cancels.
+import web_core;
+
+/// Where connections come from: a TCP listener, or a queue of mocks in tests. Shared by every worker.
+public interface Incoming {
+    /// The next connection. `Err(Closed)` when the source has ended (no more will come).
+    async fn next(borrow this) -> Result<PlainStream, NetError>;
+}
+
+impl Incoming for Listener {
+    async fn next(borrow this) -> Result<PlainStream, NetError> {
+        return await this.accept();
+    }
+}
+
+/// Serves one connection: the protocol driver (HTTP/1.1, M2) or a test's handler.
+public interface ConnectionHandler {
+    /// Serves `conn` until done. Between requests, a handler races its idle wait against the drain
+    /// (`drainStarted(ctx.drain())`) and returns `Ok` when the drain wins. `Ok` lets the server close gracefully; an
+    /// error drops the connection.
+    async fn serve(borrow this, conn: borrow mut dyn Transport, ctx: borrow ConnectionContext) -> Result<void, NetError>;
+}
+
+/// A queue of scripted connections for tests: push mocks, then close it to end the server's source.
+@noncopy
+public struct MockIncoming {
+    private queue: Channel<MockTransport>;
+
+    /// A queue holding up to `capacity` connections not yet accepted.
+    public fn create(capacity: usize) -> Result<MockIncoming, NetError> {
+        match (Channel<MockTransport>.create(capacity)) {
+            Ok(c) => { return Ok(MockIncoming { queue: c }); }
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+    }
+
+    /// Queues a connection; `Err(LimitExceeded)` if the queue is full or closed.
+    public fn push(borrow this, m: MockTransport) -> Result<void, NetError> {
+        match (this.queue.trySend(m)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(NetError.LimitExceeded); }
+        }
+    }
+
+    /// No more connections: once the queue is empty, `next` returns `Err(Closed)`.
+    public fn close(borrow this) {
+        this.queue.close();
+    }
+}
+
+impl Incoming for MockIncoming {
+    async fn next(borrow this) -> Result<PlainStream, NetError> {
+        match (await this.queue.recvAsync()) {
+            Ok(Some(m)) => { return Ok(PlainStream.mock(m)); }
+            Ok(null) => { return Err(NetError.Closed); }
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+}
+
+/// What a server did, counted by every worker.
+public struct ServerReport {
+    /// Connections taken from the source.
+    public accepted: u64;
+    /// Connections whose acceptor step failed or timed out.
+    public handshakesFailed: u64;
+    /// Connections whose handler returned `Ok`.
+    public served: u64;
+    /// Connections whose handler returned an error.
+    public failed: u64;
+    /// Failed accepts (the worker paused and tried again).
+    public acceptErrors: u64;
+    /// Whether the grace period ran out and connections in flight were cancelled.
+    public forced: bool;
+}
+
+/// The workers' shared counters.
+struct Counters {
+    accepted: AtomicU64;
+    handshakesFailed: AtomicU64;
+    served: AtomicU64;
+    failed: AtomicU64;
+    acceptErrors: AtomicU64;
+
+    fn create() -> Counters => Counters {
+        accepted: AtomicU64.create(0),
+        handshakesFailed: AtomicU64.create(0),
+        served: AtomicU64.create(0),
+        failed: AtomicU64.create(0),
+        acceptErrors: AtomicU64.create(0),
+    };
+
+    fn report(borrow this, forced: bool) -> ServerReport => ServerReport {
+        accepted: this.accepted.load(),
+        handshakesFailed: this.handshakesFailed.load(),
+        served: this.served.load(),
+        failed: this.failed.load(),
+        acceptErrors: this.acceptErrors.load(),
+        forced: forced,
+    };
+}
+
+/// Runs connection servers.
+public struct ConnectionServer {
+    /// Serves connections from `incoming` with `limits.workers` workers until the drain finishes, or until `incoming`
+    /// ends and every connection is done. Once `drain` starts, idle workers stop at once and connections in flight
+    /// have `limits.graceMs` to finish; then they are cancelled (`forced` in the report). A connection's failure ends
+    /// that connection only.
+    public async fn run(
+        incoming: borrow dyn Incoming,
+        acceptor: borrow dyn Acceptor,
+        handler: borrow dyn ConnectionHandler,
+        limits: borrow ConnectionLimits,
+        drain: borrow Drain,
+    ) -> Result<ServerReport, NetError> {
+        let counters = Counters.create();
+        let r: Result<Raced<bool>, NetError> = await Async.race(
+            async () => {
+                await Async.scope(NetError.OutOfMemory, (s) => {
+                    for (k in 0..limits.workers) {
+                        s.spawn(async () => await worker(incoming, acceptor, handler, limits, drain, counters));
+                    }
+                })?;
+                return Ok(false);
+            },
+            async () => {
+                await drain.wait()?;
+                match (await Timer.sleep(limits.graceMs)) {
+                    Ok() => { return Ok(true); }
+                    Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                }
+            },
+        );
+        match (r) {
+            Ok(raced) => { return Ok(counters.report(raced.value)); }
+            Err(e) => { return Err(e); }
+        }
+    }
+}
+
+/// One worker: accept, hand shake, serve, close; again until the drain starts or the source ends. Only cancellation
+/// ends a worker with an error.
+async fn worker(
+    incoming: borrow dyn Incoming,
+    acceptor: borrow dyn Acceptor,
+    handler: borrow dyn ConnectionHandler,
+    limits: borrow ConnectionLimits,
+    drain: borrow Drain,
+    counters: borrow Counters,
+) -> Result<void, NetError> {
+    var scratch = [0u8; 64];
+    loop {
+        if (drain.isDraining()) {
+            return Ok();
+        }
+        let next: Result<Raced<PlainStream>, NetError> = await Async.race(
+            async () => await incoming.next(),
+            async () => await drainStarted<PlainStream>(drain),
+        );
+        let stream = match (next) {
+            Ok(raced) => raced.value,
+            Err(NetError.Closed) => { return Ok(); } // the source ended
+            Err(NetError.Cancelled) => {
+                if (drain.isDraining()) {
+                    return Ok();
+                }
+                return Err(NetError.Cancelled);
+            }
+            Err(NetError.OutOfMemory) => { return Err(NetError.OutOfMemory); }
+            Err(_) => {
+                let failed = counters.acceptErrors.fetchAdd(1);
+                match (await Timer.sleep(limits.acceptBackoffMs)) {
+                    Ok() => {}
+                    Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                }
+                continue;
+            }
+        };
+        let id = counters.accepted.fetchAdd(1);
+        var conn = match (await acceptor.accept(stream, Deadline.after(limits.handshakeMs))) {
+            Ok(c) => c,
+            Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+            Err(_) => {
+                let failed = counters.handshakesFailed.fetchAdd(1);
+                continue;
+            }
+        };
+        let ctx = ConnectionContext.acceptedNow(id, drain);
+        match (await handler.serve(mut conn, ctx)) {
+            Ok() => {
+                let done = counters.served.fetchAdd(1);
+                match (await Transports.closeGracefully(
+                    mut conn,
+                    mut scratch[..],
+                    Deadline.after(limits.closeLingerMs),
+                )) {
+                    Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+                    _ => {} // the peer lingered or failed: the drop closes the socket anyway
+                }
+            }
+            Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+            Err(_) => {
+                let failed = counters.failed.fetchAdd(1);
+            }
+        }
+    }
+}

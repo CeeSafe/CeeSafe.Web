@@ -1,0 +1,64 @@
+// CeeSafe bug B4 (docs/ceesafe-upstream-work.md): a race that resolves while many tasks wait on sockets can spin for
+// ever in the runtime's cee_wake_waiters (native, kqueue). Expected: prints 1 within a second or two. Observed with
+// 0.6.0 on macOS: sometimes hangs at 100 % CPU, `sample` showing ceesafe_async_cancel → cee_wake_waiters.
+
+async fn reader(s: borrow AsyncTcpStream, total: borrow mut u64) -> Result<void, AsyncError> {
+    var buf = [0u8; 16];
+    loop {
+        let n = await s.read(mut buf[..])?;
+        if (n == 0) {
+            return Ok();
+        }
+        total += n as u64;
+    }
+}
+
+async fn tick(ms: u64) -> Result<u32, AsyncError> {
+    await Timer.sleep(ms)?;
+    return Ok(0);
+}
+
+async fn body() -> Result<u64, AsyncError> {
+    let listener = AsyncTcpListener.bind("127.0.0.1", 0)!;
+    let port = listener.port()!;
+    var clients = Vector<AsyncTcpStream>.create();
+    var servers = Vector<AsyncTcpStream>.create();
+    for (k in 0..40) {
+        clients.push(await AsyncTcpStream.connect("127.0.0.1", port)?)!;
+        servers.push(await listener.accept()?)!;
+    }
+    var totals = [0u64; 40];
+    var rounds: u64 = 0;
+    await Async.scope(AsyncError.Cancelled, (s) => {
+        for (k in 0..servers.length) {
+            s.spawn(async () => await reader(servers[k], mut totals[k]));
+        }
+        s.spawn(async () => {
+            let one = [7u8];
+            for (round in 0..300) {
+                for (k in 0..clients.length) {
+                    await clients[k].write(one[..])?;
+                    // Each race resolves with its loser parked on a timer: the cancel wakes the waiters.
+                    let r = await Async.race(async () => await tick(0), async () => await tick(1000));
+                    rounds += 1;
+                }
+            }
+            for (k in 0..clients.length) {
+                clients[k].shutdownWrite()!;
+            }
+            return Ok();
+        });
+    })?;
+    var sum: u64 = 0;
+    for (k in 0..totals.length) {
+        sum += totals[k];
+    }
+    return Ok(if (sum == 300 * 40 && rounds == 300 * 40) 1u64 else 0u64);
+}
+
+fn main() {
+    match (Async.run(body())) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(_) => { Console.writeLine("error"); }
+    }
+}

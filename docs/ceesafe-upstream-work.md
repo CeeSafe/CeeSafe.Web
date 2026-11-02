@@ -300,6 +300,66 @@ the program reaches that type's other operations.
 `MockTransport`) fails to build natively. `tests/web_transport/{mock,acceptor}` carry a `native-xfail` marker until
 this is fixed; the runner reports XPASS when it is.
 
+**General form (found in M1, 2026-11-02): it is not about sockets, and it now blocks M1.** Any type with a `drop`
+block (`Channel<T>`, `AsyncTcpStream`, …) that a library struct holds, in a program that never reaches the type's
+operations: the drop glue `ceeD_<T>` is emitted for every instantiated type and calls the `drop` block
+`ceeM_<T>_drop`, which is emitted only when reachable from `main`. From `tests/web_transport/workers`, built with
+`--emit c` (0.6.0):
+
+```c
+static void ceeD_S7Channel1u8(ceeT_7Channel1u8 *p) {
+    ceeM_S7Channel1u8_drop(p);   // never emitted: 'call to undeclared function'
+}
+```
+
+`web_core`'s `Drain` holds a `Channel<u8>`, so **every native program that imports `web_core` and does not start a
+drain fails to build**, the echo example included. The same goes for `web_transport`'s `MockIncoming`
+(`Channel<MockTransport>`). **Fix, probably:** when the drop glue of a type is emitted, mark that type's `drop` block
+reachable (or emit drop glue only for the types that are reached).
+
+**Effect on CeeSafe.Web:** M1 waits on a branch (`m1`) until a release fixes this. On it, six tests carry
+`native-xfail` (B2), and the runner reports XPASS once they build.
+
+## B4 — Bug: kqueue livelock in `cee_wake_waiters` when a cancel unparks socket waiters   *(found 2026-11-02, 0.6.0)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/wake-waiters-livelock-bug.cee`. 40 (or 10) connected sockets with a reader
+task each, while another task writes a byte to each in turn and resolves an `Async.race` after each write (the loser
+parked on a timer). Natively on macOS it hangs **20 of 20 runs** at 100 % CPU; with 10 sockets, 10 of 10. The
+interpreter prints `1`, and so does `CEESAFE_REACTOR_POLL=1` (0 hangs of 10).
+
+**Observed** (`sample`): one call `ceesafe_async_cancel → cee_cancel_scope → cee_wake_waiters` that never returns,
+spinning through `cee_unpark`. The same signature hung `tests/web_transport/server` about once in eight runs.
+
+**Likely cause** (`runtime/hosted/ceesafe_rt_async.c` at `v0.6.0`):
+1. `cee_wake_waiters` walks `cee_exec.parked`, keeping `next = t->next` and then calling `cee_unpark(t)`.
+2. Unparking a socket waiter detaches it (`cee_fd_detach` → `cee_reactor_disarm`), which queues an `EV_DELETE` through
+   `cee_kqueue_change`.
+3. When the 64-entry change buffer is full, `cee_kqueue_change` flushes it with `cee_kqueue_call(&now)`, which
+   readies tasks through `cee_fd_ready` → `cee_unpark`. It can unpark the saved `next`, whose `next` link then belongs
+   to another list, so the walk never ends.
+
+epoll's disarm calls `epoll_ctl` directly, so Linux may be unaffected; this was not run.
+
+**Fix, probably:** never unpark from inside the change queue's flush while a walk is in progress. For example, flush
+without readying, keeping the events for the next wait, or restart the walk from the head after each unpark.
+
+**Effect on CeeSafe.Web:** `tests/web_transport/server` runs natively on macOS with `CEESAFE_REACTOR_POLL=1` (a
+`native-env` marker, `tools/run_tests.py`) until this is fixed.
+
+## B5 — Performance: every cancellation wakes every socket waiter   *(found 2026-11-02, 0.6.0; not a correctness bug)*
+
+`cee_wake_waiters` unparks **every** parked task waiting on a descriptor, in the whole executor, whenever any scope
+is cancelled, on the readiness backends (kqueue, epoll, poll). Its filter is `!t->on_scope && cancellable`; a
+descriptor wait is not `on_op` (that flag marks IOCP completions only, `ceesafe_rt_async.c:110`), so it counts as
+cancellable. This was read in the code, not measured. Each such task
+retries its system call, gets `EAGAIN` and parks again, rearming the reactor.
+
+A server cancels a scope every time a race resolves: each deadline-bounded read (`Transports.readWithin`), and each
+accept that loses to the drain. So with *n* idle connections, every request costs O(*n*) spurious wake-ups, and the
+server is O(*n*²) overall. **Wanted:** wake only the tasks of the cancelled scope and its descendants, for example by
+walking the scope's own children instead of the executor's parked list. This blocks M1's overload benchmark, but not
+M1's correctness.
+
 ## B3 — Bug: generated C discards `const` for a race child's captured array   *(found 2026-11-02, 0.6.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/race-capture-const-warning.cee`: an `Async.race` child that lends a captured

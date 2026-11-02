@@ -10,7 +10,7 @@ that needs an unreleased compiler is not merged to main.
 | Milestone | Minimum | Needs | Status |
 |---|---|---|---|
 | M0 contracts, engines, MockTransport | **0.5.1** | async interfaces, `dyn` async methods (ADR 0036), regions, completion I/O (ADR 0035) | released |
-| M1 transport lifecycle | 0.6.0 (expected) | U1 socket options/IPv6, U2 error kinds, U4 `Async.timeout` | upstream, not started |
+| M1 transport lifecycle | the release after 0.6.0 | **a fix for B2 (general form)** to merge at all; then U1 socket options/IPv6, U2 error kinds (ADR 0044, on CeeSafe main); U4 `Async.timeout` optional (ADR 0046 drafted); B4 and B5 for the overload gate | on branch `m1` with 0.6.0 (`docs/milestones/M1.md`) |
 | M2 HTTP/1.1 fast path | 0.6.0 (expected) | U3 vectored send | upstream, not started |
 | M4 TLS | 0.6.x | U8 manifest `links` (OpenSSL) | upstream, not started |
 | M5 client | 0.6.x | U5 DNS | upstream, not started |

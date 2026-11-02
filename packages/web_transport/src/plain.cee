@@ -65,21 +65,24 @@ impl Transport for PlainStream {
 /// Turns an accepted plain stream into the connection's transport: as it is, or after a TLS handshake (web_tls's
 /// TlsAcceptor). The server takes one, so packages below web_tls never link OpenSSL (Web ADR 0004 §3.5).
 public interface Acceptor {
-    /// The transport for `stream`; an error closes the connection.
-    async fn accept(borrow this, stream: PlainStream) -> Result<Box<dyn Transport>, NetError>;
+    /// The transport for `stream`, its handshake finished by `deadline` (else `Err(TimedOut)`); an error closes the
+    /// connection. The acceptor bounds its own I/O (`Transports.readWithin`), since a task racing it could not hand it
+    /// the stream (a race child cannot move a captured value, N0251).
+    async fn accept(borrow this, stream: PlainStream, deadline: Deadline) -> Result<Box<dyn Transport>, NetError>;
 }
 
 /// Turns a connected plain stream into the client's transport; `host` is the name a TLS connector verifies.
 public interface Connector {
-    /// The transport for `stream`; an error closes the connection.
-    async fn connect(borrow this, stream: PlainStream, host: StringView) -> Result<Box<dyn Transport>, NetError>;
+    /// The transport for `stream`, its handshake finished by `deadline` (else `Err(TimedOut)`); an error closes the
+    /// connection.
+    async fn connect(borrow this, stream: PlainStream, host: StringView, deadline: Deadline,) -> Result<Box<dyn Transport>, NetError>;
 }
 
 /// The acceptor for plain connections: boxes the stream as it is.
 public struct PlainAcceptor {}
 
 impl Acceptor for PlainAcceptor {
-    async fn accept(borrow this, stream: PlainStream) -> Result<Box<dyn Transport>, NetError> {
+    async fn accept(borrow this, stream: PlainStream, deadline: Deadline) -> Result<Box<dyn Transport>, NetError> {
         match (Box.create(stream)) {
             Ok(b) => { return Ok(b); }
             Err(e) => { return Err(NetErrors.fromAlloc(e)); }
@@ -91,7 +94,12 @@ impl Acceptor for PlainAcceptor {
 public struct PlainConnector {}
 
 impl Connector for PlainConnector {
-    async fn connect(borrow this, stream: PlainStream, host: StringView) -> Result<Box<dyn Transport>, NetError> {
+    async fn connect(
+        borrow this,
+        stream: PlainStream,
+        host: StringView,
+        deadline: Deadline,
+    ) -> Result<Box<dyn Transport>, NetError> {
         match (Box.create(stream)) {
             Ok(b) => { return Ok(b); }
             Err(e) => { return Err(NetErrors.fromAlloc(e)); }

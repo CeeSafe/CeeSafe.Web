@@ -41,6 +41,53 @@ public struct Deadline {
     public fn earlier(this, other: Deadline) -> Deadline => if (other.at < this.at) other else this;
 }
 
+/// A minimum receive rate, the guard against slow senders (slowloris; implementation plan M1 task 3). After a grace
+/// period, the bytes received must keep up with `bytesPerSecond` on average since the start. Sans-I/O: the driver
+/// records what it reads and bounds each read by `deadline()`.
+public struct MinRate {
+    private rate: u64;
+    private graceMs: u64;
+    private startedAt: u64;
+    private received: u64;
+
+    /// A guard from `startedAt` (on `Timer.now()`'s clock). A rate of 0 turns it off.
+    public fn create(bytesPerSecond: u64, graceMs: u64, startedAt: u64) -> MinRate =>
+        MinRate { rate: bytesPerSecond, graceMs: graceMs, startedAt: startedAt, received: 0 };
+
+    /// A guard from now.
+    public fn startingNow(bytesPerSecond: u64, graceMs: u64) -> MinRate =>
+        MinRate.create(bytesPerSecond, graceMs, Timer.now());
+
+    /// A guard that never expires.
+    public fn off() -> MinRate => MinRate.create(0, 0, 0);
+
+    /// Records `n` bytes received.
+    public fn record(borrow mut this, n: usize) {
+        let add = n as u64;
+        this.received = if (add > 0xFFFFFFFFFFFFFFFF - this.received) 0xFFFFFFFFFFFFFFFF else this.received + add;
+    }
+
+    /// The bytes received so far.
+    public fn receivedBytes(borrow this) -> u64 => this.received;
+
+    /// When the next byte is due: the start, plus the grace, plus the time the bytes so far buy at the rate. Never if
+    /// the guard is off (or the sum overflows).
+    public fn deadline(borrow this) -> Deadline {
+        if (this.rate == 0) {
+            return Deadline.never();
+        }
+        if (this.received > 0xFFFFFFFFFFFFFFFF / 1000) {
+            return Deadline.never();
+        }
+        let bought = this.received * 1000 / this.rate;
+        let base = this.startedAt;
+        if (this.graceMs > 0xFFFFFFFFFFFFFFFE - base || bought > 0xFFFFFFFFFFFFFFFE - base - this.graceMs) {
+            return Deadline.never();
+        }
+        return Deadline.atInstant(base + this.graceMs + bought);
+    }
+}
+
 /// Waits until `deadline` passes, then returns `Err(NetError.TimedOut)`; a cancelled task returns
 /// `Err(NetError.Cancelled)`. It never returns `Ok`, so it is the second child of an `Async.race` that bounds an
 /// operation by a deadline (Web ADR 0001 §3.5):

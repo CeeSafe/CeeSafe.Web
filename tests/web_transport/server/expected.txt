@@ -1,0 +1,18 @@
+12 connections accepted and served ok
+every echo matched ok
+admission: never more than 4 at once ok
+not forced ok
+a reset at each of 27 offsets fails its connection only ok
+the server goes on serving ok
+a stalled handshake times out ok
+after the handshake deadline ok
+drain stops 8 idle workers at once ok
+requests in flight finish during the drain ok
+the drain ends when they do ok
+idle keep-alive connections close on drain ok
+connections ignoring the drain are cancelled after the grace ok
+shutdown within drain + grace + epsilon ok
+8 TCP clients echoed through 4 workers ok
+TCP report: 8 accepted, 8 served ok
+the TCP server drains at once when idle ok
+descriptors back to the baseline ok

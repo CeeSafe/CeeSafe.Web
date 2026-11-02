@@ -8,6 +8,13 @@ A file named native-xfail holds the reason a test's native build is known to fai
 example "B2", docs/ceesafe-upstream-work.md). The test still runs in the interpreter and must pass there; the native
 build must still fail, and the runner says XPASS (a failure) once it no longer does, so the marker cannot go stale.
 
+A file named native-env sets the environment of a test's native runs on one platform, to keep a CeeSafe runtime bug
+out of the way while it is open. Each line is "<platform> KEY=VALUE <reason>", with platform a prefix of
+sys.platform ("darwin", "linux", "win"), for example "darwin CEESAFE_REACTOR_POLL=1 B4". The bug's probe in
+tests/probes tracks when the line can go; the runner prints the line on every run so it is not forgotten.
+
+A run that does not finish in time is a failure ("timed out"), not a crash of the runner.
+
 --alloc-sweep (Web ADR 0005 §2.2): after a test passes natively, run it again once per allocation attempt with
 that attempt failing (CEESAFE_FAIL_ALLOC_AT). Each run must exit 0 (no panic, no crash) with live=0. Its output
 may differ: a test reports the failure as a value.
@@ -34,7 +41,28 @@ REPORT = re.compile(r"ceesafe alloc: attempts=\d+ live=(\d+)\n?")
 
 
 def run(cmd, cwd, env=None, timeout=120):
-    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        return subprocess.CompletedProcess(cmd, 124, out, f"timed out after {timeout} s\n")
+
+
+def native_env(t: pathlib.Path):
+    """The environment lines of t/native-env that apply here: ({KEY: VALUE}, [reasons])."""
+    values, reasons = {}, []
+    f = t / "native-env"
+    if not f.exists():
+        return values, reasons
+    for line in f.read_text(encoding="utf-8").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or line.lstrip().startswith("#"):
+            continue
+        if sys.platform.startswith(parts[0]) and "=" in parts[1]:
+            key, value = parts[1].split("=", 1)
+            values[key] = value
+            reasons.append(f"{parts[1]} ({parts[2] if len(parts) > 2 else 'no reason given'})")
+    return values, reasons
 
 
 def leak_and_strip(stderr: str):
@@ -77,6 +105,8 @@ def main() -> int:
                 problems.append("check failed:\n" + r.stderr)
 
         modes = []
+        extra_env, env_reasons = native_env(t)
+        native_env_vars = dict(env, **extra_env)
         xfail = (t / "native-xfail").read_text(encoding="utf-8").strip() if (t / "native-xfail").exists() else None
         notes = []
         if not problems:
@@ -97,9 +127,10 @@ def main() -> int:
                     problems.append("build failed:\n" + r.stderr)
                 else:
                     modes.append(("native", [str(exe)]))
+                    notes.extend(f"native env {r}" for r in env_reasons)
 
         for mode, cmd in modes:
-            r = run(cmd, t, env=env)
+            r = run(cmd, t, env=native_env_vars if mode == "native" else env)
             live, stderr = leak_and_strip(r.stderr)
             if r.returncode != 0:
                 problems.append(f"{mode}: exit {r.returncode}\n{stderr}")
@@ -115,11 +146,11 @@ def main() -> int:
         swept = 0
         if args.alloc_sweep and not problems and any(m == "native" for m, _ in modes):
             exe = [cmd for m, cmd in modes if m == "native"][0]
-            first = run(exe, t, env=env)
+            first = run(exe, t, env=native_env_vars)
             m = re.search(r"ceesafe alloc: attempts=(\d+)", first.stderr)
             attempts = int(m.group(1)) if m else 0
             for k in range(1, attempts + 1):
-                r = run(exe, t, env=dict(env, CEESAFE_FAIL_ALLOC_AT=str(k)))
+                r = run(exe, t, env=dict(native_env_vars, CEESAFE_FAIL_ALLOC_AT=str(k)))
                 live, stderr = leak_and_strip(r.stderr)
                 if r.returncode != 0:
                     problems.append(f"alloc-sweep {k}/{attempts}: exit {r.returncode}\n{stderr}")

@@ -30,7 +30,7 @@ async fn worker(listener: borrow Listener) -> Result<void, NetError> {
     let acceptor = PlainAcceptor {};
     loop {
         let stream = await listener.accept()?;
-        match (await acceptor.accept(stream)) {
+        match (await acceptor.accept(stream, Deadline.after(10000))) {
             Ok(conn) => {
                 var c = conn;
                 match (await echo(mut c)) {

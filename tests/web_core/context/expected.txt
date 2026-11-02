@@ -2,3 +2,5 @@ id ok
 accepted now ok
 age grows ok
 a future acceptance has age 0 ok
+not draining ok
+sees the drain ok

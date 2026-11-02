@@ -1,0 +1,6 @@
+a new drain has not started ok
+one start wakes all six waiters ok
+a waiter after the start returns at once ok
+starting again is harmless ok
+the operation finishes before a drain ok
+a drain stops the operation as Cancelled ok

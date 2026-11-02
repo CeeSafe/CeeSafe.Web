@@ -33,7 +33,7 @@ async fn worker(listener: borrow Listener, served: borrow mut u32) -> Result<voi
     let acceptor = PlainAcceptor {};
     loop {
         let stream = await listener.accept()?;
-        var conn = await acceptor.accept(stream)?;
+        var conn = await acceptor.accept(stream, Deadline.never())?;
         await serveOne(mut conn)?;
         served += 1;
     }

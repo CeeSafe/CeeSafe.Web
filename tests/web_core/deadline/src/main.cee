@@ -60,6 +60,24 @@ async fn checks() -> Result<void, NetError> {
         Err(NetError.TimedOut) => true,
         _ => false,
     })?;
+
+    // MinRate: the next byte is due at start + grace + received × 1000 / rate (worked by hand).
+    var rate = MinRate.create(1000, 5000, 100);
+    await show("min rate: due after the grace", rate.deadline().instant() == 5100)?;
+    rate.record(500);
+    await show("min rate: 500 bytes buy 500 ms", rate.deadline().instant() == 5600)?;
+    rate.record(1500);
+    await show("min rate: 2000 bytes buy 2000 ms", rate.deadline().instant() == 7100 && rate.receivedBytes() == 2000)?;
+    var trickle = MinRate.create(240, 0, 0);
+    trickle.record(1);
+    await show("min rate: 1 byte at 240 B/s buys 4 ms", trickle.deadline().instant() == 4)?;
+    await show("min rate off is never", MinRate.off().deadline().isNever())?;
+    var huge = MinRate.create(1, 0, 0);
+    huge.record(0xFFFFFFFFFFFFFFFF);
+    huge.record(5);
+    await show("min rate saturates to never", huge.receivedBytes() == 0xFFFFFFFFFFFFFFFF && huge.deadline().isNever())?;
+    let late = MinRate.create(1, 100, 0xFFFFFFFFFFFFFFF0);
+    await show("min rate overflow is never", late.deadline().isNever())?;
     return Ok();
 }
 

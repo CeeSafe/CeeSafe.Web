@@ -128,6 +128,50 @@ public struct Transports {
         return Ok();
     }
 
+    /// Reads as `read`, bounded by `deadline`: `Err(TimedOut)` once it passes. A read cancelled by the deadline after
+    /// the kernel completed it is not lost: its bytes come with the next read (Web ADR 0001 §3.4).
+    public async fn readWithin(
+        t: borrow mut dyn Transport,
+        buffer: SliceMut<u8>,
+        deadline: Deadline,
+    ) -> Result<usize, NetError> {
+        if (deadline.isExpired()) {
+            return Err(NetError.TimedOut);
+        }
+        let r: Result<Raced<usize>, NetError> = await Async.race(
+            async () => await t.read(buffer),
+            async () => await deadlineElapsed<usize>(deadline),
+        );
+        match (r) {
+            Ok(raced) => { return Ok(raced.value); }
+            Err(e) => { return Err(e); }
+        }
+    }
+
+    /// Writes as `write`, bounded by `deadline`: `Err(TimedOut)` once it passes. A write stopped by the deadline may
+    /// have sent part of the bytes, so the transport is poisoned (Web ADR 0001 §3.4): the write timeout of M1 ends
+    /// the connection.
+    public async fn writeWithin(
+        t: borrow mut dyn Transport,
+        bytes: Slice<u8>,
+        deadline: Deadline,
+    ) -> Result<void, NetError> {
+        if (deadline.isExpired()) {
+            return Err(NetError.TimedOut);
+        }
+        let r: Result<Raced<u32>, NetError> = await Async.race(
+            async () => {
+                await t.write(bytes)?;
+                return Ok(0u32);
+            },
+            async () => await deadlineElapsed<u32>(deadline),
+        );
+        match (r) {
+            Ok(_) => { return Ok(); }
+            Err(e) => { return Err(e); }
+        }
+    }
+
     /// Closes gracefully: ends writing, then reads (into `scratch`, discarding) until the peer ends its side or
     /// `deadline` passes. Dropping the transport afterwards closes the socket. `Err(TimedOut)` if the peer did not
     /// finish in time.

@@ -1,0 +1,76 @@
+// Probe (M1): a closed Channel wakes every task waiting on it, so it can broadcast a server's drain; a context with a
+// region parameter lends the drain to a dyn interface method. Expected: prints 1005.
+
+struct Drain {
+    private channel: Channel<u8>;
+    private raised: AtomicBool;
+
+    fn create() -> Result<Drain, AllocError> {
+        let c = Channel<u8>.create(1)?;
+        return Ok(Drain { channel: c, raised: AtomicBool.create(false) });
+    }
+
+    fn start(borrow this) {
+        this.raised.store(true);
+        this.channel.close();
+    }
+
+    fn isDraining(borrow this) -> bool => this.raised.load();
+
+    async fn wait(borrow this) -> Result<void, AsyncError> {
+        let r = await this.channel.recvAsync()?;
+        return Ok();
+    }
+}
+
+struct Context<region r> {
+    drain: borrow(r) Drain;
+    id: u64;
+}
+
+interface Handler {
+    async fn serve(borrow this, ctx: borrow Context) -> Result<u64, AsyncError>;
+}
+
+struct WaitHandler {}
+
+impl Handler for WaitHandler {
+    async fn serve(borrow this, ctx: borrow Context) -> Result<u64, AsyncError> {
+        await ctx.drain.wait()?;
+        return Ok(if (ctx.drain.isDraining()) 1u64 else 0u64);
+    }
+}
+
+async fn waiter(h: borrow dyn Handler, drain: borrow Drain, id: u64, out: borrow mut u64) -> Result<void, AsyncError> {
+    let ctx = Context { drain: drain, id: id };
+    out = await h.serve(ctx)?;
+    return Ok();
+}
+
+async fn body() -> Result<u64, AsyncError> {
+    let drain = Drain.create()!;
+    let handler = WaitHandler {};
+    var a: u64 = 0;
+    var b: u64 = 0;
+    var c: u64 = 0;
+    var d: u64 = 0;
+    await Async.scope(AsyncError.Cancelled, (s) => {
+        s.spawn(async () => await waiter(handler, drain, 1, mut a));
+        s.spawn(async () => await waiter(handler, drain, 2, mut b));
+        s.spawn(async () => await waiter(handler, drain, 3, mut c));
+        s.spawn(async () => await waiter(handler, drain, 4, mut d));
+        s.spawn(async () => {
+            await Timer.sleep(10)?;
+            drain.start();
+            return Ok();
+        });
+    })?;
+    return Ok(1000 + a + b + c + d + (if (drain.isDraining()) 1u64 else 0u64));
+}
+
+fn main() {
+    match (Async.run(body())) {
+        Ok(v) => { Console.writeLine(v); }
+        Err(_) => { Console.writeLine("error"); }
+    }
+}

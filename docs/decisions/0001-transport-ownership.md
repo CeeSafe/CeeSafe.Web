@@ -191,3 +191,23 @@ v0-expressible forms:
    `ConnectionReset` to `Reset` (U2).
 6. Methods cannot have type parameters of their own (N0216), so generic helpers are top-level functions
    (`deadlineElapsed<T>`). Type arguments on a method call (`d.expire<u32>()`) do not parse.
+
+## 8. Amendment 2 (2026-11-02, implementing M1's lifecycle)
+
+Found while building M1's connection server against the 0.6.0 release. The decision's intent is unchanged:
+
+1. **`Acceptor.accept` and `Connector.connect` take a `deadline`** (§3.3). The acceptor bounds its handshake's own
+   I/O (`Transports.readWithin`/`writeWithin`), because a server cannot race it: a race child cannot move a captured
+   value (N0251), and the acceptor takes the stream by value.
+2. **The drain is `web_core`'s `Drain`, a broadcast** (§3.5, §3.6). CeeSafe's `AsyncSignal` wakes one waiting task,
+   and a drain must wake every worker. `Drain` is a `Channel<u8>` that is never sent to and is closed to start the
+   drain, so every waiter's `recvAsync` ends (`tests/probes/drain-broadcast.cee`), plus an `AtomicBool` for cheap
+   checks. `drainStarted<T>(drain)` is the race child, as `deadlineElapsed<T>` is for deadlines. The race against
+   an `AsyncSignal` of §3.5 is still right for one task.
+3. **`ConnectionContext` has a region parameter and lends the server's drain** (`drain()`, `isDraining()`). It is
+   lent to handlers, never stored, so the v0 rule that scoped types cannot implement interfaces does not matter.
+4. **Deadline-bounded I/O is `Transports.readWithin` and `writeWithin`** (§3.5, amendment 1.4): a generic
+   `withDeadline` still waits for U4 (CeeSafe's ADR 0046 draft) or a fix for B1. A write stopped by its deadline
+   poisons the transport, as §3.4 requires.
+5. **`MinRate`** (`web_core`) computes the slow-sender deadline, sans-I/O: start, plus grace, plus the time the bytes
+   received so far buy at the minimum rate.

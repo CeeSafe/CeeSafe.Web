@@ -274,3 +274,4 @@ Weeks 28-35  M10 -> v0.5
    - M1 onward: the release that ships U1, U2 and U4 (expected 0.6.0). Each milestone records its minimum in `docs/toolchain.md`.
    - CI: the main job uses the released binary; a non-blocking job builds against CeeSafe main.
    - While developing U items, `~/dev/CeeSafe/out/ceesafec` is used locally on a branch. CeeSafe.Web code that needs an unreleased compiler is not merged to main.
+7. **Connections get tasks through connection workers (recorded 2026-11-02)**, for M1–M3: N workers each loop accept → serve on one shared source, so N is the admission limit (`docs/milestones/M0.md`, option A). Spawning into a running scope (U11) is proposed to CeeSafe before M7, where per-stream tasks matter most. M1's task 1 changes accordingly: admission is the worker count, not `Async.scopeIn`'s pool (`docs/milestones/M1.md`).
