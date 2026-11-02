@@ -1,0 +1,100 @@
+// PlainStream and the acceptor and connector interfaces (Web ADR 0001 §3.3): the concrete transport TLS wraps, and the
+// point where a connection becomes a Box<dyn Transport>.
+import web_core;
+
+/// The plain transports, dispatched by match (v0 implements interfaces only for concrete types, so TLS wraps this
+/// enum rather than a type parameter).
+enum Plain {
+    Tcp(TcpTransport),
+    Mock(MockTransport),
+}
+
+/// A plain (not encrypted) transport: TCP, or a mock in tests. TLS (web_tls) wraps one.
+public struct PlainStream {
+    private plain: Plain;
+
+    /// A TCP connection.
+    public fn tcp(t: TcpTransport) -> PlainStream => PlainStream { plain: Plain.Tcp(t) };
+
+    /// A scripted transport, for tests.
+    public fn mock(m: MockTransport) -> PlainStream => PlainStream { plain: Plain.Mock(m) };
+
+    /// Whether it is a mock.
+    public fn isMock(borrow this) -> bool => match (borrow this.plain) {
+        Plain.Mock(_) => true,
+        Plain.Tcp(_) => false,
+    };
+}
+
+impl Transport for PlainStream {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        match (borrow mut this.plain) {
+            Plain.Tcp(t) => { return await t.read(buffer); }
+            Plain.Mock(m) => { return await m.read(buffer); }
+        }
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        match (borrow mut this.plain) {
+            Plain.Tcp(t) => { return await t.write(bytes); }
+            Plain.Mock(m) => { return await m.write(bytes); }
+        }
+    }
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        match (borrow mut this.plain) {
+            Plain.Tcp(t) => { return await t.writeVectored(parts); }
+            Plain.Mock(m) => { return await m.writeVectored(parts); }
+        }
+    }
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> {
+        match (borrow mut this.plain) {
+            Plain.Tcp(t) => { return await t.shutdownWrite(); }
+            Plain.Mock(m) => { return await m.shutdownWrite(); }
+        }
+    }
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => match (borrow this.plain) {
+        Plain.Tcp(t) => t.alpn(),
+        Plain.Mock(m) => m.alpn(),
+    };
+}
+
+/// Turns an accepted plain stream into the connection's transport: as it is, or after a TLS handshake (web_tls's
+/// TlsAcceptor). The server takes one, so packages below web_tls never link OpenSSL (Web ADR 0004 §3.5).
+public interface Acceptor {
+    /// The transport for `stream`; an error closes the connection.
+    async fn accept(borrow this, stream: PlainStream) -> Result<Box<dyn Transport>, NetError>;
+}
+
+/// Turns a connected plain stream into the client's transport; `host` is the name a TLS connector verifies.
+public interface Connector {
+    /// The transport for `stream`; an error closes the connection.
+    async fn connect(borrow this, stream: PlainStream, host: StringView) -> Result<Box<dyn Transport>, NetError>;
+}
+
+/// The acceptor for plain connections: boxes the stream as it is.
+public struct PlainAcceptor {}
+
+impl Acceptor for PlainAcceptor {
+    async fn accept(borrow this, stream: PlainStream) -> Result<Box<dyn Transport>, NetError> {
+        match (Box.create(stream)) {
+            Ok(b) => { return Ok(b); }
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+    }
+}
+
+/// The connector for plain connections: boxes the stream as it is.
+public struct PlainConnector {}
+
+impl Connector for PlainConnector {
+    async fn connect(borrow this, stream: PlainStream, host: StringView) -> Result<Box<dyn Transport>, NetError> {
+        match (Box.create(stream)) {
+            Ok(b) => { return Ok(b); }
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+    }
+}

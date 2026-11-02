@@ -1,0 +1,163 @@
+// TcpTransport and Listener over loopback (Web ADR 0001 §3.4): an echo through PlainStream, a read cancelled while
+// the kernel holds it losing nothing, and a write blocked on a full socket buffer cancelled by a deadline and then
+// poisoned.
+import web_core;
+import web_transport;
+
+async fn show(label: StringView, ok: bool) -> Result<void, NetError> {
+    match (await AsyncConsole.write(label)) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    match (await AsyncConsole.writeLine(if (ok) " ok" else " FAILED")) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn nap(ms: u64) -> Result<void, NetError> {
+    match (await Timer.sleep(ms)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+fn equals(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+async fn echo() -> Result<bool, NetError> {
+    let listener = Listener.bind("127.0.0.1", 0)?;
+    let port = listener.port()?;
+    let message = "the quick brown fox jumps over the lazy dog";
+    var got = Vector<u8>.create();
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            var conn = await listener.accept()?;
+            var buf = [0u8; 7]; // small, so the echo takes several reads
+            loop {
+                let n = await conn.read(mut buf[..])?;
+                if (n == 0) {
+                    await conn.shutdownWrite()?;
+                    return Ok();
+                }
+                await conn.write(buf[0..n])?;
+            }
+        });
+        s.spawn(async () => {
+            var c = await TcpTransport.connect("127.0.0.1", port)?;
+            let bytes = message.bytes();
+            let parts = IoParts.two(bytes[0..10], bytes[10..]);
+            await Transports.writeAllVectored(mut c, parts)?;
+            await c.shutdownWrite()?;
+            var buf = [0u8; 16];
+            loop {
+                let n = await c.read(mut buf[..])?;
+                if (n == 0) {
+                    return Ok();
+                }
+                for (i in 0..n) {
+                    match (got.push(buf[i])) {
+                        Ok() => {}
+                        Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+                    }
+                }
+            }
+        });
+    })?;
+    return Ok(equals(got.view(), message.bytes()));
+}
+
+async fn noLoss() -> Result<bool, NetError> {
+    let listener = Listener.bind("127.0.0.1", 0)?;
+    let port = listener.port()?;
+    var timedOut = false;
+    var after: usize = 0;
+    var late = false;
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            var conn = await listener.accept()?;
+            await nap(60)?; // after the client's deadline
+            await conn.write("late".bytes())?;
+            await conn.shutdownWrite()?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            var c = await TcpTransport.connect("127.0.0.1", port)?;
+            var buf = [0u8; 16];
+            let first: Result<Raced<usize>, NetError> =
+                await Async.race(
+                    async () => await c.read(mut buf[..]),
+                    async () => await deadlineElapsed<usize>(Deadline.after(10)),
+                );
+            timedOut = match (first) {
+                Err(NetError.TimedOut) => true,
+                _ => false,
+            };
+            after = await c.read(mut buf[..])?;
+            late = equals(buf[0..after], "late".bytes());
+            return Ok();
+        });
+    })?;
+    return Ok(timedOut && after == 4 && late);
+}
+
+async fn poisoned() -> Result<bool, NetError> {
+    let listener = Listener.bind("127.0.0.1", 0)?;
+    let port = listener.port()?;
+    var timedOut = false;
+    var poisonedAfter = false;
+    var closedAfter = false;
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            let conn = await listener.accept()?; // never reads, so the client's writes fill the buffers
+            await nap(400)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            var c = await TcpTransport.connect("127.0.0.1", port)?;
+            var chunk = [120u8; 65536];
+            let r: Result<Raced<u32>, NetError> = await Async.race(
+                async () => {
+                    loop {
+                        await c.write(chunk[..])?;
+                    }
+                },
+                async () => await deadlineElapsed<u32>(Deadline.after(100)),
+            );
+            timedOut = match (r) {
+                Err(NetError.TimedOut) => true,
+                _ => false,
+            };
+            poisonedAfter = c.isPoisoned();
+            closedAfter = match (await c.write("x".bytes())) {
+                Err(NetError.Closed) => true,
+                _ => false,
+            };
+            return Ok();
+        });
+    })?;
+    return Ok(timedOut && poisonedAfter && closedAfter);
+}
+
+async fn checks() -> Result<void, NetError> {
+    await show("echo over loopback", await echo()?)?;
+    await show("cancelled read loses nothing", await noLoss()?)?;
+    await show("cancelled blocked write poisons", await poisoned()?)?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(checks())) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

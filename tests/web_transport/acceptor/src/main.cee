@@ -1,0 +1,66 @@
+// PlainStream, PlainAcceptor and PlainConnector (Web ADR 0001 §3.3): a plain stream becomes the connection's
+// Box<dyn Transport>, through the interfaces a server and a client take.
+import web_core;
+import web_transport;
+
+async fn show(label: StringView, ok: bool) -> Result<void, NetError> {
+    match (await AsyncConsole.write(label)) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    match (await AsyncConsole.writeLine(if (ok) " ok" else " FAILED")) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+fn stream(text: StringView) -> Result<PlainStream, NetError> {
+    match (MockTransport.create(text.bytes())) {
+        Ok(m) => { return Ok(PlainStream.mock(m.withChunk(2).withAlpn(Alpn.Http11))); }
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+    }
+}
+
+/// What a server does with any acceptor: accept, then read through dyn Transport.
+async fn serve(acceptor: borrow dyn Acceptor, s: PlainStream) -> Result<usize, NetError> {
+    var t = await acceptor.accept(s)?;
+    var buf = [0u8; 8];
+    var total: usize = 0;
+    loop {
+        let n = await t.read(mut buf[..])?;
+        if (n == 0) {
+            return Ok(total);
+        }
+        total += n;
+    }
+}
+
+async fn checks() -> Result<void, NetError> {
+    let s = stream("hello")?;
+    await show("plain stream from a mock", s.isMock())?;
+    let acceptor = PlainAcceptor {};
+    await show("accepted through dyn Acceptor", await serve(acceptor, s)? == 5)?;
+
+    let connector = PlainConnector {};
+    var c = await connector.connect(stream("ab")?, "example.org")?;
+    var buf = [0u8; 4];
+    let n = await c.read(mut buf[..])?;
+    await show("connected through Connector", n == 2 && match (c.alpn()) {
+        Alpn.Http11 => true,
+        _ => false,
+    })?;
+    await c.write("req".bytes())?;
+    await c.shutdownWrite()?;
+    await show("write and shutdown through the box", match (await c.write("x".bytes())) {
+        Err(NetError.Closed) => true,
+        _ => false,
+    })?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(checks())) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

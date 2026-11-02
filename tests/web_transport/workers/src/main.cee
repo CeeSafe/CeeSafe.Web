@@ -1,0 +1,114 @@
+// The connection-worker pattern (M1's design question, docs/milestones/M0.md): a scope cannot spawn after its body,
+// so a server runs a fixed set of workers, each looping accept → serve on one shared listener. Here 4 workers serve
+// 12 clients that connect at once; every client gets its own echo back, and finishing the clients cancels the idle
+// workers through Async.race.
+import web_core;
+import web_transport;
+
+async fn show(label: StringView, ok: bool) -> Result<void, NetError> {
+    match (await AsyncConsole.write(label)) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    match (await AsyncConsole.writeLine(if (ok) " ok" else " FAILED")) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+/// One connection: echo until the peer ends its side.
+async fn serveOne(conn: borrow mut dyn Transport) -> Result<void, NetError> {
+    var buf = [0u8; 32];
+    loop {
+        let n = await conn.read(mut buf[..])?;
+        if (n == 0) {
+            return await conn.shutdownWrite();
+        }
+        await conn.write(buf[0..n])?;
+    }
+}
+
+/// A worker: accepts and serves connections one after another, for ever (until cancelled).
+async fn worker(listener: borrow Listener, served: borrow mut u32) -> Result<void, NetError> {
+    let acceptor = PlainAcceptor {};
+    loop {
+        let stream = await listener.accept()?;
+        var conn = await acceptor.accept(stream)?;
+        await serveOne(mut conn)?;
+        served += 1;
+    }
+}
+
+/// A client: sends its number and checks the echo.
+async fn client(port: u16, k: u32) -> Result<bool, NetError> {
+    var c = await TcpTransport.connect("127.0.0.1", port)?;
+    let msg = [65u8 + truncate<u8>(k), 0x2D, 0x6F, 0x6B]; // "A-ok", "B-ok", …
+    await c.write(msg[..])?;
+    await c.shutdownWrite()?;
+    var buf = [0u8; 8];
+    var got: usize = 0;
+    loop {
+        let n = await c.read(mut buf[got..])?;
+        if (n == 0) {
+            break;
+        }
+        got += n;
+    }
+    return Ok(got == 4 && buf[0] == msg[0] && buf[3] == msg[3]);
+}
+
+async fn run() -> Result<void, NetError> {
+    let listener = Listener.bind("127.0.0.1", 0)?;
+    let port = listener.port()?;
+    var s0: u32 = 0;
+    var s1: u32 = 0;
+    var s2: u32 = 0;
+    var s3: u32 = 0;
+    var good: u32 = 0;
+    var results = [false; 12];
+    let r: Result<Raced<u32>, NetError> = await Async.race(
+        async () => {
+            await Async.scope(NetError.OutOfMemory, (s) => {
+                s.spawn(async () => await worker(listener, mut s0));
+                s.spawn(async () => await worker(listener, mut s1));
+                s.spawn(async () => await worker(listener, mut s2));
+                s.spawn(async () => await worker(listener, mut s3));
+            })?;
+            return Ok(0u32);
+        },
+        async () => {
+            await Async.scope(NetError.OutOfMemory, (s) => {
+                for (k in 0..results.length) {
+                    let slot = borrow mut results[k];
+                    let n = truncate<u32>(k);
+                    s.spawn(async move () => {
+                        slot = await client(port, n)?;
+                        return Ok();
+                    });
+                }
+            })?;
+            return Ok(1u32);
+        },
+    );
+    for (ok in results) {
+        if (ok) {
+            good += 1;
+        }
+    }
+    await show("clients finish first; workers cancelled", match (r) {
+        Ok(raced) => raced.winner == 1,
+        Err(_) => false,
+    })?;
+    await show("12 clients echoed", good == 12)?;
+    await show("4 workers served 12 connections", s0 + s1 + s2 + s3 == 12)?;
+    await show("more than one worker served", (if (s0 > 0) 1 else 0) + (if (s1 > 0) 1 else 0) + (if (s2 > 0) 1 else 0) +
+        (if (s3 > 0) 1 else 0) > 1)?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

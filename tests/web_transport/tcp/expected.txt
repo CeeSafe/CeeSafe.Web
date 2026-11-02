@@ -1,0 +1,3 @@
+echo over loopback ok
+cancelled read loses nothing ok
+cancelled blocked write poisons ok

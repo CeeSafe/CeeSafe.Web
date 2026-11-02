@@ -1,2 +1,0 @@
-// web_transport: TcpTransport and MockTransport over lib/std, the PlainStream enum, the Acceptor/Connector interfaces, Listener with admission control and drain.
-// Milestone M0-M1 (docs/implementation-plan.md). Empty until then.

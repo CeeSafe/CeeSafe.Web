@@ -1,0 +1,279 @@
+// MockTransport (Web ADR 0001 §3.7): a scripted transport for deterministic tests of engines and drivers.
+import web_core;
+
+/// How a MockTransport splits its input into reads.
+enum Splits {
+    /// Each read returns as much as fits.
+    Whole,
+    /// Each read returns at most this many bytes.
+    Fixed(usize),
+    /// Each read returns 1 to `max` bytes, chosen by a xorshift64 generator from `state`: the same seed gives the same
+    /// splits on every run and in the interpreter.
+    Seeded(u64, usize),
+}
+
+/// A Transport whose peer is a script: input delivered in chosen fragments, optional failures at chosen offsets, and
+/// everything written recorded. Reads and writes suspend only when asked to (`withPause`), so a test chooses where
+/// cancellation can land. It follows Transport's contract: an empty read buffer is `LimitExceeded`, and a failed or
+/// cancelled write poisons it (Web ADR 0001 §3.4).
+public struct MockTransport {
+    private input: Vector<u8>;
+    private at: usize;
+    private splits: Splits;
+    private resetAt: usize;
+    private resetArmed: bool;
+    private hang: bool;
+    private pauseMs: u64;
+    private paused: bool;
+    private out: Vector<u8>;
+    private step: usize;
+    private failAfter: usize;
+    private failArmed: bool;
+    private poisoned: bool;
+    private shut: bool;
+    private protocol: Alpn;
+
+    /// A transport whose peer sends `input` and then ends its side.
+    public fn create(input: Slice<u8>) -> Result<MockTransport, AllocError> {
+        var v = Vector<u8>.withCapacity(input.length)?;
+        for (b in input) {
+            v.push(b)?;
+        }
+        return Ok(MockTransport {
+            input: v,
+            at: 0,
+            splits: Splits.Whole,
+            resetAt: 0,
+            resetArmed: false,
+            hang: false,
+            pauseMs: 0,
+            paused: false,
+            out: Vector<u8>.create(),
+            step: 0,
+            failAfter: 0,
+            failArmed: false,
+            poisoned: false,
+            shut: false,
+            protocol: Alpn.None,
+        });
+    }
+
+    /// Each read returns at most `n` bytes (n ≥ 1; 0 is taken as 1).
+    public fn withChunk(this, n: usize) -> MockTransport {
+        var m = this;
+        m.splits = Splits.Fixed(if (n == 0) 1 else n);
+        return m;
+    }
+
+    /// Each read returns 1 to `max` bytes, chosen from `seed` (reproducible). A zero seed is replaced by a fixed one.
+    public fn withSeededSplits(this, seed: u64, max: usize) -> MockTransport {
+        var m = this;
+        m.splits = Splits.Seeded(if (seed == 0) 0x9E3779B97F4A7C15 else seed, if (max == 0) 1 else max);
+        return m;
+    }
+
+    /// The read that would deliver the byte at `offset` returns `Err(Reset)` instead, after delivering the bytes
+    /// before it. Every later read is `Err(Reset)` too.
+    public fn withResetAt(this, offset: usize) -> MockTransport {
+        var m = this;
+        m.resetAt = offset;
+        m.resetArmed = true;
+        return m;
+    }
+
+    /// At the end of the input, reads wait (until cancelled) instead of returning 0: a peer that never ends its side.
+    public fn withHang(this) -> MockTransport {
+        var m = this;
+        m.hang = true;
+        return m;
+    }
+
+    /// Each read and write first waits `ms` milliseconds (0: suspends once and resumes at once), so a cancellation
+    /// or a deadline can land in it.
+    public fn withPause(this, ms: u64) -> MockTransport {
+        var m = this;
+        m.pauseMs = ms;
+        m.paused = true;
+        return m;
+    }
+
+    /// Each `writeVectored` step writes at most `n` bytes (0: no limit).
+    public fn withWriteStep(this, n: usize) -> MockTransport {
+        var m = this;
+        m.step = n;
+        return m;
+    }
+
+    /// After `n` bytes have been written in total, the next write fails with `Err(Reset)` (and poisons). The bytes
+    /// before the limit are recorded, as a kernel would have sent them.
+    public fn withWriteFailureAfter(this, n: usize) -> MockTransport {
+        var m = this;
+        m.failAfter = n;
+        m.failArmed = true;
+        return m;
+    }
+
+    /// The protocol `alpn()` reports.
+    public fn withAlpn(this, protocol: Alpn) -> MockTransport {
+        var m = this;
+        m.protocol = protocol;
+        return m;
+    }
+
+    /// Everything written so far.
+    public fn written(borrow this) -> Slice<u8> => this.out.view();
+
+    /// How many input bytes have been read.
+    public fn consumed(borrow this) -> usize => this.at;
+
+    /// Whether `shutdownWrite` was called.
+    public fn isShutdown(borrow this) -> bool => this.shut;
+
+    /// Whether a failed or cancelled write poisoned it.
+    public fn isPoisoned(borrow this) -> bool => this.poisoned;
+
+    /// The size of the next read, for a buffer of `room` bytes.
+    fn nextChunk(borrow mut this, room: usize) -> usize {
+        let left = this.input.length - this.at;
+        var n = if (room < left) room else left;
+        match (this.splits) {
+            Splits.Whole => {}
+            Splits.Fixed(k) => {
+                if (k < n) {
+                    n = k;
+                }
+            }
+            Splits.Seeded(state, max) => {
+                var x = state;
+                x = x ^ (x << 13);
+                x = x ^ (x >> 7);
+                x = x ^ (x << 17);
+                this.splits = Splits.Seeded(x, max);
+                let k = 1 + truncate<usize>(x % (max as u64));
+                if (k < n) {
+                    n = k;
+                }
+            }
+        }
+        if (this.resetArmed && this.at < this.resetAt && this.at + n > this.resetAt) {
+            n = this.resetAt - this.at;
+        }
+        return n;
+    }
+
+    /// Waits, if asked to; a cancellation landing here is reported.
+    async fn pause(borrow this) -> Result<void, NetError> {
+        if (!this.paused) {
+            return Ok();
+        }
+        match (await Timer.sleep(this.pauseMs)) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+
+    /// Records one byte, honouring the write-failure limit.
+    fn record(borrow mut this, b: u8) -> Result<void, NetError> {
+        if (this.failArmed && this.out.length >= this.failAfter) {
+            this.poisoned = true;
+            return Err(NetError.Reset);
+        }
+        match (this.out.push(b)) {
+            Ok() => { return Ok(); }
+            Err(_) => {
+                this.poisoned = true;
+                return Err(NetError.OutOfMemory);
+            }
+        }
+    }
+}
+
+impl Transport for MockTransport {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        if (buffer.length == 0) {
+            return Err(NetError.LimitExceeded);
+        }
+        await this.pause()?;
+        if (this.resetArmed && this.at >= this.resetAt) {
+            return Err(NetError.Reset);
+        }
+        if (this.at == this.input.length) {
+            if (this.hang) {
+                loop {
+                    match (await Timer.sleep(86400000)) {
+                        Ok() => {}
+                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                    }
+                }
+            }
+            return Ok(0);
+        }
+        let n = this.nextChunk(buffer.length);
+        for (i in 0..n) {
+            buffer[i] = this.input[this.at + i];
+        }
+        this.at += n;
+        return Ok(n);
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        if (this.poisoned || this.shut) {
+            return Err(NetError.Closed);
+        }
+        match (await this.pause()) {
+            Ok() => {}
+            Err(e) => {
+                this.poisoned = true; // a cancelled write may have sent part of its bytes (§3.4)
+                return Err(e);
+            }
+        }
+        for (b in bytes) {
+            this.record(b)?;
+        }
+        return Ok();
+    }
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        if (this.poisoned || this.shut) {
+            return Err(NetError.Closed);
+        }
+        match (await this.pause()) {
+            Ok() => {}
+            Err(e) => {
+                this.poisoned = true;
+                return Err(e);
+            }
+        }
+        var n: usize = 0;
+        for (i in 0..parts.parts()) {
+            let p = parts.part(truncate<u32>(i));
+            for (b in p) {
+                if (this.step != 0 && n == this.step) {
+                    return Ok(n);
+                }
+                match (this.record(b)) {
+                    Ok() => {}
+                    Err(e) => {
+                        if (n > 0) {
+                            return Ok(n); // the bytes before the failure were sent; the next step reports it
+                        }
+                        return Err(e);
+                    }
+                }
+                n += 1;
+            }
+        }
+        return Ok(n);
+    }
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> {
+        if (this.poisoned) {
+            return Err(NetError.Closed);
+        }
+        this.shut = true;
+        return Ok();
+    }
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => this.protocol;
+}

@@ -1,0 +1,4 @@
+clients finish first; workers cancelled ok
+12 clients echoed ok
+4 workers served 12 connections ok
+more than one worker served ok
