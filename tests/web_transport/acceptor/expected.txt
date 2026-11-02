@@ -1,4 +1,0 @@
-plain stream from a mock ok
-accepted through dyn Acceptor ok
-connected through Connector ok
-write and shutdown through the box ok

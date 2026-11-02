@@ -231,7 +231,8 @@ Found while building M1's connection server against the 0.6.0 release. The decis
    their race against `deadlineElapsed` while CeeSafe bug B6 is open: `Async.deadline` over a body of
    `Result<void, E>` crashes `ceesafec check` (`tests/probes/async-deadline-void-bug.cee`). `deadlineElapsed<T>`
    stays for races with more than an operation and a deadline. The frame is about the same: `Async.deadline` is
-   lowered as a race (CeeSafe ADR 0046 §3), and `readWithin` went from 1296 to 1168 bytes.
+   lowered as a race (CeeSafe ADR 0046 §3), and `readWithin` went from 1296 to 1168 bytes. **Update (0.8.0):** B6
+   is fixed, and `writeWithin` and `closeGracefully` use `Async.deadline` too.
 5. **TCP** (§3.3): `TcpTransport.connectTo(SocketAddress)`, `setNoDelay`, and `abort()`, an abortive close (SO_LINGER
    0, so the peer gets a reset), for a connection that broke the protocol and for tests of a peer's reset.
    `Listener.bindWith(SocketAddress, ListenOptions)` sets the backlog, address and port reuse, and dual stack;

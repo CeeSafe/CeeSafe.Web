@@ -1,0 +1,51 @@
+// PlainStream, PlainAcceptor and PlainConnector (Web ADR 0001 §3.3): a plain stream becomes the connection's
+// Box<dyn Transport>, through the interfaces a server and a client take. Ported from tests/web_transport/acceptor.
+import web_core;
+
+fn plainMock(text: StringView) -> Result<PlainStream, NetError> {
+    let m = mockOf(text.bytes())?;
+    return Ok(PlainStream.mock(m.withChunk(2).withAlpn(Alpn.Http11)));
+}
+
+/// What a server does with any acceptor: accept, then read through dyn Transport.
+async fn serveThrough(acceptor: borrow dyn Acceptor, s: PlainStream) -> Result<usize, NetError> {
+    var t = await acceptor.accept(s, Deadline.never())?;
+    var buf = [0u8; 8];
+    var total: usize = 0;
+    loop {
+        let n = await t.read(mut buf[..])?;
+        if (n == 0) {
+            return Ok(total);
+        }
+        total += n;
+    }
+}
+
+@test
+async fn plain_acceptor_serves_a_mock() -> Result<void, TestFailure> {
+    let s = net(plainMock("hello"))?;
+    Check.isTrue(s.isMock(), "plain stream from a mock")?;
+    let acceptor = PlainAcceptor {};
+    // accepted through dyn Acceptor
+    Check.equalU64(5, net(await serveThrough(acceptor, s))? as u64)?;
+    return Ok();
+}
+
+@test
+async fn plain_connector_boxes_a_mock() -> Result<void, TestFailure> {
+    let connector = PlainConnector {};
+    var c = net(await connector.connect(net(plainMock("ab"))?, "example.org", Deadline.never()))?;
+    var buf = [0u8; 4];
+    let n = net(await c.read(mut buf[..]))?;
+    Check.isTrue(n == 2 && match (c.alpn()) {
+        Alpn.Http11 => true,
+        _ => false,
+    }, "connected through Connector")?;
+    netDone(await c.write("req".bytes()))?;
+    netDone(await c.shutdownWrite())?;
+    Check.isTrue(match (await c.write("x".bytes())) {
+        Err(NetError.Closed) => true,
+        _ => false,
+    }, "write and shutdown through the box")?;
+    return Ok();
+}

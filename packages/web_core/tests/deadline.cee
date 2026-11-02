@@ -1,0 +1,107 @@
+// Deadline and deadlineElapsed (Web ADR 0001 §3.5): saturation, ordering, expiry, and bounding an operation with
+// Async.race. Only relations are checked, so the interpreter's virtual clock and the real clock agree.
+// Ported from tests/web_core/deadline to `ceesafec test` (CeeSafe ADR 0049).
+
+@test
+fn deadline_never() -> Result<void, TestFailure> {
+    let never = Deadline.never();
+    Check.isTrue(never.isNever() && !never.isExpired(), "never never expires")?;
+    // "never has no end"
+    Check.equalU64(0xFFFFFFFFFFFFFFFF, never.remaining())?;
+    Check.isTrue(Deadline.after(0xFFFFFFFFFFFFFFFF).isNever(), "huge after is never")?;
+    return Ok();
+}
+
+@test
+fn deadline_ordering_and_expiry() -> Result<void, TestFailure> {
+    let never = Deadline.never();
+    let soon = Deadline.after(20);
+    let later = Deadline.after(1000);
+    Check.isTrue(!soon.isExpired() && soon.remaining() <= 20, "after is not expired yet")?;
+    // "earlier picks the sooner"
+    Check.equalU64(soon.instant(), soon.earlier(later).instant())?;
+    // "earlier with never"
+    Check.equalU64(soon.instant(), never.earlier(soon).instant())?;
+    // "past instant is expired"
+    Check.isTrue(Deadline.atInstant(0).isExpired(), "past instant is expired")?;
+    Check.equalU64(0, Deadline.atInstant(0).remaining())?;
+    return Ok();
+}
+
+@test
+async fn deadline_operation_first() -> Result<void, TestFailure> {
+    // The operation finishes first: its value wins.
+    let later = Deadline.after(1000);
+    let fast: Result<Raced<u32>, NetError> =
+        await Async.race(async () => await work(5, 7), async () => await deadlineElapsed<u32>(later));
+    let r = net(fast)?;
+    // "operation before deadline"
+    Check.equalU64(0, r.winner as u64)?;
+    Check.equalU64(7, r.value as u64)?;
+    return Ok();
+}
+
+@test
+async fn deadline_before_operation() -> Result<void, TestFailure> {
+    // The deadline passes first: TimedOut, and the operation is cancelled and awaited.
+    let soon = Deadline.after(20);
+    let slow: Result<Raced<u32>, NetError> =
+        await Async.race(async () => await work(1000, 9), async () => await deadlineElapsed<u32>(soon));
+    Check.isTrue(match (slow) {
+        Err(NetError.TimedOut) => true,
+        _ => false,
+    }, "deadline before operation")?;
+    // "soon has now expired"
+    Check.isTrue(soon.isExpired(), "soon has now expired")?;
+    Check.equalU64(0, soon.remaining())?;
+    return Ok();
+}
+
+@test
+async fn deadline_already_expired() -> Result<void, TestFailure> {
+    // An already expired deadline times out at once.
+    let past: Result<Raced<u32>, NetError> =
+        await Async.race(
+            async () => await work(1000, 1),
+            async () => await deadlineElapsed<u32>(Deadline.atInstant(0)),
+        );
+    Check.isTrue(match (past) {
+        Err(NetError.TimedOut) => true,
+        _ => false,
+    }, "expired deadline times out")?;
+    return Ok();
+}
+
+@test
+fn min_rate_by_hand() -> Result<void, TestFailure> {
+    // The next byte is due at start + grace + received × 1000 / rate (worked by hand).
+    var rate = MinRate.create(1000, 5000, 100);
+    // "min rate: due after the grace"
+    Check.equalU64(5100, rate.deadline().instant())?;
+    rate.record(500);
+    // "min rate: 500 bytes buy 500 ms"
+    Check.equalU64(5600, rate.deadline().instant())?;
+    rate.record(1500);
+    // "min rate: 2000 bytes buy 2000 ms"
+    Check.equalU64(7100, rate.deadline().instant())?;
+    Check.equalU64(2000, rate.receivedBytes())?;
+    var trickle = MinRate.create(240, 0, 0);
+    trickle.record(1);
+    // "min rate: 1 byte at 240 B/s buys 4 ms"
+    Check.equalU64(4, trickle.deadline().instant())?;
+    return Ok();
+}
+
+@test
+fn min_rate_limits() -> Result<void, TestFailure> {
+    Check.isTrue(MinRate.off().deadline().isNever(), "min rate off is never")?;
+    var huge = MinRate.create(1, 0, 0);
+    huge.record(0xFFFFFFFFFFFFFFFF);
+    huge.record(5);
+    // "min rate saturates to never"
+    Check.equalU64(0xFFFFFFFFFFFFFFFF, huge.receivedBytes())?;
+    Check.isTrue(huge.deadline().isNever(), "min rate saturates to never")?;
+    let late = MinRate.create(1, 100, 0xFFFFFFFFFFFFFFF0);
+    Check.isTrue(late.deadline().isNever(), "min rate overflow is never")?;
+    return Ok();
+}

@@ -67,19 +67,14 @@ jobs:
             (cd "$p" && ceesafec fetch --offline && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
           done
 
-      - name: Tests (interpreter and native, leak check)
+      - name: Tests (ceesafec test, native and interpreter, leak check)
         shell: bash
         run: python3 tools/run_tests.py
 
-      - name: Tests with ASan and UBSan
+      - name: Tests with ASan and UBSan, allocation-failure and cancellation sweeps
         if: matrix.sanitize
         shell: bash
-        run: python3 tools/run_tests.py --sanitize
-
-      - name: Allocation-failure sweep
-        if: matrix.sanitize
-        shell: bash
-        run: python3 tools/run_tests.py --alloc-sweep
+        run: python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep
 
       - name: Example builds
         shell: bash

@@ -2,8 +2,21 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.8.0 (released 2026-11-02, tag `v0.8.0` = CeeSafe `2c32172`)
+
+| Item | Status | Checked by |
+|---|---|---|
+| B5 every cancel wakes every socket waiter | **fixed** (`226b514`: a cancel wakes only the tasks it reaches) | `benchmarks/overload/run.py`: server CPU per request with 1000 parked connections no higher than with none (150 vs 290 µs) |
+| B6 `Async.deadline` over `Result<void, E>` | **fixed** (`ca4589d`) | probe prints `ok`; `writeWithin` and `closeGracefully` use `Async.deadline` |
+| T2 `ceesafec test` (ADR 0049) | **released** | every test is an `@test` now (Web ADR 0005 amendment 1): 50 tests, native, interpreter, sanitizers, both sweeps |
+| U8 system libraries in the manifest (ADR 0047) | **released** | not used yet (M4, OpenSSL) |
+| U5 DNS for tasks (ADR 0048) | **released** | not used yet (M5) |
+| U6, U7, U9, U10, U11 | not in 0.8.0 | — |
+
+No open CeeSafe bug blocks CeeSafe.Web.
 
 ## Status at 0.7.0 (released 2026-11-02, tag `v0.7.0` = CeeSafe `b2bef17`)
 
@@ -366,7 +379,7 @@ without readying, keeping the events for the next wait, or restart the walk from
 **Effect on CeeSafe.Web:** `tests/web_transport/server` runs natively on macOS with `CEESAFE_REACTOR_POLL=1` (a
 `native-env` marker, `tools/run_tests.py`) until this is fixed.
 
-## B5 — Performance: every cancellation wakes every socket waiter   *(found 2026-11-02, 0.6.0; not a correctness bug)*
+## B5 — Performance: every cancellation wakes every socket waiter   *(found 2026-11-02, 0.6.0; fixed in 0.8.0)*
 
 `cee_wake_waiters` unparks **every** parked task waiting on a descriptor, in the whole executor, whenever any scope
 is cancelled, on the readiness backends (kqueue, epoll, poll). Its filter is `!t->on_scope && cancellable`; a
@@ -390,7 +403,7 @@ The program runs correctly (prints 7), but `--cflag -Werror` fails.
 
 **Expected:** no warning: the capture is mutable, so its C type should not be const.
 
-## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0)*
+## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/async-deadline-void-bug.cee`:
 
@@ -435,7 +448,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 ## Tooling (small, any time before M1's exit)
 
 - **T1 Sweeps on any package.** CeeSafe.Web's M1 gate reuses `tools/cancel_sweep.py` and `tools/fault_sweep.py`. Check that both accept a package directory, not only corpus files. If they don't, add a `--package <dir>` mode.
-- **T2 `ceesafec test`** *(optional)*. There is no test command (`guide/ceesafec.md`). CeeSafe.Web will use its own runner first, so this is only worth an ADR if more packages want it.
+- **T2 `ceesafec test`** *(optional; released in 0.8.0 as ADR 0049, and CeeSafe.Web's tests use it)*.
 
 ---
 
@@ -444,8 +457,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | Release | Items | Unblocks in CeeSafe.Web |
 |---|---|---|
 | **0.7.0** (released 2026-11-02) | U1, U2, U3, U4, T1; B1–B4 fixed | M1 transport/lifecycle (merged), M2 HTTP/1.1 fast path |
-| next | B5, B6 | M1's overload gate and benchmarks (B5); `void` deadlines (B6) |
-| 0.7.x | U8 (by CeeSafe.Web week 9), U5 | M4 TLS (OpenSSL), M5 client |
+| **0.8.0** (released 2026-11-02) | B5, B6 fixed; U8, U5, T2 | M1's overload gate (passed); M4 TLS (OpenSSL), M5 client |
 | later | U6, U7, U9 | M9 sendfile, M10 HTTP/3 |
 | unscheduled | U10 | simplifications only |
 

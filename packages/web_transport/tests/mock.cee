@@ -1,0 +1,177 @@
+// MockTransport (Web ADR 0001 §3.7): splits (fixed, seeded and reproducible), reset at an offset, hang until a
+// deadline, write steps, write failure and poisoning, shutdown, the empty-buffer rule, and cancellation landing in a
+// paused read or write. Ported from tests/web_transport/mock.
+import web_core;
+
+fn mockText(text: StringView) -> Result<MockTransport, TestFailure> => net(mockOf(text.bytes()));
+
+/// Reads to the end, recording each read's size into `sizes` (as decimal digits, one per read, sizes < 10).
+async fn readAllSizes(t: borrow mut dyn Transport, sizes: borrow mut Vector<u8>) -> Result<usize, NetError> {
+    var buf = [0u8; 16];
+    var total: usize = 0;
+    loop {
+        let n = await t.read(mut buf[..])?;
+        if (n == 0) {
+            return Ok(total);
+        }
+        match (sizes.push(48 + truncate<u8>(n % 10))) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+        total += n;
+    }
+}
+
+@test
+async fn mock_fixed_chunk_splits() -> Result<void, TestFailure> {
+    var fixed = mockText("abcdefghijklmnopqrstuvwxyz")?.withChunk(4);
+    var sizes = Vector<u8>.create();
+    let n = net(await readAllSizes(mut fixed, mut sizes))?;
+    Check.isTrue(n == 26 && sameBytes(sizes.view(), "4444442".bytes()), "fixed chunk 4 of 26: 4444442")?;
+    return Ok();
+}
+
+@test
+async fn mock_seeded_splits() -> Result<void, TestFailure> {
+    let text = "abcdefghijklmnopqrstuvwxyz";
+    var a = mockText(text)?.withSeededSplits(42, 5);
+    var b = mockText(text)?.withSeededSplits(42, 5);
+    var sa = Vector<u8>.create();
+    var sb = Vector<u8>.create();
+    let na = net(await readAllSizes(mut a, mut sa))?;
+    let nb = net(await readAllSizes(mut b, mut sb))?;
+    var inRange = true;
+    for (s in sa) {
+        inRange = inRange && s >= 49 && s <= 53;
+    }
+    Check.isTrue(na == 26 && nb == 26 && sameBytes(sa.view(), sb.view()), "seeded splits are reproducible")?;
+    Check.isTrue(inRange && sa.length >= 6, "seeded splits stay within 1..5")?;
+    return Ok();
+}
+
+@test
+async fn mock_whole_reads() -> Result<void, TestFailure> {
+    var whole = mockText("abcdefghijklmnopqrstuvwxyz")?;
+    var sw = Vector<u8>.create();
+    let nw = net(await readAllSizes(mut whole, mut sw))?;
+    Check.isTrue(nw == 26 && sameBytes(sw.view(), "60".bytes()), "whole reads fill the buffer: 16 then 10")?;
+    return Ok();
+}
+
+@test
+async fn mock_reset_and_empty_buffer() -> Result<void, TestFailure> {
+    var buf = [0u8; 16];
+    var r = mockText("0123456789")?.withResetAt(6);
+    let first = net(await r.read(mut buf[..]))?;
+    let second = await r.read(mut buf[..]);
+    Check.isTrue(first == 6 && match (second) {
+        Err(NetError.Reset) => true,
+        _ => false,
+    }, "reset at 6: 6 bytes, then Reset")?;
+
+    var e = mockText("x")?;
+    Check.isTrue(match (await e.read(mut buf[0..0])) {
+        Err(NetError.LimitExceeded) => true,
+        _ => false,
+    }, "empty buffer is LimitExceeded")?;
+    return Ok();
+}
+
+@test
+async fn mock_hang_until_deadline() -> Result<void, TestFailure> {
+    var buf = [0u8; 16];
+    var h = mockText("")?.withHang();
+    let raced: Result<Raced<usize>, NetError> =
+        await Async.race(
+            async () => await h.read(mut buf[..]),
+            async () => await deadlineElapsed<usize>(Deadline.after(10)),
+        );
+    Check.isTrue(match (raced) {
+        Err(NetError.TimedOut) => true,
+        _ => false,
+    }, "hang until deadline")?;
+    return Ok();
+}
+
+@test
+async fn mock_write_failure_and_step() -> Result<void, TestFailure> {
+    var w = mockText("")?.withWriteFailureAfter(3);
+    let wrote = await w.write("abcdef".bytes());
+    let after = await w.write("z".bytes());
+    Check.isTrue(sameBytes(w.written(), "abc".bytes()) && match (wrote) {
+        Err(NetError.Reset) => true,
+        _ => false,
+    } && match (after) {
+        Err(NetError.Closed) => true,
+        _ => false,
+    } && w.isPoisoned(), "write failure after 3 bytes: Reset, then Closed")?;
+
+    var v = mockText("")?.withWriteStep(2);
+    let hello = "hello";
+    let world = " world";
+    let parts = match (IoParts.of(hello.bytes()).then(world.bytes())) {
+        Some(p) => p,
+        null => { return Check.fail("two parts fit in IoParts"); },
+    };
+    let step = net(await v.writeVectored(parts))?;
+    netDone(await Transports.writeAllVectored(mut v, parts))?;
+    Check.isTrue(step == 2 && sameBytes(v.written(), "hehello world".bytes()), "write step 2, then writeAllVectored")?;
+    return Ok();
+}
+
+@test
+async fn mock_shutdown_closes_writes() -> Result<void, TestFailure> {
+    var s = mockText("")?;
+    netDone(await s.shutdownWrite())?;
+    Check.isTrue(s.isShutdown() && match (await s.write("x".bytes())) {
+        Err(NetError.Closed) => true,
+        _ => false,
+    }, "shutdown, then write is Closed")?;
+    return Ok();
+}
+
+@test
+async fn mock_cancelled_paused_write_poisons() -> Result<void, TestFailure> {
+    // A write paused for 50 ms, bounded by a 5 ms deadline: TimedOut wins, and the cancelled write poisons.
+    var w = mockText("")?.withPause(50);
+    let raced: Result<Raced<u32>, NetError> = await Async.race(
+        async () => {
+            await w.write("never".bytes())?;
+            return Ok(1u32);
+        },
+        async () => await deadlineElapsed<u32>(Deadline.after(5)),
+    );
+    Check.isTrue(w.isPoisoned() && w.written().length == 0 && match (raced) {
+        Err(NetError.TimedOut) => true,
+        _ => false,
+    }, "cancelled paused write poisons")?;
+    return Ok();
+}
+
+@test
+async fn mock_cancelled_paused_read_loses_nothing() -> Result<void, TestFailure> {
+    // A paused read cancelled the same way loses nothing: the next read gets the bytes.
+    var r = mockText("data")?.withPause(50);
+    var buf = [0u8; 8];
+    let lost: Result<Raced<usize>, NetError> =
+        await Async.race(
+            async () => await r.read(mut buf[..]),
+            async () => await deadlineElapsed<usize>(Deadline.after(5)),
+        );
+    let again = net(await r.read(mut buf[..]))?;
+    Check.isTrue(again == 4 && r.consumed() == 4 && match (lost) {
+        Err(NetError.TimedOut) => true,
+        _ => false,
+    }, "cancelled paused read loses nothing")?;
+    return Ok();
+}
+
+@test
+fn mock_alpn() -> Result<void, TestFailure> {
+    let a = mockText("")?.withAlpn(Alpn.Http2);
+    Check.isTrue(match (a.alpn()) {
+        Alpn.Http2 => true,
+        _ => false,
+    }, "alpn")?;
+    return Ok();
+}

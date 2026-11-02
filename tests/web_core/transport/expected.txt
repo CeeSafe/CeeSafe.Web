@@ -1,6 +1,0 @@
-reads at every fragment size reassemble ok
-writeAllVectored at every step size ok
-a step writing nothing is Closed ok
-IoParts slots ok
-closeGracefully: peer ends, or deadline ok
-Box<dyn Transport> ok

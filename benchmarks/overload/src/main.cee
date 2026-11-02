@@ -1,0 +1,151 @@
+// The server of M1's overload gate (implementation plan §7, M1; Web ADR 0005 §2.4), driven by run.py. A
+// ConnectionServer on 127.0.0.1 with CW_WORKERS workers and a listen backlog of CW_BACKLOG (0: the system's largest).
+// Each connection sends up to 64 bytes and ends its side; the handler holds it CW_HOLD_MS (the work of a request),
+// echoes the bytes, and records two times: service, from the request read to the echo written (the server's own
+// latency for an admitted connection), and connection, from accept to the echo written (which includes waiting for
+// the client to send). A request "STOP" starts the drain. At the end it prints one line: `report accepted=… served=…
+// failed=… handshakes_failed=… accept_errors=… service_max_ms=… service_sum_ms=… connection_max_ms=…`.
+import web_core;
+import web_transport;
+
+/// An unsigned decimal environment variable, or `otherwise` if unset or not a number.
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    let bytes = text.bytes();
+    if (bytes.length == 0 || bytes.length > 18) {
+        return otherwise;
+    }
+    var value: u64 = 0;
+    for (b in bytes) {
+        if (b < 48 || b > 57) {
+            return otherwise;
+        }
+        value = value * 10 + (b - 48) as u64;
+    }
+    return value;
+}
+
+/// Holds each request, echoes it, and records service times.
+struct Work {
+    holdMs: u64;
+    served: AtomicU64;
+    serviceMax: AtomicU64;
+    serviceSum: AtomicU64;
+    connectionMax: AtomicU64;
+}
+
+/// Raises `max` to `value` if it is larger.
+fn raise(max: borrow AtomicU64, value: u64) {
+    loop {
+        let seen = max.load();
+        if (value <= seen) {
+            return;
+        }
+        match (max.compareExchange(seen, value)) {
+            Ok(_) => { return; }
+            Err(_) => {}
+        }
+    }
+}
+
+impl ConnectionHandler for Work {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        var buf = [0u8; 64];
+        var got: usize = 0;
+        while (got < buf.length) {
+            let n = await Transports.readWithin(conn, mut buf[got..], Deadline.after(10000))?;
+            if (n == 0) {
+                break;
+            }
+            got += n;
+        }
+        if (got == 4 && buf[0] == 83 && buf[1] == 84 && buf[2] == 79 && buf[3] == 80) { // "STOP"
+            ctx.drain().start();
+            return Ok();
+        }
+        let read = Timer.now();
+        if (this.holdMs > 0) {
+            match (await Timer.sleep(this.holdMs)) {
+                Ok() => {}
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+        }
+        await Transports.writeWithin(conn, buf[0..got], Deadline.after(10000))?;
+        let now = Timer.now();
+        let took = if (now >= read) now - read else 0;
+        let n = this.served.fetchAdd(1);
+        let total = this.serviceSum.fetchAdd(took);
+        raise(this.serviceMax, took);
+        raise(this.connectionMax, ctx.ageMs());
+        return Ok();
+    }
+}
+
+async fn say(w: borrow TextWriter) -> Result<void, NetError> {
+    match (await AsyncConsole.writeLine(StringView.fromUtf8(w.written())!)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn serve() -> Result<void, NetError> {
+    let port = setting("CW_PORT", 7008);
+    let options = ListenOptions {
+        backlog: truncate<u32>(setting("CW_BACKLOG", 0)),
+        reuseAddress: true,
+        reusePort: false,
+        v6Only: false,
+    };
+    let listener = Listener.bindWith(SocketAddresses.v4Loopback(truncate<u16>(port)), options)?;
+    var limits = ConnectionLimits.defaults();
+    limits.workers = truncate<u32>(setting("CW_WORKERS", 64));
+    let work = Work {
+        holdMs: setting("CW_HOLD_MS", 20),
+        served: AtomicU64.create(0),
+        serviceMax: AtomicU64.create(0),
+        serviceSum: AtomicU64.create(0),
+        connectionMax: AtomicU64.create(0),
+    };
+    let drain = Drain.create()?;
+    let acceptor = PlainAcceptor {};
+    var text = [0u8; 256];
+    var w = TextWriter.create(mut text[..]);
+    w.text("ready port=");
+    w.decimal(port);
+    await say(w)?;
+    let r = await ConnectionServer.run(listener, acceptor, work, limits, drain)?;
+    var line = [0u8; 256];
+    var o = TextWriter.create(mut line[..]);
+    o.text("report accepted=");
+    o.decimal(r.accepted);
+    o.text(" served=");
+    o.decimal(r.served);
+    o.text(" failed=");
+    o.decimal(r.failed);
+    o.text(" handshakes_failed=");
+    o.decimal(r.handshakesFailed);
+    o.text(" accept_errors=");
+    o.decimal(r.acceptErrors);
+    o.text(" service_max_ms=");
+    o.decimal(work.serviceMax.load());
+    o.text(" service_sum_ms=");
+    o.decimal(work.serviceSum.load());
+    o.text(" connection_max_ms=");
+    o.decimal(work.connectionMax.load());
+    await say(o)?;
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(serve())) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

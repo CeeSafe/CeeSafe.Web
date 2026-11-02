@@ -1,0 +1,40 @@
+// Helpers shared by web_core's tests (CeeSafe ADR 0049): turning the package's errors into a TestFailure, so a test
+// can `?` an operation that fails with NetError or AllocError.
+
+/// `r`, with a NetError turned into a failure that describes it.
+fn net<T>(r: Result<T, NetError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(borrow e))); }
+    }
+}
+
+/// The same for an operation that gives no value: `net` cannot be instantiated with `void` (N0222, its `Ok(v)`).
+fn netVoid(r: Result<void, NetError>) -> Result<void, TestFailure> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(borrow e))); }
+    }
+}
+
+/// `r`, with an AllocError turned into an out-of-memory failure.
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+/// Sleeps `ms`, with the timer's error as a NetError.
+async fn sleepMs(ms: u64) -> Result<void, NetError> {
+    match (await Timer.sleep(ms)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+/// An operation that takes `ms` and then gives `v`.
+async fn work(ms: u64, v: u32) -> Result<u32, NetError> {
+    await sleepMs(ms)?;
+    return Ok(v);
+}

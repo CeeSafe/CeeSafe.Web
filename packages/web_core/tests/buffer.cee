@@ -1,0 +1,105 @@
+// OwnedBuffer and BufferPool (Web ADR 0001 §3.1): the readable window, limits, compaction, recycling by move.
+// Ported from tests/web_core/buffer to `ceesafec test` (CeeSafe ADR 0049).
+
+/// `r` failed with LimitExceeded.
+fn bufferLimit(r: Result<void, NetError>) -> bool => match (r) {
+    Err(NetError.LimitExceeded) => true,
+    _ => false,
+};
+
+/// `r` succeeded.
+fn bufferOk(r: Result<void, NetError>) -> bool => match (r) {
+    Ok() => true,
+    Err(_) => false,
+};
+
+@test
+fn owned_buffer_window() -> Result<void, TestFailure> {
+    var b = alloc(OwnedBuffer.create(8))?;
+    // "new: capacity 8, empty, 8 spare"
+    Check.equalU64(8, b.capacity() as u64)?;
+    Check.isTrue(b.isEmpty(), "new: capacity 8, empty, 8 spare")?;
+    Check.equalU64(8, b.spareLength() as u64)?;
+
+    // A read of 5 bytes into spare(), then commit.
+    let spare = b.spare();
+    let src = "hello".bytes();
+    for (i in 0..src.length) {
+        spare[i] = src[i];
+    }
+    Check.isTrue(bufferOk(b.commit(5)), "commit 5")?;
+    // "readable is hello"
+    Check.equalBytes("hello".bytes(), b.readable())?;
+    Check.equalU64(5, b.length() as u64)?;
+    Check.equalU64(3, b.spareLength() as u64)?;
+    Check.isTrue(bufferLimit(b.commit(4)), "commit past capacity refused")?;
+    // "refused commit changed nothing"
+    Check.equalU64(5, b.length() as u64)?;
+
+    Check.isTrue(bufferOk(b.consume(2)), "consume 2")?;
+    // "readable is llo"
+    Check.equalBytes("llo".bytes(), b.readable())?;
+    Check.isTrue(bufferLimit(b.consume(4)), "consume past readable refused")?;
+
+    // 3 spare at the end; appending 4 needs the 2 consumed bytes: compaction makes room.
+    Check.isTrue(bufferOk(b.append("!!!?".bytes())), "append 4 compacts")?;
+    // "readable is llo!!!?"
+    Check.equalBytes("llo!!!?".bytes(), b.readable())?;
+    Check.equalU64(1, b.spareLength() as u64)?;
+    Check.isTrue(bufferLimit(b.append("ab".bytes())), "append past capacity refused")?;
+    // "refused append changed nothing"
+    Check.equalBytes("llo!!!?".bytes(), b.readable())?;
+
+    Check.isTrue(bufferOk(b.consume(7)) && b.isEmpty(), "consume all resets window")?;
+    Check.equalU64(8, b.spareLength() as u64)?;
+    Check.isTrue(bufferOk(b.append("12345678".bytes())), "append exactly capacity")?;
+    Check.equalU64(0, b.spareLength() as u64)?;
+    b.clear();
+    Check.isTrue(b.isEmpty(), "clear")?;
+    Check.equalU64(8, b.spareLength() as u64)?;
+    return Ok();
+}
+
+@test
+fn owned_buffer_zero_capacity() -> Result<void, TestFailure> {
+    var z = alloc(OwnedBuffer.create(0))?;
+    // "zero capacity"
+    Check.equalU64(0, z.capacity() as u64)?;
+    Check.equalU64(0, z.spareLength() as u64)?;
+    Check.isTrue(bufferLimit(z.append("x".bytes())), "zero capacity")?;
+    Check.isTrue(bufferOk(z.append("".bytes())), "empty append on zero capacity")?;
+    return Ok();
+}
+
+@test
+fn buffer_pool_recycles() -> Result<void, TestFailure> {
+    var p = BufferPool.create(16, 2);
+    // "pool starts idle 0"
+    Check.equalU64(0, p.idle() as u64)?;
+    Check.equalU64(16, p.bufferSize() as u64)?;
+    var a = alloc(p.take())?;
+    let b = alloc(p.take())?;
+    let c = alloc(p.take())?;
+    // "taken buffers have the pool's size"
+    Check.equalU64(16, a.capacity() as u64)?;
+    Check.equalU64(16, b.capacity() as u64)?;
+    Check.equalU64(16, c.capacity() as u64)?;
+    Check.isTrue(bufferOk(a.append("data".bytes())), "append before give")?;
+    p.give(a);
+    // "given back"
+    Check.equalU64(1, p.idle() as u64)?;
+    var again = alloc(p.take())?;
+    Check.isTrue(again.isEmpty(), "recycled buffer is empty")?;
+    Check.equalU64(16, again.capacity() as u64)?;
+    Check.equalU64(0, p.idle() as u64)?;
+    p.give(again);
+    p.give(b);
+    p.give(c);
+    // "maxIdle keeps 2"
+    Check.equalU64(2, p.idle() as u64)?;
+    let other = alloc(OwnedBuffer.create(32))?;
+    p.give(other);
+    // "other size freed, not kept"
+    Check.equalU64(2, p.idle() as u64)?;
+    return Ok();
+}

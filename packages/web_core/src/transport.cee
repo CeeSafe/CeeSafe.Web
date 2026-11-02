@@ -92,22 +92,13 @@ public struct Transports {
         bytes: Slice<u8>,
         deadline: Deadline,
     ) -> Result<void, NetError> {
+        if (deadline.isNever()) {
+            return await t.write(bytes);
+        }
         if (deadline.isExpired()) {
             return Err(NetError.TimedOut);
         }
-        // A race, not `Async.deadline`, while a body of `Result<void, E>` crashes ceesafec 0.7.0 (bug B6,
-        // tests/probes/async-deadline-void-bug.cee); so is closeGracefully's.
-        let r: Result<Raced<u32>, NetError> = await Async.race(
-            async () => {
-                await t.write(bytes)?;
-                return Ok(0u32);
-            },
-            async () => await deadlineElapsed<u32>(deadline),
-        );
-        match (r) {
-            Ok(_) => { return Ok(); }
-            Err(e) => { return Err(e); }
-        }
+        return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await t.write(bytes));
     }
 
     /// Closes gracefully: ends writing, then reads (into `scratch`, discarding) until the peer ends its side or
@@ -119,20 +110,16 @@ public struct Transports {
         deadline: Deadline,
     ) -> Result<void, NetError> {
         await t.shutdownWrite()?;
-        let r: Result<Raced<u32>, NetError> = await Async.race(
-            async () => {
-                loop {
-                    let n = await t.read(scratch)?;
-                    if (n == 0) {
-                        return Ok(0u32);
-                    }
-                }
-            },
-            async () => await deadlineElapsed<u32>(deadline),
-        );
-        match (r) {
-            Ok(_) => { return Ok(); }
-            Err(e) => { return Err(e); }
+        if (deadline.isExpired()) {
+            return Err(NetError.TimedOut);
         }
+        return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => {
+            loop {
+                let n = await t.read(scratch)?;
+                if (n == 0) {
+                    return Ok();
+                }
+            }
+        });
     }
 }

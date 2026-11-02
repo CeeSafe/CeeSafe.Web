@@ -1,0 +1,72 @@
+// NetErrors (Web ADR 0001 §3.2): conversions from AsyncError, IoError and AllocError, and descriptions.
+// Ported from tests/web_core/errors to `ceesafec test` (CeeSafe ADR 0049).
+
+@test
+fn errors_from_async() -> Result<void, TestFailure> {
+    Check.isTrue(match (NetErrors.fromAsync(AsyncError.Cancelled)) {
+        NetError.Cancelled => true,
+        _ => false,
+    }, "cancelled")?;
+    Check.isTrue(match (NetErrors.fromAsync(AsyncError.TimedOut)) {
+        NetError.TimedOut => true,
+        _ => false,
+    }, "timed out")?;
+    Check.isTrue(match (NetErrors.fromAsync(AsyncError.Io(IoError.BrokenPipe))) {
+        NetError.Closed => true,
+        _ => false,
+    }, "broken pipe is closed")?;
+    Check.isTrue(match (NetErrors.fromAsync(AsyncError.Io(IoError.ConnectionAborted))) {
+        NetError.Reset => true,
+        _ => false,
+    }, "aborted is Reset")?;
+    return Ok();
+}
+
+@test
+fn errors_from_io() -> Result<void, TestFailure> {
+    Check.isTrue(match (NetErrors.fromIo(IoError.OutOfMemory)) {
+        NetError.OutOfMemory => true,
+        _ => false,
+    }, "io out of memory")?;
+    Check.isTrue(match (NetErrors.fromIo(IoError.ConnectionReset)) {
+        NetError.Reset => true,
+        _ => false,
+    }, "reset is Reset")?;
+    Check.isTrue(match (NetErrors.fromIo(IoError.TimedOut)) {
+        NetError.TimedOut => true,
+        _ => false,
+    }, "kernel timeout is TimedOut")?;
+    Check.isTrue(match (NetErrors.fromIo(IoError.NotConnected)) {
+        NetError.Io(IoError.NotConnected) => true,
+        _ => false,
+    }, "not connected stays io")?;
+    Check.isTrue(match (NetErrors.fromIo(IoError.ConnectionRefused)) {
+        NetError.Io(IoError.ConnectionRefused) => true,
+        _ => false,
+    }, "refused stays io")?;
+    Check.isTrue(match (NetErrors.fromIo(IoError.Other(5))) {
+        NetError.Io(IoError.Other(5)) => true,
+        _ => false,
+    }, "other errno kept")?;
+    return Ok();
+}
+
+@test
+fn errors_from_alloc() -> Result<void, TestFailure> {
+    Check.isTrue(match (NetErrors.fromAlloc(AllocError.OutOfMemory)) {
+        NetError.OutOfMemory => true,
+        _ => false,
+    }, "alloc")?;
+    return Ok();
+}
+
+@test
+fn errors_describe() -> Result<void, TestFailure> {
+    // "describe reset"
+    Check.equalText("connection reset by peer", NetErrors.describe(NetError.Reset))?;
+    // "describe tls"
+    Check.equalText("TLS certificate rejected", NetErrors.describe(NetError.Tls(TlsReason.Certificate)))?;
+    // "describe io uses the platform text"
+    Check.equalText(IoError.ConnectionRefused.message(), NetErrors.describe(NetError.Io(IoError.ConnectionRefused)))?;
+    return Ok();
+}

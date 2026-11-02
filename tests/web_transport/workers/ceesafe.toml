@@ -1,8 +1,0 @@
-[package]
-name = "test_transport_workers"
-version = "0.1.0"
-kind = "executable"
-
-[dependencies]
-web_core = { path = "../../../packages/web_core" }
-web_transport = { path = "../../../packages/web_transport" }

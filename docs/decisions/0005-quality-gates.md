@@ -117,3 +117,26 @@ A release (plan §7) is blocked by any of the following:
    nightly.**
 2. Should the benchmark regression gate be 5 %, or looser until v1.0? Recommended: 5 %, on a dedicated machine.
    **5 %, on a dedicated machine.**
+
+## 5. Amendment 1 (2026-11-02, ceesafec 0.8.0's `ceesafec test`)
+
+CeeSafe ADR 0049 (released in 0.8.0) gives packages a test command. It replaces §2.1.3's runner. The gates are
+unchanged:
+
+1. **Tests are `@test` functions in `packages/<name>/tests/*.cee`**, part of their package, so they also reach its
+   private items. They replace the executable packages under `tests/<kind>/<name>/` and their `expected.txt`. A check
+   is a `Check` call: `Check.equalU64(expected, actual)` or `Check.isTrue(condition, "what")`. Its expected value is
+   still written by hand from the test's own reasoning or an outside oracle (§2.2). `tests/probes/` stays as it is.
+2. **`ceesafec test` runs each test as its own process.** With `CEESAFE_ALLOC_REPORT` on, a leak fails the test, and
+   so does a test that runs past `--timeout`. `tools/run_tests.py` runs it in every package that has tests: natively
+   and in the interpreter (§2.1.3's two runs; each must pass, as there is no output to compare). Its other modes:
+   - `--sanitize`: `--cflag -fsanitize=address,undefined` (§2.1.4);
+   - `--alloc-sweep` and `--cancel-sweep`: `ceesafec test --sweep alloc|cancel`, each test on its own (§2.2).
+
+   The interpreter skips a test that calls C, which replaces the native-only marker.
+3. **Descriptors back to the baseline** (§2.1.5): a test that opens sockets counts `/dev/fd` before and after its
+   `Async.run` (`descriptorsBackTo`, `packages/web_transport/tests/support.cee`). The harness has no per-test hook for
+   this.
+4. **No more `native-xfail` or `native-env` markers.** They were for CeeSafe bugs B2 and B4, both fixed in 0.7.0. A
+   CeeSafe bug that breaks a test keeps the test failing on a branch until a release fixes it (Web ADR 0006).
+5. §3's M0 deliverable is now CeeSafe's (T1, T2).

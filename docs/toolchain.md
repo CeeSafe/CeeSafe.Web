@@ -10,10 +10,10 @@ that needs an unreleased compiler is not merged to main.
 | Milestone | Minimum | Needs | Status |
 |---|---|---|---|
 | M0 contracts, engines, MockTransport | **0.5.1** | async interfaces, `dyn` async methods (ADR 0036), regions, completion I/O (ADR 0035) | released |
-| M1 transport lifecycle | **0.7.0** | B2 fixed; U1 addresses, IPv6, options and U2 error kinds (ADR 0044); U3 `IoParts` (ADR 0045); U4 `Async.deadline` (ADR 0046); B4 fixed; T1 for the cancel sweep. B5 for the overload gate | merged to main (`docs/milestones/M1.md`) |
-| M2 HTTP/1.1 fast path | 0.7.0 | U3 vectored send | released |
-| M4 TLS | 0.7.x | U8 manifest `links` (OpenSSL) | upstream, not started |
-| M5 client | 0.7.x | U5 DNS | upstream, not started |
+| M1 transport lifecycle | **0.8.0** | 0.7.0's B2/B4 fixes, U1–U4 (ADRs 0044–0046); 0.8.0's B5 fix (overload gate), B6 fix (`void` deadlines) and `ceesafec test` (ADR 0049, the tests) | on main (`docs/milestones/M1.md`) |
+| M2 HTTP/1.1 fast path | 0.8.0 | U3 vectored send | released |
+| M4 TLS | 0.8.0 | U8 manifest `links` (OpenSSL, ADR 0047) | released |
+| M5 client | 0.8.0 | U5 DNS (ADR 0048) | released |
 | M9 sendfile | later | U7 | upstream, not started |
 | M10 HTTP/3 | later | U6 UDP | upstream, not started |
 
@@ -21,8 +21,7 @@ that needs an unreleased compiler is not merged to main.
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.7.0** (release, tag `v0.7.0` = CeeSafe `b2bef17`) | the toolchain for main |
-| `~/dev/CeeSafe/tools/cancel_sweep.py` | same as at `v0.7.0` | `tools/run_tests.py --cancel-sweep` (the release does not install it) |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.8.0** (release, tag `v0.8.0` = CeeSafe `2c32172`) | the toolchain for main; `ceesafec test` runs the tests and both sweeps |
 
 0.7.0 breaks source in two ways that touched CeeSafe.Web: lib/std's new `IoParts` collided with `web_core`'s (Web ADR
 0001 amendment 3.1), and `IoError` gained eight variants (a `match` without `_` stops compiling; `web_core`'s have

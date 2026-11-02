@@ -87,6 +87,8 @@ per layer. The section above, between the `CEESAFE` markers, is written by `cees
 python3 tools/check_layers.py                          # the dependency layering
 (cd packages/<name> && ceesafec fetch && ceesafec check)   # one package; fetch after changing dependencies
 (cd packages/<name> && ceesafec fmt --check)
+(cd packages/<name> && ceesafec test)                    # its @test functions (packages/<name>/tests/, CeeSafe ADR 0049)
+python3 tools/run_tests.py [--sanitize --alloc-sweep --cancel-sweep]   # every package's tests, every mode
 ```
 
 ## Layout
@@ -95,5 +97,7 @@ python3 tools/check_layers.py                          # the dependency layering
 packages/       one CeeSafe library package per layer (web_core … web_proxy)
 docs/           implementation plan, ADRs (decisions/), toolchain, upstream work
 tools/          check_layers.py; later the test runner and sweeps
-tests/ examples/ benchmarks/ third_party/   (from M0's later tasks on)
+packages/<name>/tests/   the package's @test functions (`ceesafec test`)
+tests/probes/   design probes and CeeSafe bug repros
+examples/ benchmarks/ third_party/
 ```

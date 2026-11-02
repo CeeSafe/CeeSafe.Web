@@ -1,0 +1,29 @@
+// ConnectionContext (Web ADR 0001 §3.6): identity, age and the server's drain.
+// Ported from tests/web_core/context to `ceesafec test` (CeeSafe ADR 0049).
+
+@test
+async fn context_identity_and_age() -> Result<void, TestFailure> {
+    let drain = net(Drain.create())?;
+    let c = ConnectionContext.acceptedNow(42, drain);
+    // "id"
+    Check.equalU64(42, c.id())?;
+    Check.isTrue(c.acceptedAtMs() <= Timer.now() && c.ageMs() < 1000, "accepted now")?;
+    netVoid(await sleepMs(15))?;
+    Check.isTrue(c.ageMs() >= 15, "age grows")?;
+    let future = ConnectionContext.create(7, Timer.now() + 100000, drain);
+    // "a future acceptance has age 0"
+    Check.equalU64(0, future.ageMs())?;
+    Check.equalU64(7, future.id())?;
+    return Ok();
+}
+
+@test
+fn context_sees_the_drain() -> Result<void, TestFailure> {
+    let drain = net(Drain.create())?;
+    let c = ConnectionContext.acceptedNow(42, drain);
+    let future = ConnectionContext.create(7, Timer.now() + 100000, drain);
+    Check.isTrue(!c.isDraining() && !c.drain().isDraining(), "not draining")?;
+    drain.start();
+    Check.isTrue(c.isDraining() && future.isDraining(), "sees the drain")?;
+    return Ok();
+}

@@ -1,0 +1,499 @@
+// ConnectionServer over MockIncoming (implementation plan M1): admission by workers, a failure at every step ending
+// only its connection, the handshake deadline, and drain: idle workers stop at once, connections in flight finish
+// within the grace period, and a connection that ignores the drain is cancelled when the grace runs out. Then over
+// real TCP: an echo through 4 workers, and a real RST; each TCP test checks that the process's descriptors are back to
+// their count at its start. Ported from tests/web_transport/server.
+import web_core;
+
+/// The input of every echo connection.
+fn alphabet() -> [u8; 26] => [
+    0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D,
+    0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A,
+];
+
+/// Echoes until the peer ends its side, each read and write bounded; counts the bytes and the connections whose
+/// echo matched the alphabet, and the highest number of connections served at once.
+struct EchoHandler {
+    bytes: AtomicU64;
+    matched: AtomicU64;
+    active: AtomicU64;
+    peak: AtomicU64;
+    /// Connections whose context had a loopback peer address.
+    loopbackPeers: AtomicU64;
+    /// The local port of the last connection with a local address.
+    localPort: AtomicU64;
+}
+
+impl ConnectionHandler for EchoHandler {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        match (ctx.peerAddress()) {
+            Some(a) => {
+                if (a.isLoopback()) {
+                    let n = this.loopbackPeers.fetchAdd(1);
+                }
+            }
+            null => {}
+        }
+        match (ctx.localAddress()) {
+            Some(a) => { this.localPort.store(a.port() as u64); }
+            null => {}
+        }
+        let now = this.active.fetchAdd(1) + 1;
+        loop {
+            let seen = this.peak.load();
+            if (now <= seen) {
+                break;
+            }
+            match (this.peak.compareExchange(seen, now)) {
+                Ok(_) => { break; }
+                Err(_) => {}
+            }
+        }
+        let r = await echoInto(this, conn);
+        let left = this.active.fetchSub(1);
+        return r;
+    }
+}
+
+async fn echoInto(h: borrow EchoHandler, conn: borrow mut dyn Transport) -> Result<void, NetError> {
+    var buf = [0u8; 8];
+    var got: usize = 0;
+    var same = true;
+    let m = alphabet();
+    loop {
+        let n = await Transports.readWithin(conn, mut buf[..], Deadline.after(1000))?;
+        if (n == 0) {
+            break;
+        }
+        for (i in 0..n) {
+            if (got + i >= m.length || buf[i] != m[got + i]) {
+                same = false;
+            }
+        }
+        got += n;
+        let added = h.bytes.fetchAdd(n as u64);
+        await nap(1)?; // lets other workers run, so connections overlap
+        await Transports.writeWithin(conn, buf[0..n], Deadline.after(1000))?;
+    }
+    if (same && got == m.length) {
+        let k = h.matched.fetchAdd(1);
+    }
+    return Ok();
+}
+
+fn echoHandler() -> EchoHandler => EchoHandler {
+    bytes: AtomicU64.create(0),
+    matched: AtomicU64.create(0),
+    active: AtomicU64.create(0),
+    peak: AtomicU64.create(0),
+    loopbackPeers: AtomicU64.create(0),
+    localPort: AtomicU64.create(0),
+};
+
+/// Reads once and records whether the read failed with `Reset`; `reading` is set first, so a client knows when to
+/// reset the connection.
+struct ResetHandler {
+    reading: AtomicBool;
+    resets: AtomicU64;
+}
+
+impl ConnectionHandler for ResetHandler {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        var buf = [0u8; 8];
+        this.reading.store(true);
+        let r = await Transports.readWithin(conn, mut buf[..], Deadline.after(2000));
+        match (r) {
+            Err(NetError.Reset) => {
+                let n = this.resets.fetchAdd(1);
+            }
+            _ => {}
+        }
+        let done = r?;
+        return Ok();
+    }
+}
+
+/// Works for `ms` milliseconds (a request in flight), whatever the drain, then returns.
+struct SlowHandler {
+    ms: u64;
+}
+
+impl ConnectionHandler for SlowHandler {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        await nap(this.ms)?;
+        return Ok();
+    }
+}
+
+/// An idle keep-alive connection that honours the drain: it waits for a request that never comes, and returns when
+/// the drain starts.
+struct IdleHandler {}
+
+impl ConnectionHandler for IdleHandler {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        var buf = [0u8; 8];
+        let r: Result<Raced<usize>, NetError> = await Async.race(
+            async () => await conn.read(mut buf[..]),
+            async () => await drainStarted<usize>(ctx.drain()),
+        );
+        match (r) {
+            Ok(_) => { return Ok(); }
+            Err(NetError.Cancelled) => {
+                if (ctx.isDraining()) {
+                    return Ok(); // drained between requests: close gracefully
+                }
+                return Err(NetError.Cancelled);
+            }
+            Err(e) => { return Err(e); }
+        }
+    }
+}
+
+/// A connection that ignores the drain: it reads a peer that never sends.
+struct StubbornHandler {}
+
+impl ConnectionHandler for StubbornHandler {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        var buf = [0u8; 8];
+        let n = await conn.read(mut buf[..])?;
+        return Ok();
+    }
+}
+
+/// An acceptor whose handshake never finishes: it honours its deadline.
+struct StalledAcceptor {}
+
+impl Acceptor for StalledAcceptor {
+    async fn accept(borrow this, stream: PlainStream, deadline: Deadline) -> Result<Box<dyn Transport>, NetError> {
+        return await deadlineElapsed<Box<dyn Transport>>(deadline);
+    }
+}
+
+fn serverLimits(workers: u32, graceMs: u64) -> ConnectionLimits {
+    var l = ConnectionLimits.defaults();
+    l.workers = workers;
+    l.graceMs = graceMs;
+    l.closeLingerMs = 100;
+    l.handshakeMs = 20;
+    return l;
+}
+
+/// Runs the server until `incoming` ends (`drainAfterMs` 0) or until a drain started after `drainAfterMs`.
+async fn serveUntil(
+    incoming: borrow MockIncoming,
+    acceptor: borrow dyn Acceptor,
+    handler: borrow dyn ConnectionHandler,
+    l: borrow ConnectionLimits,
+    drainAfterMs: u64,
+    report: borrow mut ServerReport,
+) -> Result<void, NetError> {
+    let drain = Drain.create()?;
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            report = await ConnectionServer.run(incoming, acceptor, handler, l, drain)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            if (drainAfterMs > 0) {
+                await nap(drainAfterMs)?;
+                drain.start();
+            }
+            return Ok();
+        });
+    })?;
+    return Ok();
+}
+
+fn emptyReport() -> ServerReport => ServerReport {
+    accepted: 0,
+    handshakesFailed: 0,
+    served: 0,
+    failed: 0,
+    acceptErrors: 0,
+    forced: false,
+};
+
+/// A TCP client: sends the alphabet, ends its side, and checks the echo.
+async fn echoClient(port: u16) -> Result<bool, NetError> {
+    var c = await TcpTransport.connect("127.0.0.1", port)?;
+    let m = alphabet();
+    await c.write(m[..])?;
+    await c.shutdownWrite()?;
+    var buf = [0u8; 32];
+    var got: usize = 0;
+    loop {
+        let n = await c.read(mut buf[got..])?;
+        if (n == 0) {
+            break;
+        }
+        got += n;
+    }
+    var same = got == m.length;
+    for (i in 0..got) {
+        if (i < m.length && buf[i] != m[i]) {
+            same = false;
+        }
+    }
+    return Ok(same);
+}
+
+@test
+async fn server_serves_every_connection() -> Result<void, TestFailure> {
+    let incoming = net(MockIncoming.create(16))?;
+    let m = alphabet();
+    for (k in 0..12u64) {
+        netDone(incoming.push(net(mockOf(m[..]))?.withSeededSplits(k + 1, 5)))?;
+    }
+    incoming.close();
+    let h = echoHandler();
+    let a = PlainAcceptor {};
+    let l = serverLimits(4, 1000);
+    var r = emptyReport();
+    netDone(await serveUntil(incoming, a, h, l, 0, mut r))?;
+    Check.isTrue(r.accepted == 12 && r.served == 12 && r.failed == 0, "12 connections accepted and served")?;
+    Check.isTrue(h.matched.load() == 12 && h.bytes.load() == 12 * 26, "every echo matched")?;
+    Check.isTrue(h.peak.load() <= 4 && h.peak.load() >= 2, "admission: never more than 4 at once")?;
+    Check.isFalse(r.forced, "not forced")?;
+    return Ok();
+}
+
+@test
+async fn server_failure_at_every_step() -> Result<void, TestFailure> {
+    let m = alphabet();
+    let incoming = net(MockIncoming.create(64))?;
+    for (k in 0..m.length + 1) {
+        netDone(incoming.push(net(mockOf(m[..]))?.withChunk(3).withResetAt(k)))?;
+    }
+    for (k in 0..m.length) {
+        netDone(incoming.push(net(mockOf(m[..]))?.withChunk(3).withWriteFailureAfter(k)))?;
+    }
+    netDone(incoming.push(net(mockOf(m[..]))?))?;
+    incoming.close();
+    let h = echoHandler();
+    let a = PlainAcceptor {};
+    let l = serverLimits(3, 1000);
+    var r = emptyReport();
+    netDone(await serveUntil(incoming, a, h, l, 0, mut r))?;
+    Check.isTrue(r.accepted == 54 && r.failed == 53, "a reset at each of 27 offsets fails its connection only")?;
+    Check.isTrue(r.served == 1 && h.matched.load() == 1, "the server goes on serving")?;
+    return Ok();
+}
+
+@test
+async fn server_handshake_deadline() -> Result<void, TestFailure> {
+    let m = alphabet();
+    let incoming = net(MockIncoming.create(4))?;
+    netDone(incoming.push(net(mockOf(m[..]))?))?;
+    netDone(incoming.push(net(mockOf(m[..]))?))?;
+    incoming.close();
+    let h = echoHandler();
+    let a = StalledAcceptor {};
+    let l = serverLimits(1, 1000);
+    var r = emptyReport();
+    let started = Timer.now();
+    netDone(await serveUntil(incoming, a, h, l, 0, mut r))?;
+    let took = Timer.now() - started;
+    Check.isTrue(r.handshakesFailed == 2 && r.served == 0, "a stalled handshake times out")?;
+    Check.isTrue(took >= 40 && took < 1000, "after the handshake deadline")?;
+    return Ok();
+}
+
+@test
+async fn server_drain_stops_idle_workers() -> Result<void, TestFailure> {
+    let incoming = net(MockIncoming.create(4))?; // never closed: the workers wait in accept
+    let h = echoHandler();
+    let a = PlainAcceptor {};
+    let l = serverLimits(8, 5000);
+    var r = emptyReport();
+    let started = Timer.now();
+    netDone(await serveUntil(incoming, a, h, l, 10, mut r))?;
+    let took = Timer.now() - started;
+    Check.isTrue(took < 1000 && !r.forced && r.accepted == 0, "drain stops 8 idle workers at once")?;
+    return Ok();
+}
+
+@test
+async fn server_drain_lets_in_flight_finish() -> Result<void, TestFailure> {
+    let m = alphabet();
+    let incoming = net(MockIncoming.create(4))?;
+    netDone(incoming.push(net(mockOf(m[..]))?))?;
+    netDone(incoming.push(net(mockOf(m[..]))?))?;
+    let h = SlowHandler { ms: 60 };
+    let a = PlainAcceptor {};
+    let l = serverLimits(4, 5000);
+    var r = emptyReport();
+    let started = Timer.now();
+    netDone(await serveUntil(incoming, a, h, l, 10, mut r))?;
+    let took = Timer.now() - started;
+    Check.isTrue(r.served == 2 && !r.forced, "requests in flight finish during the drain")?;
+    Check.isTrue(took >= 60 && took < 2000, "the drain ends when they do")?;
+    return Ok();
+}
+
+@test
+async fn server_drain_closes_idle_connections() -> Result<void, TestFailure> {
+    let m = alphabet();
+    let incoming = net(MockIncoming.create(4))?;
+    netDone(incoming.push(net(mockOf(m[0..0]))?.withHang()))?;
+    netDone(incoming.push(net(mockOf(m[0..0]))?.withHang()))?;
+    let h = IdleHandler {};
+    let a = PlainAcceptor {};
+    let l = serverLimits(4, 5000);
+    var r = emptyReport();
+    let started = Timer.now();
+    netDone(await serveUntil(incoming, a, h, l, 10, mut r))?;
+    let took = Timer.now() - started;
+    Check.isTrue(r.served == 2 && !r.forced && took < 2000, "idle keep-alive connections close on drain")?;
+    return Ok();
+}
+
+@test
+async fn server_grace_runs_out() -> Result<void, TestFailure> {
+    let m = alphabet();
+    let incoming = net(MockIncoming.create(4))?;
+    netDone(incoming.push(net(mockOf(m[0..0]))?.withHang()))?;
+    netDone(incoming.push(net(mockOf(m[0..0]))?.withHang()))?;
+    let h = StubbornHandler {};
+    let a = PlainAcceptor {};
+    let l = serverLimits(4, 50);
+    var r = emptyReport();
+    let started = Timer.now();
+    netDone(await serveUntil(incoming, a, h, l, 10, mut r))?;
+    let took = Timer.now() - started;
+    Check.isTrue(r.forced && r.served == 0, "connections ignoring the drain are cancelled after the grace")?;
+    Check.isTrue(took >= 60 && took < 1000, "shutdown within drain + grace + epsilon")?;
+    return Ok();
+}
+
+/// 8 TCP clients through 4 workers: the echoes, the report, the drain and each connection's context.
+async fn overTcpChecks() -> Result<void, TestFailure> {
+    let listener = net(Listener.bind("127.0.0.1", 0))?;
+    let port = net(listener.port())?;
+    let drain = net(Drain.create())?;
+    let h = echoHandler();
+    let a = PlainAcceptor {};
+    let l = serverLimits(4, 1000);
+    var r = emptyReport();
+    var good: u32 = 0;
+    var drainedAt: u64 = 0;
+    netDone(await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            r = await ConnectionServer.run(listener, a, h, l, drain)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            var ok = [false; 8];
+            let clients = await Async.scope(NetError.OutOfMemory, (c) => {
+                for (k in 0..ok.length) {
+                    c.spawn(async () => {
+                        ok[k] = await echoClient(port)?;
+                        return Ok();
+                    });
+                }
+            });
+            for (k in 0..ok.length) {
+                if (ok[k]) {
+                    good += 1;
+                }
+            }
+            drainedAt = Timer.now();
+            drain.start(); // whatever the clients did, so the server always stops
+            return clients;
+        });
+    }))?;
+    let stopped = Timer.now() - drainedAt;
+    Check.isTrue(good == 8 && h.matched.load() == 8, "8 TCP clients echoed through 4 workers")?;
+    Check.isTrue(r.accepted == 8 && r.served == 8 && r.failed == 0, "TCP report: 8 accepted, 8 served")?;
+    Check.isTrue(!r.forced && stopped < 500, "the TCP server drains at once when idle")?;
+    Check.isTrue(
+        h.loopbackPeers.load() == 8 && h.localPort.load() == port as u64,
+        "each TCP context has the loopback peer and the listener's port",
+    )?;
+    return Ok();
+}
+
+/// A real RST (SO_LINGER 0, `TcpTransport.abort`) while the handler reads: its read is `Err(Reset)`, the connection
+/// counts as failed, and the server serves on.
+async fn resetOverTcpChecks() -> Result<void, TestFailure> {
+    let listener = net(Listener.bind("127.0.0.1", 0))?;
+    let port = net(listener.port())?;
+    let drain = net(Drain.create())?;
+    let h = ResetHandler { reading: AtomicBool.create(false), resets: AtomicU64.create(0) };
+    let a = PlainAcceptor {};
+    let l = serverLimits(2, 1000);
+    var r = emptyReport();
+    var sawReading = false;
+    netDone(await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            r = await ConnectionServer.run(listener, a, h, l, drain)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            let c = await TcpTransport.connect("127.0.0.1", port)?;
+            for (i in 0..200) {
+                if (h.reading.load()) {
+                    break;
+                }
+                await nap(5)?;
+            }
+            sawReading = h.reading.load();
+            c.abort();
+            for (i in 0..200) {
+                if (h.resets.load() > 0) {
+                    break;
+                }
+                await nap(5)?;
+            }
+            drain.start();
+            return Ok();
+        });
+    }))?;
+    Check.isTrue(sawReading && h.resets.load() == 1, "a peer's RST fails the read with Reset")?;
+    Check.isTrue(r.accepted == 1 && r.failed == 1 && r.served == 0, "the reset connection counts as failed")?;
+    return Ok();
+}
+
+// The TCP tests are sync, so that they can count the process's descriptors (a blocking call, which an async fn may not
+// make) before Async.run and after it, when every socket the run opened has been dropped.
+
+@test
+fn server_over_tcp() -> Result<void, TestFailure> {
+    let before = openDescriptors();
+    match (Async.run(overTcpChecks())) {
+        Ok() => {}
+        Err(failure) => { return Err(failure); }
+    }
+    Check.isTrue(descriptorsBackTo(before), "descriptors back to the baseline")?;
+    return Ok();
+}
+
+@test
+fn server_reset_over_tcp() -> Result<void, TestFailure> {
+    let before = openDescriptors();
+    match (Async.run(resetOverTcpChecks())) {
+        Ok() => {}
+        Err(failure) => { return Err(failure); }
+    }
+    Check.isTrue(descriptorsBackTo(before), "descriptors back to the baseline")?;
+    return Ok();
+}

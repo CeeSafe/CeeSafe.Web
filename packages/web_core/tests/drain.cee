@@ -1,0 +1,67 @@
+// Drain (implementation plan M1 task 4): one start wakes every waiter, a late waiter returns at once, starting twice
+// is harmless, and drainStarted stops the operation it races.
+// Ported from tests/web_core/drain to `ceesafec test` (CeeSafe ADR 0049).
+
+@test
+async fn drain_wakes_every_waiter() -> Result<void, TestFailure> {
+    let drain = net(Drain.create())?;
+    Check.isFalse(drain.isDraining(), "a new drain has not started")?;
+
+    // Six waiters, one start.
+    var woken = [false; 6];
+    netVoid(await Async.scope(NetError.OutOfMemory, (s) => {
+        for (k in 0..woken.length) {
+            s.spawn(async () => {
+                await drain.wait()?;
+                woken[k] = true;
+                return Ok();
+            });
+        }
+        s.spawn(async () => {
+            await sleepMs(10)?;
+            drain.start();
+            return Ok();
+        });
+    }))?;
+    var all = true;
+    for (k in 0..woken.length) {
+        all = all && woken[k];
+    }
+    Check.isTrue(all && drain.isDraining(), "one start wakes all six waiters")?;
+
+    let before = Timer.now();
+    netVoid(await drain.wait())?;
+    Check.isTrue(Timer.now() - before < 5, "a waiter after the start returns at once")?;
+    drain.start();
+    Check.isTrue(drain.isDraining(), "starting again is harmless")?;
+    return Ok();
+}
+
+@test
+async fn drain_started_races_an_operation() -> Result<void, TestFailure> {
+    // drainStarted against an operation: the operation wins before a start, the drain wins after one.
+    let fresh = net(Drain.create())?;
+    let quick: Result<Raced<u32>, NetError> =
+        await Async.race(async () => await work(5, 7), async () => await drainStarted<u32>(fresh));
+    let r = net(quick)?;
+    // "the operation finishes before a drain"
+    Check.equalU64(7, r.value as u64)?;
+    Check.equalU64(0, r.winner as u64)?;
+    var stopped: Result<Raced<u32>, NetError> = Err(NetError.Closed);
+    netVoid(await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            stopped = await Async.race(async () => await work(100000, 7), async () => await drainStarted<u32>(fresh));
+            return Ok();
+        });
+        s.spawn(async () => {
+            await sleepMs(10)?;
+            fresh.start();
+            return Ok();
+        });
+    }))?;
+    Check.isTrue(match (stopped) {
+        Err(NetError.Cancelled) => fresh.isDraining(),
+        _ => false,
+    }, "a drain stops the operation as Cancelled")?;
+    return Ok();
+}

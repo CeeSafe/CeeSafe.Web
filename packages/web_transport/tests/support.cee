@@ -1,0 +1,67 @@
+// Helpers shared by web_transport's tests (CeeSafe ADR 0049): NetError results as test failures, mocks, bytes, a nap.
+import web_core;
+
+/// `r`, with a NetError as the test's failure, so a test can `?` it.
+fn net<T>(r: Result<T, NetError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+}
+
+/// The same for a result with no value.
+fn netDone(r: Result<void, NetError>) -> Result<void, TestFailure> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+}
+
+/// A MockTransport over `input`.
+fn mockOf(input: Slice<u8>) -> Result<MockTransport, NetError> {
+    match (MockTransport.create(input)) {
+        Ok(m) => { return Ok(m); }
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+    }
+}
+
+/// Whether `a` and `b` have the same bytes.
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Sleeps `ms` milliseconds.
+async fn nap(ms: u64) -> Result<void, NetError> {
+    match (await Timer.sleep(ms)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+/// The process's open descriptors (`/dev/fd`), or null where it cannot be listed (Windows).
+fn openDescriptors() -> usize? {
+    match (Directory.list("/dev/fd")) {
+        Ok(names) => { return Some(names.length); }
+        Err(_) => { return null; }
+    }
+}
+
+/// Whether the descriptors open now are as many as `before`; true where they cannot be counted.
+fn descriptorsBackTo(before: usize?) -> bool {
+    let after = openDescriptors();
+    return match (before) {
+        Some(b) => match (after) {
+            Some(a) => a == b,
+            null => false,
+        },
+        null => true,
+    };
+}
