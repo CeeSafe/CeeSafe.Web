@@ -11,7 +11,7 @@ that needs an unreleased compiler is not merged to main.
 |---|---|---|---|
 | M0 contracts, engines, MockTransport | **0.5.1** | async interfaces, `dyn` async methods (ADR 0036), regions, completion I/O (ADR 0035) | released |
 | M1 transport lifecycle | **0.8.0** | 0.7.0's B2/B4 fixes, U1–U4 (ADRs 0044–0046); 0.8.0's B5 fix (overload gate), B6 fix (`void` deadlines) and `ceesafec test` (ADR 0049, the tests) | on main (`docs/milestones/M1.md`) |
-| M2 HTTP/1.1 server | **0.8.0** | U3 vectored send, `ceesafec test`; `web_server` needs a fix for **B8** (open in 0.9.0) and U10 (0.9.0) | HTTP/1.1 on main; `web_server` on branch `m2-server` (`docs/milestones/M2.md`) |
+| M2 HTTP/1.1 server | **0.9.1** | U3 vectored send, `ceesafec test`; U12 wall clock (ADR 0055, `Date`); `web_server` needs the B8 fix (0.9.1) and U10 (0.9.0) | HTTP/1.1 on main; `web_server` on branch `m2-server` (`docs/milestones/M2.md`) |
 | M4 TLS | 0.8.0 | U8 manifest `links` (OpenSSL, ADR 0047) | released |
 | M5 client | 0.8.0 | U5 DNS (ADR 0048) | released |
 | M9 sendfile | 0.9.0 | U7 (ADR 0051) | released |
@@ -21,10 +21,10 @@ that needs an unreleased compiler is not merged to main.
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.9.0** (release, tag `v0.9.0` = CeeSafe `b361e63`) | the toolchain for main; `ceesafec test` runs the tests and both sweeps |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.9.1** (release, tag `v0.9.1` = CeeSafe `74226b0`) | the toolchain for main; `ceesafec test` runs the tests and both sweeps |
 | `/root/cw-fuzz/ceesafec-0.8.0/ceesafec` on the Debian x86_64 fuzz host | **0.8.0** (release, linux-x64) | M2's 24 h fuzz campaign only |
 
-0.9.0 needed no change in CeeSafe.Web: every package checks and is formatted, and all 16 test runs pass
+0.9.1 and 0.9.0 needed no change in CeeSafe.Web: every package checks and is formatted, and all 16 test runs pass
 (2026-11-02, macOS arm64; `docs/ceesafe-upstream-work.md`, "Status at 0.9.0").
 
 0.7.0 breaks source in two ways that touched CeeSafe.Web: lib/std's new `IoParts` collided with `web_core`'s (Web ADR

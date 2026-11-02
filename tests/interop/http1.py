@@ -6,6 +6,7 @@ usage: python3 tests/interop/http1.py
 Builds examples/http1, starts it on a free port, and checks each client's view of it: exact bodies, status codes,
 headers and connection reuse for curl; zero errors for h2load and wrk. Prints one line per check; exit 0 if all pass.
 """
+import email.utils
 import os
 import pathlib
 import random
@@ -53,8 +54,15 @@ def main() -> int:
         code, out, err = curl(base + "/hello")
         check("curl GET /hello", code == 0 and out == b"hello, world", f"{code} {out!r} {err}")
 
+        before = int(time.time())
         code, out, err = curl("-i", base + "/hello")
+        after = int(time.time())
         head = out.split(b"\r\n\r\n")[0].decode()
+        dates = re.findall(r"\r\ndate: ([^\r]*)", head)
+        # RFC 9110 §6.6.1: one Date, an IMF-fixdate of the time the response was made; the oracle is Python's formatter.
+        allowed = {email.utils.formatdate(t, usegmt=True) for t in range(before - 1, after + 2)}
+        check("curl -i: one Date field, the wall clock's IMF-fixdate (within a second)",
+              len(dates) == 1 and dates[0] in allowed, f"{dates} not in {sorted(allowed)}")
         check("curl -i: 200, content-length 12, content-type",
               head.startswith("HTTP/1.1 200 OK") and "content-length: 12" in head and "content-type: text/plain" in head,
               head)

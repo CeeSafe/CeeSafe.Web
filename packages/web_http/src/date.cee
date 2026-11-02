@@ -1,5 +1,5 @@
-// HTTP dates (RFC 9110 §5.6.7): IMF-fixdate, from Unix seconds. CeeSafe has no wall clock yet (upstream U12), so a
-// server sends no Date field until it has one (RFC 9110 §6.6.1: a server without a clock must not).
+// HTTP dates (RFC 9110 §5.6.7): IMF-fixdate, from Unix seconds, and the `Date` field's value from lib/std's wall clock
+// (CeeSafe ADR 0055). RFC 9110 §6.6.1: an origin server with a clock sends `Date`.
 
 /// Formatting IMF-fixdate.
 public struct HttpDate {
@@ -53,4 +53,38 @@ public struct HttpDate {
 fn twoDigits(out: borrow mut [u8; 29], at: usize, v: u64) {
     out[at] = truncate<u8>(48 + (v / 10) % 10);
     out[at + 1] = truncate<u8>(48 + v % 10);
+}
+
+/// The `Date` field's value for a connection's responses, formatted again only when the second changes.
+public struct DateCache {
+    private enabled: bool;
+    private second: i64;
+    private text: [u8; 29];
+
+    /// A cache that answers nothing unless `enabled`.
+    public fn create(enabled: bool) -> DateCache => DateCache { enabled: enabled, second: -1, text: [0u8; 29] };
+
+    /// Reads the wall clock (`Clock.now()`).
+    public fn refresh(borrow mut this) {
+        if (this.enabled) {
+            this.at(Clock.now().seconds);
+        }
+    }
+
+    /// Sets the time to `unixSeconds`; a time before 1970 is ignored.
+    public fn at(borrow mut this, unixSeconds: i64) {
+        if (unixSeconds < 0 || unixSeconds == this.second) {
+            return;
+        }
+        HttpDate.format(truncate<u64>(unixSeconds), mut this.text);
+        this.second = unixSeconds;
+    }
+
+    /// The 29-byte IMF-fixdate, or null when disabled or not yet set.
+    public fn bytes(borrow this) -> Slice<u8>? {
+        if (!this.enabled || this.second < 0) {
+            return null;
+        }
+        return Some(this.text[..]);
+    }
 }

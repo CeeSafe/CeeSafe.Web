@@ -24,6 +24,7 @@ public async fn serve(
     var b = buffer(limits.maxHeadBytes)?;
     var out = buffer(limits.writeBufferBytes)?;
     var pending = buffer(limits.writeBufferBytes)?;
+    var date = DateCache.create(limits.sendDate);
     var response = match (ResponseHead.create(4096)) {
         Ok(h) => h,
         Err(_) => { return Err(NetError.OutOfMemory); },
@@ -37,7 +38,7 @@ public async fn serve(
                 Ok(true) => { break; }
                 Ok(false) => {}
                 Err(e) => {
-                    await reject(conn, mut out, mut response, ProtocolErrors.status(e), limits);
+                    await reject(conn, mut out, mut response, mut date, ProtocolErrors.status(e), limits);
                     return Ok();
                 }
             }
@@ -45,7 +46,7 @@ public async fn serve(
             await flush(conn, mut out, limits)?;
             a.compact();
             if (a.spareLength() == 0) {
-                await reject(conn, mut out, mut response, Status.headerFieldsTooLarge(), limits);
+                await reject(conn, mut out, mut response, mut date, Status.headerFieldsTooLarge(), limits);
                 return Ok();
             }
             let idle = a.isEmpty();
@@ -74,7 +75,7 @@ public async fn serve(
                 match (await Transports.readWithin(conn, a.spare(), headDeadline)) {
                     Ok(v) => { n = v; }
                     Err(NetError.TimedOut) => {
-                        await reject(conn, mut out, mut response, Status.requestTimeout(), limits);
+                        await reject(conn, mut out, mut response, mut date, Status.requestTimeout(), limits);
                         return Ok();
                     }
                     Err(e) => { return Err(e); }
@@ -103,6 +104,7 @@ public async fn serve(
             mut out,
             mut pending,
             mut response,
+            mut date,
         )?;
         if (!keep) {
             match (await flush(conn, mut out, limits)) {
@@ -132,12 +134,13 @@ async fn exchangeOne(
     out: borrow mut OwnedBuffer,
     pending: borrow mut OwnedBuffer,
     response: borrow mut ResponseHead,
+    date: borrow mut DateCache,
 ) -> Result<bool, NetError> {
     let input = a.readable();
     let head = match (parseHead(input, start, end, limits)) {
         Ok(h) => h,
         Err(e) => {
-            await reject(conn, out, response, ProtocolErrors.status(e), limits);
+            await reject(conn, out, response, date, ProtocolErrors.status(e), limits);
             return Ok(false);
         },
     };
@@ -152,6 +155,7 @@ async fn exchangeOne(
         app,
         head.request,
         limits,
+        date,
         head.framing,
         head.expectContinue,
         head.keepAlive && !connection.isDraining(),
@@ -203,12 +207,14 @@ async fn reject(
     conn: borrow mut dyn Transport,
     out: borrow mut OwnedBuffer,
     response: borrow mut ResponseHead,
+    date: borrow mut DateCache,
     status: StatusCode,
     limits: borrow Limits,
 ) {
     response.reset();
     response.setStatus(status);
-    match (Encoder.head(response, ResponseFraming.Length(0), false, null, out)) {
+    date.refresh();
+    match (Encoder.head(response, ResponseFraming.Length(0), false, date.bytes(), out)) {
         Ok() => {}
         Err(_) => {
             // No room beside the responses still waiting in `out`: send them first, then this one.
@@ -216,7 +222,7 @@ async fn reject(
                 Ok() => {}
                 Err(_) => { return; }
             }
-            match (Encoder.head(response, ResponseFraming.Length(0), false, null, out)) {
+            match (Encoder.head(response, ResponseFraming.Length(0), false, date.bytes(), out)) {
                 Ok() => {}
                 Err(_) => { return; }
             }

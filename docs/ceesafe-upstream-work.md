@@ -2,8 +2,17 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.9.1 (released 2026-11-02, tag `v0.9.1` = CeeSafe `74226b0`)
+
+| Item | Status | Checked by |
+|---|---|---|
+| **B8** `Box<dyn I<S>>` parameter not storable when `S` is a type parameter | **fixed** (`1a124ec`: a `dyn` type's interface arguments bring no loans) | `tests/probes/generic-dyn-box-flow-bug.cee` prints 2 |
+| **U12** wall-clock time (ADR 0055: `Clock.now() -> UnixTime`) | **released** | every response carries `Date` (Web ADR 0003 amendment 4); interop checks it against Python's clock |
+
+No open CeeSafe item blocks a CeeSafe.Web milestone.
 
 ## Status at 0.9.0 (released 2026-11-02, tag `v0.9.0` = CeeSafe `b361e63`)
 
@@ -422,7 +431,7 @@ The program runs correctly (prints 7), but `--cflag -Werror` fails.
 
 **Expected:** no warning: the capture is mutable, so its C type should not be const.
 
-## B8 — Bug: a `Box<dyn I<S>>` parameter cannot be stored when `S` is a type parameter   *(found 2026-11-02, 0.8.0; still open in 0.9.0; was B7 here)*
+## B8 — Bug: a `Box<dyn I<S>>` parameter cannot be stored when `S` is a type parameter   *(found 2026-11-02, 0.8.0; was B7 here; fixed in 0.9.1)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/generic-dyn-box-flow-bug.cee`:
 
@@ -448,7 +457,7 @@ names of a type are not collected through a `dyn` interface's type arguments, wh
 2026-11-02: typed state `S`; with U10 released in 0.9.0, `web_server` implements `Application` for every `Server<S>`
 itself). `web_server` waits on branch `m2-server`. It is the only CeeSafe item blocking a CeeSafe.Web milestone.
 
-## U12 — Wall-clock time   *(found 2026-11-02 while writing M2's serializer; needed for `Date`)*
+## U12 — Wall-clock time   *(found 2026-11-02 while writing M2's serializer; needed for `Date`; released in 0.9.1 as ADR 0055)*
 
 **Gap:** lib/std has only the monotonic clock (`Timer.now()`, `lib/core/async.cee:37`); nothing reads the system's
 real time, and the runtime has no `CLOCK_REALTIME` call (searched `runtime/` and `lib/` at `v0.8.0`).
@@ -518,7 +527,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.7.0** (released 2026-11-02) | U1, U2, U3, U4, T1; B1–B4 fixed | M1 transport/lifecycle (merged), M2 HTTP/1.1 fast path |
 | **0.8.0** (released 2026-11-02) | B5, B6 fixed; U8, U5, T2 | M1's overload gate (passed); M4 TLS (OpenSSL), M5 client |
 | **0.9.0** (released 2026-11-02) | U6, U7, U9, U10, U11 | M9 sendfile, M10 HTTP/3; `web_server` without delegating impls |
-| next | B8 fixed; U12 | `web_server` (M2 task 5); the `Date` field |
+| **0.9.1** (released 2026-11-02) | B8 fixed; U12 | `web_server` (M2 task 5); the `Date` field |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

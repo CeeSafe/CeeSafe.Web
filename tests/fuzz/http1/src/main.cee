@@ -8,7 +8,7 @@
 //  2. parseHead gives the same result twice;
 //  3. a chunked body decodes to the same data (or the same error) whole and in random pieces, with random room;
 //  4. the driver, over a scripted transport, writes byte-identical output whether the input arrives in one read or
-//     in random small reads.
+//     in random small reads (the 29 bytes after each "\r\ndate: " masked in both, since the clock may tick between).
 // A broken invariant prints the input in hex and exits 1; a panic or a sanitizer report ends the run by itself.
 import web_core;
 import web_http;
@@ -382,6 +382,37 @@ async fn driverOutput(
     return Ok(s.output);
 }
 
+/// `out` with the 29 bytes after every "\r\ndate: " replaced by '#'.
+fn withoutDates(out: Slice<u8>) -> Result<Vector<u8>, NetError> {
+    let marker = "\r\ndate: ".bytes();
+    var masked = Vector<u8>.create();
+    var i: usize = 0;
+    while (i < out.length) {
+        if (i + marker.length <= out.length && equalBytes(out[i..i + marker.length], marker)) {
+            for (b in marker) {
+                if (!push(mut masked, b)) {
+                    return Err(NetError.OutOfMemory);
+                }
+            }
+            i += marker.length;
+            var k: usize = 0;
+            while (k < 29 && i < out.length) {
+                if (!push(mut masked, 35)) {
+                    return Err(NetError.OutOfMemory);
+                }
+                k += 1;
+                i += 1;
+            }
+        } else {
+            if (!push(mut masked, out[i])) {
+                return Err(NetError.OutOfMemory);
+            }
+            i += 1;
+        }
+    }
+    return Ok(masked);
+}
+
 fn equalBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
     if (a.length != b.length) {
         return false;
@@ -515,8 +546,11 @@ async fn fuzz() -> Result<bool, NetError> {
             _ => {}
         }
         // 4. The driver: one read versus small reads.
-        let one = await driverOutput(bytes, 1 << 20, limits, drain)?;
-        let small = await driverOutput(bytes, 1 + truncate<usize>(rng.below(9)), limits, drain)?;
+        let oneRaw = await driverOutput(bytes, 1 << 20, limits, drain)?;
+        let smallRaw = await driverOutput(bytes, 1 + truncate<usize>(rng.below(9)), limits, drain)?;
+        // The two runs may straddle a second, so the Date values are masked alike in both.
+        let one = withoutDates(oneRaw.view())?;
+        let small = withoutDates(smallRaw.view())?;
         if (!equalBytes(one.view(), small.view())) {
             await report("driver: output depends on how the input was split", bytes)?;
             return Ok(false);

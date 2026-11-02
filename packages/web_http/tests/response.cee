@@ -80,3 +80,56 @@ fn response_head_fields() -> Result<void, TestFailure> {
     Check.isTrue(h.fieldBytes().length == 0 && h.contentLength() == null && !h.closes(), "reset clears it")?;
     return Ok();
 }
+
+@test
+fn date_cache() -> Result<void, TestFailure> {
+    var off = DateCache.create(false);
+    off.at(784111777);
+    off.refresh();
+    let none = match (off.bytes()) {
+        Some(_) => false,
+        null => true,
+    };
+    Check.isTrue(none, "a disabled cache gives no date")?;
+
+    var c = DateCache.create(true);
+    let unset = match (c.bytes()) {
+        Some(_) => false,
+        null => true,
+    };
+    Check.isTrue(unset, "no date before the first reading")?;
+    c.at(784111777);
+    c.at(-1); // before 1970: ignored
+    match (c.bytes()) {
+        Some(b) => { Check.equalBytes("Sun, 06 Nov 1994 08:49:37 GMT".bytes(), b)?; }
+        null => { return Check.fail("a date after at()"); }
+    }
+
+    // The clock: the cache's text is the formatter's for this second or the next (the clock may tick between reads).
+    let before = Clock.now().seconds;
+    c.refresh();
+    let after = Clock.now().seconds;
+    Check.isTrue(before >= 946684800, "the wall clock reads 2000 or later")?;
+    let early = dateOf(truncate<u64>(before));
+    let late = dateOf(truncate<u64>(after));
+    match (c.bytes()) {
+        Some(b) => {
+            let same = sameBytes(b, early[..]) || sameBytes(b, late[..]);
+            Check.isTrue(same, "the cache holds the clock's second")?;
+        }
+        null => { return Check.fail("a date after refresh()"); }
+    }
+    return Ok();
+}
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}

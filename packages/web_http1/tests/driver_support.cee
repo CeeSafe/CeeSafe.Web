@@ -159,3 +159,10 @@ async fn run(text: StringView, step: usize, limits: borrow Limits) -> Result<Scr
 }
 
 fn same(expected: StringView, got: borrow Vector<u8>) -> Result<void, TestFailure> => Check.equalBytes(expected.bytes(), got.view());
+
+/// Limits without `Date`, for tests that compare the bytes written.
+fn quiet() -> Limits {
+    var l = Limits.defaults();
+    l.sendDate = false;
+    return l;
+}

@@ -36,7 +36,7 @@ fn pushBytes(out: borrow mut Vector<u8>, s: Slice<u8>) -> bool {
 
 @test
 async fn one_get() -> Result<void, TestFailure> {
-    let s = await run("GET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, Limits.defaults())?;
+    let s = await run("GET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
     same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\n\r\n/a:", s.output)?;
     Check.equalU64(1, s.writes.length as u64)?;
     return Ok();
@@ -49,10 +49,10 @@ async fn pipelined_requests_coalesce_and_keep_their_own_heads() -> Result<void, 
     echoed("/a", "", mut expected)?;
     echoed("/b", "xyz", mut expected)?;
     echoed("/c", "", mut expected)?;
-    let whole = await run(text, 4096, Limits.defaults())?;
+    let whole = await run(text, 4096, quiet())?;
     Check.equalBytes(expected.view(), whole.output.view())?;
     Check.equalU64(1, whole.writes.length as u64)?; // all three in one write
-    let trickle = await run(text, 1, Limits.defaults())?;
+    let trickle = await run(text, 1, quiet())?;
     Check.equalBytes(expected.view(), trickle.output.view())?; // one byte per read: the same bytes
     return Ok();
 }
@@ -77,7 +77,7 @@ async fn a_hundred_pipelined_in_order() -> Result<void, TestFailure> {
         Some(t) => t,
         null => { return Err(TestFailure.create("text")); },
     };
-    let s = await run(text, 65536, Limits.defaults())?;
+    let s = await run(text, 65536, quiet())?;
     Check.equalBytes(expected.view(), s.output.view())?;
     Check.equalU64(1, s.writes.length as u64)?; // 100 responses of 50 bytes fit one 16 KiB write
     return Ok();
@@ -93,7 +93,7 @@ async fn sixteen_coalesce_and_a_stream_flushes_first() -> Result<void, TestFailu
         Some(t) => t,
         null => { return Err(TestFailure.create("text")); },
     };
-    let s = await run(plain, 65536, Limits.defaults())?;
+    let s = await run(plain, 65536, quiet())?;
     Check.equalU64(1, s.writes.length as u64)?; // 16 pipelined requests, one flush
 
     // The 8th request streams: everything before it and its first chunk go at its flush; the rest of it when it
@@ -114,7 +114,7 @@ async fn sixteen_coalesce_and_a_stream_flushes_first() -> Result<void, TestFailu
         Some(t) => t,
         null => { return Err(TestFailure.create("text")); },
     };
-    let m = await run(text, 65536, Limits.defaults())?;
+    let m = await run(text, 65536, quiet())?;
     Check.equalBytes(expected.view(), m.output.view())?;
     Check.equalU64(3, m.writes.length as u64)?;
     // Write 2 is the stream's remainder: "5\r\npart2\r\n0\r\n\r\n", 15 bytes, ending the response.
@@ -129,7 +129,7 @@ async fn bodies_by_length_and_chunked_at_every_read_size() -> Result<void, TestF
     echoed("/l", "hello", mut expected)?;
     echoed("/c", "abcde", mut expected)?;
     for (step in 1..12usize) {
-        let s = await run(text, step, Limits.defaults())?;
+        let s = await run(text, step, quiet())?;
         Check.equalBytes(expected.view(), s.output.view())?;
     }
     return Ok();
@@ -138,13 +138,13 @@ async fn bodies_by_length_and_chunked_at_every_read_size() -> Result<void, TestF
 @test
 async fn expect_100_continue() -> Result<void, TestFailure> {
     let read = await run("POST /e HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", 4096,
-        Limits.defaults())?;
+        quiet())?;
     same("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 5\r\n\r\n/e:hi", read.output)?;
     // A handler that never reads: no 100, and the connection closes (the client may or may not send the body).
     let unread = await run(
         "POST /ignore HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhiGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
         4096,
-        Limits.defaults(),
+        quiet(),
     )?;
     same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok", unread.output)?;
     return Ok();
@@ -156,9 +156,9 @@ async fn unread_bodies_are_drained_or_close() -> Result<void, TestFailure> {
     var expected = Vector<u8>.create();
     Check.isTrue(pushText(mut expected, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 2\r\n\r\nok"), "e")?;
     echoed("/a", "", mut expected)?;
-    let drained = await run(text, 4096, Limits.defaults())?;
+    let drained = await run(text, 4096, quiet())?;
     Check.equalBytes(expected.view(), drained.output.view())?; // 10 bytes drained, the next request served
-    var small = Limits.defaults();
+    var small = quiet();
     small.drainBytes = 4;
     let closed = await run(text, 4096, small)?;
     same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 2\r\n\r\nok", closed.output)?; // past 4 bytes: closed
@@ -168,17 +168,17 @@ async fn unread_bodies_are_drained_or_close() -> Result<void, TestFailure> {
 @test
 async fn rejected_requests_close() -> Result<void, TestFailure> {
     let two = await run("GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096,
-        Limits.defaults())?;
+        quiet())?;
     same("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", two.output)?;
     let smuggle = await run(
         "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
         4096,
-        Limits.defaults(),
+        quiet(),
     )?;
     same("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", smuggle.output)?;
-    let bad = await run("POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 4096, Limits.defaults())?;
+    let bad = await run("POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 4096, quiet())?;
     same("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", bad.output)?;
-    var tiny = Limits.defaults();
+    var tiny = quiet();
     tiny.maxRequestLineBytes = 16;
     let long = await run("GET /aaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: x\r\n\r\n", 4096, tiny)?;
     same("HTTP/1.1 414 URI Too Long\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", long.output)?;
@@ -187,12 +187,12 @@ async fn rejected_requests_close() -> Result<void, TestFailure> {
 
 @test
 async fn head_version_and_errors() -> Result<void, TestFailure> {
-    let head = await run("HEAD /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, Limits.defaults())?;
+    let head = await run("HEAD /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
     same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\n\r\n", head.output)?; // GET's length, no content
-    let old = await run("GET /a HTTP/1.0\r\n\r\nGET /b HTTP/1.0\r\n\r\n", 4096, Limits.defaults())?;
+    let old = await run("GET /a HTTP/1.0\r\n\r\nGET /b HTTP/1.0\r\n\r\n", 4096, quiet())?;
     same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\nconnection: close\r\n\r\n/a:", old.output)?;
     let failed = await run("GET /fail HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096,
-        Limits.defaults())?;
+        quiet())?;
     var expected = Vector<u8>.create();
     Check.isTrue(pushText(mut expected, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"), "e")?;
     echoed("/a", "", mut expected)?;
@@ -215,12 +215,73 @@ async fn large_responses() -> Result<void, TestFailure> {
     Check.isTrue(pushText(mut chunked, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ntransfer-encoding: chunked\r\n\r\n4000\r\n") &&
         pushBytes(mut chunked, xs[0..16384]) && pushText(mut chunked, "\r\ne20\r\n") &&
         pushBytes(mut chunked, xs[16384..]) && pushText(mut chunked, "\r\n0\r\n\r\n"), "e")?;
-    let big = await run("GET /big HTTP/1.1\r\nHost: x\r\n\r\n", 4096, Limits.defaults())?;
+    let big = await run("GET /big HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
     Check.equalBytes(chunked.view(), big.output.view())?;
     var known = Vector<u8>.create();
     Check.isTrue(pushText(mut known, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 20000\r\n\r\n") &&
         pushBytes(mut known, x.view()), "e")?;
-    let declared = await run("GET /bigknown HTTP/1.1\r\nHost: x\r\n\r\n", 4096, Limits.defaults())?;
+    let declared = await run("GET /bigknown HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
     Check.equalBytes(known.view(), declared.output.view())?;
     return Ok();
+}
+
+/// With the default limits every response carries `Date` (RFC 9110 §6.6.1) right after the status line: an
+/// IMF-fixdate of a second of the wall clock while the requests were served. The rejection carries it too.
+@test
+async fn responses_carry_the_date() -> Result<void, TestFailure> {
+    let before = Clock.now().seconds;
+    let s = await run(
+        "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\nBAD\r\n\r\n",
+        4096,
+        Limits.defaults(),
+    )?;
+    let after = Clock.now().seconds;
+    let out = s.output.view();
+    // Each response is "<status line>date: <29 bytes>\r\n<the rest>"; the two 200s are 89 bytes each.
+    let first: usize = 23; // after "HTTP/1.1 200 OK\r\ndate: "
+    let second: usize = 89 + 23;
+    let third: usize = 178 + 32; // after "HTTP/1.1 400 Bad Request\r\ndate: "
+    Check.isTrue(out.length == third + 29 + 42, "three responses of the expected lengths")?;
+    let d1 = out[first..first + 29];
+    let d2 = out[second..second + 29];
+    let d3 = out[third..third + 29];
+    Check.isTrue(inWindow(d1, before, after), "the first response's date is the clock's")?;
+    Check.isTrue(inWindow(d2, before, after), "the second response's date is the clock's")?;
+    Check.isTrue(inWindow(d3, before, after), "the rejection's date is the clock's")?;
+    var expected = Vector<u8>.create();
+    let ok = pushText(mut expected, "HTTP/1.1 200 OK\r\ndate: ") && pushBytes(mut expected, d1) &&
+        pushText(mut expected, "\r\nx-hook: 1\r\ncontent-length: 3\r\n\r\n/a:") &&
+        pushText(mut expected, "HTTP/1.1 200 OK\r\ndate: ") && pushBytes(mut expected, d2) &&
+        pushText(mut expected, "\r\nx-hook: 1\r\ncontent-length: 3\r\n\r\n/b:") &&
+        pushText(mut expected, "HTTP/1.1 400 Bad Request\r\ndate: ") && pushBytes(mut expected, d3) &&
+        pushText(mut expected, "\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    Check.isTrue(ok, "expected bytes")?;
+    Check.equalBytes(expected.view(), out)?;
+    return Ok();
+}
+
+/// `date` is the IMF-fixdate of a second from `before` to `after`.
+fn inWindow(date: Slice<u8>, before: i64, after: i64) -> bool {
+    var t = before;
+    while (t <= after) {
+        var text = [0u8; 29];
+        HttpDate.format(truncate<u64>(t), mut text);
+        if (sameBytes(date, text[..])) {
+            return true;
+        }
+        t += 1;
+    }
+    return false;
+}
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
 }

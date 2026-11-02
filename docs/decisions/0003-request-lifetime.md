@@ -183,3 +183,18 @@ interface, N0267). So they are one concrete type, **`web_http.Exchange<r>`**, an
    close)`, `keepAlive()`, `streamed()`.
 4. A handler that answers without reading a body sent with `Expect: 100-continue` gets `Connection: close`: the client
    may or may not send that body.
+
+## 10. Amendment 4 (2026-11-02, ceesafec 0.9.1): `Date`
+
+CeeSafe 0.9.1 has a wall clock (CeeSafe ADR 0055, upstream U12), so amendment 2.3 ends: every response the driver
+writes carries `Date` (RFC 9110 §6.6.1), right after the status line.
+1. **`DateCache`** (`web_http`, `date.cee`): one per connection; `refresh()` reads `Clock.now()` and formats again only
+   when the second changed; `bytes()` gives the 29-byte IMF-fixdate. The monotonic `Timer` still governs every wait.
+2. **`Limits.sendDate`** (default true). Off only where bytes are compared exactly: the driver tests' `quiet()`
+   limits.
+3. **Where:** `Exchange.sendHead` and `respondError`, and the driver's rejections (`serve.cee`, `reject`); interim
+   `100 Continue` carries none (RFC 9110 §6.6.1 makes it optional for 1xx).
+4. **Tests:** `web_http` `date_cache` (RFC 9110's example date; the clock's second); `web_http1`
+   `responses_carry_the_date` (two responses and a rejection, each the IMF-fixdate of a second the run spanned);
+   `tests/interop/http1.py` (curl's `Date` against Python's `email.utils.formatdate`). The fuzzer's invariant 4 masks
+   the 29 date bytes in both outputs, since the clock may tick between its two runs.

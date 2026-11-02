@@ -47,6 +47,7 @@ public struct Exchange<region r> {
     private app: borrow(r) dyn Application;
     private request: borrow(r) Request<r>;
     private limits: borrow(r) Limits;
+    private date: borrow mut(r) DateCache;
 
     private body: BodyState;
     private left: u64;
@@ -74,6 +75,7 @@ public struct Exchange<region r> {
         app: borrow(r) dyn Application,
         request: borrow(r) Request<r>,
         limits: borrow(r) Limits,
+        date: borrow mut(r) DateCache,
         framing: BodyFraming,
         expectContinue: bool,
         keepAlive: bool,
@@ -107,6 +109,7 @@ public struct Exchange<region r> {
             app: app,
             request: request,
             limits: limits,
+            date: date,
             body: state,
             left: length,
             decoder: decoder,
@@ -433,11 +436,12 @@ public struct Exchange<region r> {
             // it or not, so the connection cannot carry another request (and says so).
             this.keep = false;
         }
-        match (Encoder.head(this.response, this.framing, this.keep, null, this.out)) {
+        this.date.refresh();
+        match (Encoder.head(this.response, this.framing, this.keep, this.date.bytes(), this.out)) {
             Ok() => {}
             Err(_) => {
                 await this.flushOut()?;
-                match (Encoder.head(this.response, this.framing, this.keep, null, this.out)) {
+                match (Encoder.head(this.response, this.framing, this.keep, this.date.bytes(), this.out)) {
                     Ok() => {}
                     Err(_) => { return Err(HandlerError.Internal); } // the head alone is larger than the buffer
                 }
@@ -534,7 +538,8 @@ public struct Exchange<region r> {
         this.response.setStatus(status);
         this.pending.clear();
         let framing = if (status.allowsContent()) ResponseFraming.Length(0) else ResponseFraming.NoContent;
-        match (Encoder.head(this.response, framing, this.keep, null, this.out)) {
+        this.date.refresh();
+        match (Encoder.head(this.response, framing, this.keep, this.date.bytes(), this.out)) {
             Ok() => {}
             Err(_) => {
                 // No room beside the responses waiting in `out`: send them, then try again.
@@ -542,7 +547,7 @@ public struct Exchange<region r> {
                     Ok() => {}
                     Err(_) => { return false; }
                 }
-                match (Encoder.head(this.response, framing, this.keep, null, this.out)) {
+                match (Encoder.head(this.response, framing, this.keep, this.date.bytes(), this.out)) {
                     Ok() => {}
                     Err(_) => {
                         this.keep = false;

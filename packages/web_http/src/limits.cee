@@ -27,10 +27,12 @@ public struct Limits {
     public minBodyRateGraceMs: u64;
     /// The write buffer, which also bounds how many pipelined responses are coalesced into one flush.
     public writeBufferBytes: usize;
+    /// Sends the `Date` field (RFC 9110 §6.6.1); off only for tests that compare bytes.
+    public sendDate: bool;
 
     /// 8 KiB request line, 16 KiB head, 64 fields, 8 MiB body, 256-byte chunk extensions, 4 KiB trailers, 64 KiB
     /// drain; 10 s for a head, 60 s idle, 30 s per write; 240 B/s after 5 s (Kestrel's minimum rate); 16 KiB of
-    /// output per flush.
+    /// output per flush; `Date` sent.
     public fn defaults() -> Limits => Limits {
         maxRequestLineBytes: 8192,
         maxHeadBytes: 16384,
@@ -45,5 +47,6 @@ public struct Limits {
         minBodyRate: 240,
         minBodyRateGraceMs: 5000,
         writeBufferBytes: 16384,
+        sendDate: true,
     };
 }
