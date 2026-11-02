@@ -1,0 +1,37 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "web_core"
+source = "path+../../packages/web_core"
+
+[[package]]
+name = "web_http"
+source = "path+../../packages/web_http"
+
+[[package]]
+name = "web_http1"
+source = "path+../../packages/web_http1"
+
+[[package]]
+name = "web_http2"
+source = "path+../../packages/web_http2"
+
+[[package]]
+name = "web_server"
+source = "path+../../packages/web_server"
+
+[[package]]
+name = "web_sse"
+source = "path+../../packages/web_sse"
+
+[[package]]
+name = "web_tls"
+source = "path+../../packages/web_tls"
+
+[[package]]
+name = "web_transport"
+source = "path+../../packages/web_transport"
+
+[[package]]
+name = "web_ws"
+source = "path+../../packages/web_ws"

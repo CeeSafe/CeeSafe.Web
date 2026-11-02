@@ -1,0 +1,115 @@
+// TLS configurations (Web ADR 0002 §3.3): one OpenSSL SSL_CTX, shared by every connection made from it.
+import web_core;
+
+/// Why a configuration could not be made.
+public enum TlsSetupError {
+    /// The certificate chain or the private key could not be read, or they do not match.
+    BadCertificate,
+    /// No certificate could be read from the trust PEM, or the system's trust store could not be loaded.
+    BadTrust,
+    /// An ALPN list longer than the shim holds.
+    BadAlpn,
+    /// OpenSSL could not make the configuration (out of memory, usually).
+    Internal,
+}
+
+/// A TLS configuration: TLS 1.2 (ECDHE with AEAD only) and 1.3, no renegotiation, no compression. A server's has its
+/// certificate; a client's verifies the server against its trust store and the name it connects to.
+@noncopy
+public struct TlsConfig {
+    private raw: *mut void;
+    private serverSide: bool;
+
+    /// A server configuration presenting `chainPem` (the leaf certificate first, then intermediates) with `keyPem`.
+    /// Safety: wt_cfg_new returns a fresh SSL_CTX or null; the shim copies the PEM bytes and keeps no pointer to them.
+    public fn server(chainPem: Slice<u8>, keyPem: Slice<u8>) -> Result<TlsConfig, TlsSetupError> {
+        let raw = unsafe { wt_cfg_new(1) };
+        if (raw.isNull()) {
+            return Err(TlsSetupError.Internal);
+        }
+        let config = TlsConfig { raw: raw, serverSide: true };
+        let ok = unsafe { wt_cfg_use_pem(raw, chainPem.ptr, chainPem.length, keyPem.ptr, keyPem.length) };
+        if (ok != 1) {
+            return Err(TlsSetupError.BadCertificate);
+        }
+        return Ok(config);
+    }
+
+    /// A client configuration that trusts nothing yet: add `trustPem` or `trustSystem`.
+    /// Safety: as `server`.
+    public fn client() -> Result<TlsConfig, TlsSetupError> {
+        let raw = unsafe { wt_cfg_new(0) };
+        if (raw.isNull()) {
+            return Err(TlsSetupError.Internal);
+        }
+        return Ok(TlsConfig { raw: raw, serverSide: false });
+    }
+
+    /// Trusts every certificate in `pem` as a root.
+    /// Safety: `raw` is this configuration's live SSL_CTX; the shim copies the bytes.
+    public fn trustPem(borrow mut this, pem: Slice<u8>) -> Result<void, TlsSetupError> {
+        if (unsafe { wt_cfg_trust_pem(this.raw, pem.ptr, pem.length) } < 1) {
+            return Err(TlsSetupError.BadTrust);
+        }
+        return Ok();
+    }
+
+    /// Trusts the system's default CA locations (OpenSSL's).
+    /// Safety: as `trustPem`.
+    public fn trustSystem(borrow mut this) -> Result<void, TlsSetupError> {
+        if (unsafe { wt_cfg_trust_default(this.raw) } != 1) {
+            return Err(TlsSetupError.BadTrust);
+        }
+        return Ok();
+    }
+
+    /// The application protocols, in preference order: a server picks its first that the client offers (none in
+    /// common: no ALPN, so HTTP/1.1); a client offers them all. `Alpn.None` entries are skipped.
+    /// Safety: as `trustPem`; the wire list is a local array the shim copies.
+    public fn setAlpn(borrow mut this, protocols: Slice<Alpn>) -> Result<void, TlsSetupError> {
+        var wire = [0u8; 64];
+        var n: usize = 0;
+        for (p in protocols) {
+            let name = match (p) {
+                Alpn.Http11 => "http/1.1",
+                Alpn.Http2 => "h2",
+                _ => "",
+            };
+            if (name.length == 0) {
+                continue;
+            }
+            if (n + 1 + name.length > wire.length) {
+                return Err(TlsSetupError.BadAlpn);
+            }
+            wire[n] = truncate<u8>(name.length);
+            n += 1;
+            for (b in name.bytes()) {
+                wire[n] = b;
+                n += 1;
+            }
+        }
+        if (n == 0) {
+            return Ok();
+        }
+        if (unsafe { wt_cfg_set_alpn(this.raw, wire[0..n].ptr, n) } != 1) {
+            return Err(TlsSetupError.BadAlpn);
+        }
+        return Ok();
+    }
+
+    /// Whether this is a server's configuration.
+    public fn isServer(borrow this) -> bool => this.serverSide;
+
+    /// The SSL_CTX, for a connection.
+    fn handle(borrow this) -> *mut void => this.raw;
+
+    /// Safety: `raw` is this configuration's own SSL_CTX reference; connections made from it hold references of
+    /// their own, so it lives on until they are freed.
+    drop {
+        unsafe { wt_cfg_free(this.raw); }
+    }
+}
+
+/// The OpenSSL in use, as its version text ("OpenSSL 3.6.4 25 Aug 2026"), written into `out`; its length.
+/// Safety: the shim copies at most `out.length` bytes into `out`.
+public fn opensslVersion(out: SliceMut<u8>) -> usize => unsafe { wt_openssl_version(out.ptr, out.length) };

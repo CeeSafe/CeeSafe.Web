@@ -131,3 +131,39 @@ Exceeding any limit closes the connection with an alert where possible.
 1. Route OpenSSL's allocations through CeeSafe's allocator in test builds (§3.5)? Recommended: yes. **Yes.**
 2. Require OpenSSL ≥ 3.5 from M4 instead of M10, to test one version range only? Recommended: no. 3.0 LTS is what
    Debian 12 and Ubuntu 22.04 ship; raise the floor at M10. **No: 3.0 for M4, 3.5 from M10.**
+
+## 7. Amendment 1 (2026-11-02, M4 stage 1: the shim as built)
+
+1. **Configuration functions**, which §3.2's table did not list. A configuration is one `SSL_CTX`; connections hold
+   their own references, so freeing it while they live is safe.
+
+   | Function | Result |
+   |---|---|
+   | `wt_cfg_new(server) -> SSL_CTX*` | §3.3's settings: TLS 1.2–1.3, `ECDHE+AESGCM:ECDHE+CHACHA20` for 1.2, no renegotiation, no compression, server cipher preference, release buffers, `max_cert_list` 64 KiB; a client verifies its peer. NULL on failure |
+   | `wt_cfg_free(ctx)` | drops this reference |
+   | `wt_cfg_use_pem(ctx, chain, len, key, len) -> i32` | the leaf first, then the chain; checks the key matches. 1 on success |
+   | `wt_cfg_trust_pem(ctx, pem, len) -> i32` | adds each certificate as a root; the number added |
+   | `wt_cfg_trust_default(ctx) -> i32` | OpenSSL's default CA locations |
+   | `wt_cfg_set_alpn(ctx, wire, len) -> i32` | the protocols in preference order (wire form, at most 64 bytes): offered by a client; a server picks its own first that the client offers, and with none in common goes on without ALPN (`SSL_TLSEXT_ERR_NOACK`), so a client without `h2` still gets HTTP/1.1 |
+
+2. **Connection functions added:** `wt_ctx_new(cfg, server, host, len)` (a client's `host` is copied and verified
+   against the SAN, as an IP address when it parses as one; SNI is sent for names only); `wt_pending(ctx)`;
+   `wt_version(ctx)` (`0x0303`, `0x0304`); `wt_reason(ctx)` (why the last `WT_ERROR` happened, in web_core's
+   `TlsReason` order: a failed certificate check before the handshake ends is `Certificate`, an alert from the peer
+   `Alert`, another TLS error `Handshake` or `Protocol` by whether the handshake had finished, anything else
+   `Internal`); `wt_openssl_version(out, cap)`. `wt_error` returns the text's length through a `size_t*`.
+3. **`wt_feed` returns `WT_FULL`** when the read BIO already holds §3.4's two records; the transport treats it as a
+   protocol error, since a peer that is speaking TLS never gets that far ahead of what OpenSSL consumes.
+4. **The end of the stream without close_notify** is a read of 0, not an error. HTTP/1.1's framing (a length, or the
+   last chunk) finds a body cut short; a body framed by the connection's close is HTTP/1.0's, which this server sends
+   only to HTTP/1.0 clients.
+5. **TlsTransport reads and writes its `PlainStream` directly**, not through `Transports.readWithin` (`dyn
+   Transport`). Through `dyn`, the read could be a `TlsTransport`'s own, and CeeSafe refuses an async frame that may
+   contain itself (N0343).
+6. **Not Send.** A configuration holds a raw pointer, which CeeSafe v0 does not let a library outside lib/std declare
+   thread-safe (`@threadSafe`, spec §38.3). M1's connection server runs its workers as tasks of one thread, so nothing
+   needs it yet. Sharing a configuration across threads (and `Arc<CertSet>` hot reload, §3.3) will need that from
+   CeeSafe: an upstream item, raised when M4's stage 4 gets there.
+7. **Allocation routing (§3.5, §6.1) is not done in stage 1.** OpenSSL keeps global allocations until the process
+   exits, so routing them through CeeSafe's allocator needs the leak check to tell those apart. It comes with stage 3
+   and its own tests.

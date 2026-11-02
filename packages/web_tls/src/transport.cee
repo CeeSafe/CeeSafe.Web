@@ -1,0 +1,356 @@
+// TlsTransport (Web ADR 0002 §3.2, Web ADR 0001 §3.3): TLS over a PlainStream. OpenSSL works on memory BIOs; this
+// type does the I/O: ciphertext read from the stream is fed to the shim, and ciphertext the shim produces is taken
+// and written. Reads may be cancelled (bytes read but not yet fed stay in `incoming`); a failed or cancelled write
+// poisons the transport, as for every transport (Web ADR 0001 §3.4).
+import web_core;
+import web_transport;
+
+/// The most ciphertext a handshake may consume before it is cut off (Web ADR 0002 §3.4).
+const HANDSHAKE_BYTES: u64 = 65536;
+
+/// A TLS connection over a plain stream.
+@noncopy
+public struct TlsTransport {
+    private plain: PlainStream;
+    private conn: *mut void;
+    /// Ciphertext read from the stream and not yet fed to the shim.
+    private incoming: OwnedBuffer;
+    /// Where ciphertext from the shim is taken to, then written.
+    private outgoing: OwnedBuffer;
+    private negotiated: Alpn;
+    private poisoned: bool;
+    /// Ciphertext fed during the handshake.
+    private fed: u64;
+
+    /// A server connection over `stream` with `config`, its handshake finished by `deadline`.
+    public async fn accept(
+        stream: PlainStream,
+        config: borrow TlsConfig,
+        deadline: Deadline,
+    ) -> Result<TlsTransport, NetError> {
+        var t = TlsTransport.wrap(stream, config, "")?;
+        await t.handshake(deadline)?;
+        return Ok(t);
+    }
+
+    /// A client connection over `stream` to `host` (a DNS name or an IP address, verified against the server's
+    /// certificate), its handshake finished by `deadline`.
+    public async fn connect(
+        stream: PlainStream,
+        config: borrow TlsConfig,
+        host: StringView,
+        deadline: Deadline,
+    ) -> Result<TlsTransport, NetError> {
+        if (host.length == 0) {
+            return Err(NetError.Tls(TlsReason.Certificate)); // nothing to verify against
+        }
+        var t = TlsTransport.wrap(stream, config, host)?;
+        await t.handshake(deadline)?;
+        return Ok(t);
+    }
+
+    /// The TLS version agreed: 0x0303 (1.2) or 0x0304 (1.3).
+    /// Safety: `conn` is this transport's live context.
+    public fn version(borrow this) -> u32 => truncate<u32>(unsafe { wt_version(this.conn) }); // 0, 0x0303 or 0x0304
+
+    /// The text of the last TLS failure (OpenSSL's, or the certificate check's) in `out`; its length.
+    /// Safety: the shim copies at most `out.length` bytes into `out` and writes the length into a local.
+    public fn failure(borrow this, out: SliceMut<u8>) -> usize {
+        var n: usize = 0;
+        unsafe { wt_error(this.conn, out.ptr, out.length, borrow mut n as *mut usize); }
+        return n;
+    }
+
+    /// The transport for `stream`, before its handshake. `host` is empty for a server.
+    /// Safety: wt_ctx_new copies `host` and returns a fresh context or null; a null result frees nothing of ours.
+    fn wrap(stream: PlainStream, config: borrow TlsConfig, host: StringView) -> Result<TlsTransport, NetError> {
+        let incoming = buffer(17408 + 5)?;
+        let outgoing = buffer(16384)?;
+        let side = if (config.isServer()) 1 else 0;
+        let conn = unsafe { wt_ctx_new(config.handle(), side, host.ptr, host.length) };
+        if (conn.isNull()) {
+            return Err(NetError.OutOfMemory);
+        }
+        return Ok(TlsTransport {
+            plain: stream,
+            conn: conn,
+            incoming: incoming,
+            outgoing: outgoing,
+            negotiated: Alpn.None,
+            poisoned: false,
+            fed: 0,
+        });
+    }
+
+    /// Runs the handshake to its end by `deadline`, then reads the agreed protocol.
+    /// Safety: `conn` is this transport's live context; wt_alpn copies at most the local array's length.
+    async fn handshake(borrow mut this, deadline: Deadline) -> Result<void, NetError> {
+        loop {
+            let r = unsafe { wt_handshake(this.conn) } as i64;
+            await this.sendOutput(deadline)?; // a flight, or the alert that ends a failed handshake
+            if (r == Wt.done()) {
+                break;
+            }
+            if (r != Wt.wantRead() && r != Wt.wantWrite()) {
+                return Err(this.failed());
+            }
+            if (r == Wt.wantRead()) {
+                if (!await this.pull(deadline, true)?) {
+                    return Err(NetError.Tls(TlsReason.Handshake)); // the peer left mid-handshake
+                }
+            }
+        }
+        var name = [0u8; 16];
+        let n = unsafe { wt_alpn(this.conn, borrow mut name[0] as *mut u8, name.length) };
+        this.negotiated =
+            if (n == 2 && name[0] == 104 && name[1] == 50) Alpn.Http2 else if (n == 8) Alpn.Http11 else Alpn.None;
+        return Ok();
+    }
+
+    /// Writes every byte of ciphertext the shim has for the peer.
+    /// Safety: wt_take copies at most the spare room's length into it.
+    async fn sendOutput(borrow mut this, deadline: Deadline) -> Result<void, NetError> {
+        loop {
+            this.outgoing.clear();
+            let spare = this.outgoing.spare();
+            let n = unsafe { wt_take(this.conn, spare.ptr, spare.length) };
+            if (n <= 0) {
+                return Ok();
+            }
+            if (this.poisoned) {
+                return Err(NetError.Closed);
+            }
+            match (this.outgoing.commit(truncate<usize>(n))) {
+                Ok() => {}
+                Err(e) => { return Err(e); }
+            }
+            match (await writePlain(mut this.plain, this.outgoing.readable(), deadline)) {
+                Ok() => {}
+                Err(e) => {
+                    this.poisoned = true;
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Gives the shim more ciphertext: what was read before and not yet fed, else a new read from the stream by
+    /// `deadline`. False at the end of the stream. During the handshake (`counting`), more than HANDSHAKE_BYTES is
+    /// `LimitExceeded`.
+    /// Safety: wt_feed reads at most the readable bytes' length from them and keeps no pointer.
+    async fn pull(borrow mut this, deadline: Deadline, counting: bool) -> Result<bool, NetError> {
+        if (this.incoming.isEmpty()) {
+            this.incoming.clear();
+            let n = await readPlain(mut this.plain, this.incoming.spare(), deadline)?;
+            if (n == 0) {
+                return Ok(false);
+            }
+            this.incoming.commit(n)?;
+        }
+        let ready = this.incoming.readable();
+        let taken = unsafe { wt_feed(this.conn, ready.ptr, ready.length) };
+        if (taken == Wt.full()) {
+            return Err(NetError.Tls(TlsReason.Protocol)); // two records the shim has not consumed: not TLS
+        }
+        if (taken < 0) {
+            return Err(this.failed());
+        }
+        this.incoming.consume(truncate<usize>(taken))?; // taken >= 0 here
+        if (counting) {
+            this.fed += truncate<u64>(taken);
+            if (this.fed > HANDSHAKE_BYTES) {
+                return Err(NetError.LimitExceeded);
+            }
+        }
+        return Ok(true);
+    }
+
+    /// The error for the shim's last failure.
+    /// Safety: `conn` is this transport's live context.
+    fn failed(borrow this) -> NetError => NetError.Tls(reasonOf(unsafe { wt_reason(this.conn) }));
+
+    /// Encrypts `bytes` without writing; the caller sends the output.
+    /// Safety: wt_write reads at most each chunk's length and keeps no pointer.
+    fn encrypt(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        var at: usize = 0;
+        while (at < bytes.length) {
+            var end = at + 16384;
+            if (end > bytes.length) {
+                end = bytes.length;
+            }
+            let chunk = bytes[at..end];
+            let r = unsafe { wt_write(this.conn, chunk.ptr, chunk.length) };
+            if (r < 0) {
+                this.poisoned = true;
+                return Err(this.failed());
+            }
+            at = end;
+        }
+        return Ok();
+    }
+
+    /// Safety: `conn` is this transport's own context, freed once, here; the shim frees its SSL and BIOs.
+    drop {
+        unsafe { wt_ctx_free(this.conn); }
+    }
+}
+
+impl Transport for TlsTransport {
+    /// Decrypted bytes: at least one, or 0 at the end (the peer's close_notify, or the stream ending without one:
+    /// HTTP's own framing finds a body cut short).
+    /// Safety: wt_read writes at most `buffer.length` bytes into it.
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        if (buffer.length == 0) {
+            return Err(NetError.LimitExceeded);
+        }
+        loop {
+            let n = unsafe { wt_read(this.conn, buffer.ptr, buffer.length) };
+            if (n > 0) {
+                return Ok(truncate<usize>(n)); // n > 0 here
+            }
+            if (n == Wt.closed()) {
+                return Ok(0);
+            }
+            if (n != Wt.wantRead() && n != Wt.wantWrite()) {
+                return Err(this.failed());
+            }
+            await this.sendOutput(Deadline.never())?; // a reply the protocol owes (a key update)
+            if (!await this.pull(Deadline.never(), false)?) {
+                return Ok(0);
+            }
+        }
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        if (this.poisoned) {
+            return Err(NetError.Closed);
+        }
+        this.encrypt(bytes)?;
+        return await this.sendOutput(Deadline.never());
+    }
+
+    /// Encrypts every part, then writes the records in as few writes as fit: all of `parts`, or an error.
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        if (this.poisoned) {
+            return Err(NetError.Closed);
+        }
+        var total: usize = 0;
+        for (i in 0..parts.count()) {
+            let p = parts.part(i);
+            this.encrypt(p)?;
+            total += p.length;
+        }
+        await this.sendOutput(Deadline.never())?;
+        return Ok(total);
+    }
+
+    /// Sends close_notify, then ends the stream's writing.
+    /// Safety: `conn` is this transport's live context.
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> {
+        if (this.poisoned) {
+            return Err(NetError.Closed);
+        }
+        unsafe { wt_shutdown(this.conn); }
+        await this.sendOutput(Deadline.never())?;
+        return await this.plain.shutdownWrite();
+    }
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => this.negotiated;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => this.plain.peerAddress();
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => this.plain.localAddress();
+}
+
+/// Reads from the plain stream by `deadline`. It calls `PlainStream` directly, not through `dyn Transport`
+/// (`Transports.readWithin`): through `dyn` the read could be a TlsTransport's own, and its frame would contain itself
+/// (N0343).
+async fn readPlain(plain: borrow mut PlainStream, into: SliceMut<u8>, deadline: Deadline) -> Result<usize, NetError> {
+    if (deadline.isNever()) {
+        return await plain.read(into);
+    }
+    if (deadline.isExpired()) {
+        return Err(NetError.TimedOut);
+    }
+    return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await plain.read(into));
+}
+
+/// Writes all of `bytes` to the plain stream by `deadline`, as `readPlain`.
+async fn writePlain(plain: borrow mut PlainStream, bytes: Slice<u8>, deadline: Deadline) -> Result<void, NetError> {
+    if (deadline.isNever()) {
+        return await plain.write(bytes);
+    }
+    if (deadline.isExpired()) {
+        return Err(NetError.TimedOut);
+    }
+    return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await plain.write(bytes));
+}
+
+fn buffer(n: usize) -> Result<OwnedBuffer, NetError> {
+    match (OwnedBuffer.create(n)) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}
+
+/// The acceptor for TLS servers: a handshake with its configuration on every accepted stream.
+@noncopy
+public struct TlsAcceptor {
+    private config: TlsConfig;
+
+    /// An acceptor presenting `config` (a server configuration).
+    public fn create(config: TlsConfig) -> Result<TlsAcceptor, TlsSetupError> {
+        if (!config.isServer()) {
+            return Err(TlsSetupError.Internal);
+        }
+        return Ok(TlsAcceptor { config: config });
+    }
+}
+
+impl Acceptor for TlsAcceptor {
+    async fn accept(borrow this, stream: PlainStream, deadline: Deadline) -> Result<Box<dyn Transport>, NetError> {
+        let t = await TlsTransport.accept(stream, this.config, deadline)?;
+        match (Box.create(t)) {
+            Ok(b) => {
+                let d: Box<dyn Transport> = b;
+                return Ok(d);
+            }
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+}
+
+/// The connector for TLS clients: a handshake with its configuration, verifying the host.
+@noncopy
+public struct TlsConnector {
+    private config: TlsConfig;
+
+    /// A connector with `config` (a client configuration).
+    public fn create(config: TlsConfig) -> Result<TlsConnector, TlsSetupError> {
+        if (config.isServer()) {
+            return Err(TlsSetupError.Internal);
+        }
+        return Ok(TlsConnector { config: config });
+    }
+}
+
+impl Connector for TlsConnector {
+    async fn connect(
+        borrow this,
+        stream: PlainStream,
+        host: StringView,
+        deadline: Deadline,
+    ) -> Result<Box<dyn Transport>, NetError> {
+        let t = await TlsTransport.connect(stream, this.config, host, deadline)?;
+        match (Box.create(t)) {
+            Ok(b) => {
+                let d: Box<dyn Transport> = b;
+                return Ok(d);
+            }
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+}

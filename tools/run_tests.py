@@ -7,7 +7,9 @@ usage: python3 tools/run_tests.py [--ceesafec PATH] [--filter TEXT] [--no-interp
 
 Tests are `@test` functions in packages/<name>/tests/*.cee, part of their package. Each runs as its own process,
 natively, and must pass with no allocation left live (a leak fails it); a test past --timeout (default 120 s) fails.
-By default every package is run twice, natively and in the interpreter (`--interp`: virtual clock, fixed order).
+By default every package is run twice, natively and in the interpreter (`--interp`: virtual clock, fixed order). A
+package with C of its own (`c = [...]`), or depending on web_tls, is not interpreted: the interpreter runs no C
+(CeeSafe spec §28.6; Web ADR 0002 §4).
 
 --sanitize    the native run with ASan and UBSan (`--cflag -fsanitize=address,undefined`).
 --alloc-sweep each passing test again once per allocation, that allocation failing (`--sweep alloc`): no panic,
@@ -55,9 +57,14 @@ def main() -> int:
         modes.append(("cancel sweep", native + ["--sweep", "cancel"]))
 
     failed = 0
+    skipped = 0
     for package in packages:
         name = package.name
         for mode, flags in modes:
+            if mode == "interp" and has_c(package):
+                skipped += 1
+                print(f"skip {name} ({mode}): it runs C, which the interpreter cannot")
+                continue
             command = [args.ceesafec, "test"] + flags
             if args.filter:
                 command += ["--filter", args.filter]
@@ -70,8 +77,15 @@ def main() -> int:
                 failed += 1
                 print(f"FAIL {name} ({mode})")
                 print("  " + "\n  ".join(lines))
-    print(f"run_tests: {len(packages) * len(modes) - failed} runs passed, {failed} failed")
+    print(f"run_tests: {len(packages) * len(modes) - failed - skipped} runs passed, {failed} failed, {skipped} skipped")
     return 1 if failed else 0
+
+
+def has_c(package: pathlib.Path) -> bool:
+    """Whether the package has C files of its own, or depends on web_tls (whose shim is C)."""
+    manifest = (package / "ceesafe.toml").read_text()
+    return any(line.strip().startswith("c = [") for line in manifest.splitlines()) or "web_tls" in manifest.split(
+        "[dependencies]", 1)[-1]
 
 
 if __name__ == "__main__":

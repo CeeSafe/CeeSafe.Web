@@ -2,9 +2,14 @@
 name = "web_tls"
 version = "0.1.0"
 kind = "library"
-# OpenSSL (Web ADR 0002) is linked through the manifest once CeeSafe has U8:
-#   links = ["ssl", "crypto"]
-# Until then, builds that use web_tls pass --cflag -lssl --cflag -lcrypto.
+# OpenSSL >= 3.0 (Web ADR 0002 §3.1), linked through the manifest (CeeSafe ADR 0047). The shim is the only C.
+c = ["c/tls_shim.c"]
+links = ["ssl", "crypto"]
+
+[target.macos]
+# Homebrew's openssl@3, not the system's LibreSSL.
+lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
+include-dirs = ["/opt/homebrew/opt/openssl@3/include"]
 
 [dependencies]
 web_core = { path = "../web_core" }

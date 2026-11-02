@@ -1,2 +1,0 @@
-// web_tls: OpenSSL adapter (C shim over memory BIOs), TlsTransport, TlsAcceptor and TlsConnector.
-// Milestone M4 (docs/implementation-plan.md). Empty until then.

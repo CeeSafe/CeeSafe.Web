@@ -1,0 +1,169 @@
+// HTTPS: web_server behind web_tls's TlsAcceptor (Web ADR 0002), for the TLS interop checks (tests/interop/tls.py).
+// Listens on 127.0.0.1:CW_PORT (default 8443) with the certificate chain CW_CERT and key CW_KEY (PEM files),
+// offering ALPN http/1.1.
+//
+//   GET  /       "hello, tls"
+//   POST /echo   the request body back
+//   POST /stop   starts the drain
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_tls;
+
+struct App {}
+
+struct Hello {}
+
+impl Handler<App> for Hello {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> =>
+        await exchange.send(Status.ok(), "hello, tls".bytes());
+}
+
+struct Echo {}
+
+impl Handler<App> for Echo {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var body = match (OwnedBuffer.create(2097152)) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        await exchange.readToEnd(mut body)?;
+        return await exchange.send(Status.ok(), body.readable());
+    }
+}
+
+struct Stop {}
+
+impl Handler<App> for Stop {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        ctx.connection().drain().start();
+        return await exchange.send(Status.ok(), "stopping".bytes());
+    }
+}
+
+fn handler<H: Handler<App>>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App>>, RouteError> {
+    match (b) {
+        Ok(h) => {
+            let d: Box<dyn Handler<App>> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn application() -> Result<Server<App>, RouteError> {
+    var limits = Limits.defaults();
+    limits.maxBodyBytes = 2097152;
+    var server = Server<App>.create(App {}, limits)?;
+    server.router().get("/", handler(Box.create(Hello {}))?)?;
+    server.router().post("/echo", handler(Box.create(Echo {}))?)?;
+    server.router().post("/stop", handler(Box.create(Stop {}))?)?;
+    return Ok(server);
+}
+
+/// The whole file at the path in environment variable `name`, into `out`.
+async fn readFile(name: StringView, out: borrow mut Vector<u8>) -> Result<void, NetError> {
+    let path = match (Environment.variable(name)) {
+        Some(p) => p,
+        null => { return Err(NetError.Closed); },
+    };
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(e) => { return Err(NetErrors.fromAsync(e)); },
+    };
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (await AsyncFiles.read(mut file, mut chunk[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(NetErrors.fromAsync(e)); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        for (i in 0..n) {
+            match (out.push(chunk[i])) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+    }
+}
+
+fn port() -> u16 {
+    let text = match (Environment.variable("CW_PORT")) {
+        Some(t) => t,
+        null => { return 8443; },
+    };
+    return match (Ascii.parseDecimal(text.bytes())) {
+        Some(v) => if (v > 0 && v < 65536) truncate<u16>(v) else 8443,
+        null => 8443,
+    };
+}
+
+async fn say(text: StringView) -> Result<void, NetError> {
+    match (await AsyncConsole.writeLine(text)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
+    var chain = Vector<u8>.create();
+    var key = Vector<u8>.create();
+    await readFile("CW_CERT", mut chain)?;
+    await readFile("CW_KEY", mut key)?;
+    var config = match (TlsConfig.server(chain.view(), key.view())) {
+        Ok(c) => c,
+        Err(_) => {
+            await say("https: the certificate or key could not be used")?;
+            return Ok();
+        },
+    };
+    var protocols = [Alpn.Http11];
+    match (config.setAlpn(protocols[..])) {
+        Ok() => {}
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+    }
+    let acceptor = match (TlsAcceptor.create(config)) {
+        Ok(a) => a,
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
+    };
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = Listener.bindWith(SocketAddresses.v4Loopback(port()), options)?;
+    let drain = Drain.create()?;
+    var limits = ConnectionLimits.defaults();
+    limits.graceMs = 1000;
+    await say("https: listening")?;
+    let report = await server.run(listener, acceptor, limits, drain)?;
+    return await say("https: drained");
+}
+
+fn main() {
+    let server = match (application()) {
+        Ok(s) => s,
+        Err(_) => {
+            Console.writeLine("https: could not build the routes");
+            return;
+        },
+    };
+    match (Async.run(serve(server))) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

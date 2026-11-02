@@ -1,0 +1,65 @@
+// The shim's functions (c/tls_shim.c; Web ADR 0002 §3.2 and amendment 1). Each does no I/O and keeps no pointer it
+// is given, so each is declared without effects. `cfg` is an SSL_CTX, `c` a connection context.
+import web_core;
+
+extern "C" {
+    @effects()
+    fn wt_cfg_new(server: i32) -> *mut void;
+    @effects()
+    fn wt_cfg_free(cfg: *mut void);
+    @effects()
+    fn wt_cfg_use_pem(cfg: *mut void, chain: *u8, chainLength: usize, key: *u8, keyLength: usize) -> i32;
+    @effects()
+    fn wt_cfg_trust_pem(cfg: *mut void, pem: *u8, length: usize) -> i32;
+    @effects()
+    fn wt_cfg_trust_default(cfg: *mut void) -> i32;
+    @effects()
+    fn wt_cfg_set_alpn(cfg: *mut void, wire: *u8, length: usize) -> i32;
+    @effects()
+    fn wt_ctx_new(cfg: *mut void, server: i32, host: *u8, hostLength: usize) -> *mut void;
+    @effects()
+    fn wt_ctx_free(c: *mut void);
+    @effects()
+    fn wt_feed(c: *mut void, input: *u8, length: usize) -> i64;
+    @effects()
+    fn wt_take(c: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn wt_pending(c: *mut void) -> u64;
+    @effects()
+    fn wt_handshake(c: *mut void) -> i32;
+    @effects()
+    fn wt_read(c: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn wt_write(c: *mut void, input: *u8, length: usize) -> i64;
+    @effects()
+    fn wt_shutdown(c: *mut void) -> i32;
+    @effects()
+    fn wt_alpn(c: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn wt_version(c: *mut void) -> i32;
+    @effects()
+    fn wt_reason(c: *mut void) -> i32;
+    @effects()
+    fn wt_error(c: *mut void, out: *mut u8, capacity: usize, length: *mut usize) -> u64;
+    @effects()
+    fn wt_openssl_version(out: *mut u8, capacity: usize) -> usize;
+}
+
+/// The shim's status codes (negative results).
+struct Wt {
+    fn done() -> i64 => 0;
+    fn wantRead() -> i64 => -1;
+    fn wantWrite() -> i64 => -2;
+    fn closed() -> i64 => -3;
+    fn error() -> i64 => -4;
+    fn full() -> i64 => -5;
+}
+
+/// The TlsReason for the shim's `wt_reason` code.
+fn reasonOf(code: i32) -> TlsReason => match (code) {
+    2 => TlsReason.Certificate,
+    3 => TlsReason.Protocol,
+    4 => TlsReason.Alert,
+    5 => TlsReason.Internal,
+    _ => TlsReason.Handshake,
+};
