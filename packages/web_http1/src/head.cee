@@ -1,0 +1,377 @@
+// The HTTP/1.1 request head (RFC 9112 §2-3, §5-6), sans-I/O (Web ADR 0004 §3.1): `HeadScanner` finds where a head
+// ends as bytes arrive, then `parseHead` parses it in place into a `Request` whose views borrow the input (Web ADR
+// 0003 §3.1). Strict where RFC 9112 allows a server to be: a bare LF, obsolete line folding, whitespace before a
+// field's colon, a control byte in a value, both Content-Length and Transfer-Encoding, differing Content-Lengths and
+// any Transfer-Encoding but `chunked` are each rejected.
+import web_http;
+
+/// How a request's body is delimited (RFC 9112 §6.3).
+public enum BodyFraming {
+    /// No body.
+    None,
+    /// Exactly this many bytes.
+    Length(u64),
+    /// Chunked transfer coding.
+    Chunked,
+}
+
+/// Finds the end of a request head as its bytes arrive, without scanning any byte twice. A connection keeps one
+/// per request and calls `scan` with the whole buffered input each time more arrives.
+public struct HeadScanner {
+    private scanned: usize;
+    private lineStart: usize;
+    private firstLineEnd: usize;
+    private headStart: usize;
+    private headEnd: usize;
+
+    /// A scanner at the start of a request.
+    public fn create() -> HeadScanner =>
+        HeadScanner { scanned: 0, lineStart: 0, firstLineEnd: 0, headStart: 0, headEnd: 0 };
+
+    /// Scans `input` (the buffered bytes, starting where the request starts; longer each call). True once the
+    /// empty line that ends the head has arrived: then `end()` is the head's length. Errors: a bare LF
+    /// (`BareLineFeed`); a request line longer than the limit (`RequestLineTooLong`); a head longer than the limit
+    /// (`HeadTooLarge`). Empty lines before the request line are skipped (RFC 9112 §2.2).
+    public fn scan(borrow mut this, input: Slice<u8>, limits: borrow Limits) -> Result<bool, ProtocolError> {
+        if (this.headEnd > 0) {
+            return Ok(true);
+        }
+        while (this.scanned < input.length) {
+            let k = this.scanned;
+            this.scanned += 1;
+            if (input[k] != 10) {
+                continue;
+            }
+            if (k == 0 || input[k - 1] != 13) {
+                return Err(ProtocolError.BareLineFeed);
+            }
+            let lineLength = k + 1 - this.lineStart; // CRLF included
+            if (lineLength == 2) {
+                if (this.firstLineEnd == 0) {
+                    // An empty line before the request line: skip it.
+                    this.headStart = k + 1;
+                    this.lineStart = k + 1;
+                    continue;
+                }
+                this.headEnd = k + 1;
+                if (this.headEnd - this.headStart > limits.maxHeadBytes) {
+                    return Err(ProtocolError.HeadTooLarge);
+                }
+                return Ok(true);
+            }
+            if (this.firstLineEnd == 0) {
+                if (lineLength > limits.maxRequestLineBytes) {
+                    return Err(ProtocolError.RequestLineTooLong);
+                }
+                this.firstLineEnd = k + 1;
+            }
+            this.lineStart = k + 1;
+        }
+        let pending = input.length - this.headStart;
+        if (this.firstLineEnd == 0 && input.length - this.lineStart > limits.maxRequestLineBytes) {
+            return Err(ProtocolError.RequestLineTooLong);
+        }
+        if (pending > limits.maxHeadBytes) {
+            return Err(ProtocolError.HeadTooLarge);
+        }
+        return Ok(false);
+    }
+
+    /// Where the head starts (after skipped empty lines).
+    public fn start(borrow this) -> usize => this.headStart;
+
+    /// Where the head ends (after its empty line); 0 until `scan` returned true.
+    public fn end(borrow this) -> usize => this.headEnd;
+}
+
+/// A parsed head: the request, how its body is framed, and what the connection should do.
+public struct Head<region r> {
+    /// The request; its views borrow the input.
+    public request: Request<r>;
+    /// The body's framing.
+    public framing: BodyFraming;
+    /// Whether the connection may stay open after this request: HTTP/1.1 unless `Connection: close`; HTTP/1.0 only
+    /// with `Connection: keep-alive` (RFC 9112 §9.3).
+    public keepAlive: bool;
+    /// Whether the client sent `Expect: 100-continue` (RFC 9110 §10.1.1).
+    public expectContinue: bool;
+}
+
+/// Parses the complete head `input[start..end]` (from a `HeadScanner`: it ends with CRLF CRLF). The request's views
+/// borrow `input`. Any other range is an error, never a panic.
+public fn parseHead<region r>(
+    input: Slice<r, u8>,
+    start: usize,
+    end: usize,
+    limits: borrow Limits,
+) -> Result<Head<r>, ProtocolError> {
+    if (start >= end || end > input.length || end - start < 4) {
+        return Err(ProtocolError.BadRequestLine);
+    }
+    // The request line: method SP request-target SP HTTP-version CRLF (RFC 9112 §3), single spaces.
+    var lineEnd = start;
+    while (lineEnd < end && input[lineEnd] != 13) {
+        lineEnd += 1;
+    }
+    if (lineEnd + 1 >= end || input[lineEnd + 1] != 10) {
+        return Err(ProtocolError.BadRequestLine);
+    }
+    var sp1 = start;
+    while (sp1 < lineEnd && input[sp1] != 32) {
+        sp1 += 1;
+    }
+    var sp2 = sp1 + 1;
+    while (sp2 < lineEnd && input[sp2] != 32) {
+        sp2 += 1;
+    }
+    if (sp1 >= lineEnd || sp2 >= lineEnd) {
+        return Err(ProtocolError.BadRequestLine);
+    }
+    let methodToken = input[start..sp1];
+    let targetBytes = input[sp1 + 1..sp2];
+    let versionBytes = input[sp2 + 1..lineEnd];
+    if (!Ascii.isToken(methodToken) || targetBytes.length == 0) {
+        return Err(ProtocolError.BadRequestLine);
+    }
+    for (b in targetBytes) {
+        if (b <= 32 || b >= 127) { // visible ASCII only: no space, control, DEL or non-ASCII
+            return Err(ProtocolError.BadRequestLine);
+        }
+    }
+    let version = parseVersion(versionBytes)?;
+    let method = Methods.parse(methodToken);
+    checkTargetForm(method, targetBytes)?;
+    let target = match (StringView.fromUtf8(targetBytes)) {
+        Some(t) => t,
+        null => { return Err(ProtocolError.BadRequestLine); },
+    };
+
+    // Field lines: field-name ":" OWS field-value OWS CRLF (RFC 9112 §5).
+    var headers = HeaderList.create(input);
+    var at = lineEnd + 2;
+    while (at < end - 2) {
+        var eol = at;
+        while (eol < end && input[eol] != 13) {
+            eol += 1;
+        }
+        if (eol + 1 >= end || input[eol + 1] != 10) {
+            return Err(ProtocolError.BadHeader); // a bare CR
+        }
+        let first = input[at];
+        if (first == 32 || first == 9) {
+            return Err(ProtocolError.ObsoleteFold);
+        }
+        var colon = at;
+        while (colon < eol && input[colon] != 58) {
+            colon += 1;
+        }
+        if (colon >= eol || !Ascii.isToken(input[at..colon])) {
+            return Err(ProtocolError.BadHeader); // no colon, an empty name, or whitespace before the colon
+        }
+        var vs = colon + 1;
+        var ve = eol;
+        while (vs < ve && Ascii.isWhitespace(input[vs])) {
+            vs += 1;
+        }
+        while (ve > vs && Ascii.isWhitespace(input[ve - 1])) {
+            ve -= 1;
+        }
+        for (i in vs..ve) {
+            if (!Ascii.isFieldValueChar(input[i])) {
+                return Err(ProtocolError.BadHeader); // NUL, CR or another control byte
+            }
+        }
+        headers.push(at, colon, vs, ve, limits.maxHeaders)?;
+        at = eol + 2;
+    }
+
+    let framing = bodyFraming(borrow headers, version, limits)?;
+    let hosts = headers.countOf(HeaderName.Host);
+    match (version) {
+        Version.Http11 => {
+            if (hosts != 1) {
+                return Err(ProtocolError.BadHost);
+            }
+        }
+        _ => {
+            if (hosts > 1) {
+                return Err(ProtocolError.BadHost);
+            }
+        }
+    }
+    match (headers.get(HeaderName.Host)) {
+        Some(h) => {
+            if (!validHost(h)) {
+                return Err(ProtocolError.BadHost);
+            }
+        }
+        null => {}
+    }
+    let close = headers.hasToken(HeaderName.Connection, "close");
+    let keepAlive = match (version) {
+        Version.Http10 => !close && headers.hasToken(HeaderName.Connection, "keep-alive"),
+        _ => !close,
+    };
+    let expectContinue = match (version) {
+        Version.Http11 => headers.hasToken(HeaderName.Expect, "100-continue"),
+        _ => false, // RFC 9110 §10.1.1: ignore it from HTTP/1.0
+    };
+    return Ok(Head {
+        request: Request.create(method, methodToken, target, version, headers),
+        framing: framing,
+        keepAlive: keepAlive,
+        expectContinue: expectContinue,
+    });
+}
+
+/// `HTTP/1.0`, or `HTTP/1.1` for 1.1 and later 1.x; another major version is `UnsupportedVersion`, anything else
+/// `BadRequestLine`. The name is case-sensitive (RFC 9112 §2.3).
+fn parseVersion(v: Slice<u8>) -> Result<Version, ProtocolError> {
+    if (v.length != 8 || !Ascii.equals(v[0..5], "HTTP/") || v[6] != 46) {
+        return Err(ProtocolError.BadRequestLine);
+    }
+    let major = v[5];
+    let minor = v[7];
+    if (major < 48 || major > 57 || minor < 48 || minor > 57) {
+        return Err(ProtocolError.BadRequestLine);
+    }
+    if (major == 49) {
+        // HTTP/1.x past 1.1 is handled as HTTP/1.1, the highest this server supports (RFC 9110 §2.5).
+        return Ok(if (minor == 48) Version.Http10 else Version.Http11);
+    }
+    return Err(ProtocolError.UnsupportedVersion);
+}
+
+/// The target's form must suit the method (RFC 9112 §3.2): authority-form only for CONNECT, `*` only for OPTIONS;
+/// otherwise origin-form (`/…`) or absolute-form (`scheme:…`).
+fn checkTargetForm(method: Method, target: Slice<u8>) -> Result<void, ProtocolError> {
+    match (method) {
+        Method.Connect => {
+            // host:port, no path.
+            for (b in target) {
+                if (b == 47 || b == 63 || b == 35) {
+                    return Err(ProtocolError.BadRequestLine);
+                }
+            }
+            return Ok();
+        }
+        _ => {}
+    }
+    if (target.length == 1 && target[0] == 42) {
+        return match (method) {
+            Method.Options => Ok(),
+            _ => Err(ProtocolError.BadRequestLine),
+        };
+    }
+    if (target[0] == 47) {
+        return Ok();
+    }
+    // absolute-form: a scheme (ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )) then ':'.
+    var i: usize = 0;
+    while (i < target.length && target[i] != 58) {
+        let b = target[i];
+        let letter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+        if (!letter && (i == 0 || !((b >= 48 && b <= 57) || b == 43 || b == 45 || b == 46))) {
+            return Err(ProtocolError.BadRequestLine);
+        }
+        i += 1;
+    }
+    if (i == 0 || i >= target.length) {
+        return Err(ProtocolError.BadRequestLine);
+    }
+    return Ok();
+}
+
+/// A Host value: `uri-host [ ":" port ]` characters only (RFC 3986 reg-name, IP literal and port), and not empty
+/// from HTTP/1.1 unless the target has no authority (an empty Host is allowed then, RFC 9112 §3.2).
+fn validHost(h: Slice<u8>) -> bool {
+    for (b in h) {
+        let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 ||
+            b == 95 || b == 126 || b == 58 || b == 91 || b == 93 || b == 37 || b == 33 || b == 36 || b == 38 ||
+            b == 39 || b == 40 || b == 41 || b == 42 || b == 43 || b == 44 || b == 59 || b == 61;
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The body's framing from the fields (RFC 9112 §6.1-6.3).
+fn bodyFraming(
+    headers: borrow HeaderList,
+    version: Version,
+    limits: borrow Limits,
+) -> Result<BodyFraming, ProtocolError> {
+    let encodings = headers.countOf(HeaderName.TransferEncoding);
+    let lengths = headers.countOf(HeaderName.ContentLength);
+    if (encodings > 0) {
+        if (lengths > 0) {
+            return Err(ProtocolError.LengthAndEncoding);
+        }
+        match (version) {
+            Version.Http10 => { return Err(ProtocolError.BadTransferEncoding); }
+            _ => {}
+        }
+        // Every coding listed, across every field, must be exactly one `chunked`, and nothing else: this server
+        // decodes no other coding, and chunked twice is an error (RFC 9112 §6.1).
+        var chunked: u32 = 0;
+        for (i in 0..headers.count()) {
+            if (HeaderNames.same(headers.name(i), HeaderName.TransferEncoding)) {
+                let v = headers.value(i);
+                var s: usize = 0;
+                for (k in 0..v.length + 1) {
+                    if (k == v.length || v[k] == 44) {
+                        let coding = trimWhitespace(v[s..k]);
+                        if (Ascii.equalsIgnoringCase(coding, "chunked")) {
+                            chunked += 1;
+                        } else {
+                            return Err(ProtocolError.BadTransferEncoding);
+                        }
+                        s = k + 1;
+                    }
+                }
+            }
+        }
+        if (chunked != 1) {
+            return Err(ProtocolError.BadTransferEncoding);
+        }
+        return Ok(BodyFraming.Chunked);
+    }
+    if (lengths > 0) {
+        // Every Content-Length field, and every element of a list in one, must be the same number (RFC 9112 §6.3
+        // item 5 lets a list of equal values stand for one).
+        var value: u64? = null;
+        for (i in 0..headers.count()) {
+            if (HeaderNames.same(headers.name(i), HeaderName.ContentLength)) {
+                let v = headers.value(i);
+                var s: usize = 0;
+                for (k in 0..v.length + 1) {
+                    if (k == v.length || v[k] == 44) {
+                        let n = match (Ascii.parseDecimal(trimWhitespace(v[s..k]))) {
+                            Some(x) => x,
+                            null => { return Err(ProtocolError.BadContentLength); },
+                        };
+                        match (value) {
+                            Some(prev) => {
+                                if (prev != n) {
+                                    return Err(ProtocolError.BadContentLength);
+                                }
+                            }
+                            null => { value = Some(n); }
+                        }
+                        s = k + 1;
+                    }
+                }
+            }
+        }
+        let n = match (value) {
+            Some(x) => x,
+            null => { return Err(ProtocolError.BadContentLength); },
+        };
+        if (n > limits.maxBodyBytes) {
+            return Err(ProtocolError.BodyTooLarge);
+        }
+        return Ok(if (n == 0) BodyFraming.None else BodyFraming.Length(n));
+    }
+    return Ok(BodyFraming.None);
+}

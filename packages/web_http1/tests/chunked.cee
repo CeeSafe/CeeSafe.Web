@@ -1,0 +1,146 @@
+// The chunked decoder against RFC 9112 §7.1: data, extensions, trailers, every split, and each malformed shape.
+import web_http;
+
+/// Decodes all of `input` (fed from `split` on: first `input[0..split]`, then the rest), appending data to `out`.
+/// Returns the bytes consumed and whether the body finished, or the error.
+fn decodeAll(input: Slice<u8>, split: usize, limits: borrow Limits, out: borrow mut Vector<u8>) -> Result<usize, ProtocolError> {
+    var d = ChunkDecoder.create(limits);
+    var at: usize = 0;
+    var available = if (split < input.length) split else input.length;
+    loop {
+        let step = d.decode(input[at..available])?;
+        for (i in 0..step.dataLength) {
+            match (out.push(input[at + step.dataStart + i])) {
+                Ok() => {}
+                Err(_) => { return Err(ProtocolError.BodyTooLarge); }
+            }
+        }
+        at += step.consumed;
+        if (step.finished) {
+            return Ok(at);
+        }
+        if (at == available) {
+            if (available == input.length) {
+                return Ok(at); // incomplete
+            }
+            available = input.length;
+        }
+    }
+}
+
+fn errorOf(text: StringView, limits: borrow Limits) -> ProtocolError? {
+    var out = Vector<u8>.create();
+    match (decodeAll(text.bytes(), text.bytes().length, limits, mut out)) {
+        Ok(_) => { return null; }
+        Err(e) => { return Some(e); }
+    }
+}
+
+@test
+fn decodes_at_every_split() -> Result<void, TestFailure> {
+    // Two chunks (5 and 0xA = 10 bytes: ", chunked!"), an extension, a trailer, then the next request's bytes.
+    let text = "5;name=val\r\nhello\r\nA\r\n, chunked!\r\n0\r\nX-Sum: 1\r\n\r\nGET";
+    let input = text.bytes();
+    let limits = Limits.defaults();
+    for (split in 0..input.length + 1) {
+        var out = Vector<u8>.create();
+        let used = match (decodeAll(input, split, limits, mut out)) {
+            Ok(n) => n,
+            Err(_) => { return Err(TestFailure.create("no error at any split")); },
+        };
+        Check.equalBytes("hello, chunked!".bytes(), out.view())?;
+        Check.equalU64((input.length - 3) as u64, used as u64)?; // "GET" is left for the next request
+    }
+    return Ok();
+}
+
+@test
+fn sizes() -> Result<void, TestFailure> {
+    let limits = Limits.defaults();
+    Check.isTrue(errorOf("a\r\n0123456789\r\n0\r\n\r\n", limits) == null, "lower-case hex")?;
+    Check.isTrue(errorOf("A\r\n0123456789\r\n0\r\n\r\n", limits) == null, "upper-case hex")?;
+    Check.isTrue(errorOf("5 ;x\r\nhello\r\n0\r\n\r\n", limits) == null, "BWS before an extension")?;
+    Check.isTrue(match (errorOf("1000000000000000\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "16 hex digits (an overflow attempt)")?;
+    Check.isTrue(match (errorOf("FFFFFFFFFFFFFFFFF\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "17 hex digits")?;
+    Check.isTrue(match (errorOf("\r\nhello\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "no size")?;
+    Check.isTrue(match (errorOf("-5\r\nhello\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "a sign")?;
+    Check.isTrue(match (errorOf("0x5\r\nhello\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "a 0x prefix")?;
+    var small = Limits.defaults();
+    small.maxBodyBytes = 8;
+    Check.isTrue(match (errorOf("5\r\nhello\r\n4\r\nmore\r\n0\r\n\r\n", small)) {
+        Some(ProtocolError.BodyTooLarge) => true,
+        _ => false,
+    }, "5 + 4 bytes past an 8-byte limit")?;
+    Check.isTrue(errorOf("5\r\nhello\r\n3\r\nmor\r\n0\r\n\r\n", small) == null, "5 + 3 bytes fit 8")?;
+    return Ok();
+}
+
+@test
+fn framing_errors() -> Result<void, TestFailure> {
+    let limits = Limits.defaults();
+    Check.isTrue(match (errorOf("5\nhello\r\n0\r\n\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "a bare LF after the size")?;
+    Check.isTrue(match (errorOf("5\r\nhelloX\r\n0\r\n\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "data longer than its size")?;
+    Check.isTrue(match (errorOf("5\r\nhello\n0\r\n\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "a bare LF after the data")?;
+    Check.isTrue(match (errorOf("5;a\u{0}b\r\nhello\r\n", limits)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "NUL in an extension")?;
+    var ext = Limits.defaults();
+    ext.maxChunkExtensionBytes = 4;
+    Check.isTrue(errorOf("1;abc\r\nx\r\n0\r\n\r\n", ext) == null, "';abc' is 4 extension bytes, its ';' included")?;
+    Check.isTrue(match (errorOf("1;abcd\r\nx\r\n0\r\n\r\n", ext)) {
+        Some(ProtocolError.BadChunk) => true,
+        _ => false,
+    }, "';abcd' is 5")?;
+    return Ok();
+}
+
+@test
+fn trailers() -> Result<void, TestFailure> {
+    let limits = Limits.defaults();
+    Check.isTrue(errorOf("0\r\nA: 1\r\nB: 2\r\n\r\n", limits) == null, "two trailer fields")?;
+    Check.isTrue(match (errorOf("0\r\nbad\r\n\r\n", limits)) {
+        Some(ProtocolError.BadTrailer) => true,
+        _ => false,
+    }, "a trailer line without a colon")?;
+    Check.isTrue(match (errorOf("0\r\nA : 1\r\n\r\n", limits)) {
+        Some(ProtocolError.BadTrailer) => true,
+        _ => false,
+    }, "space before a trailer's colon")?;
+    Check.isTrue(match (errorOf("0\r\nA: 1\n\r\n", limits)) {
+        Some(ProtocolError.BadTrailer) => true,
+        _ => false,
+    }, "a bare LF in the trailers")?;
+    var small = Limits.defaults();
+    small.maxTrailerBytes = 4;
+    Check.isTrue(errorOf("0\r\nA: 1\r\n\r\n", small) == null, "'A: 1' is 4 trailer bytes")?;
+    Check.isTrue(match (errorOf("0\r\nA: 12\r\n\r\n", small)) {
+        Some(ProtocolError.BadTrailer) => true,
+        _ => false,
+    }, "'A: 12' is 5")?;
+    return Ok();
+}

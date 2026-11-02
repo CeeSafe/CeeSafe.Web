@@ -1,0 +1,72 @@
+// Helpers for web_http1's tests.
+import web_http;
+
+/// What scanning and parsing one text as a request head gave.
+enum Outcome {
+    Parsed,
+    Incomplete,
+    Rejected(ProtocolError),
+}
+
+/// Scans `text` (all at once) and, once complete, parses it.
+fn outcomeOf(text: StringView, limits: borrow Limits) -> Outcome {
+    let input = text.bytes();
+    var scanner = HeadScanner.create();
+    match (scanner.scan(input, limits)) {
+        Err(e) => { return Outcome.Rejected(e); }
+        Ok(false) => { return Outcome.Incomplete; }
+        Ok(true) => {}
+    }
+    match (parseHead(input, scanner.start(), scanner.end(), limits)) {
+        Ok(_) => { return Outcome.Parsed; }
+        Err(e) => { return Outcome.Rejected(e); }
+    }
+}
+
+/// The outcome as text, for messages.
+fn describe(o: Outcome) -> StringView => match (o) {
+    Outcome.Parsed => "parsed",
+    Outcome.Incomplete => "incomplete",
+    Outcome.Rejected(e) => ProtocolErrors.describe(e),
+};
+
+/// Fails unless `text` is rejected with `expected`; `what` names the case.
+fn rejects(text: StringView, expected: ProtocolError, what: StringView) -> Result<void, TestFailure> {
+    let limits = Limits.defaults();
+    let got = outcomeOf(text, limits);
+    let ok = match (got) {
+        Outcome.Rejected(e) => Ascii.equals(ProtocolErrors.describe(e).bytes(), ProtocolErrors.describe(expected)),
+        _ => false,
+    };
+    if (ok) {
+        return Ok();
+    }
+    var f = TestFailure.create(what);
+    appendText(mut f, ": expected ");
+    appendText(mut f, ProtocolErrors.describe(expected));
+    appendText(mut f, ", got ");
+    appendText(mut f, describe(got));
+    return Err(f);
+}
+
+/// Fails unless `text` parses; `what` names the case.
+fn accepts(text: StringView, what: StringView) -> Result<void, TestFailure> {
+    let got = outcomeOf(text, Limits.defaults());
+    match (got) {
+        Outcome.Parsed => { return Ok(); }
+        _ => {}
+    }
+    var f = TestFailure.create(what);
+    appendText(mut f, ": got ");
+    appendText(mut f, describe(got));
+    return Err(f);
+}
+
+fn appendText(f: borrow mut TestFailure, s: StringView) {
+    for (b in s.bytes()) {
+        match (f.message.push(b)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+    }
+}

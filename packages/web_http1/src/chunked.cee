@@ -1,0 +1,224 @@
+// The chunked transfer coding (RFC 9112 §7.1), sans-I/O: a byte-by-byte state machine that never buffers. Data comes
+// back as a range of the caller's input. Limits: chunk sizes past 15 hex digits, extensions (every byte between the
+// size and its CRLF) past `maxChunkExtensionBytes`, trailers past `maxTrailerBytes` and a body past `maxBodyBytes` are errors. Trailer fields
+// are checked and discarded.
+import web_http;
+
+/// What one `ChunkDecoder.decode` call found.
+public struct ChunkStep {
+    /// Bytes of the input used, data included; the caller drops them.
+    public consumed: usize;
+    /// Body data at `input[dataStart..dataStart + dataLength]` (length 0: none in this step).
+    public dataStart: usize;
+    public dataLength: usize;
+    /// The last chunk and the trailer section have been read: the body is complete.
+    public finished: bool;
+}
+
+enum ChunkState {
+    Size,
+    Extension,
+    SizeLf,
+    Data,
+    DataCr,
+    DataLf,
+    TrailerStart,
+    TrailerName,
+    TrailerValue,
+    TrailerLf,
+    LastLf,
+    Done,
+}
+
+/// Decodes one chunked body.
+public struct ChunkDecoder {
+    private state: ChunkState;
+    private size: u64;
+    private digits: u32;
+    private left: u64;
+    private extensionBytes: usize;
+    private trailerBytes: usize;
+    private total: u64;
+    private maxExtension: usize;
+    private maxTrailer: usize;
+    private maxBody: u64;
+
+    /// A decoder at the start of a body, with `limits`' chunk, trailer and body limits.
+    public fn create(limits: borrow Limits) -> ChunkDecoder => ChunkDecoder {
+        state: ChunkState.Size,
+        size: 0,
+        digits: 0,
+        left: 0,
+        extensionBytes: 0,
+        trailerBytes: 0,
+        total: 0,
+        maxExtension: limits.maxChunkExtensionBytes,
+        maxTrailer: limits.maxTrailerBytes,
+        maxBody: limits.maxBodyBytes,
+    };
+
+    /// Whether the whole body has been decoded.
+    public fn isFinished(borrow this) -> bool => match (this.state) {
+        ChunkState.Done => true,
+        _ => false,
+    };
+
+    /// The body bytes decoded so far.
+    public fn bodyBytes(borrow this) -> u64 => this.total;
+
+    /// Decodes from the start of `input` until it finds data (returned at once), finishes the body, or uses all of
+    /// `input`. Call again with the bytes after `consumed`, and more as they arrive.
+    public fn decode(borrow mut this, input: Slice<u8>) -> Result<ChunkStep, ProtocolError> {
+        var i: usize = 0;
+        while (i < input.length) {
+            let b = input[i];
+            match (this.state) {
+                ChunkState.Size => {
+                    let d = hexValue(b);
+                    if (d < 16) {
+                        this.digits += 1;
+                        if (this.digits > 15) {
+                            return Err(ProtocolError.BadChunk); // past 2^60: an overflow attempt
+                        }
+                        this.size = this.size * 16 + d as u64;
+                    } else if (b == 59 || b == 32 || b == 9) { // ';', or BWS before it
+                        if (this.digits == 0) {
+                            return Err(ProtocolError.BadChunk);
+                        }
+                        this.extensionBytes = 1; // every byte after the size counts, this one included
+                        this.state = ChunkState.Extension;
+                    } else if (b == 13) {
+                        if (this.digits == 0) {
+                            return Err(ProtocolError.BadChunk);
+                        }
+                        this.state = ChunkState.SizeLf;
+                    } else {
+                        return Err(ProtocolError.BadChunk);
+                    }
+                }
+                ChunkState.Extension => {
+                    if (b == 13) {
+                        this.state = ChunkState.SizeLf;
+                    } else {
+                        if (!Ascii.isFieldValueChar(b)) {
+                            return Err(ProtocolError.BadChunk); // a bare LF, NUL or another control
+                        }
+                        this.extensionBytes += 1;
+                        if (this.extensionBytes > this.maxExtension) {
+                            return Err(ProtocolError.BadChunk);
+                        }
+                    }
+                }
+                ChunkState.SizeLf => {
+                    if (b != 10) {
+                        return Err(ProtocolError.BadChunk);
+                    }
+                    this.extensionBytes = 0;
+                    if (this.size == 0) {
+                        this.state = ChunkState.TrailerStart;
+                    } else {
+                        if (this.size > this.maxBody - this.total) {
+                            return Err(ProtocolError.BodyTooLarge);
+                        }
+                        this.total += this.size;
+                        this.left = this.size;
+                        this.state = ChunkState.Data;
+                    }
+                    this.size = 0;
+                    this.digits = 0;
+                }
+                ChunkState.Data => {
+                    let available = (input.length - i) as u64;
+                    let n = if (this.left < available) this.left else available;
+                    this.left -= n;
+                    if (this.left == 0) {
+                        this.state = ChunkState.DataCr;
+                    }
+                    let length = truncate<usize>(n);
+                    return Ok(ChunkStep { consumed: i + length, dataStart: i, dataLength: length, finished: false });
+                }
+                ChunkState.DataCr => {
+                    if (b != 13) {
+                        return Err(ProtocolError.BadChunk);
+                    }
+                    this.state = ChunkState.DataLf;
+                }
+                ChunkState.DataLf => {
+                    if (b != 10) {
+                        return Err(ProtocolError.BadChunk);
+                    }
+                    this.state = ChunkState.Size;
+                }
+                ChunkState.TrailerStart => {
+                    if (b == 13) {
+                        this.state = ChunkState.LastLf;
+                    } else {
+                        if (!Ascii.isTokenChar(b)) {
+                            return Err(ProtocolError.BadTrailer);
+                        }
+                        this.countTrailer()?;
+                        this.state = ChunkState.TrailerName;
+                    }
+                }
+                ChunkState.TrailerName => {
+                    if (b == 58) {
+                        this.state = ChunkState.TrailerValue;
+                    } else if (!Ascii.isTokenChar(b)) {
+                        return Err(ProtocolError.BadTrailer);
+                    }
+                    this.countTrailer()?;
+                }
+                ChunkState.TrailerValue => {
+                    if (b == 13) {
+                        this.state = ChunkState.TrailerLf;
+                    } else {
+                        if (!Ascii.isFieldValueChar(b)) {
+                            return Err(ProtocolError.BadTrailer);
+                        }
+                        this.countTrailer()?;
+                    }
+                }
+                ChunkState.TrailerLf => {
+                    if (b != 10) {
+                        return Err(ProtocolError.BadTrailer);
+                    }
+                    this.state = ChunkState.TrailerStart;
+                }
+                ChunkState.LastLf => {
+                    if (b != 10) {
+                        return Err(ProtocolError.BadChunk);
+                    }
+                    this.state = ChunkState.Done;
+                    return Ok(ChunkStep { consumed: i + 1, dataStart: 0, dataLength: 0, finished: true });
+                }
+                ChunkState.Done => {
+                    return Ok(ChunkStep { consumed: i, dataStart: 0, dataLength: 0, finished: true });
+                }
+            }
+            i += 1;
+        }
+        return Ok(ChunkStep { consumed: i, dataStart: 0, dataLength: 0, finished: this.isFinished() });
+    }
+
+    fn countTrailer(borrow mut this) -> Result<void, ProtocolError> {
+        this.trailerBytes += 1;
+        if (this.trailerBytes > this.maxTrailer) {
+            return Err(ProtocolError.BadTrailer);
+        }
+        return Ok();
+    }
+}
+
+/// A hex digit's value, or 16 if `b` is not one.
+fn hexValue(b: u8) -> u32 {
+    if (b >= 48 && b <= 57) {
+        return (b - 48) as u32;
+    }
+    if (b >= 97 && b <= 102) {
+        return (b - 87) as u32;
+    }
+    if (b >= 65 && b <= 70) {
+        return (b - 55) as u32;
+    }
+    return 16;
+}
