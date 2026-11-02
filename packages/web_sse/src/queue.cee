@@ -1,0 +1,88 @@
+// The bounded queue between an event producer and the stream (Web ADR 0008 §3.3).
+import web_core;
+
+/// What `publish` does when the queue is full.
+public enum Overflow {
+    /// Wait for room: the producer slows to the client's pace.
+    Block,
+    /// Close the queue: the stream ends after the events already queued, and the producer stops.
+    Disconnect,
+    /// Drop the oldest queued event. Needs CeeSafe U13 (`Channel.tryRecv`); until then `create` refuses it.
+    DropOldest,
+}
+
+/// Why `publish` did not queue an event.
+public enum PublishError {
+    /// The queue was closed: the client left, or the stream ended. Stop producing.
+    Closed,
+    /// The queue was full under `Overflow.Disconnect` (or already closed): it is closed now. Stop producing.
+    Disconnected,
+    /// The producer's task was cancelled.
+    Cancelled,
+}
+
+/// Why a queue could not be made.
+public enum QueueError {
+    /// `capacity` is 0.
+    BadCapacity,
+    /// The policy needs what CeeSafe does not provide yet (`DropOldest`: U13).
+    Unsupported,
+    /// Out of memory.
+    OutOfMemory,
+}
+
+/// A bounded queue of events with an overflow policy. Every handle may publish and take; `share` makes another
+/// handle to the same queue, for the producer.
+@noncopy
+public struct EventQueue {
+    private channel: Channel<Event>;
+    private policy: Overflow;
+
+    /// A queue holding up to `capacity` events.
+    public fn create(capacity: usize, policy: Overflow) -> Result<EventQueue, QueueError> {
+        if (capacity == 0) {
+            return Err(QueueError.BadCapacity);
+        }
+        match (policy) {
+            Overflow.DropOldest => { return Err(QueueError.Unsupported); }
+            _ => {}
+        }
+        match (Channel<Event>.create(capacity)) {
+            Ok(c) => { return Ok(EventQueue { channel: c, policy: policy }); }
+            Err(_) => { return Err(QueueError.OutOfMemory); }
+        }
+    }
+
+    /// Another handle to the same queue.
+    public fn share(borrow this) -> EventQueue => EventQueue { channel: this.channel.clone(), policy: this.policy };
+
+    /// Queues `e` under the queue's policy.
+    public async fn publish(borrow this, e: Event) -> Result<void, PublishError> {
+        match (this.policy) {
+            Overflow.Block => {
+                match (await this.channel.sendAsync(e)) {
+                    Ok() => { return Ok(); }
+                    Err(SendError.Closed(_)) => { return Err(PublishError.Closed); }
+                    Err(SendError.Cancelled(_)) => { return Err(PublishError.Cancelled); }
+                }
+            }
+            _ => {
+                match (this.channel.trySend(e)) {
+                    Ok() => { return Ok(); }
+                    Err(_) => {
+                        this.channel.close();
+                        return Err(PublishError.Disconnected);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The next event, waiting while the queue is empty; null once it is closed and empty.
+    public async fn next(borrow this) -> Result<Event?, AsyncError> => await this.channel.recvAsync();
+
+    /// No more events: the stream ends after those queued, and later `publish` calls fail with `Closed`.
+    public fn close(borrow this) {
+        this.channel.close();
+    }
+}

@@ -15,7 +15,8 @@ re-check them before editing.
 | **B12** generic impl passing `this` as `dyn` emits the uninstantiated type | **fixed** (`7be63c6`) | `tests/probes/generic-impl-this-dyn-bug.cee` builds and prints 7 |
 
 M2's task 5 (`web_server`) is unblocked: `Server<S>`, its tests and `examples/server` build and pass on 0.9.2.
-Nothing is open.
+Opened since, while building M3's `web_sse`: **U13** (`Channel.tryRecv`, wanted, blocks nothing) and **B13** (an
+`Async.scope` with a droppable error type does not build; tests avoid it).
 
 ## Status at 0.9.1 (released 2026-11-02, tag `v0.9.1` = CeeSafe `74226b0`)
 
@@ -538,6 +539,53 @@ must not), cookies' `Expires`, logs, and TLS certificate validity (M4, though Op
 **Effect on CeeSafe.Web until then:** the server sends no `Date`, which RFC 9110 allows a server without a clock to
 do. `web_http.HttpDate.format(unixSeconds, …)` is written and tested, so the driver turns `Date` on when U12 lands.
 
+## U13 — `Channel.tryRecv`: a receive that does not wait   *(found 2026-11-02 while designing M3, Web ADR 0008; wanted, not blocking)*
+
+**Gap:** `Channel<T>` (`lib/std/channel.cee`, CeeSafe ADR 0032) can send without waiting (`trySend`), but every
+receive waits: `recv` blocks the thread, `recvAsync` parks the task. Nothing takes a value only if one is there.
+
+**Needed by:** `web_sse` (Web ADR 0008 §3.3–3.4):
+- `Overflow.DropOldest`: on a full queue, the producer takes and drops the oldest event, then sends;
+- batching: after writing one event, the stream writes every event already queued before it flushes once, instead
+  of a flush (a socket write) per event.
+Later, the same need appears in HTTP/2's per-stream queues (M7) and the proxy (M8).
+
+**Wanted:** `public fn tryRecv(borrow this) -> T?` returns the next value if one is buffered, else `null` at once,
+whether the channel is empty or closed. It has no effect, like `trySend`, so async code and `drop` blocks may call
+it. With a way to tell "empty" from "closed and empty" if that is cheap (for example `Result<T?, ...>`, or
+`isClosed()`), but `null` for both is enough for these uses.
+
+**Effect on CeeSafe.Web until then:** `EventQueue.create(…, Overflow.DropOldest)` returns `Err(Unsupported)`, and the
+stream flushes after every event. Nothing else waits.
+
+## B13 — Bug: an `Async.scope` whose error type has a drop gives C that does not compile   *(found 2026-11-02, 0.9.2)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/scope-droppable-error-bug.cee`:
+
+```ceesafe
+struct Failure { text: Vector<u8>; }
+async fn run() -> Result<u64, Failure> {
+    var a: u64 = 0;
+    var b: u64 = 0;
+    let r: Result<void, Failure> = await Async.scope(Failure { text: Vector<u8>.create() }, (s) => {
+        s.spawn(async () => { a = 1; return Ok(); });
+        s.spawn(async () => { b = 2; return Ok(); });
+    });
+    ...
+}
+```
+
+**Observed:** it checks, and `run --interp` prints 3. `build` fails with 3 C errors: `call to undeclared function
+'ceeD_RvS7Failure'`, at the join's `ceeD_RvS7Failure(&f->cee_result); /* a later child's error, not the scope's */`,
+then `static declaration of 'ceeD_…' follows non-static declaration`. The drop function of `Result<void, Failure>` is
+called before it is declared. The same happens with lib/std's `TestFailure` as the error type, which is how it was
+found (`web_sse`'s tests).
+
+**Expected:** it builds and prints 3.
+
+**Effect on CeeSafe.Web:** tests use a copyable error type for scopes (`NetError`, as M1's tests already did). Library
+code is not affected so far: its scopes use `NetError` or `HandlerError`.
+
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/async-deadline-void-bug.cee`:
@@ -596,6 +644,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.9.0** (released 2026-11-02) | U6, U7, U9, U10, U11 | M9 sendfile, M10 HTTP/3; `web_server` without delegating impls |
 | **0.9.1** (released 2026-11-02) | B8 fixed; U12 | the `Date` field |
 | **0.9.2** (released 2026-11-02) | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
+| next | U13; B13 fixed | `web_sse`'s `DropOldest` and batched flushes (M3); scopes with `TestFailure` in tests |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

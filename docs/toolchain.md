@@ -12,6 +12,7 @@ that needs an unreleased compiler is not merged to main.
 | M0 contracts, engines, MockTransport | **0.5.1** | async interfaces, `dyn` async methods (ADR 0036), regions, completion I/O (ADR 0035) | released |
 | M1 transport lifecycle | **0.8.0** | 0.7.0's B2/B4 fixes, U1–U4 (ADRs 0044–0046); 0.8.0's B5 fix (overload gate), B6 fix (`void` deadlines) and `ceesafec test` (ADR 0049, the tests) | on main (`docs/milestones/M1.md`) |
 | M2 HTTP/1.1 server | **0.9.2** | U3 vectored send, `ceesafec test`; U12 wall clock (ADR 0055, `Date`); `web_server` needs U10 (0.9.0), the B8 fix (0.9.1) and the B9–B12 fixes (0.9.2) | on main (`docs/milestones/M2.md`) |
+| M3 streaming and SSE | **0.9.2** | everything M2 needs; nothing new (U13 is wanted for `DropOldest`) | gate passed (`docs/milestones/M3.md`) |
 | M4 TLS | 0.8.0 | U8 manifest `links` (OpenSSL, ADR 0047) | released |
 | M5 client | 0.8.0 | U5 DNS (ADR 0048) | released |
 | M9 sendfile | 0.9.0 | U7 (ADR 0051) | released |

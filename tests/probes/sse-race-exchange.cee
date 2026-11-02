@@ -1,0 +1,78 @@
+// Probe for M3 (web_sse): can one task race "the peer closed" (a method borrowing the exchange mutably) against "the
+// next event or a heartbeat" (a channel and a timer), then write to the exchange after the race? Expected output:
+// 3 events written, 2 heartbeats, then the peer closes: 3, 2, "closed".
+
+struct Exch {
+    peer: Channel<u8>;
+    events: u64;
+    beats: u64;
+
+    /// Waits until the peer goes away (the test closes `peer`).
+    async fn peerClosed(borrow mut this) -> Result<u32, AsyncError> {
+        loop {
+            match (await this.peer.recvAsync()?) {
+                Some(_) => {}
+                null => { return Ok(0); }
+            }
+        }
+    }
+}
+
+/// 0: closed; 1: an event; 2: a heartbeat; 3: the producer ended.
+async fn next(ex: borrow mut Exch, events: borrow Channel<u64>) -> Result<u32, AsyncError> {
+    let r = await Async.race(
+        async () => await ex.peerClosed(),
+        async () => {
+            let raced: Result<Raced<u32>, AsyncError> = await Async.race(
+                async () => {
+                    match (await events.recvAsync()?) {
+                        Some(_) => { return Ok(1u32); }
+                        null => { return Ok(3u32); }
+                    }
+                },
+                async () => {
+                    await Timer.sleep(50)?;
+                    return Ok(2u32);
+                },
+            );
+            return Ok(raced?.value);
+        },
+    )?;
+    return Ok(r.value);
+}
+
+async fn serve(ex: borrow mut Exch, events: borrow Channel<u64>) -> Result<void, AsyncError> {
+    loop {
+        match (await next(mut ex, events)?) {
+            0 => { return Ok(); }
+            1 => { ex.events += 1; }
+            2 => { ex.beats += 1; }
+            _ => { return Ok(); }
+        }
+    }
+}
+
+async fn run() -> Result<u64, AsyncError> {
+    var ex = Exch { peer: Channel<u8>.create(1)!, events: 0, beats: 0 };
+    let events = Channel<u64>.create(8)!;
+    let peer = ex.peer.clone();
+    await Async.scope(AsyncError.Cancelled, (s) => {
+        s.spawn(async () => await serve(mut ex, events));
+        s.spawn(async () => {
+            for (i in 0..3u64) {
+                events.trySend(i)!;
+            }
+            await Timer.sleep(120)?; // two heartbeats at 50 ms
+            peer.close();
+            return Ok();
+        });
+    })?;
+    return Ok(ex.events * 10 + ex.beats);
+}
+
+fn main() {
+    let n = Async.run(run())!;
+    Console.writeLine(n / 10);
+    Console.writeLine(n % 10);
+    Console.writeLine("closed");
+}

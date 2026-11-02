@@ -1,0 +1,33 @@
+// CeeSafe bug repro (B13): an `Async.scope` whose error type has a drop (here a struct owning a Vector) gives C that
+// does not compile: the scope's join drops "a later child's error" through the error's drop function before that
+// function is declared. Expected: it builds and prints 3, as `run --interp` does.
+
+struct Failure {
+    text: Vector<u8>;
+}
+
+async fn run() -> Result<u64, Failure> {
+    var a: u64 = 0;
+    var b: u64 = 0;
+    let r: Result<void, Failure> = await Async.scope(Failure { text: Vector<u8>.create() }, (s) => {
+        s.spawn(async () => {
+            a = 1;
+            return Ok();
+        });
+        s.spawn(async () => {
+            b = 2;
+            return Ok();
+        });
+    });
+    match (r) {
+        Ok() => { return Ok(a + b); }
+        Err(e) => { return Err(e); }
+    }
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok(n) => { Console.writeLine(n); }
+        Err(_) => { Console.writeLine("failed"); }
+    }
+}

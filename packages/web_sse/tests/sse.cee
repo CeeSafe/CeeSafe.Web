@@ -1,0 +1,302 @@
+// web_sse (Web ADR 0008). Expected wire forms are written by hand from WHATWG HTML §9.2.5–9.2.6 (one `data:` line per
+// line of data, lines split at LF, CR and CRLF; fields as `name: value`); chunk sizes were computed apart, in Python.
+import web_core;
+import web_http;
+
+@test
+fn encoding() -> Result<void, TestFailure> {
+    same("data: x\n\n", event("x")?)?;
+    // Empty data still dispatches an event: one empty `data:` line.
+    same("data: \n\n", event("")?)?;
+    same("data: a\ndata: b\n\n", event("a\nb")?)?;
+    // CRLF is one line end, a lone CR is one too; a final line end leaves an empty last line.
+    same("data: a\ndata: b\ndata: c\ndata: \n\n", event("a\r\nb\rc\n")?)?;
+    // The client strips one space after the colon, so a leading space in the data survives.
+    same("data:  lead\n\n", event(" lead")?)?;
+    let full = made(made(event("x")?.withType("tick".bytes()))?.withId("7".bytes()))?.withRetry(3000);
+    same("event: tick\nid: 7\nretry: 3000\ndata: x\n\n", full)?;
+    // An empty id is sent: it resets the client's last event id.
+    same("id: \ndata: x\n\n", made(event("x")?.withId("".bytes()))?)?;
+    same("retry: 0\ndata: x\n\n", event("x")?.withRetry(0))?;
+    Check.isTrue(isInvalid(event("x")?.withId("a\nb".bytes())), "LF in an id")?;
+    Check.isTrue(isInvalid(event("x")?.withId("a\rb".bytes())), "CR in an id")?;
+    var nul = [97u8, 0u8];
+    Check.isTrue(isInvalid(event("x")?.withId(nul[..])), "NUL in an id")?;
+    Check.isTrue(isInvalid(event("x")?.withType("a\rb".bytes())), "CR in a type")?;
+    Check.equalBytes(":\n".bytes(), Events.heartbeat().bytes())?;
+    return Ok();
+}
+
+@test
+async fn overflow_policies() -> Result<void, TestFailure> {
+    let isBad = match (EventQueue.create(0, Overflow.Block)) {
+        Err(QueueError.BadCapacity) => true,
+        _ => false,
+    };
+    Check.isTrue(isBad, "capacity 0")?;
+    let unsupported = match (EventQueue.create(4, Overflow.DropOldest)) {
+        Err(QueueError.Unsupported) => true,
+        _ => false,
+    };
+    Check.isTrue(unsupported, "DropOldest waits for U13")?;
+
+    // Disconnect: the third event finds the queue full, closes it, and the two queued still come out.
+    let d = queued(EventQueue.create(2, Overflow.Disconnect))?;
+    Check.isTrue(isOk(await d.publish(event("1")?)), "first")?;
+    Check.isTrue(isOk(await d.publish(event("2")?)), "second")?;
+    let third = match (await d.publish(event("3")?)) {
+        Err(PublishError.Disconnected) => true,
+        _ => false,
+    };
+    Check.isTrue(third, "disconnected")?;
+    Check.isTrue(await nextIs(d, "1"), "1 kept")?;
+    Check.isTrue(await nextIs(d, "2"), "2 kept")?;
+    Check.isTrue(await isEnd(d), "then the end")?;
+
+    // Block: the third publish waits (a 20 ms timer wins the race) until a `next` makes room.
+    let b = queued(EventQueue.create(2, Overflow.Block))?;
+    Check.isTrue(isOk(await b.publish(event("1")?)), "first")?;
+    Check.isTrue(isOk(await b.publish(event("2")?)), "second")?;
+    let raced: Result<Raced<u32>, AsyncError> = await Async.race(
+        async () => {
+            let three = match (Event.create("3".bytes())) {
+                Ok(e) => e,
+                Err(_) => { return Ok(9u32); },
+            };
+            match (await b.publish(three)) {
+                Ok() => { return Ok(1u32); }
+                Err(_) => { return Ok(9u32); }
+            }
+        },
+        async () => {
+            await Timer.sleep(20)?;
+            return Ok(2u32);
+        },
+    );
+    match (raced) {
+        Ok(r) => { Check.equalU64(2, r.value as u64)?; }
+        Err(_) => { return Check.fail("the race"); }
+    }
+    Check.isTrue(await nextIs(b, "1"), "1")?;
+    Check.isTrue(isOk(await b.publish(event("3")?)), "room again")?;
+    b.close();
+    let closed = match (await b.publish(event("4")?)) {
+        Err(PublishError.Closed) => true,
+        _ => false,
+    };
+    Check.isTrue(closed, "closed")?;
+    Check.isTrue(await nextIs(b, "2"), "2")?;
+    Check.isTrue(await nextIs(b, "3"), "3")?;
+    Check.isTrue(await isEnd(b), "end")?;
+    return Ok();
+}
+
+/// Two events, then the queue ends: the head, one chunk per event, the last chunk.
+@test
+async fn events_then_the_end() -> Result<void, TestFailure> {
+    var conn = peer(null);
+    let q = queued(EventQueue.create(4, Overflow.Block))?;
+    Check.isTrue(isOk(await q.publish(event("one")?)), "one")?;
+    let two = made(made(event("a\r\nb")?.withType("tick".bytes()))?.withId("7".bytes()))?;
+    Check.isTrue(isOk(await q.publish(two)), "two")?;
+    q.close();
+    let end = await streamed(mut conn, q, StreamOptions.defaults(), Silent {})?;
+    Check.isTrue(isFinished(end), "finished")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\ntransfer-encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n23\r\nevent: tick\nid: 7\ndata: a\ndata: b\n\n\r\n0\r\n\r\n".bytes(),
+        conn.output.view(),
+    )?;
+    return Ok();
+}
+
+/// A quiet stream sends a heartbeat every 50 ms: two before an event published at 125 ms, then the end.
+@test
+async fn heartbeats_while_quiet() -> Result<void, TestFailure> {
+    var conn = peer(null);
+    let q = queued(EventQueue.create(4, Overflow.Block))?;
+    let producer = q.share();
+    var end = StreamEnd.ClientClosed;
+    var failed = false;
+    var lost = false;
+    // The scope's error type is `NetError`, as in M1's tests: a droppable one hits CeeSafe B13.
+    let r: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            match (await streamed(mut conn, q, StreamOptions { heartbeatMs: 50 }, Silent {})) {
+                Ok(e) => { end = e; }
+                Err(_) => {
+                    failed = true;
+                    q.close(); // as the stream itself would: the producer must not wait for it
+                }
+            }
+            return Ok();
+        });
+        s.spawn(async () => {
+            match (await Timer.sleep(125)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Cancelled); }
+            }
+            let late = match (Event.create("late".bytes())) {
+                Ok(e) => e,
+                Err(_) => { return Err(NetError.OutOfMemory); },
+            };
+            if (!isOk(await producer.publish(late))) {
+                lost = true;
+            }
+            producer.close();
+            return Ok();
+        });
+    });
+    Check.isTrue(isDone(r) && !failed && !lost, "both tasks")?;
+    Check.isTrue(isFinished(end), "finished")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\ntransfer-encoding: chunked\r\n\r\n2\r\n:\n\r\n2\r\n:\n\r\nc\r\ndata: late\n\n\r\n0\r\n\r\n".bytes(),
+        conn.output.view(),
+    )?;
+    return Ok();
+}
+
+/// The client closes at 40 ms while the stream is idle under a 10 s heartbeat. The stream notices at once and closes
+/// the queue, so the producer's next `publish` fails with `Closed`: both end long before a heartbeat.
+@test
+async fn a_closed_client_frees_the_producer() -> Result<void, TestFailure> {
+    let started = Timer.now();
+    var conn = peer(Some(started + 40));
+    let q = queued(EventQueue.create(1, Overflow.Block))?;
+    let producer = q.share();
+    var end = StreamEnd.Finished;
+    var failed = false;
+    var producerSaw: u32 = 0;
+    let r: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            match (await streamed(mut conn, q, StreamOptions { heartbeatMs: 10000 }, Silent {})) {
+                Ok(e) => { end = e; }
+                Err(_) => {
+                    failed = true;
+                    q.close(); // as the stream itself would: the producer must not wait for it
+                }
+            }
+            return Ok();
+        });
+        s.spawn(async () => {
+            // An event every 100 ms from 10 ms: after the close at 40 ms, the next one finds the queue closed.
+            match (await Timer.sleep(10)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Cancelled); }
+            }
+            loop {
+                let x = match (Event.create("x".bytes())) {
+                    Ok(e) => e,
+                    Err(_) => { return Err(NetError.OutOfMemory); },
+                };
+                match (await producer.publish(x)) {
+                    Ok() => {
+                        match (await Timer.sleep(100)) {
+                            Ok() => {}
+                            Err(_) => { return Err(NetError.Cancelled); }
+                        }
+                    }
+                    Err(PublishError.Closed) => {
+                        producerSaw = 1;
+                        return Ok();
+                    }
+                    Err(_) => {
+                        producerSaw = 2;
+                        return Ok();
+                    }
+                }
+            }
+        });
+    });
+    Check.isTrue(isDone(r) && !failed, "both tasks")?;
+    let elapsed = Timer.now() - started;
+    let closed = match (end) {
+        StreamEnd.ClientClosed => true,
+        _ => false,
+    };
+    Check.isTrue(closed, "client closed")?;
+    Check.equalU64(1, producerSaw as u64)?;
+    Check.isTrue(elapsed < 1000, "well within one heartbeat")?;
+    return Ok();
+}
+
+/// `serveEvents` cancels a producer that is asleep when the client leaves: the stream ends at the close (40 ms), not
+/// when the producer would next wake (10 s).
+@test
+async fn a_closed_client_cancels_a_sleeping_producer() -> Result<void, TestFailure> {
+    let started = Timer.now();
+    var conn = peer(Some(started + 40));
+    let q = queued(EventQueue.create(4, Overflow.Block))?;
+    let end = await streamed(mut conn, q, StreamOptions { heartbeatMs: 10000 }, Sleeper {})?;
+    let elapsed = Timer.now() - started;
+    let closed = match (end) {
+        StreamEnd.ClientClosed => true,
+        _ => false,
+    };
+    Check.isTrue(closed, "client closed")?;
+    Check.isTrue(elapsed < 1000, "the producer was cancelled")?;
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\ntransfer-encoding: chunked\r\n\r\nd\r\ndata: first\n\n\r\n0\r\n\r\n".bytes(),
+        conn.output.view(),
+    )?;
+    return Ok();
+}
+
+@test
+fn last_event_id() -> Result<void, TestFailure> {
+    let head = requestText();
+    var fields = HeaderList.create(head.bytes());
+    match (fields.push(22, 35, 37, 39, 64)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a field"); }
+    }
+    let hb = head.bytes();
+    let request = Request.create(Method.Get, hb[0..3], "/events", Version.Http11, fields);
+    match (lastEventId(request)) {
+        Some(v) => { Check.equalBytes("41".bytes(), v)?; }
+        null => { return Check.fail("an id"); }
+    }
+    let bare = "GET / HTTP/1.1\r\n\r\n";
+    let bb = bare.bytes();
+    let none = Request.create(Method.Get, bb[0..3], "/", Version.Http11, HeaderList.create(bb));
+    let absent = match (lastEventId(none)) {
+        Some(_) => false,
+        null => true,
+    };
+    Check.isTrue(absent, "no id")?;
+    return Ok();
+}
+
+/// Checks that `e` encodes to `expected`.
+fn same(expected: StringView, e: Event) -> Result<void, TestFailure> {
+    let got = encoded(e)?;
+    return Check.equalBytes(expected.bytes(), got.view());
+}
+
+fn isDone(r: Result<void, NetError>) -> bool => match (r) {
+    Ok() => true,
+    Err(_) => false,
+};
+
+fn isOk(r: Result<void, PublishError>) -> bool => match (r) {
+    Ok() => true,
+    Err(_) => false,
+};
+
+fn isFinished(e: StreamEnd) -> bool => match (e) {
+    StreamEnd.Finished => true,
+    StreamEnd.ClientClosed => false,
+};
+
+async fn nextIs(q: borrow EventQueue, data: StringView) -> bool {
+    match (await q.next()) {
+        Ok(Some(e)) => { return Ascii.equals(e.data(), data); }
+        _ => { return false; }
+    }
+}
+
+async fn isEnd(q: borrow EventQueue) -> bool {
+    match (await q.next()) {
+        Ok(null) => { return true; }
+        _ => { return false; }
+    }
+}

@@ -221,6 +221,40 @@ public struct Exchange<region r> {
         }
     }
 
+    /// Returns when the client has closed or reset the connection; never while it is open and quiet, so it belongs
+    /// inside a `race` (Web ADR 0008 §3.1). The body must be read first (`Internal` otherwise). Bytes the client
+    /// sends meanwhile are kept for the driver; once that buffer is full this waits until it is cancelled, and a
+    /// failed write finds the close instead. Cancelling it loses nothing.
+    public async fn peerClosed(borrow mut this) -> Result<void, HandlerError> {
+        match (this.body) {
+            BodyState.Done => {}
+            _ => { return Err(HandlerError.Internal); }
+        }
+        loop {
+            this.carry.compact();
+            if (this.carry.spareLength() == 0) {
+                match (await Timer.sleep(3600000)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                }
+                continue; // nothing to do until the race ends this
+            }
+            let n = match (await this.conn.read(this.carry.spare())) {
+                Ok(n) => n,
+                Err(NetError.Cancelled) => { return Err(HandlerError.Io(NetError.Cancelled)); },
+                Err(_) => 0, // a reset is a close
+            };
+            if (n == 0) {
+                this.keep = false;
+                return Ok();
+            }
+            match (this.carry.commit(n)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+        }
+    }
+
     /// The body bytes not yet read, if the body has a length; 0 once it is read; null for a chunked body.
     public fn remaining(borrow this) -> u64? => match (this.body) {
         BodyState.Done => Some(0u64),

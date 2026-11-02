@@ -1,0 +1,225 @@
+// Helpers for web_sse's tests: a transport that stays open (or closes at a set time) and records what is written, and
+// a request with its exchange built by hand, as web_http1's driver would.
+import web_core;
+import web_http;
+
+/// Reads nothing: it waits until `closeAtMs` (on `Timer.now()`'s clock) and then reports the end of the stream, or
+/// forever if that is null. Records every byte written.
+struct Peer {
+    closeAtMs: u64?;
+    output: Vector<u8>;
+}
+
+impl Transport for Peer {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        loop {
+            var wait: u64 = 3600000;
+            match (this.closeAtMs) {
+                Some(at) => {
+                    let now = Timer.now();
+                    if (now >= at) {
+                        return Ok(0);
+                    }
+                    wait = at - now;
+                }
+                null => {}
+            }
+            match (await Timer.sleep(wait)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Cancelled); }
+            }
+        }
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        for (b in bytes) {
+            match (this.output.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+        return Ok();
+    }
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        var total: usize = 0;
+        for (i in 0..parts.count()) {
+            let p = parts.part(i);
+            for (b in p) {
+                match (this.output.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(NetError.OutOfMemory); }
+                }
+            }
+            total += p.length;
+        }
+        return Ok(total);
+    }
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => Ok();
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => Alpn.None;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => null;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => null;
+}
+
+fn peer(closeAtMs: u64?) -> Peer => Peer { closeAtMs: closeAtMs, output: Vector<u8>.create() };
+
+/// An application with no hooks: the exchange calls its `beforeHead`.
+struct NoHooks {}
+
+impl Application for NoHooks {
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> =>
+        Ok();
+
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// The request every stream test answers: `GET /events` with `Last-Event-ID: 41`.
+fn requestText() -> StringView => "GET /events HTTP/1.1\r\nlast-event-id: 41\r\n\r\n";
+
+/// A source that publishes nothing and waits until it is cancelled: the tests publish from their own tasks.
+struct Silent {}
+
+impl EventSource<u8> for Silent {
+    async fn produce(borrow this, queue: borrow EventQueue, context: borrow u8) {
+        loop {
+            match (await Timer.sleep(3600000)) {
+                Ok() => {}
+                Err(_) => { return; }
+            }
+        }
+    }
+}
+
+/// Publishes one event, then sleeps 10 s: its stream ends early only if it is cancelled.
+struct Sleeper {}
+
+impl EventSource<u8> for Sleeper {
+    async fn produce(borrow this, queue: borrow EventQueue, context: borrow u8) {
+        let e = match (Event.create("first".bytes())) {
+            Ok(e) => e,
+            Err(_) => { return; },
+        };
+        match (await queue.publish(e)) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+        match (await Timer.sleep(10000)) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+    }
+}
+
+/// Runs `serveEvents` with `source` for that request over `conn`, as the driver would, then finishes the response.
+/// The stream's end, or its error as text.
+async fn streamed(
+    conn: borrow mut Peer,
+    queue: borrow EventQueue,
+    options: StreamOptions,
+    source: borrow dyn EventSource<u8>,
+) -> Result<StreamEnd, TestFailure> {
+    let head = requestText();
+    var fields = HeaderList.create(head.bytes());
+    match (fields.push(22, 35, 37, 39, 64)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("a field")); }
+    }
+    let hb = head.bytes();
+    let request = Request.create(Method.Get, hb[0..3], "/events", Version.Http11, fields);
+    var carry = buffer(1024)?;
+    var out = buffer(16384)?;
+    var pending = buffer(16384)?;
+    var response = match (ResponseHead.create(4096)) {
+        Ok(r) => r,
+        Err(_) => { return Err(TestFailure.create("a head")); },
+    };
+    var date = DateCache.create(false);
+    let limits = Limits.defaults();
+    let app = NoHooks {};
+    var exchange = Exchange.create(
+        conn,
+        mut carry,
+        mut out,
+        mut pending,
+        mut response,
+        app,
+        request,
+        limits,
+        mut date,
+        BodyFraming.None,
+        false,
+        true,
+    );
+    let context: u8 = 0;
+    let end = match (await serveEvents(mut exchange, queue, options, source, context)) {
+        Ok(e) => e,
+        Err(_) => { return Err(TestFailure.create("the stream failed")); },
+    };
+    match (await exchange.finish()) {
+        Ok() => { return Ok(end); }
+        Err(_) => { return Err(TestFailure.create("finish failed")); }
+    }
+}
+
+fn buffer(n: usize) -> Result<OwnedBuffer, TestFailure> {
+    match (OwnedBuffer.create(n)) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(TestFailure.create("a buffer")); }
+    }
+}
+
+/// An event, or the test's failure.
+fn event(data: StringView) -> Result<Event, TestFailure> {
+    match (Event.create(data.bytes())) {
+        Ok(e) => { return Ok(e); }
+        Err(_) => { return Err(TestFailure.create("an event")); }
+    }
+}
+
+fn made<T>(r: Result<T, EventError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("an event error")); }
+    }
+}
+
+fn queued(r: Result<EventQueue, QueueError>) -> Result<EventQueue, TestFailure> {
+    match (r) {
+        Ok(q) => { return Ok(q); }
+        Err(_) => { return Err(TestFailure.create("a queue")); }
+    }
+}
+
+/// The wire form of `e`.
+fn encoded(e: borrow Event) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    match (Events.encode(e, mut out)) {
+        Ok() => { return Ok(out); }
+        Err(_) => { return Err(TestFailure.create("encoding")); }
+    }
+}
+
+fn isInvalid<T>(r: Result<T, EventError>) -> bool {
+    match (r) {
+        Ok(_) => { return false; }
+        Err(EventError.Invalid) => { return true; }
+        Err(_) => { return false; }
+    }
+}

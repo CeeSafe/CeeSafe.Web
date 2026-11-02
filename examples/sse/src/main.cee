@@ -1,0 +1,278 @@
+// Server-Sent Events on web_server (Web ADR 0008): a counter stream that resumes from `Last-Event-ID`, and a flood
+// stream for the slow-client gate. Listens on 127.0.0.1:CW_PORT (default 8080).
+//
+//   GET  /count    an event per CW_TICK_MS (default 1000), ids counting on from Last-Event-ID; `?n=K` stops after K
+//   GET  /flood    1 KiB events as fast as the client takes them (Overflow.Block)
+//   GET  /stats    "<streams open> <events produced>"
+//   POST /stop     starts the drain
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_sse;
+
+struct App {
+    open: AtomicU64;
+    produced: AtomicU64;
+    tickMs: u64;
+    heartbeatMs: u64;
+}
+
+/// Streams `source`'s events, counting the stream as open meanwhile (`serveEvents`: a client that leaves cancels the
+/// producer at once).
+async fn serveStream(
+    ctx: borrow mut RequestContext<App>,
+    exchange: borrow mut Exchange,
+    source: borrow dyn EventSource<App>,
+) -> Result<void, HandlerError> {
+    let app = ctx.state();
+    let queue = opened(EventQueue.create(16, Overflow.Block))?;
+    let options = StreamOptions { heartbeatMs: app.heartbeatMs };
+    app.open.fetchAdd(1);
+    let r = await serveEvents(exchange, queue, options, source, app);
+    app.open.fetchSub(1);
+    match (r) {
+        Ok(_) => { return Ok(); }
+        Err(e) => { return Err(e); }
+    }
+}
+
+/// Events `first`, `first + 1`, … every `app.tickMs`, `limit` of them (0: no limit).
+struct Counter {
+    first: u64;
+    limit: u64;
+}
+
+impl EventSource<App> for Counter {
+    async fn produce(borrow this, queue: borrow EventQueue, app: borrow App) {
+        var n = this.first;
+        var sent: u64 = 0;
+        while (this.limit == 0 || sent < this.limit) {
+            var digits = [0u8; 20];
+            let start = decimal(n, mut digits);
+            let plain = match (Event.create(digits[start..])) {
+                Ok(p) => p,
+                Err(_) => { return; },
+            };
+            let e = match (plain.withId(digits[start..])) {
+                Ok(w) => w,
+                Err(_) => { return; },
+            };
+            match (await queue.publish(e)) {
+                Ok() => {}
+                Err(_) => { return; }
+            }
+            app.produced.fetchAdd(1);
+            n += 1;
+            sent += 1;
+            match (await Timer.sleep(app.tickMs)) {
+                Ok() => {}
+                Err(_) => { return; }
+            }
+        }
+    }
+}
+
+/// 1 KiB events, as fast as the queue takes them.
+struct Flood {}
+
+impl EventSource<App> for Flood {
+    async fn produce(borrow this, queue: borrow EventQueue, app: borrow App) {
+        let block = [120u8; 1024];
+        loop {
+            let e = match (Event.create(block[..])) {
+                Ok(e) => e,
+                Err(_) => { return; },
+            };
+            match (await queue.publish(e)) {
+                Ok() => {}
+                Err(_) => { return; }
+            }
+            app.produced.fetchAdd(1);
+        }
+    }
+}
+
+struct CountRoute {}
+
+impl Handler<App> for CountRoute {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let first = match (lastEventId(request)) {
+            Some(v) => match (Ascii.parseDecimal(v)) {
+                Some(n) => n + 1,
+                null => 1,
+            },
+            null => 1,
+        };
+        let limit = match (request.query()) {
+            Some(q) => queryNumber(q.bytes(), "n="),
+            null => 0,
+        };
+        let source = Counter { first: first, limit: limit };
+        return await serveStream(ctx, exchange, source);
+    }
+}
+
+struct FloodRoute {}
+
+impl Handler<App> for FloodRoute {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let source = Flood {};
+        return await serveStream(ctx, exchange, source);
+    }
+}
+
+struct Stats {}
+
+impl Handler<App> for Stats {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var a = [0u8; 20];
+        var b = [0u8; 20];
+        let i = decimal(ctx.state().open.load(), mut a);
+        let j = decimal(ctx.state().produced.load(), mut b);
+        exchange.setContentLength((20 - i + 1 + 20 - j) as u64);
+        await exchange.write(a[i..])?;
+        await exchange.write(" ".bytes())?;
+        await exchange.write(b[j..])?;
+        return Ok();
+    }
+}
+
+struct Stop {}
+
+impl Handler<App> for Stop {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        ctx.connection().drain().start();
+        return await exchange.send(Status.ok(), "stopping".bytes());
+    }
+}
+
+fn opened(r: Result<EventQueue, QueueError>) -> Result<EventQueue, HandlerError> {
+    match (r) {
+        Ok(q) => { return Ok(q); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+/// The decimal value after `key` in a query (`n=5&…`), or 0.
+fn queryNumber(q: Slice<u8>, key: StringView) -> u64 {
+    let k = key.bytes();
+    if (q.length < k.length) {
+        return 0;
+    }
+    for (i in 0..k.length) {
+        if (q[i] != k[i]) {
+            return 0;
+        }
+    }
+    var end = k.length;
+    while (end < q.length && q[end] != 38) {
+        end += 1;
+    }
+    return match (Ascii.parseDecimal(q[k.length..end])) {
+        Some(n) => n,
+        null => 0,
+    };
+}
+
+/// `v` in decimal at the end of `out`; the index of its first digit.
+fn decimal(v: u64, out: borrow mut [u8; 20]) -> usize {
+    var n = v;
+    var i: usize = 20;
+    loop {
+        i -= 1;
+        out[i] = truncate<u8>(48 + n % 10);
+        n /= 10;
+        if (n == 0) {
+            return i;
+        }
+    }
+}
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    return match (Ascii.parseDecimal(text.bytes())) {
+        Some(v) => v,
+        null => otherwise,
+    };
+}
+
+fn handler<H: Handler<App>>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App>>, RouteError> {
+    match (b) {
+        Ok(h) => {
+            let d: Box<dyn Handler<App>> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn application() -> Result<Server<App>, RouteError> {
+    let app = App {
+        open: AtomicU64.create(0),
+        produced: AtomicU64.create(0),
+        tickMs: setting("CW_TICK_MS", 1000),
+        heartbeatMs: setting("CW_HEARTBEAT_MS", 15000),
+    };
+    var server = Server<App>.create(app, Limits.defaults())?;
+    server.router().get("/count", handler(Box.create(CountRoute {}))?)?;
+    server.router().get("/flood", handler(Box.create(FloodRoute {}))?)?;
+    server.router().get("/stats", handler(Box.create(Stats {}))?)?;
+    server.router().post("/stop", handler(Box.create(Stop {}))?)?;
+    return Ok(server);
+}
+
+async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
+    let port = truncate<u16>(setting("CW_PORT", 8080));
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = Listener.bindWith(SocketAddresses.v4Loopback(port), options)?;
+    let drain = Drain.create()?;
+    var limits = ConnectionLimits.defaults();
+    limits.graceMs = 1000;
+    match (await AsyncConsole.writeLine("sse: listening")) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    let report = await server.run(listener, PlainAcceptor {}, limits, drain)?;
+    match (await AsyncConsole.writeLine("sse: drained")) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+fn main() {
+    let server = match (application()) {
+        Ok(s) => s,
+        Err(_) => {
+            Console.writeLine("sse: could not build the routes");
+            return;
+        },
+    };
+    match (Async.run(serve(server))) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

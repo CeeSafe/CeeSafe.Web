@@ -1,0 +1,156 @@
+// Server-Sent Events (Web ADR 0008 §3.2): one event and its wire form, WHATWG HTML §9.2 ("Server-sent events"). Sans
+// I/O: encoding appends to a vector.
+import web_core;
+import web_http;
+
+/// Why an event could not be made.
+public enum EventError {
+    /// An `id` or `event` with LF or CR, or an `id` with NUL (§9.2.6: a client would split the line or ignore it).
+    Invalid,
+    /// Out of memory.
+    OutOfMemory,
+}
+
+/// One event: its data, and optionally an id, a type and a reconnection time. It owns its bytes, so it can cross a
+/// channel to the task writing the stream.
+public struct Event {
+    private body: Vector<u8>;
+    private idBytes: Vector<u8>;
+    private hasId: bool;
+    private kind: Vector<u8>;
+    private retryMs: u64?;
+
+    /// An event whose data is `data`, of the default type `message`. `data` may hold several lines (LF, CR or CRLF);
+    /// the client receives them joined with LF.
+    public fn create(data: Slice<u8>) -> Result<Event, EventError> {
+        return Ok(Event {
+            body: copied(data)?,
+            idBytes: Vector<u8>.create(),
+            hasId: false,
+            kind: Vector<u8>.create(),
+            retryMs: null,
+        });
+    }
+
+    /// The same event with the id `id`, which the client sends back as `Last-Event-ID` when it reconnects. An empty
+    /// id resets the client's last id.
+    public fn withId(this, id: Slice<u8>) -> Result<Event, EventError> {
+        for (b in id) {
+            if (b == 10 || b == 13 || b == 0) {
+                return Err(EventError.Invalid);
+            }
+        }
+        var e = this;
+        e.idBytes = copied(id)?;
+        e.hasId = true;
+        return Ok(e);
+    }
+
+    /// The same event with the type `name` (the client's `addEventListener(name, …)`).
+    public fn withType(this, name: Slice<u8>) -> Result<Event, EventError> {
+        for (b in name) {
+            if (b == 10 || b == 13) {
+                return Err(EventError.Invalid);
+            }
+        }
+        var e = this;
+        e.kind = copied(name)?;
+        return Ok(e);
+    }
+
+    /// The same event, telling the client to wait `ms` milliseconds before reconnecting.
+    public fn withRetry(this, ms: u64) -> Event {
+        var e = this;
+        e.retryMs = Some(ms);
+        return e;
+    }
+
+    /// The data.
+    public fn data(borrow this) -> Slice<u8> => this.body.view();
+}
+
+/// Encoding events and reading what a reconnecting client sent.
+public struct Events {
+    /// Appends the wire form of `e` to `out`: `event:`, `id:` and `retry:` lines, one `data:` line per line of the
+    /// data, then an empty line. Each field is written with a space after its colon, which the client strips, so data
+    /// starting with a space keeps it. `Err(OutOfMemory)` if `out` could not grow; `out` may then hold part of it.
+    public fn encode(e: borrow Event, out: borrow mut Vector<u8>) -> Result<void, EventError> {
+        if (e.kind.length > 0) {
+            field(out, "event: ", e.kind.view())?;
+        }
+        if (e.hasId) {
+            field(out, "id: ", e.idBytes.view())?;
+        }
+        match (e.retryMs) {
+            Some(ms) => {
+                var digits = [0u8; 20];
+                let start = decimal(ms, mut digits);
+                field(out, "retry: ", digits[start..])?;
+            }
+            null => {}
+        }
+        let data = e.body.view();
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < data.length) {
+            let b = data[i];
+            if (b == 10 || b == 13) {
+                field(out, "data: ", data[start..i])?;
+                if (b == 13 && i + 1 < data.length && data[i + 1] == 10) {
+                    i += 1; // CRLF is one line end
+                }
+                start = i + 1;
+            }
+            i += 1;
+        }
+        field(out, "data: ", data[start..])?;
+        return push(out, 10);
+    }
+
+    /// The heartbeat: a comment line, which clients ignore (§9.2.6).
+    public fn heartbeat() -> StringView => ":\n";
+}
+
+/// The `Last-Event-ID` a reconnecting client sent, if any.
+public fn lastEventId<region r>(request: borrow Request<r>) -> Slice<r, u8>? =>
+    request.headers().getNamed("last-event-id");
+
+/// Appends `name`, `value` and LF.
+fn field(out: borrow mut Vector<u8>, name: StringView, value: Slice<u8>) -> Result<void, EventError> {
+    for (b in name.bytes()) {
+        push(out, b)?;
+    }
+    for (b in value) {
+        push(out, b)?;
+    }
+    return push(out, 10);
+}
+
+fn push(out: borrow mut Vector<u8>, b: u8) -> Result<void, EventError> {
+    match (out.push(b)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(EventError.OutOfMemory); }
+    }
+}
+
+fn copied(bytes: Slice<u8>) -> Result<Vector<u8>, EventError> {
+    var v = Vector<u8>.create();
+    for (b in bytes) {
+        push(mut v, b)?;
+    }
+    return Ok(v);
+}
+
+/// `v` in decimal at the end of `out`; the index of its first digit.
+fn decimal(v: u64, out: borrow mut [u8; 20]) -> usize {
+    var n = v;
+    var i: usize = 20;
+    loop {
+        i -= 1;
+        out[i] = truncate<u8>(48 + n % 10);
+        n /= 10;
+        if (n == 0) {
+            return i;
+        }
+    }
+}

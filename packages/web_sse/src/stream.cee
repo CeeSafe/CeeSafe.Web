@@ -1,0 +1,172 @@
+// Writing an event stream (Web ADR 0008 §3.4): events from a queue, heartbeats while it is quiet, and the client's
+// close noticed while idle. The stream races only waits (the client's close, the queue, the heartbeat timer), never a
+// write: a cancelled write would poison the connection (Web ADR 0001 §3.4).
+import web_core;
+import web_http;
+
+/// How a stream behaves.
+public struct StreamOptions {
+    /// The quiet time after which a heartbeat comment is sent, in milliseconds.
+    public heartbeatMs: u64;
+
+    /// A 15 s heartbeat: below the 30–60 s idle timeouts common in proxies and load balancers.
+    public fn defaults() -> StreamOptions => StreamOptions { heartbeatMs: 15000 };
+}
+
+/// How a stream ended without an error.
+public enum StreamEnd {
+    /// The queue was closed and every event in it was sent.
+    Finished,
+    /// The client closed the connection.
+    ClientClosed,
+}
+
+/// What woke the stream.
+enum Wake {
+    Closed,
+    Next(Event),
+    Ended,
+    Beat,
+}
+
+/// Produces a stream's events for `serveEvents`. `C` is what the producer reads besides its own fields (the
+/// application's state, say), lent for the stream's duration.
+public interface EventSource<C> {
+    /// Publishes events to `queue` until there are no more, or until `publish` fails because the client left.
+    async fn produce(borrow this, queue: borrow EventQueue, context: borrow C);
+}
+
+/// Runs `source` and `EventStream.run` over `queue` together. When `source` returns, the queue is closed and the stream
+/// ends after the queued events. When the stream ends first (the client left, or a write failed), `source` is
+/// cancelled at once, wherever it is waiting.
+public async fn serveEvents<C>(
+    exchange: borrow mut Exchange,
+    queue: borrow EventQueue,
+    options: borrow StreamOptions,
+    source: borrow dyn EventSource<C>,
+    context: borrow C,
+) -> Result<StreamEnd, HandlerError> {
+    let producer = queue.share();
+    let r: Result<Raced<StreamEnd>, HandlerError> = await Async.race(
+        async () => await EventStream.run(exchange, queue, options),
+        async () => {
+            await source.produce(producer, context);
+            producer.close();
+            loop {
+                // The stream decides: it ends once it has sent what is queued, and cancels this.
+                match (await Timer.sleep(3600000)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                }
+            }
+        },
+    );
+    let won = r?;
+    return Ok(won.value);
+}
+
+/// Writes event streams.
+public struct EventStream {
+    /// Sends the response head (`text/event-stream`, no length, so HTTP/1.1 frames it chunked), then each event from
+    /// `queue` as it comes, a heartbeat after each quiet `options.heartbeatMs`, until the queue ends or the client
+    /// closes. On any end other than the queue's own, it closes `queue`, so a producer blocked in `publish` wakes
+    /// with `Closed`.
+    public async fn run(
+        exchange: borrow mut Exchange,
+        queue: borrow EventQueue,
+        options: borrow StreamOptions,
+    ) -> Result<StreamEnd, HandlerError> {
+        match (start(exchange)) {
+            Ok() => {}
+            Err(e) => {
+                queue.close();
+                return Err(e);
+            }
+        }
+        var scratch = Vector<u8>.create();
+        loop {
+            let woke = match (await wake(exchange, queue, options.heartbeatMs)) {
+                Ok(w) => w,
+                Err(e) => {
+                    queue.close();
+                    return Err(e);
+                },
+            };
+            let sent = match (woke) {
+                Wake.Closed => {
+                    queue.close();
+                    return Ok(StreamEnd.ClientClosed);
+                },
+                Wake.Ended => { return Ok(StreamEnd.Finished); },
+                Wake.Beat => await send(exchange, Events.heartbeat().bytes()),
+                Wake.Next(e) => await sendEvent(exchange, e, mut scratch),
+            };
+            match (sent) {
+                Ok() => {}
+                Err(e) => {
+                    queue.close();
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+fn start(exchange: borrow mut Exchange) -> Result<void, HandlerError> {
+    exchange.header("content-type", "text/event-stream".bytes())?;
+    exchange.header("cache-control", "no-store".bytes())?;
+    return Ok();
+}
+
+/// Encodes `e` into `scratch`, then sends it.
+async fn sendEvent(
+    exchange: borrow mut Exchange,
+    e: Event,
+    scratch: borrow mut Vector<u8>,
+) -> Result<void, HandlerError> {
+    scratch.clear();
+    match (Events.encode(e, scratch)) {
+        Ok() => { return await send(exchange, scratch.view()); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+/// Writes `bytes` and flushes them to the client.
+async fn send(exchange: borrow mut Exchange, bytes: Slice<u8>) -> Result<void, HandlerError> {
+    await exchange.write(bytes)?;
+    return await exchange.flush();
+}
+
+/// Waits for the client's close, the next event or the queue's end, or a quiet `heartbeatMs`.
+async fn wake(exchange: borrow mut Exchange, queue: borrow EventQueue, heartbeatMs: u64) -> Result<Wake, HandlerError> {
+    if (!exchange.headSent()) {
+        await exchange.flush()?; // the head, so the client sees the stream open before the first event
+    }
+    let r: Result<Raced<Wake>, HandlerError> = await Async.race(
+        async () => {
+            await exchange.peerClosed()?;
+            return Ok(Wake.Closed);
+        },
+        async () => {
+            let inner: Result<Raced<Wake>, HandlerError> = await Async.race(
+                async () => {
+                    match (await queue.next()) {
+                        Ok(Some(e)) => { return Ok(Wake.Next(e)); }
+                        Ok(null) => { return Ok(Wake.Ended); }
+                        Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                    }
+                },
+                async () => {
+                    match (await Timer.sleep(heartbeatMs)) {
+                        Ok() => { return Ok(Wake.Beat); }
+                        Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                    }
+                },
+            );
+            let won = inner?;
+            return Ok(won.value);
+        },
+    );
+    let won = r?;
+    return Ok(won.value);
+}
