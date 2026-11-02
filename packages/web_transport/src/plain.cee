@@ -90,8 +90,7 @@ public interface Acceptor {
 public interface Connector {
     /// The transport for `stream`, its handshake finished by `deadline` (else `Err(TimedOut)`); an error closes the
     /// connection.
-    /// The box is `Send`, so a client's pool can share connections across its tasks (Web ADR 0009 §2).
-    async fn connect(borrow this, stream: PlainStream, host: StringView, deadline: Deadline,) -> Result<Box<dyn Transport + Send>, NetError>;
+    async fn connect(borrow this, stream: PlainStream, host: StringView, deadline: Deadline,) -> Result<Box<dyn Transport>, NetError>;
 }
 
 /// The acceptor for plain connections: boxes the stream as it is.
@@ -115,7 +114,7 @@ impl Connector for PlainConnector {
         stream: PlainStream,
         host: StringView,
         deadline: Deadline,
-    ) -> Result<Box<dyn Transport + Send>, NetError> {
+    ) -> Result<Box<dyn Transport>, NetError> {
         match (Box.create(stream)) {
             Ok(b) => { return Ok(b); }
             Err(e) => { return Err(NetErrors.fromAlloc(e)); }

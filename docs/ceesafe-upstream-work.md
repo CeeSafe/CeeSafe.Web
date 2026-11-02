@@ -606,7 +606,9 @@ next to "dyn Job.run"). The dyn-call frame's C name leaves out `+ Send`, so the 
 layout, or get distinct names.
 
 **Blocks:** M5's `web_client` natively. Its pool holds `Box<dyn Transport + Send>` (Web ADR 0009 §2), and every
-program also awaits `dyn Transport` (M1's server, the driver). Its 11 tests pass in the interpreter; native, the
+program also awaits `dyn Transport` (M1's server, the driver). The mere existence of a `dyn Transport + Send` box in
+a program is enough: changing `Connector.connect` to return one broke every native build on main, so that change
+waits too (it is on `m5-client`). Its 11 tests pass in the interpreter; native, the
 sanitizers and the sweeps wait. The client is on branch `m5-client`.
 
 ## B13 — Bug: an `Async.scope` whose error type has a drop gives C that does not compile   *(found 2026-11-02, 0.9.2)*

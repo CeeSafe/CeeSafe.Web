@@ -419,11 +419,11 @@ impl Connector for TlsConnector {
         stream: PlainStream,
         host: StringView,
         deadline: Deadline,
-    ) -> Result<Box<dyn Transport + Send>, NetError> {
+    ) -> Result<Box<dyn Transport>, NetError> {
         let t = await TlsTransport.connect(stream, this.config, host, deadline)?;
         match (Box.create(t)) {
             Ok(b) => {
-                let d: Box<dyn Transport + Send> = b;
+                let d: Box<dyn Transport> = b;
                 return Ok(d);
             }
             Err(_) => { return Err(NetError.OutOfMemory); }
