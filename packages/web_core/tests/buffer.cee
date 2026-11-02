@@ -103,3 +103,19 @@ fn buffer_pool_recycles() -> Result<void, TestFailure> {
     Check.equalU64(2, p.idle() as u64)?;
     return Ok();
 }
+
+@test
+fn owned_buffer_truncate() -> Result<void, TestFailure> {
+    var b = alloc(OwnedBuffer.create(8))?;
+    Check.isTrue(bufferOk(b.append("abcdef".bytes())), "append abcdef")?;
+    Check.isTrue(bufferOk(b.consume(2)), "consume ab")?;
+    b.truncate(3); // "cdef" -> "cde"
+    Check.equalBytes("cde".bytes(), b.readable())?;
+    b.truncate(9); // past the length: nothing changes
+    Check.equalBytes("cde".bytes(), b.readable())?;
+    Check.isTrue(bufferOk(b.append("XY".bytes())), "append after truncate")?;
+    Check.equalBytes("cdeXY".bytes(), b.readable())?;
+    b.truncate(0);
+    Check.isTrue(b.isEmpty(), "truncate 0 empties it")?;
+    return Ok();
+}

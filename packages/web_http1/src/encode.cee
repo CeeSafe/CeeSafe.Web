@@ -1,0 +1,137 @@
+// Writing HTTP/1.1 responses (RFC 9112 §4, §6, §7.1), sans-I/O: into the caller's buffer, never allocating.
+import web_core;
+import web_http;
+
+/// How a response's content is delimited on the wire.
+public enum ResponseFraming {
+    /// No content and no length field: 1xx, 204, 304 (RFC 9110 §6.4.1), or a HEAD response whose length is unknown.
+    NoContent,
+    /// `Content-Length: n`. For a HEAD response the length is sent and the content is not.
+    Length(u64),
+    /// `Transfer-Encoding: chunked` (HTTP/1.1 only).
+    Chunked,
+    /// Content until the connection closes (an HTTP/1.0 client and an unknown length).
+    UntilClose,
+}
+
+/// Response encoding.
+public struct Encoder {
+    /// Writes the status line, `Date` (if `date` is given), the head's fields, the framing field and, unless
+    /// `keepAlive`, `Connection: close`, then the empty line. `Err(LimitExceeded)` if `out` has no room; nothing
+    /// partial is left in it then.
+    public fn head(
+        head: borrow ResponseHead,
+        framing: ResponseFraming,
+        keepAlive: bool,
+        date: Slice<u8>?,
+        out: borrow mut OwnedBuffer,
+    ) -> Result<void, NetError> {
+        let before = out.length();
+        match (Encoder.headParts(head, framing, keepAlive, date, out)) {
+            Ok() => { return Ok(); }
+            Err(e) => {
+                out.truncate(before);
+                return Err(e);
+            }
+        }
+    }
+
+    fn headParts(
+        head: borrow ResponseHead,
+        framing: ResponseFraming,
+        keepAlive: bool,
+        date: Slice<u8>?,
+        out: borrow mut OwnedBuffer,
+    ) -> Result<void, NetError> {
+        let status = head.status();
+        out.append("HTTP/1.1 ".bytes())?;
+        appendDecimal(out, status.code() as u64)?;
+        out.append(" ".bytes())?;
+        out.append(status.reason().bytes())?;
+        out.append("\r\n".bytes())?;
+        match (date) {
+            Some(d) => {
+                out.append("date: ".bytes())?;
+                out.append(d)?;
+                out.append("\r\n".bytes())?;
+            }
+            null => {}
+        }
+        out.append(head.fieldBytes())?;
+        match (framing) {
+            ResponseFraming.Length(n) => {
+                out.append("content-length: ".bytes())?;
+                appendDecimal(out, n)?;
+                out.append("\r\n".bytes())?;
+            }
+            ResponseFraming.Chunked => { out.append("transfer-encoding: chunked\r\n".bytes())?; }
+            _ => {}
+        }
+        if (!keepAlive) {
+            out.append("connection: close\r\n".bytes())?;
+        }
+        out.append("\r\n".bytes())?;
+        return Ok();
+    }
+
+    /// A chunk's size line, `hex\r\n`, before `n` bytes of data (n > 0); the data is followed by `chunkEnd`.
+    public fn chunkHeader(n: usize, out: borrow mut OwnedBuffer) -> Result<void, NetError> {
+        var digits = [0u8; 16];
+        var k: usize = 16;
+        var v = n as u64;
+        loop {
+            k -= 1;
+            let d = truncate<u8>(v % 16);
+            digits[k] = if (d < 10) 48 + d else 87 + d;
+            v /= 16;
+            if (v == 0) {
+                break;
+            }
+        }
+        out.append(digits[k..])?;
+        out.append("\r\n".bytes())?;
+        return Ok();
+    }
+
+    /// The CRLF after a chunk's data.
+    public fn chunkEnd(out: borrow mut OwnedBuffer) -> Result<void, NetError> => out.append("\r\n".bytes());
+
+    /// The last chunk and an empty trailer section: `0\r\n\r\n`.
+    public fn lastChunk(out: borrow mut OwnedBuffer) -> Result<void, NetError> => out.append("0\r\n\r\n".bytes());
+
+    /// How a response is framed: no content for 1xx, 204 and 304; for HEAD, the length if known; otherwise the
+    /// length if known, else chunked for HTTP/1.1 and until-close for HTTP/1.0 (RFC 9112 §6.3, §7).
+    public fn framing(status: StatusCode, method: Method, version: Version, length: u64?) -> ResponseFraming {
+        if (!status.allowsContent()) {
+            return ResponseFraming.NoContent;
+        }
+        match (length) {
+            Some(n) => { return ResponseFraming.Length(n); }
+            null => {}
+        }
+        match (method) {
+            Method.Head => { return ResponseFraming.NoContent; }
+            _ => {}
+        }
+        return match (version) {
+            Version.Http10 => ResponseFraming.UntilClose,
+            _ => ResponseFraming.Chunked,
+        };
+    }
+}
+
+/// Appends `v` in decimal.
+fn appendDecimal(out: borrow mut OwnedBuffer, v: u64) -> Result<void, NetError> {
+    var digits = [0u8; 20];
+    var k: usize = 20;
+    var x = v;
+    loop {
+        k -= 1;
+        digits[k] = truncate<u8>(48 + x % 10);
+        x /= 10;
+        if (x == 0) {
+            break;
+        }
+    }
+    return out.append(digits[k..]);
+}

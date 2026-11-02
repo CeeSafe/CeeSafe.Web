@@ -1,0 +1,56 @@
+// HTTP dates (RFC 9110 §5.6.7): IMF-fixdate, from Unix seconds. CeeSafe has no wall clock yet (upstream U12), so a
+// server sends no Date field until it has one (RFC 9110 §6.6.1: a server without a clock must not).
+
+/// Formatting IMF-fixdate.
+public struct HttpDate {
+    /// The 29-byte IMF-fixdate of `unixSeconds` into `out`, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+    public fn format(unixSeconds: u64, out: borrow mut [u8; 29]) {
+        let days = unixSeconds / 86400;
+        let secs = unixSeconds % 86400;
+        // Civil date from days since 1970-01-01 (Howard Hinnant's days_from_civil, inverted), for years >= 1970.
+        let z = days + 719468;
+        let era = z / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if (mp < 10) mp + 3 else mp - 9;
+        let year = yoe + era * 400 + (if (month <= 2) 1u64 else 0u64);
+        let weekday = (days + 4) % 7; // 1970-01-01 was a Thursday
+        let names = "SunMonTueWedThuFriSat";
+        let months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+        let nb = names.bytes();
+        let mb = months.bytes();
+        let w = truncate<usize>(weekday) * 3;
+        let m = (truncate<usize>(month) - 1) * 3;
+        out[0] = nb[w];
+        out[1] = nb[w + 1];
+        out[2] = nb[w + 2];
+        out[3] = 44;
+        out[4] = 32;
+        twoDigits(out, 5, day);
+        out[7] = 32;
+        out[8] = mb[m];
+        out[9] = mb[m + 1];
+        out[10] = mb[m + 2];
+        out[11] = 32;
+        twoDigits(out, 12, (year / 100) % 100);
+        twoDigits(out, 14, year % 100);
+        out[16] = 32;
+        twoDigits(out, 17, secs / 3600);
+        out[19] = 58;
+        twoDigits(out, 20, (secs / 60) % 60);
+        out[22] = 58;
+        twoDigits(out, 23, secs % 60);
+        out[25] = 32;
+        out[26] = 71;
+        out[27] = 77;
+        out[28] = 84;
+    }
+}
+
+fn twoDigits(out: borrow mut [u8; 29], at: usize, v: u64) {
+    out[at] = truncate<u8>(48 + (v / 10) % 10);
+    out[at + 1] = truncate<u8>(48 + v % 10);
+}

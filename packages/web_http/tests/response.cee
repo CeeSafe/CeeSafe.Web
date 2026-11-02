@@ -1,0 +1,82 @@
+// ResponseHead (Web ADR 0003 §3.5, amendment 2) and HttpDate. The dates' expected text is Python's
+// email.utils.formatdate(t, usegmt=True) for each t; 784111777 is RFC 9110 §5.6.7's own example.
+
+fn dateOf(t: u64) -> [u8; 29] {
+    var out = [0u8; 29];
+    HttpDate.format(t, mut out);
+    return out;
+}
+
+@test
+fn imf_fixdate() -> Result<void, TestFailure> {
+    let a = dateOf(0);
+    Check.equalBytes("Thu, 01 Jan 1970 00:00:00 GMT".bytes(), a[..])?;
+    let b = dateOf(784111777);
+    Check.equalBytes("Sun, 06 Nov 1994 08:49:37 GMT".bytes(), b[..])?;
+    let c = dateOf(951782400);
+    Check.equalBytes("Tue, 29 Feb 2000 00:00:00 GMT".bytes(), c[..])?;
+    let d = dateOf(951868799);
+    Check.equalBytes("Tue, 29 Feb 2000 23:59:59 GMT".bytes(), d[..])?;
+    let e = dateOf(4102444800);
+    Check.equalBytes("Fri, 01 Jan 2100 00:00:00 GMT".bytes(), e[..])?;
+    let f = dateOf(1798761599);
+    Check.equalBytes("Thu, 31 Dec 2026 23:59:59 GMT".bytes(), f[..])?;
+    return Ok();
+}
+
+@test
+fn response_head_fields() -> Result<void, TestFailure> {
+    var h = match (ResponseHead.create(64)) {
+        Ok(v) => v,
+        Err(_) => { return Err(TestFailure.create("a head")); },
+    };
+    Check.equalU64(200, h.status().code() as u64)?;
+    h.setStatus(Status.notFound());
+    Check.isTrue(match (h.add("Content-Type", "text/plain".bytes())) {
+        Ok() => true,
+        _ => false,
+    }, "Content-Type is added")?;
+    Check.equalBytes("Content-Type: text/plain\r\n".bytes(), h.fieldBytes())?;
+    Check.isTrue(h.has("content-type"), "has content-type, any case")?;
+    Check.isFalse(h.has("type"), "not a suffix of a name")?;
+    Check.isFalse(h.has("text/plain"), "not a value")?;
+    Check.isTrue(match (h.add("X-Evil", "a\r\nSet-Cookie: x".bytes())) {
+        Err(FieldError.BadValue) => true,
+        _ => false,
+    }, "CRLF in a value is refused (header injection)")?;
+    Check.isTrue(match (h.add("Bad Name", "v".bytes())) {
+        Err(FieldError.BadName) => true,
+        _ => false,
+    }, "a space in a name is refused")?;
+    Check.isTrue(match (h.add("content-length", "5".bytes())) {
+        Err(FieldError.Reserved) => true,
+        _ => false,
+    }, "Content-Length is the writer's")?;
+    Check.isTrue(match (h.add("Transfer-Encoding", "chunked".bytes())) {
+        Err(FieldError.Reserved) => true,
+        _ => false,
+    }, "Transfer-Encoding is the writer's")?;
+    Check.isTrue(match (h.add("Connection", "close".bytes())) {
+        Err(FieldError.Reserved) => true,
+        _ => false,
+    }, "Connection is the writer's")?;
+    // 64 - 26 used = 38 left; "X-Long: " + 28 + CRLF = 38 fits; one more byte does not.
+    Check.isTrue(match (h.add("X-Long", "aaaaaaaaaaaaaaaaaaaaaaaaaaaa".bytes())) {
+        Ok() => true,
+        _ => false,
+    }, "a field that exactly fills the buffer")?;
+    Check.isTrue(match (h.add("X", "".bytes())) {
+        Err(FieldError.TooLarge) => true,
+        _ => false,
+    }, "then nothing more fits")?;
+    h.setContentLength(5);
+    h.closeConnection();
+    Check.isTrue(h.closes() && match (h.contentLength()) {
+        Some(n) => n == 5,
+        null => false,
+    }, "length and close are kept")?;
+    h.reset();
+    Check.equalU64(200, h.status().code() as u64)?;
+    Check.isTrue(h.fieldBytes().length == 0 && h.contentLength() == null && !h.closes(), "reset clears it")?;
+    return Ok();
+}

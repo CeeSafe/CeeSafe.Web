@@ -1,0 +1,128 @@
+// The response head (Web ADR 0003 §3.5, amendment 2): a status and fields that the handler and middleware build
+// before it is sent. The connection owns one and reuses it for every response; its fields live in a buffer
+// allocated once per connection. Framing fields (Content-Length, Transfer-Encoding, Connection) are the writer's.
+import web_core;
+
+/// Why a field could not be added to a response head.
+public enum FieldError {
+    /// The name is not a token (RFC 9110 §5.1).
+    BadName,
+    /// The value holds CR, LF, NUL or another control byte: a header injection, refused.
+    BadValue,
+    /// Content-Length, Transfer-Encoding or Connection: the writer sets these from the body and the connection.
+    Reserved,
+    /// The fields would exceed the head's buffer.
+    TooLarge,
+}
+
+/// A response's status and fields, before they are sent.
+public struct ResponseHead {
+    private code: StatusCode;
+    private fields: OwnedBuffer;
+    private length: u64?;
+    private closing: bool;
+
+    /// A head with room for `capacity` bytes of fields ("name: value\r\n" each), status 200.
+    public fn create(capacity: usize) -> Result<ResponseHead, AllocError> {
+        let buffer = OwnedBuffer.create(capacity)?;
+        return Ok(ResponseHead { code: Status.ok(), fields: buffer, length: null, closing: false });
+    }
+
+    /// Back to status 200 with no fields, for the next response.
+    public fn reset(borrow mut this) {
+        this.code = Status.ok();
+        this.fields.clear();
+        this.length = null;
+        this.closing = false;
+    }
+
+    /// The status.
+    public fn status(borrow this) -> StatusCode => this.code;
+
+    /// Sets the status.
+    public fn setStatus(borrow mut this, status: StatusCode) {
+        this.code = status;
+    }
+
+    /// Adds the field `name: value`. The name must be a token and not a framing field; the value is sent as given,
+    /// so it must be free of control bytes other than HTAB.
+    public fn add(borrow mut this, name: StringView, value: Slice<u8>) -> Result<void, FieldError> {
+        let n = name.bytes();
+        if (!Ascii.isToken(n)) {
+            return Err(FieldError.BadName);
+        }
+        match (HeaderNames.classify(n)) {
+            HeaderName.ContentLength => { return Err(FieldError.Reserved); }
+            HeaderName.TransferEncoding => { return Err(FieldError.Reserved); }
+            HeaderName.Connection => { return Err(FieldError.Reserved); }
+            _ => {}
+        }
+        for (b in value) {
+            if (!Ascii.isFieldValueChar(b)) {
+                return Err(FieldError.BadValue);
+            }
+        }
+        if (this.fields.spareLength() < n.length + value.length + 4) {
+            return Err(FieldError.TooLarge);
+        }
+        let colon = ": ";
+        let crlf = "\r\n";
+        // Room was checked above, so these appends cannot fail.
+        match (this.fields.append(n)) {
+            Ok() => {}
+            Err(_) => { return Err(FieldError.TooLarge); }
+        }
+        match (this.fields.append(colon.bytes())) {
+            Ok() => {}
+            Err(_) => { return Err(FieldError.TooLarge); }
+        }
+        match (this.fields.append(value)) {
+            Ok() => {}
+            Err(_) => { return Err(FieldError.TooLarge); }
+        }
+        match (this.fields.append(crlf.bytes())) {
+            Ok() => {}
+            Err(_) => { return Err(FieldError.TooLarge); }
+        }
+        return Ok();
+    }
+
+    /// Whether a field named `name` (lower case) was added.
+    public fn has(borrow this, name: StringView) -> bool {
+        let f = this.fields.readable();
+        var start: usize = 0;
+        for (i in 0..f.length) {
+            if (f[i] == 58 && i >= start) {
+                if (Ascii.equalsIgnoringCase(f[start..i], name)) {
+                    return true;
+                }
+                // skip to the end of this line
+                var k = i;
+                while (k < f.length && f[k] != 10) {
+                    k += 1;
+                }
+                start = k + 1;
+            }
+        }
+        return false;
+    }
+
+    /// The fields as they will be sent: "name: value\r\n" each.
+    public fn fieldBytes(borrow this) -> Slice<u8> => this.fields.readable();
+
+    /// Declares the body's length, so the writer sends Content-Length instead of chunking.
+    public fn setContentLength(borrow mut this, n: u64) {
+        this.length = Some(n);
+    }
+
+    /// The declared length, if any.
+    public fn contentLength(borrow this) -> u64? => this.length;
+
+    /// Asks for the connection to close after this response.
+    public fn closeConnection(borrow mut this) {
+        this.closing = true;
+    }
+
+    /// Whether the connection closes after this response.
+    public fn closes(borrow this) -> bool => this.closing;
+}

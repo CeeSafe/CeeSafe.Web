@@ -403,6 +403,20 @@ The program runs correctly (prints 7), but `--cflag -Werror` fails.
 
 **Expected:** no warning: the capture is mutable, so its C type should not be const.
 
+## U12 — Wall-clock time   *(found 2026-11-02 while writing M2's serializer; needed for `Date`)*
+
+**Gap:** lib/std has only the monotonic clock (`Timer.now()`, `lib/core/async.cee:37`); nothing reads the system's
+real time, and the runtime has no `CLOCK_REALTIME` call (searched `runtime/` and `lib/` at `v0.8.0`).
+
+**Needed by:** the `Date` response field (RFC 9110 §6.6.1: an origin server with a clock must send it; one without
+must not), cookies' `Expires`, logs, and TLS certificate validity (M4, though OpenSSL reads its own clock).
+
+**Wanted:** `Clock.unixMillis() -> u64` (or seconds and nanoseconds), `clock_gettime(CLOCK_REALTIME)` /
+`GetSystemTimePreciseAsFileTime`, with the interpreter's virtual clock answering deterministically.
+
+**Effect on CeeSafe.Web until then:** the server sends no `Date`, which RFC 9110 allows a server without a clock to
+do. `web_http.HttpDate.format(unixSeconds, …)` is written and tested, so the driver turns `Date` on when U12 lands.
+
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/async-deadline-void-bug.cee`:

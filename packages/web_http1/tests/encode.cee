@@ -1,0 +1,127 @@
+// The response encoder against RFC 9112 §4, §6.3 and §7.1; the expected bytes are written out by hand.
+import web_core;
+import web_http;
+
+fn buffer(n: usize) -> Result<OwnedBuffer, TestFailure> {
+    match (OwnedBuffer.create(n)) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(TestFailure.create("a buffer")); }
+    }
+}
+
+fn head() -> Result<ResponseHead, TestFailure> {
+    match (ResponseHead.create(256)) {
+        Ok(h) => { return Ok(h); }
+        Err(_) => { return Err(TestFailure.create("a head")); }
+    }
+}
+
+@test
+fn heads() -> Result<void, TestFailure> {
+    var h = head()?;
+    match (h.add("Content-Type", "text/plain".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("add")); }
+    }
+    var out = buffer(512)?;
+    let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+    match (Encoder.head(h, ResponseFraming.Length(5), true, Some(date.bytes()), mut out)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("encode with a length")); }
+    }
+    Check.equalBytes(
+        "HTTP/1.1 200 OK\r\ndate: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Type: text/plain\r\ncontent-length: 5\r\n\r\n".bytes(),
+        out.readable(),
+    )?;
+    out.clear();
+    h.reset();
+    h.setStatus(Status.notFound());
+    match (Encoder.head(h, ResponseFraming.Chunked, false, null, mut out)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("encode chunked, closing")); }
+    }
+    Check.equalBytes(
+        "HTTP/1.1 404 Not Found\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".bytes(),
+        out.readable(),
+    )?;
+    out.clear();
+    match (StatusCode.of(299)) {
+        Some(s) => { h.setStatus(s); }
+        null => { return Err(TestFailure.create("299")); }
+    }
+    match (Encoder.head(h, ResponseFraming.NoContent, true, null, mut out)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("encode an unnamed status")); }
+    }
+    Check.equalBytes("HTTP/1.1 299 \r\n\r\n".bytes(), out.readable())?; // an empty reason phrase is allowed (§4)
+    return Ok();
+}
+
+@test
+fn a_head_that_does_not_fit_leaves_nothing() -> Result<void, TestFailure> {
+    var h = head()?;
+    var out = buffer(24)?;
+    match (out.append("before".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("append")); }
+    }
+    Check.isTrue(match (Encoder.head(h, ResponseFraming.Length(123456), true, null, mut out)) {
+        Err(NetError.LimitExceeded) => true,
+        _ => false,
+    }, "too large for 24 bytes")?;
+    Check.equalBytes("before".bytes(), out.readable())?;
+    return Ok();
+}
+
+@test
+fn chunks() -> Result<void, TestFailure> {
+    var out = buffer(64)?;
+    let ok = match (Encoder.chunkHeader(255, mut out)) {
+        Ok() => true,
+        Err(_) => false,
+    } && match (Encoder.chunkEnd(mut out)) {
+        Ok() => true,
+        Err(_) => false,
+    } && match (Encoder.chunkHeader(1, mut out)) {
+        Ok() => true,
+        Err(_) => false,
+    } && match (Encoder.chunkHeader(4096, mut out)) {
+        Ok() => true,
+        Err(_) => false,
+    } && match (Encoder.lastChunk(mut out)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+    Check.isTrue(ok, "every chunk part fits")?;
+    Check.equalBytes("ff\r\n\r\n1\r\n1000\r\n0\r\n\r\n".bytes(), out.readable())?;
+    return Ok();
+}
+
+@test
+fn framing_rules() -> Result<void, TestFailure> {
+    Check.isTrue(match (Encoder.framing(Status.noContent(), Method.Get, Version.Http11, Some(5))) {
+        ResponseFraming.NoContent => true,
+        _ => false,
+    }, "204 has no content, whatever the length (RFC 9110 §15.3.5)")?;
+    Check.isTrue(match (Encoder.framing(Status.notModified(), Method.Get, Version.Http11, null)) {
+        ResponseFraming.NoContent => true,
+        _ => false,
+    }, "304 has no content")?;
+    Check.isTrue(match (Encoder.framing(Status.ok(), Method.Head, Version.Http11, Some(42))) {
+        ResponseFraming.Length(n) => n == 42,
+        _ => false,
+    }, "HEAD keeps the length GET would send (RFC 9110 §9.3.2)")?;
+    Check.isTrue(match (Encoder.framing(Status.ok(), Method.Head, Version.Http11, null)) {
+        ResponseFraming.NoContent => true,
+        _ => false,
+    }, "HEAD of unknown length: no framing field")?;
+    Check.isTrue(match (Encoder.framing(Status.ok(), Method.Get, Version.Http11, null)) {
+        ResponseFraming.Chunked => true,
+        _ => false,
+    }, "unknown length over 1.1: chunked")?;
+    Check.isTrue(match (Encoder.framing(Status.ok(), Method.Get, Version.Http10, null)) {
+        ResponseFraming.UntilClose => true,
+        _ => false,
+    }, "unknown length over 1.0: until close (no chunked in 1.0)")?;
+    return Ok();
+}

@@ -93,6 +93,14 @@ public struct OwnedBuffer {
         return Ok();
     }
 
+    /// Keeps only the first `length` readable bytes, forgetting those written after them (to undo a partial write of
+    /// several appends). A `length` at or past the readable length changes nothing.
+    public fn truncate(borrow mut this, length: usize) {
+        if (length < this.end - this.start) {
+            this.end = this.start + length;
+        }
+    }
+
     /// Forgets every readable byte.
     public fn clear(borrow mut this) {
         this.start = 0;

@@ -150,3 +150,16 @@ The decision (option A, views into the head buffer with no allocation) is unchan
    not be UTF-8. Names and the target are ASCII (the parser checks them); the target is a `StringView<r>`.
 3. **`Method` has no payload.** `Extension` carries no view; the token is `Request.methodToken()`. So `Method` has
    no region, and the router can store methods.
+
+## 8. Amendment 2 (2026-11-02, the response head in M2)
+
+§3.5's `head(status, headers)` becomes a reusable builder, so `Middleware.after` (Web ADR 0007 §3.2) can add fields
+before the head is sent:
+
+1. **`ResponseHead`** (`web_http`) holds the status, the fields as their wire bytes (`name: value\r\n`) in an
+   `OwnedBuffer` allocated once per connection, a declared length and a close request. The connection reuses it
+   (`reset()`); nothing is allocated per response.
+2. **`add(name, value)`** refuses a name that is not a token, a value with CR, LF, NUL or another control byte (a
+   header injection), and the framing fields `Content-Length`, `Transfer-Encoding` and `Connection`, which the writer
+   derives from `setContentLength`, the body and `closeConnection()`.
+3. **No `Date` until CeeSafe has a wall clock** (upstream U12); `HttpDate.format` is ready for it.
