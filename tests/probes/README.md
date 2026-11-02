@@ -32,6 +32,8 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `generic-impl-this-dyn-bug.cee` | builds and prints `7` since 0.9.2; before, the C named `Wrap<S>` uninstantiated | CeeSafe bug B12; `impl<S> ConnectionHandler for Server<S>` | 0007 |
 | `generic-dyn-box-flow-bug.cee` | prints `2` since 0.9.1; with 0.8.0 and 0.9.0, N0272 on `Generic<S>.add` storing a `Box<dyn Handler<S>>` (the non-generic twin was accepted) | CeeSafe bug B8, fixed in 0.9.1 | 0007 |
 | `sse-race-exchange.cee` | prints `3`, `2`, `closed`, interpreted and native | one task races a `borrow mut` method of the exchange against a channel and a timer, then writes after the race | 0008 §1 |
+| `dyn-send-type-argument-bug.cee` | **should** check and print `1`; N0103 on `Vector<Box<dyn Job + Send>>.create()` | CeeSafe bug B14; `web_client`'s held connection | 0009 |
+| `dyn-send-async-frames-bug.cee` | **should** build and print `3`; `--interp` does, the C defines the dyn-call frame twice | CeeSafe bug B15; blocks `web_client` natively | 0009 |
 | `scope-droppable-error-bug.cee` | **should** build and print `3`; `--interp` does, the C calls the error's drop function before declaring it | CeeSafe bug B13; scopes in `web_sse`'s tests | 0008 |
 
 ## Runs

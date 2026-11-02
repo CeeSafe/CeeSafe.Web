@@ -1,0 +1,19 @@
+// CeeSafe bug repro (B14): `dyn I + Send` as a type argument in expression position does not parse:
+// `Vector<Box<dyn Job + Send>>.create()` is "comparison operators cannot be chained" (N0103). The same type parses in
+// a declaration (`var v: Vector<Box<dyn Job + Send>>`). Expected: it checks and prints 1.
+interface Job {
+    fn id(borrow this) -> u32;
+}
+
+struct One {}
+
+impl Job for One {
+    fn id(borrow this) -> u32 => 1;
+}
+
+fn main() {
+    var v = Vector<Box<dyn Job + Send>>.create();
+    let b: Box<dyn Job + Send> = Box.create(One {})!;
+    v.push(b)!;
+    Console.writeLine(v[0].id());
+}

@@ -8,7 +8,9 @@ import web_transport;
 /// The most ciphertext a handshake may consume before it is cut off (Web ADR 0002 §3.4).
 const HANDSHAKE_BYTES: u64 = 65536;
 
-/// A TLS connection over a plain stream.
+/// A TLS connection over a plain stream. Thread-safe by this package's claim (Web ADR 0009 §1): its SSL is used by one
+/// task at a time (`borrow mut`), and only OpenSSL's read-only getters are reached through shared borrows.
+@threadSafe
 @noncopy
 public struct TlsTransport {
     private plain: PlainStream;
@@ -417,11 +419,11 @@ impl Connector for TlsConnector {
         stream: PlainStream,
         host: StringView,
         deadline: Deadline,
-    ) -> Result<Box<dyn Transport>, NetError> {
+    ) -> Result<Box<dyn Transport + Send>, NetError> {
         let t = await TlsTransport.connect(stream, this.config, host, deadline)?;
         match (Box.create(t)) {
             Ok(b) => {
-                let d: Box<dyn Transport> = b;
+                let d: Box<dyn Transport + Send> = b;
                 return Ok(d);
             }
             Err(_) => { return Err(NetError.OutOfMemory); }
@@ -431,6 +433,8 @@ impl Connector for TlsConnector {
 
 /// A client's TLS session, kept to resume a later connection to the same server (`TlsTransport.connectResuming`): a
 /// shorter handshake without the certificate exchange.
+/// Thread-safe by this package's claim: OpenSSL counts an SSL_SESSION's references atomically.
+@threadSafe
 @noncopy
 public struct TlsSession {
     private raw: *mut void;

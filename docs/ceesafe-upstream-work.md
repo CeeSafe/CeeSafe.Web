@@ -17,7 +17,9 @@ re-check them before editing.
 M2's task 5 (`web_server`) is unblocked: `Server<S>`, its tests and `examples/server` build and pass on 0.9.2.
 Opened since, while building M3's `web_sse`: **U13** (`Channel.tryRecv`, wanted, blocks nothing) and **B13** (an
 `Async.scope` with a droppable error type does not build; tests avoid it). While building M4's `web_tls`: **U14**
-(C allocations outside the leak check, for OpenSSL in tests) and **T3** (four warnings in Windows builds).
+(C allocations outside the leak check, for OpenSSL in tests) and **T3** (four warnings in Windows builds). While
+building M5's `web_client`: **B14** (`dyn I + Send` as a type argument in an expression does not parse) and **B15**
+(async calls through `dyn I` and `dyn I + Send` collide in C; **blocks the client natively**).
 
 ## Status at 0.9.1 (released 2026-11-02, tag `v0.9.1` = CeeSafe `74226b0`)
 
@@ -583,6 +585,30 @@ signedness: 'unsigned long' to 'long'` at `ceesafe_rt_io.c` (3) and `ceesafe_rt_
 `ioctlsocket(…, FIONBIO, …)`: the SDK's `FIONBIO` macro is an `unsigned long` expression and `ioctlsocket` takes a
 `long`. **Wanted:** a cast (`(long)FIONBIO`), so builds on Windows are quiet. Cosmetic.
 
+## B14 — Bug: `dyn I + Send` as a type argument does not parse in an expression   *(found 2026-11-02, 0.9.2)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/dyn-send-type-argument-bug.cee`:
+`var v = Vector<Box<dyn Job + Send>>.create();` is `N0103: comparison operators cannot be chained`. The same type
+parses in a declaration (`var v: Vector<Box<dyn Job + Send>>`, a field). **Expected:** it checks and prints 1.
+**Effect on CeeSafe.Web:** `web_client` wraps the box in a struct (`Live { conn: Box<dyn Transport + Send> }`), which
+spells the same thing.
+
+## B15 — Bug: async calls through both `dyn I` and `dyn I + Send` give C that does not compile   *(found 2026-11-02, 0.9.2)*
+
+**Repro:** `~/dev/CeeSafe.Web/tests/probes/dyn-send-async-frames-bug.cee`: one function awaits `j.run()` with
+`j: borrow mut dyn Job`, another with `j: borrow mut Box<dyn Job + Send>`.
+
+**Observed:** `run --interp` prints 3. `build` fails with 9 C errors: `redefinition of 'ceeAF_dyn_D3Job0_m0'`, and of
+its resume function (`ceeAT_…`), its suspension table (`ceeAL_…`) and its frame info (`ceeAN_…`, "dyn Job + Send.run"
+next to "dyn Job.run"). The dyn-call frame's C name leaves out `+ Send`, so the two types' frames collide.
+
+**Expected:** it builds and prints 3. The frames could share one definition, since `+ Send` does not change the
+layout, or get distinct names.
+
+**Blocks:** M5's `web_client` natively. Its pool holds `Box<dyn Transport + Send>` (Web ADR 0009 §2), and every
+program also awaits `dyn Transport` (M1's server, the driver). Its 11 tests pass in the interpreter; native, the
+sanitizers and the sweeps wait. The client is on branch `m5-client`.
+
 ## B13 — Bug: an `Async.scope` whose error type has a drop gives C that does not compile   *(found 2026-11-02, 0.9.2)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/scope-droppable-error-bug.cee`:
@@ -669,7 +695,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.9.0** (released 2026-11-02) | U6, U7, U9, U10, U11 | M9 sendfile, M10 HTTP/3; `web_server` without delegating impls |
 | **0.9.1** (released 2026-11-02) | B8 fixed; U12 | the `Date` field |
 | **0.9.2** (released 2026-11-02) | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
-| next | U13, U14, T3; B13 fixed | `web_sse`'s `DropOldest` and batched flushes (M3); scopes with `TestFailure` in tests |
+| next | B15 fixed (blocks M5); B13, B14 fixed; U13, U14, T3 | `web_sse`'s `DropOldest` and batched flushes (M3); scopes with `TestFailure` in tests |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

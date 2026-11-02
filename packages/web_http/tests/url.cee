@@ -1,0 +1,122 @@
+// Url (Web ADR 0009 §3.2). The resolution cases are RFC 3986 §5.4's own examples (normal, §5.4.1, and abnormal,
+// §5.4.2) against its base "http://a/b/c/d;p?q", but for the empty reference, which a redirect never is.
+import web_core;
+
+fn text(u: borrow Url) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    match (u.text(mut out)) {
+        Ok() => { return Ok(out); }
+        Err(_) => { return Err(TestFailure.create("text")); }
+    }
+}
+
+fn parsed(s: StringView) -> Result<Url, TestFailure> {
+    match (Url.parse(s.bytes())) {
+        Ok(u) => { return Ok(u); }
+        Err(_) => { return Err(TestFailure.create("parse")); }
+    }
+}
+
+fn resolves(base: borrow Url, reference: StringView, expected: StringView) -> Result<void, TestFailure> {
+    let r = match (base.resolve(reference.bytes())) {
+        Ok(u) => u,
+        Err(_) => { return Check.fail(reference); },
+    };
+    let got = text(r)?;
+    return Check.equalBytes(expected.bytes(), got.view());
+}
+
+@test
+fn rfc3986_resolution() -> Result<void, TestFailure> {
+    let base = parsed("http://a/b/c/d;p?q")?;
+    resolves(base, "g", "http://a/b/c/g")?;
+    resolves(base, "./g", "http://a/b/c/g")?;
+    resolves(base, "g/", "http://a/b/c/g/")?;
+    resolves(base, "/g", "http://a/g")?;
+    resolves(base, "//g", "http://g/")?;
+    resolves(base, "?y", "http://a/b/c/d;p?y")?;
+    resolves(base, "g?y", "http://a/b/c/g?y")?;
+    resolves(base, "#s", "http://a/b/c/d;p?q")?;
+    resolves(base, "g#s", "http://a/b/c/g")?;
+    resolves(base, ";x", "http://a/b/c/;x")?;
+    resolves(base, "g;x", "http://a/b/c/g;x")?;
+    resolves(base, ".", "http://a/b/c/")?;
+    resolves(base, "./", "http://a/b/c/")?;
+    resolves(base, "..", "http://a/b/")?;
+    resolves(base, "../", "http://a/b/")?;
+    resolves(base, "../g", "http://a/b/g")?;
+    resolves(base, "../..", "http://a/")?;
+    resolves(base, "../../", "http://a/")?;
+    resolves(base, "../../g", "http://a/g")?;
+    resolves(base, "../../../g", "http://a/g")?;
+    resolves(base, "../../../../g", "http://a/g")?;
+    resolves(base, "/./g", "http://a/g")?;
+    resolves(base, "/../g", "http://a/g")?;
+    resolves(base, "g.", "http://a/b/c/g.")?;
+    resolves(base, ".g", "http://a/b/c/.g")?;
+    resolves(base, "g..", "http://a/b/c/g..")?;
+    resolves(base, "..g", "http://a/b/c/..g")?;
+    resolves(base, "./../g", "http://a/b/g")?;
+    resolves(base, "./g/.", "http://a/b/c/g/")?;
+    resolves(base, "g/./h", "http://a/b/c/g/h")?;
+    resolves(base, "g/../h", "http://a/b/c/h")?;
+    resolves(base, "g;x=1/./y", "http://a/b/c/g;x=1/y")?;
+    resolves(base, "g;x=1/../y", "http://a/b/c/y")?;
+    resolves(base, "g?y/./x", "http://a/b/c/g?y/./x")?;
+    resolves(base, "g?y/../x", "http://a/b/c/g?y/../x")?;
+    resolves(base, "https://other.example:8443/x", "https://other.example:8443/x")?;
+    let mail = match (base.resolve("mailto:x@example".bytes())) {
+        Err(UrlError.BadScheme) => true,
+        _ => false,
+    };
+    return Check.isTrue(mail, "another scheme");
+}
+
+@test
+fn parsing() -> Result<void, TestFailure> {
+    let u = parsed("HTTPS://Example.COM:8443/a/b?c=d#frag")?;
+    Check.isTrue(u.isSecure(), "https")?;
+    Check.equalBytes("example.com".bytes(), u.host())?;
+    Check.equalU64(8443, u.port() as u64)?;
+    Check.equalBytes("/a/b?c=d".bytes(), u.target())?;
+    let plain = parsed("http://h")?;
+    Check.equalU64(80, plain.port() as u64)?;
+    Check.equalBytes("/".bytes(), plain.target())?;
+    var authority = Vector<u8>.create();
+    match (plain.authority(mut authority)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("authority"); }
+    }
+    Check.equalBytes("h".bytes(), authority.view())?; // the default port is left out
+    let v6 = parsed("https://[::1]:8443/")?;
+    Check.equalBytes("[::1]".bytes(), v6.host())?;
+    Check.equalBytes("::1".bytes(), v6.hostName())?;
+    let other = parsed("https://example.com:443/z")?;
+    Check.isTrue(u.sameOrigin(parsed("https://example.com:8443/elsewhere")?), "same origin")?;
+    Check.isTrue(!u.sameOrigin(other), "another port")?;
+    Check.isTrue(isError(Url.parse("ftp://h/".bytes()), 0), "a scheme other than http(s)")?;
+    Check.isTrue(isError(Url.parse("http://user:pw@h/".bytes()), 3), "userinfo")?;
+    Check.isTrue(isError(Url.parse("http://h:0/".bytes()), 2), "port 0")?;
+    Check.isTrue(isError(Url.parse("http://h:65536/".bytes()), 2), "port 65536")?;
+    Check.isTrue(isError(Url.parse("http://h:8x/".bytes()), 2), "a port with a letter")?;
+    Check.isTrue(isError(Url.parse("http:///x".bytes()), 1), "no host")?;
+    Check.isTrue(isError(Url.parse("http://h/a b".bytes()), 4), "a space")?;
+    Check.isTrue(isError(Url.parse("http://[::1/".bytes()), 1), "an unclosed bracket")?;
+    return Ok();
+}
+
+fn isError(r: Result<Url, UrlError>, which: u32) -> bool {
+    let e = match (r) {
+        Ok(_) => { return false; },
+        Err(e) => e,
+    };
+    let n = match (e) {
+        UrlError.BadScheme => 0u32,
+        UrlError.BadHost => 1u32,
+        UrlError.BadPort => 2u32,
+        UrlError.Userinfo => 3u32,
+        UrlError.BadCharacter => 4u32,
+        UrlError.OutOfMemory => 5u32,
+    };
+    return n == which;
+}

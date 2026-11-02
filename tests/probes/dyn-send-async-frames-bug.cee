@@ -1,0 +1,32 @@
+// CeeSafe bug repro (B15): awaiting an async interface method both through `dyn I` and through `dyn I + Send` gives C
+// that does not compile: both dyn-call frames are named `ceeAF_dyn_D<…>I0_m0` (the `+ Send` is not in the name), so
+// the struct, its resume function and its frame info are each defined twice. Expected: it builds and prints 3.
+interface Job {
+    async fn run(borrow mut this) -> u32;
+}
+
+struct One {}
+
+impl Job for One {
+    async fn run(borrow mut this) -> u32 => 1;
+}
+
+struct Two {}
+
+impl Job for Two {
+    async fn run(borrow mut this) -> u32 => 2;
+}
+
+async fn viaPlain(j: borrow mut dyn Job) -> u32 => await j.run();
+
+async fn viaSend(j: borrow mut Box<dyn Job + Send>) -> u32 => await j.run();
+
+async fn both() -> u32 {
+    var one = One {};
+    var two: Box<dyn Job + Send> = Box.create(Two {})!;
+    return await viaPlain(mut one) + await viaSend(mut two);
+}
+
+fn main() {
+    Console.writeLine(Async.run(both()));
+}

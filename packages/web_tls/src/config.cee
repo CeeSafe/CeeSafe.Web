@@ -15,6 +15,9 @@ public enum TlsSetupError {
 
 /// A TLS configuration: TLS 1.2 (ECDHE with AEAD only) and 1.3, no renegotiation, no compression. A server's has its
 /// certificate; a client's verifies the server against its trust store and the name it connects to.
+/// Thread-safe by this package's claim (Web ADR 0009 §1): OpenSSL 3 lets threads share an SSL_CTX, and the shim
+/// changes its own state (SNI table, reload, ticket keys) under OpenSSL's lock.
+@threadSafe
 @noncopy
 public struct TlsConfig {
     private raw: *mut void;

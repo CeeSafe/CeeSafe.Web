@@ -1,0 +1,374 @@
+// URLs for the client (Web ADR 0009 §3.2): absolute `http` and `https` URLs (RFC 3986 §3), and resolving a
+// redirect's Location against one (§5.2). Owned bytes, so a URL outlives the text it came from.
+
+/// Why a URL was refused.
+public enum UrlError {
+    /// Not `http://` or `https://`.
+    BadScheme,
+    /// No host, a host with characters a host cannot have, or a malformed `[IPv6]`.
+    BadHost,
+    /// A port that is not a number from 1 to 65535.
+    BadPort,
+    /// Userinfo (`user:pass@`), deprecated by RFC 9110 §4.2.4: put credentials in `Authorization`.
+    Userinfo,
+    /// A space, control byte or non-ASCII byte (percent-encode them first).
+    BadCharacter,
+    /// Out of memory.
+    OutOfMemory,
+}
+
+/// An absolute http or https URL: scheme, host, port and the request target (path and query; at least `/`).
+@noncopy
+public struct Url {
+    private secure: bool;
+    private hostBytes: Vector<u8>;
+    private portNumber: u16;
+    private explicitPort: bool;
+    private targetBytes: Vector<u8>;
+
+    /// Parses `text`. The scheme and host are lower-cased; the fragment is dropped; an empty path is `/`.
+    public fn parse(text: Slice<u8>) -> Result<Url, UrlError> {
+        for (b in text) {
+            if (b <= 32 || b >= 127) {
+                return Err(UrlError.BadCharacter);
+            }
+        }
+        var rest: usize = 0;
+        var secure = false;
+        if (startsWithIgnoringCase(text, "https://")) {
+            secure = true;
+            rest = 8;
+        } else if (startsWithIgnoringCase(text, "http://")) {
+            rest = 7;
+        } else {
+            return Err(UrlError.BadScheme);
+        }
+        var authorityEnd = rest;
+        while (authorityEnd < text.length && text[authorityEnd] != 47 && text[authorityEnd] != 63 &&
+            text[authorityEnd] != 35) {
+            authorityEnd += 1;
+        }
+        var url = Url {
+            secure: secure,
+            hostBytes: Vector<u8>.create(),
+            portNumber: if (secure) 443u16 else 80u16,
+            explicitPort: false,
+            targetBytes: Vector<u8>.create(),
+        };
+        url.setAuthority(text[rest..authorityEnd])?;
+        url.setTarget(text[authorityEnd..])?;
+        return Ok(url);
+    }
+
+    /// Whether the scheme is https.
+    public fn isSecure(borrow this) -> bool => this.secure;
+
+    /// The host, lower-cased; an IPv6 address keeps its brackets (`[::1]`).
+    public fn host(borrow this) -> Slice<u8> => this.hostBytes.view();
+
+    /// The host as a name to resolve or verify: without an IPv6 address's brackets.
+    public fn hostName(borrow this) -> Slice<u8> {
+        let h = this.hostBytes.view();
+        if (h.length >= 2 && h[0] == 91) {
+            return h[1..h.length - 1];
+        }
+        return h;
+    }
+
+    /// The port: the URL's, or the scheme's default (80, 443).
+    public fn port(borrow this) -> u16 => this.portNumber;
+
+    /// The request target: the path and the query, at least `/`.
+    public fn target(borrow this) -> Slice<u8> => this.targetBytes.view();
+
+    /// The value of a request's `host` field: the host, and the port when it is not the scheme's default.
+    public fn authority(borrow this, out: borrow mut Vector<u8>) -> Result<void, UrlError> {
+        out.clear();
+        push(out, this.hostBytes.view())?;
+        if (this.portNumber != (if (this.secure) 443u16 else 80u16)) {
+            push(out, ":".bytes())?;
+            var digits = [0u8; 5];
+            let start = decimal(this.portNumber, mut digits);
+            push(out, digits[start..])?;
+        }
+        return Ok();
+    }
+
+    /// The URL as text: `scheme://authority/target`.
+    public fn text(borrow this, out: borrow mut Vector<u8>) -> Result<void, UrlError> {
+        var authority = Vector<u8>.create();
+        this.authority(mut authority)?;
+        out.clear();
+        push(out, if (this.secure) "https://".bytes() else "http://".bytes())?;
+        push(out, authority.view())?;
+        return push(out, this.targetBytes.view());
+    }
+
+    /// A copy.
+    public fn copy(borrow this) -> Result<Url, UrlError> {
+        var url = Url {
+            secure: this.secure,
+            hostBytes: Vector<u8>.create(),
+            portNumber: this.portNumber,
+            explicitPort: this.explicitPort,
+            targetBytes: Vector<u8>.create(),
+        };
+        push(mut url.hostBytes, this.hostBytes.view())?;
+        push(mut url.targetBytes, this.targetBytes.view())?;
+        return Ok(url);
+    }
+
+    /// Whether `other` has the same origin: scheme, host and port (RFC 6454).
+    public fn sameOrigin(borrow this, other: borrow Url) -> bool {
+        if (this.secure != other.secure || this.portNumber != other.portNumber) {
+            return false;
+        }
+        let a = this.hostBytes.view();
+        let b = other.hostBytes.view();
+        if (a.length != b.length) {
+            return false;
+        }
+        for (i in 0..a.length) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// A redirect's `location` resolved against this URL (RFC 3986 §5.2): an absolute URL; `//host…` (this scheme);
+    /// `/path` (this origin); or a relative path (merged with this path's directory, dot segments removed).
+    public fn resolve(borrow this, location: Slice<u8>) -> Result<Url, UrlError> {
+        if (location.length == 0) {
+            return Err(UrlError.BadCharacter);
+        }
+        if (startsWithIgnoringCase(location, "http://") || startsWithIgnoringCase(location, "https://")) {
+            return Url.parse(location);
+        }
+        if (location[0] == 35) {
+            return this.copy(); // a fragment only: the same resource
+        }
+        for (b in location) {
+            if (b <= 32 || b >= 127) {
+                return Err(UrlError.BadCharacter);
+            }
+        }
+        var scheme = false;
+        for (b in location) {
+            if (b == 58) {
+                scheme = true;
+            }
+            if (b == 47 || b == 63 || b == 35 || b == 58) {
+                break;
+            }
+        }
+        if (scheme) {
+            return Err(UrlError.BadScheme); // another scheme (mailto:, ftp:)
+        }
+        var url = Url {
+            secure: this.secure,
+            hostBytes: Vector<u8>.create(),
+            portNumber: this.portNumber,
+            explicitPort: this.explicitPort,
+            targetBytes: Vector<u8>.create(),
+        };
+        if (location.length >= 2 && location[0] == 47 && location[1] == 47) {
+            var end: usize = 2;
+            while (end < location.length && location[end] != 47 && location[end] != 63 && location[end] != 35) {
+                end += 1;
+            }
+            url.portNumber = if (this.secure) 443u16 else 80u16;
+            url.setAuthority(location[2..end])?;
+            url.setTarget(location[end..])?;
+            return Ok(url);
+        }
+        push(mut url.hostBytes, this.hostBytes.view())?;
+        if (location[0] == 47) {
+            url.setTarget(location)?;
+            return Ok(url);
+        }
+        // A relative path: this path's directory, then the location; a query-only location keeps the path.
+        var merged = Vector<u8>.create();
+        let base = this.targetBytes.view();
+        var pathEnd: usize = 0;
+        while (pathEnd < base.length && base[pathEnd] != 63) {
+            pathEnd += 1;
+        }
+        if (location[0] == 63) {
+            push(mut merged, base[0..pathEnd])?;
+        } else {
+            var slash = pathEnd;
+            while (slash > 0 && base[slash - 1] != 47) {
+                slash -= 1;
+            }
+            push(mut merged, base[0..slash])?;
+        }
+        push(mut merged, location)?;
+        url.setTarget(merged.view())?;
+        return Ok(url);
+    }
+
+    /// Sets the host and port from `authority` (no userinfo).
+    fn setAuthority(borrow mut this, authority: Slice<u8>) -> Result<void, UrlError> {
+        for (b in authority) {
+            if (b == 64) {
+                return Err(UrlError.Userinfo);
+            }
+        }
+        var hostEnd = authority.length;
+        if (authority.length > 0 && authority[0] == 91) {
+            var close: usize = 1;
+            while (close < authority.length && authority[close] != 93) {
+                let b = authority[close];
+                let hex = (b >= 48 && b <= 58) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70) || b == 46;
+                if (!hex) {
+                    return Err(UrlError.BadHost);
+                }
+                close += 1;
+            }
+            if (close >= authority.length || close < 3) {
+                return Err(UrlError.BadHost);
+            }
+            hostEnd = close + 1;
+            if (hostEnd < authority.length && authority[hostEnd] != 58) {
+                return Err(UrlError.BadHost);
+            }
+        } else {
+            var colon: usize = 0;
+            while (colon < authority.length && authority[colon] != 58) {
+                colon += 1;
+            }
+            hostEnd = colon;
+            for (b in authority[0..hostEnd]) {
+                let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 ||
+                    b == 95 || b == 126 || b == 37;
+                if (!ok) {
+                    return Err(UrlError.BadHost);
+                }
+            }
+        }
+        if (hostEnd == 0) {
+            return Err(UrlError.BadHost);
+        }
+        this.hostBytes.clear();
+        for (b in authority[0..hostEnd]) {
+            let lower = if (b >= 65 && b <= 90) b + 32 else b;
+            match (this.hostBytes.push(lower)) {
+                Ok() => {}
+                Err(_) => { return Err(UrlError.OutOfMemory); }
+            }
+        }
+        if (hostEnd < authority.length) {
+            let digits = authority[hostEnd + 1..];
+            if (digits.length == 0 || digits.length > 5) {
+                return Err(UrlError.BadPort);
+            }
+            var port: u32 = 0;
+            for (d in digits) {
+                if (d < 48 || d > 57) {
+                    return Err(UrlError.BadPort);
+                }
+                port = port * 10 + (d - 48) as u32;
+            }
+            if (port == 0 || port > 65535) {
+                return Err(UrlError.BadPort);
+            }
+            this.portNumber = truncate<u16>(port);
+            this.explicitPort = true;
+        }
+        return Ok();
+    }
+
+    /// Sets the target from a path and query (the fragment dropped, dot segments removed: RFC 3986 §5.2.4).
+    fn setTarget(borrow mut this, text: Slice<u8>) -> Result<void, UrlError> {
+        var end: usize = 0;
+        while (end < text.length && text[end] != 35) {
+            end += 1;
+        }
+        let pathAndQuery = text[0..end];
+        var pathEnd: usize = 0;
+        while (pathEnd < pathAndQuery.length && pathAndQuery[pathEnd] != 63) {
+            pathEnd += 1;
+        }
+        this.targetBytes.clear();
+        removeDotSegments(pathAndQuery[0..pathEnd], mut this.targetBytes)?;
+        if (this.targetBytes.length == 0) {
+            push(mut this.targetBytes, "/".bytes())?;
+        }
+        push(mut this.targetBytes, pathAndQuery[pathEnd..])?;
+        return Ok();
+    }
+}
+
+/// RFC 3986 §5.2.4 over `path`, appended to `out`: `.` segments go, `..` removes the segment before it.
+fn removeDotSegments(path: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, UrlError> {
+    var at: usize = 0;
+    while (at < path.length) {
+        // One segment: from a `/` (or the start) to the next `/`.
+        var next = at + 1;
+        while (next < path.length && path[next] != 47) {
+            next += 1;
+        }
+        let segment = path[at..next];
+        let dot = segment.length == 2 && segment[0] == 47 && segment[1] == 46;
+        let dotDot = segment.length == 3 && segment[0] == 47 && segment[1] == 46 && segment[2] == 46;
+        if (dotDot) {
+            while (out.length > 0 && out[out.length - 1] != 47) {
+                out.pop();
+            }
+            if (out.length > 0) {
+                out.pop();
+            }
+            if (next >= path.length) {
+                push(out, "/".bytes())?;
+            }
+        } else if (dot) {
+            if (next >= path.length) {
+                push(out, "/".bytes())?;
+            }
+        } else {
+            push(out, segment)?;
+        }
+        at = next;
+    }
+    return Ok();
+}
+
+fn startsWithIgnoringCase(text: Slice<u8>, prefix: StringView) -> bool {
+    let p = prefix.bytes();
+    if (text.length < p.length) {
+        return false;
+    }
+    for (i in 0..p.length) {
+        let a = text[i];
+        let lower = if (a >= 65 && a <= 90) a + 32 else a;
+        if (lower != p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn push(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, UrlError> {
+    for (b in bytes) {
+        match (out.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(UrlError.OutOfMemory); }
+        }
+    }
+    return Ok();
+}
+
+/// `v` in decimal at the end of `out`; the index of its first digit.
+fn decimal(v: u16, out: borrow mut [u8; 5]) -> usize {
+    var n = v;
+    var i: usize = 5;
+    loop {
+        i -= 1;
+        out[i] = truncate<u8>(48 + n % 10);
+        n /= 10;
+        if (n == 0) {
+            return i;
+        }
+    }
+}

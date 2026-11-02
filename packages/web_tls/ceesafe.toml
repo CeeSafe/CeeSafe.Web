@@ -2,6 +2,8 @@
 name = "web_tls"
 version = "0.1.0"
 kind = "library"
+# @threadSafe on TlsConfig, TlsTransport and TlsSession is this package's claim (CeeSafe ADR 0025 §3.2; Web ADR 0009 §1).
+trusted = true
 # OpenSSL >= 3.0 (Web ADR 0002 §3.1), linked through the manifest (CeeSafe ADR 0047). The shim is the only C.
 c = ["c/tls_shim.c"]
 
