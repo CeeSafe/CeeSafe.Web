@@ -4,12 +4,22 @@ version = "0.1.0"
 kind = "library"
 # OpenSSL >= 3.0 (Web ADR 0002 §3.1), linked through the manifest (CeeSafe ADR 0047). The shim is the only C.
 c = ["c/tls_shim.c"]
+
+[target.linux]
 links = ["ssl", "crypto"]
 
 [target.macos]
 # Homebrew's openssl@3, not the system's LibreSSL.
+links = ["ssl", "crypto"]
 lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
 include-dirs = ["/opt/homebrew/opt/openssl@3/include"]
+
+[target.windows]
+# OpenSSL's MSVC import libraries (Shining Light's installer, or vcpkg): OPENSSL_DIR is the install directory and
+# OPENSSL_LIB_DIR the libraries for this machine, e.g. %OPENSSL_DIR%\lib\VC\arm64\MD (x64: ...\x64\MD).
+links = ["libssl", "libcrypto"]
+lib-dirs = ["$OPENSSL_LIB_DIR"]
+include-dirs = ["$OPENSSL_DIR/include"]
 
 [dependencies]
 web_core = { path = "../web_core" }

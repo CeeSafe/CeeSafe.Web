@@ -1,6 +1,7 @@
 // HTTPS: web_server behind web_tls's TlsAcceptor (Web ADR 0002), for the TLS interop checks (tests/interop/tls.py).
 // Listens on 127.0.0.1:CW_PORT (default 8443) with the certificate chain CW_CERT and key CW_KEY (PEM files),
-// offering ALPN http/1.1.
+// offering ALPN http/1.1. CW_WORKERS (default 256) bounds the connections served at once, handshakes included, and
+// CW_HANDSHAKE_MS (default 10000) each handshake.
 //
 //   GET  /       "hello, tls"
 //   POST /echo   the request body back
@@ -105,15 +106,20 @@ async fn readFile(name: StringView, out: borrow mut Vector<u8>) -> Result<void, 
     }
 }
 
-fn port() -> u16 {
-    let text = match (Environment.variable("CW_PORT")) {
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
         Some(t) => t,
-        null => { return 8443; },
+        null => { return otherwise; },
     };
     return match (Ascii.parseDecimal(text.bytes())) {
-        Some(v) => if (v > 0 && v < 65536) truncate<u16>(v) else 8443,
-        null => 8443,
+        Some(v) => v,
+        null => otherwise,
     };
+}
+
+fn port() -> u16 {
+    let v = setting("CW_PORT", 8443);
+    return if (v > 0 && v < 65536) truncate<u16>(v) else 8443;
 }
 
 async fn say(text: StringView) -> Result<void, NetError> {
@@ -149,6 +155,8 @@ async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
     let drain = Drain.create()?;
     var limits = ConnectionLimits.defaults();
     limits.graceMs = 1000;
+    limits.workers = truncate<u32>(setting("CW_WORKERS", 256));
+    limits.handshakeMs = setting("CW_HANDSHAKE_MS", 10000);
     await say("https: listening")?;
     let report = await server.run(listener, acceptor, limits, drain)?;
     return await say("https: drained");

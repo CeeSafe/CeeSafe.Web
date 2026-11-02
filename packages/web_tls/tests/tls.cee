@@ -63,6 +63,7 @@ async fn bad_certificates_fail_closed() -> Result<void, TestFailure> {
     await refused(Cert.Expired, Trust.Ca, Host.Localhost, "expired")?;
     await refused(Cert.Future, Trust.Ca, Host.Localhost, "not yet valid")?;
     await refused(Cert.Server, Trust.Ca, Host.LocalDomain, "a name not in the SAN")?;
+    await refused(Cert.BadSignature, Trust.Ca, Host.Localhost, "a signature that does not verify")?;
     return Ok();
 }
 
@@ -82,7 +83,7 @@ async fn refused(cert: Cert, trust: Trust, host: Host, what: StringView) -> Resu
 @test
 async fn a_silent_client_hits_the_handshake_deadline() -> Result<void, TestFailure> {
     var s = setup();
-    s.silentClient = true;
+    s.raw = Raw.Silent;
     s.serverDeadlineMs = 200;
     let started = Timer.now();
     let o = await run(s)?;
@@ -98,7 +99,7 @@ async fn a_silent_client_hits_the_handshake_deadline() -> Result<void, TestFailu
 @test
 async fn plaintext_is_not_a_handshake() -> Result<void, TestFailure> {
     var s = setup();
-    s.plaintextClient = true;
+    s.raw = Raw.Plaintext;
     let o = await run(s)?;
     Check.isTrue(isTls(o.server, TlsReason.Handshake), "an HTTP request where a ClientHello belongs")?;
     return Ok();
@@ -130,5 +131,30 @@ fn bad_configurations() -> Result<void, TestFailure> {
     var version = [0u8; 64];
     let n = opensslVersion(mut version[..]);
     Check.isTrue(n > 8 && version[0] == 79, "OpenSSL's version text")?; // "OpenSSL …"
+    return Ok();
+}
+
+/// A ClientHello cut short by the end of the stream fails the handshake; the server does not wait for the deadline.
+@test
+async fn a_truncated_handshake_fails() -> Result<void, TestFailure> {
+    var s = setup();
+    s.raw = Raw.Truncated;
+    let started = Timer.now();
+    let o = await run(s)?;
+    Check.isTrue(isTls(o.server, TlsReason.Handshake), "Handshake")?;
+    Check.isTrue(Timer.now() - started < 2000, "at once, not at the 5 s deadline")?;
+    return Ok();
+}
+
+/// A record longer than TLS allows is refused from its header alone, with an alert (RFC 8446 §5.2: record_overflow).
+@test
+async fn an_oversized_record_is_refused() -> Result<void, TestFailure> {
+    var s = setup();
+    s.raw = Raw.Oversized;
+    let started = Timer.now();
+    let o = await run(s)?;
+    Check.isTrue(isTls(o.server, TlsReason.Handshake), "Handshake")?;
+    Check.equalU64(0x15, o.firstBack as u64)?; // an alert record
+    Check.isTrue(Timer.now() - started < 2000, "from the header, without waiting for the body")?;
     return Ok();
 }

@@ -16,7 +16,8 @@ re-check them before editing.
 
 M2's task 5 (`web_server`) is unblocked: `Server<S>`, its tests and `examples/server` build and pass on 0.9.2.
 Opened since, while building M3's `web_sse`: **U13** (`Channel.tryRecv`, wanted, blocks nothing) and **B13** (an
-`Async.scope` with a droppable error type does not build; tests avoid it).
+`Async.scope` with a droppable error type does not build; tests avoid it). While building M4's `web_tls`: **U14**
+(C allocations outside the leak check, for OpenSSL in tests) and **T3** (four warnings in Windows builds).
 
 ## Status at 0.9.1 (released 2026-11-02, tag `v0.9.1` = CeeSafe `74226b0`)
 
@@ -558,6 +559,30 @@ it. With a way to tell "empty" from "closed and empty" if that is cheap (for exa
 **Effect on CeeSafe.Web until then:** `EventQueue.create(…, Overflow.DropOldest)` returns `Err(Unsupported)`, and the
 stream flushes after every event. Nothing else waits.
 
+## U14 — C allocations that fault injection can fail but the leak check leaves out   *(found 2026-11-02, M4; wanted, not blocking)*
+
+**Gap:** `ceesafe_alloc` (`runtime/include/ceesafe/rt.h`) counts every allocation, fails the one numbered
+`CEESAFE_FAIL_ALLOC_AT`, and `ceesafec test` fails a test that ends with any of them live. A C library that keeps
+global state until the process exits, such as OpenSSL (error strings, providers, its default library context), cannot
+be routed through it: every test would report that state as a leak.
+
+**Needed by:** Web ADR 0002 §3.5 and §6.1 (accepted by the owner): OpenSSL's allocations go through CeeSafe's allocator
+in test builds (`CRYPTO_set_mem_functions`), so the allocation-failure sweep reaches OpenSSL's out-of-memory paths too.
+
+**Wanted:** an allocator number for C code, for example `CEE_ALLOC_FOREIGN`, whose allocations are counted and
+fault-injected like the others, but not reported by the leak check (or reported apart, as "still held by C at exit").
+`ceesafe_alloc`, `ceesafe_realloc` and `ceesafe_free` with it, declared in a header a package's C files can include
+(today a package's C files are compiled without the runtime's include directory).
+
+**Effect on CeeSafe.Web until then:** OpenSSL keeps its own allocator in every build (Web ADR 0002 amendment 2.1).
+
+## T3 — Windows: the runtime warns under `-Wsign-conversion`   *(found 2026-11-02, 0.9.2, Windows 11 ARM64, clang 23)*
+
+**Observed:** every native build on Windows prints four warnings from the runtime: `implicit conversion changes
+signedness: 'unsigned long' to 'long'` at `ceesafe_rt_io.c` (3) and `ceesafe_rt_async.c:2592`, each an
+`ioctlsocket(…, FIONBIO, …)`: the SDK's `FIONBIO` macro is an `unsigned long` expression and `ioctlsocket` takes a
+`long`. **Wanted:** a cast (`(long)FIONBIO`), so builds on Windows are quiet. Cosmetic.
+
 ## B13 — Bug: an `Async.scope` whose error type has a drop gives C that does not compile   *(found 2026-11-02, 0.9.2)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/scope-droppable-error-bug.cee`:
@@ -644,7 +669,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.9.0** (released 2026-11-02) | U6, U7, U9, U10, U11 | M9 sendfile, M10 HTTP/3; `web_server` without delegating impls |
 | **0.9.1** (released 2026-11-02) | B8 fixed; U12 | the `Date` field |
 | **0.9.2** (released 2026-11-02) | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
-| next | U13; B13 fixed | `web_sse`'s `DropOldest` and batched flushes (M3); scopes with `TestFailure` in tests |
+| next | U13, U14, T3; B13 fixed | `web_sse`'s `DropOldest` and batched flushes (M3); scopes with `TestFailure` in tests |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

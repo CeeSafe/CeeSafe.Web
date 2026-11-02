@@ -1,0 +1,151 @@
+// A TLS client with web_tls's TlsTransport.connect, for the client-side interop checks (tests/interop/tls.py):
+// connects to 127.0.0.1:CW_PORT, verifies the server as CW_HOST against the roots in CW_CA (PEM), offers ALPN
+// http/1.1, sends `GET /` and prints what it agreed and what came back:
+//
+//   tls_get: TLS 1.3 alpn=http/1.1
+//   <the response>
+//
+// or `tls_get: failed: <reason>` with OpenSSL's text.
+import web_core;
+import web_transport;
+import web_tls;
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    var v: u64 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57) {
+            return otherwise;
+        }
+        v = v * 10 + (b - 48) as u64;
+    }
+    return v;
+}
+
+async fn readFile(path: StringView, out: borrow mut Vector<u8>) -> Result<void, NetError> {
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(e) => { return Err(NetErrors.fromAsync(e)); },
+    };
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (await AsyncFiles.read(mut file, mut chunk[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(NetErrors.fromAsync(e)); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        for (i in 0..n) {
+            match (out.push(chunk[i])) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+    }
+}
+
+fn append(line: borrow mut Vector<u8>, text: StringView) -> Result<void, NetError> {
+    for (b in text.bytes()) {
+        match (line.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+    return Ok();
+}
+
+async fn say(text: StringView) -> Result<void, NetError> {
+    match (await AsyncConsole.writeLine(text)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn run() -> Result<void, NetError> {
+    let host = match (Environment.variable("CW_HOST")) {
+        Some(h) => h,
+        null => "localhost",
+    };
+    let caPath = match (Environment.variable("CW_CA")) {
+        Some(p) => p,
+        null => {
+            await say("tls_get: set CW_CA")?;
+            return Ok();
+        },
+    };
+    var ca = Vector<u8>.create();
+    await readFile(caPath, mut ca)?;
+    var config = match (TlsConfig.client()) {
+        Ok(c) => c,
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
+    };
+    match (config.trustPem(ca.view())) {
+        Ok() => {}
+        Err(_) => {
+            await say("tls_get: no root in CW_CA")?;
+            return Ok();
+        }
+    }
+    var protocols = [Alpn.Http11];
+    match (config.setAlpn(protocols[..])) {
+        Ok() => {}
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+    }
+    let port = truncate<u16>(setting("CW_PORT", 8443));
+    let tcp = PlainStream.tcp(await TcpTransport.connect("127.0.0.1", port)?);
+    var t = match (await TlsTransport.connect(tcp, config, host, Deadline.after(5000))) {
+        Ok(t) => t,
+        Err(e) => {
+            await say("tls_get: failed:")?;
+            return await say(NetErrors.describe(e));
+        },
+    };
+    let version = if (t.version() == 0x0304) "TLS 1.3" else if (t.version() == 0x0303) "TLS 1.2" else "TLS ?";
+    let alpn = match (t.alpn()) {
+        Alpn.Http11 => "http/1.1",
+        Alpn.Http2 => "h2",
+        _ => "none",
+    };
+    var line = Vector<u8>.create();
+    append(mut line, "tls_get: ")?;
+    append(mut line, version)?;
+    append(mut line, " alpn=")?;
+    append(mut line, alpn)?;
+    match (StringView.fromUtf8(line.view())) {
+        Some(text) => { await say(text)?; }
+        null => {}
+    }
+    await t.write("GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n".bytes())?;
+    var response = Vector<u8>.create();
+    var buf = [0u8; 4096];
+    loop {
+        let n = await t.read(mut buf[..])?;
+        if (n == 0) {
+            break;
+        }
+        for (i in 0..n) {
+            match (response.push(buf[i])) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+    }
+    match (StringView.fromUtf8(response.view())) {
+        Some(text) => { return await say(text); }
+        null => { return await say("tls_get: the response is not UTF-8"); }
+    }
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok() => {}
+        Err(e) => {
+            Console.writeLine("tls_get: failed:");
+            Console.writeLine(NetErrors.describe(e));
+        }
+    }
+}

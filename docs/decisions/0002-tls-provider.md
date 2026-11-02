@@ -167,3 +167,23 @@ Exceeding any limit closes the connection with an alert where possible.
 7. **Allocation routing (§3.5, §6.1) is not done in stage 1.** OpenSSL keeps global allocations until the process
    exits, so routing them through CeeSafe's allocator needs the leak check to tell those apart. It comes with stage 3
    and its own tests.
+
+## 8. Amendment 2 (2026-11-02, M4 stage 3)
+
+1. **§6.1 waits for CeeSafe (the owner's choice, 2026-11-02).** Routing OpenSSL's allocations through CeeSafe's
+   allocator in tests cannot work yet: CeeSafe's leak check counts every live allocation at the end of a test, and
+   OpenSSL keeps global state (error strings, providers) until the process exits. It needs a C allocation category
+   that fault injection can fail but the leak check leaves out: upstream **U14**. Until then OpenSSL keeps its own
+   allocator; LeakSanitizer (Linux) and the fuzz harness cover the shim's leaks.
+2. **Windows.** `web_tls`'s manifest has a `[target.windows]` table naming `libssl` and `libcrypto` from
+   `$OPENSSL_LIB_DIR`, with headers from `$OPENSSL_DIR/include`. The directory depends on the installer and the
+   machine (Shining Light: `lib\VC\arm64\MD` or `lib\VC\x64\MD`), so it is the builder's to set (CeeSafe ADR 0047
+   §3.1). macOS uses Homebrew's `openssl@3`; Linux the system's.
+3. **Versions tested:** OpenSSL 3.0.22 (Debian 12, the floor), 3.6.4 (macOS, Homebrew) and 4.1.0 (Windows 11 ARM64,
+   Shining Light). The shim uses only 3.0's API, so it compiles unchanged on 4.1.
+4. **testssl.sh's gate** is its protocol, cipher, forward-secrecy and vulnerability checks (`-p -s -f -U`). Its
+   certificate checks judge the test PKI (generated for tests: no revocation URLs, a 100-year lifetime), and HSTS is
+   the application's to send.
+5. **The fuzz harness** (`tests/fuzz/tls/fuzz_shim.c`) is guided by the shim's own coverage: the system OpenSSL is not
+   instrumented. That suits its purpose, the shim's handling of whatever OpenSSL returns for arbitrary input.
+   OpenSSL itself is fuzzed continuously by OSS-Fuzz.

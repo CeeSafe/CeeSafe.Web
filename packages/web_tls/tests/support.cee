@@ -10,6 +10,22 @@ enum Cert {
     WrongHost,
     Expired,
     Future,
+    BadSignature,
+}
+
+/// A client that does not speak TLS properly; it records the first byte the server sends back (a TLS alert record
+/// is 0x15), or 0 if the server sends nothing before closing.
+enum Raw {
+    /// It speaks TLS.
+    No,
+    /// Connects, sends nothing, waits.
+    Silent,
+    /// An HTTP request where a ClientHello belongs.
+    Plaintext,
+    /// The header of a 512-byte handshake record and 50 bytes of it, then the end of its writing.
+    Truncated,
+    /// A handshake record header claiming 18 433 bytes: past TLS's 2^14 + 2048 (RFC 8446 §5.1, §5.2).
+    Oversized,
 }
 
 /// The root the client trusts.
@@ -32,6 +48,7 @@ fn chainOf(c: Cert) -> StringView => match (c) {
     Cert.WrongHost => wronghostPem(),
     Cert.Expired => expiredPem(),
     Cert.Future => futurePem(),
+    Cert.BadSignature => badsigPem(),
 };
 
 fn keyOf(c: Cert) -> StringView => match (c) {
@@ -40,6 +57,7 @@ fn keyOf(c: Cert) -> StringView => match (c) {
     Cert.WrongHost => wronghostKey(),
     Cert.Expired => expiredKey(),
     Cert.Future => futureKey(),
+    Cert.BadSignature => badsigKey(),
 };
 
 fn trustOf(t: Trust) -> StringView => match (t) {
@@ -65,10 +83,8 @@ struct Setup {
     message: usize;
     /// The server's handshake deadline, in ms.
     serverDeadlineMs: u64;
-    /// The client connects over TCP but never starts TLS.
-    silentClient: bool;
-    /// The client sends this plaintext instead of a ClientHello.
-    plaintextClient: bool;
+    /// A client that does not speak TLS.
+    raw: Raw;
 }
 
 fn setup() -> Setup => Setup {
@@ -79,8 +95,7 @@ fn setup() -> Setup => Setup {
     clientAlpn: [Alpn.None, Alpn.None],
     message: 0,
     serverDeadlineMs: 5000,
-    silentClient: false,
-    plaintextClient: false,
+    raw: Raw.No,
 };
 
 /// What each side saw.
@@ -94,6 +109,8 @@ struct Outcome {
     echoed: bool;
     /// The server saw the client's close_notify (a read of 0) after the message.
     serverSawEnd: bool;
+    /// A raw client's first byte back.
+    firstBack: u8;
 }
 
 /// Runs `s`: a server task accepting one connection, and a client task.
@@ -113,6 +130,7 @@ async fn run(s: borrow Setup) -> Result<Outcome, TestFailure> {
         version: 0,
         echoed: false,
         serverSawEnd: false,
+        firstBack: 0,
     };
     var serverError: NetError? = null;
     var clientError: NetError? = null;
@@ -121,6 +139,7 @@ async fn run(s: borrow Setup) -> Result<Outcome, TestFailure> {
     var version: u32 = 0;
     var echoed = false;
     var sawEnd = false;
+    var firstBack: u8 = 0;
     let r: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (sc) => {
         sc.spawn(async () => {
             match (await serve(listener, serverConfig, Deadline.after(s.serverDeadlineMs), mut serverAlpn, mut sawEnd)) {
@@ -130,7 +149,7 @@ async fn run(s: borrow Setup) -> Result<Outcome, TestFailure> {
             return Ok();
         });
         sc.spawn(async () => {
-            match (await client(port, clientConfig, s, mut clientAlpn, mut version, mut echoed)) {
+            match (await client(port, clientConfig, s, mut clientAlpn, mut version, mut echoed, mut firstBack)) {
                 Ok() => {}
                 Err(e) => { clientError = Some(e); }
             }
@@ -148,6 +167,7 @@ async fn run(s: borrow Setup) -> Result<Outcome, TestFailure> {
     out.version = version;
     out.echoed = echoed;
     out.serverSawEnd = sawEnd;
+    out.firstBack = firstBack;
     return Ok(out);
 }
 
@@ -181,18 +201,18 @@ async fn client(
     alpn: borrow mut Alpn,
     version: borrow mut u32,
     echoed: borrow mut bool,
+    firstBack: borrow mut u8,
 ) -> Result<void, NetError> {
     var tcp = PlainStream.tcp(await TcpTransport.connect("127.0.0.1", port)?);
-    if (s.silentClient) {
-        var one = [0u8; 1];
-        let n = await tcp.read(mut one[..])?; // waits until the server gives up and closes
-        return Ok();
-    }
-    if (s.plaintextClient) {
-        await tcp.write("GET / HTTP/1.1\r\nhost: localhost\r\n\r\n".bytes())?;
-        var one = [0u8; 64];
-        let n = await tcp.read(mut one[..])?;
-        return Ok();
+    match (s.raw) {
+        Raw.No => {}
+        _ => {
+            await rawClient(mut tcp, s.raw)?;
+            var back = [0u8; 64];
+            let n = await tcp.read(mut back[..])?; // what the server sends before it closes, if anything
+            firstBack = if (n > 0) back[0] else 0;
+            return Ok();
+        }
     }
     var t = await TlsTransport.connect(tcp, config, nameOf(s.host), Deadline.after(5000))?;
     alpn = t.alpn();
@@ -240,6 +260,37 @@ async fn client(
     await t.shutdownWrite()?;
     var buf = [0u8; 16];
     let last = await t.read(mut buf[..])?; // the server's end, once it has seen ours
+    return Ok();
+}
+
+/// Sends what a raw client sends.
+async fn rawClient(tcp: borrow mut PlainStream, raw: Raw) -> Result<void, NetError> {
+    match (raw) {
+        Raw.Plaintext => { await tcp.write("GET / HTTP/1.1\r\nhost: localhost\r\n\r\n".bytes())?; }
+        Raw.Truncated => {
+            // A handshake record (22), TLS 1.0 in the record layer, 512 bytes long; then 50 of them: a ClientHello
+            // (1) of 508 bytes, cut short.
+            var bytes = [0u8; 55];
+            bytes[0] = 22;
+            bytes[1] = 3;
+            bytes[2] = 1;
+            bytes[3] = 2;
+            bytes[4] = 0;
+            bytes[5] = 1;
+            bytes[6] = 0;
+            bytes[7] = 1;
+            bytes[8] = 252;
+            bytes[9] = 3;
+            bytes[10] = 3;
+            await tcp.write(bytes[..])?;
+            await tcp.shutdownWrite()?;
+        }
+        Raw.Oversized => {
+            var header = [22u8, 3, 1, 0x48, 0x01];
+            await tcp.write(header[..])?;
+        }
+        _ => {}
+    }
     return Ok();
 }
 
