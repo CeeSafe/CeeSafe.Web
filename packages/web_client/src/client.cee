@@ -1,0 +1,849 @@
+// The HTTP client (Web ADR 0009 §3.3-3.8): requests, bodies, the send loop with redirects and retries, and the
+// streamed response, over the pool and web_http1's engine.
+import web_core;
+import web_transport;
+import web_http;
+import web_http1;
+
+/// A request: a method, a URL and fields. Framing fields and `host` are the client's to write.
+@noncopy
+public struct ClientRequest {
+    private verb: Method;
+    private address: Url;
+    private names: Vector<Vector<u8>>;
+    private values: Vector<Vector<u8>>;
+    private keyed: bool;
+
+    /// A request for `url` (absolute http or https). `Method.Extension` is refused: it has no token to send.
+    public fn create(method: Method, url: StringView) -> Result<ClientRequest, ClientError> {
+        match (method) {
+            Method.Extension => { return Err(ClientError.BadRequest); }
+            _ => {}
+        }
+        let address = match (Url.parse(url.bytes())) {
+            Ok(u) => u,
+            Err(e) => { return Err(ClientError.BadUrl(e)); },
+        };
+        return Ok(ClientRequest {
+            verb: method,
+            address: address,
+            names: Vector<Vector<u8>>.create(),
+            values: Vector<Vector<u8>>.create(),
+            keyed: false,
+        });
+    }
+
+    /// Adds a field. A name that is not a token, a value with CR, LF or NUL, and `host`, `content-length` and
+    /// `transfer-encoding` (the client's own) are `BadRequest`.
+    public fn header(borrow mut this, name: StringView, value: Slice<u8>) -> Result<void, ClientError> {
+        let n = name.bytes();
+        if (!Ascii.isToken(n) || Ascii.equalsIgnoringCase(n, "host") || Ascii.equalsIgnoringCase(n, "content-length") ||
+            Ascii.equalsIgnoringCase(n, "transfer-encoding")) {
+            return Err(ClientError.BadRequest);
+        }
+        for (b in value) {
+            if (!Ascii.isFieldValueChar(b)) {
+                return Err(ClientError.BadRequest);
+            }
+        }
+        if (Ascii.equalsIgnoringCase(n, "idempotency-key")) {
+            this.keyed = true;
+        }
+        var nameCopy = Vector<u8>.create();
+        var valueCopy = Vector<u8>.create();
+        copyBytes(mut nameCopy, n)?;
+        copyBytes(mut valueCopy, value)?;
+        match (this.names.push(nameCopy)) {
+            Ok() => {}
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+        }
+        match (this.values.push(valueCopy)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+        }
+    }
+
+    public fn method(borrow this) -> Method => this.verb;
+
+    public fn url(borrow this) -> borrow Url => borrow this.address;
+
+    /// Whether a failed attempt may be sent again as far as the request goes (Web ADR 0009 §3.8 rule 1): an
+    /// idempotent method (RFC 9110 §9.2.2), or an `Idempotency-Key`.
+    fn idempotent(borrow this, method: Method) -> bool => this.keyed || match (method) {
+        Method.Get => true,
+        Method.Head => true,
+        Method.Options => true,
+        Method.Trace => true,
+        Method.Put => true,
+        Method.Delete => true,
+        _ => false,
+    };
+}
+
+/// A request body, streamed.
+public interface BodySource {
+    /// Its length if known (sent as `content-length`), else null (sent chunked).
+    @effects()
+    fn length(borrow this) -> u64?;
+
+    /// The next bytes into `into`: at least one, or 0 at the end.
+    async fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, NetError>;
+
+    /// Back to the start, to send again (a retry, a 307 or 308); false if it cannot.
+    @effects()
+    fn rewind(borrow mut this) -> bool;
+}
+
+/// No body.
+public struct NoBody {}
+
+impl BodySource for NoBody {
+    @effects()
+    fn length(borrow this) -> u64? => Some(0u64);
+
+    async fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, NetError> => Ok(0);
+
+    @effects()
+    fn rewind(borrow mut this) -> bool => true;
+}
+
+/// A body held in memory: its length is known, and it can always replay.
+@noncopy
+public struct BytesBody {
+    private data: Vector<u8>;
+    private at: usize;
+
+    /// A body of a copy of `bytes`.
+    public fn of(bytes: Slice<u8>) -> Result<BytesBody, ClientError> {
+        var data = Vector<u8>.create();
+        copyBytes(mut data, bytes)?;
+        return Ok(BytesBody { data: data, at: 0 });
+    }
+}
+
+impl BodySource for BytesBody {
+    @effects()
+    fn length(borrow this) -> u64? => Some(this.data.length as u64);
+
+    async fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, NetError> {
+        var n = this.data.length - this.at;
+        if (n > into.length) {
+            n = into.length;
+        }
+        for (i in 0..n) {
+            into[i] = this.data[this.at + i];
+        }
+        this.at += n;
+        return Ok(n);
+    }
+
+    @effects()
+    fn rewind(borrow mut this) -> bool {
+        this.at = 0;
+        return true;
+    }
+}
+
+/// A failed attempt, and whether sending it again is safe as far as the connection goes (§3.8 rule 2).
+struct Failure {
+    error: ClientError;
+    resendable: bool;
+}
+
+/// An HTTP client: a pool of connections per origin, shared by concurrent requests.
+public struct Client {
+    private options: ClientOptions;
+    private pool: ConnectionPool;
+    private tls: Box<dyn Connector>?;
+    private resolver: Box<dyn Resolver>;
+    private dialer: Box<dyn Dialer>;
+
+    /// A client with the system's resolver and TCP. `tls` makes https connections (a web_tls `TlsConnector`); without
+    /// one, https URLs are `NoTls`.
+    public fn create(options: ClientOptions, tls: Box<dyn Connector>?) -> Result<Client, ClientError> {
+        let resolver: Box<dyn Resolver> = boxed(Box.create(SystemResolver {}))?;
+        let dialer: Box<dyn Dialer> = boxed(Box.create(TcpDialer {}))?;
+        return Client.withNetwork(options, tls, resolver, dialer);
+    }
+
+    /// A client with its own resolver and dialer (tests: mocks).
+    public fn withNetwork(
+        options: ClientOptions,
+        tls: Box<dyn Connector>?,
+        resolver: Box<dyn Resolver>,
+        dialer: Box<dyn Dialer>,
+    ) -> Result<Client, ClientError> {
+        let pool = ConnectionPool.create(options)?;
+        return Ok(Client { options: options, pool: pool, tls: tls, resolver: resolver, dialer: dialer });
+    }
+
+    /// GET `url`, without a body.
+    public async fn get(borrow this, url: StringView) -> Result<ClientResponse, ClientError> {
+        let request = ClientRequest.create(Method.Get, url)?;
+        var none = NoBody {};
+        return await this.send(request, mut none);
+    }
+
+    /// Sends `request` with `body`, following redirects and retrying as the options allow; the response's head has
+    /// arrived, its body is the caller's to read (then `finish`).
+    public async fn send(
+        borrow this,
+        request: borrow ClientRequest,
+        body: borrow mut dyn BodySource,
+    ) -> Result<ClientResponse, ClientError> {
+        let total = if (this.options.totalMs == 0) Deadline.never() else Deadline.after(this.options.totalMs);
+        var url = urlCopy(request.url())?;
+        var method = request.method();
+        var withBody = true;
+        var strip = false;
+        var redirects: u32 = 0;
+        var attempts: u32 = 0;
+        var none = NoBody {};
+        loop {
+            attempts += 1;
+            let r = if (withBody) await this.attempt(url, method, request, strip, body, total) else await this.attempt(
+                url,
+                method,
+                request,
+                strip,
+                mut none,
+                total,
+            );
+            match (r) {
+                Ok(response) => {
+                    let status = response.status();
+                    let redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+                    if (!redirect || redirects >= this.options.maxRedirects) {
+                        return Ok(response);
+                    }
+                    let next = match (response.location(url)) {
+                        Some(u) => u,
+                        null => { return Ok(response); },
+                    };
+                    // 303, and 301 and 302 after a POST, become GET without a body (§3.7; the owner's choice).
+                    let toGet = (status == 303 && !Methods.same(method, Method.Head)) ||
+                        ((status == 301 || status == 302) && Methods.same(method, Method.Post));
+                    if (toGet) {
+                        method = Method.Get;
+                        withBody = false;
+                    } else if (withBody && !body.rewind()) {
+                        return Ok(response); // the body cannot be sent again
+                    }
+                    if (!next.sameOrigin(url)) {
+                        strip = true;
+                    }
+                    var done = response;
+                    let drained = await done.finish(this);
+                    url = next;
+                    redirects += 1;
+                    attempts = 0;
+                }
+                Err(f) => {
+                    let again = f.resendable && attempts < this.options.retry.maxAttempts &&
+                        request.idempotent(method) && (!withBody || body.rewind()) &&
+                        !total.isExpired() && await this.pool.mayRetry(url, this.options.retry);
+                    if (!again) {
+                        return Err(f.error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Closes the idle connections; requests that start afterwards fail with `Shutdown`.
+    public async fn shutdown(borrow this) {
+        await this.pool.shutdown();
+    }
+
+    /// One attempt: a connection (pooled or new), the request, and the response head.
+    async fn attempt(
+        borrow this,
+        url: borrow Url,
+        method: Method,
+        request: borrow ClientRequest,
+        strip: bool,
+        body: borrow mut dyn BodySource,
+        total: Deadline,
+    ) -> Result<ClientResponse, Failure> {
+        let pooled = match (await this.pool.idleFor(url)) {
+            Ok(p) => p,
+            Err(e) => { return Err(Failure { error: e, resendable: false }); },
+        };
+        let reused = match (borrow pooled) {
+            Some(_) => true,
+            null => false,
+        };
+        var conn = match (pooled) {
+            Some(c) => c,
+            null => match (await this.freshConnection(url, total)) {
+                Ok(c) => c,
+                Err(f) => { return Err(f); },
+            },
+        };
+        let slots = match (await this.pool.slots(url)) {
+            Ok(s) => s,
+            Err(e) => { return Err(Failure { error: e, resendable: false }); },
+        };
+        // From here the connection owns a slot: a failure releases it when `conn` is dropped (Held).
+        var held = Held { slots: slots, live: true };
+        var written: u64 = 0;
+        match (await this.writeRequest(mut conn, url, method, request, strip, body, mut written)) {
+            Ok() => {}
+            Err(e) => { return Err(Failure { error: e, resendable: written == 0 }); }
+        }
+        let firstByte = Deadline.after(this.options.firstByteMs).earlier(total);
+        var head = Vector<u8>.create();
+        var carry = match (OwnedBuffer.create(16384)) {
+            Ok(b) => b,
+            Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
+        };
+        match (await readHead(mut conn, method, mut head, mut carry, firstByte, this.options.limits)) {
+            Ok() => {}
+            Err(e) => {
+                // A pooled connection that ended before any response byte lost a race with the server closing it.
+                let race = reused && head.length == 0 && carry.isEmpty() && isEnded(e);
+                return Err(Failure { error: e, resendable: race });
+            }
+        }
+        let parsed = match (parseResponseHead(head.view(), 0, head.length, method, this.options.limits)) {
+            Ok(p) => p,
+            Err(e) => { return Err(Failure { error: ClientError.Protocol(e), resendable: false }); },
+        };
+        let status = parsed.status;
+        let framing = parsed.body;
+        let keepAlive = parsed.keepAlive;
+        let left = match (framing) {
+            ResponseBody.Length(n) => n,
+            _ => 0,
+        };
+        let finalUrl = match (urlCopy(url)) {
+            Ok(u) => u,
+            Err(e) => { return Err(Failure { error: e, resendable: false }); },
+        };
+        held.live = false;
+        var unlimited = this.options.limits;
+        unlimited.maxBodyBytes = 0xFFFFFFFFFFFFFFFF;
+        return Ok(ClientResponse {
+            limits: this.options.limits,
+            maxDrain: this.options.maxDrainBytes,
+            address: finalUrl,
+            conn: one(conn)?,
+            slots: held.slots.clone(),
+            head: head,
+            code: status,
+            framing: framing,
+            left: left,
+            decoder: ChunkDecoder.create(unlimited),
+            carry: carry,
+            done: match (framing) {
+                ResponseBody.Empty => true,
+                ResponseBody.Length(n) => n == 0,
+                _ => false,
+            },
+            keepAlive: keepAlive,
+            readDeadline: total,
+        });
+    }
+
+    /// A new connection to `url`'s origin: a slot, DNS, Happy Eyeballs, then TLS for https.
+    async fn freshConnection(
+        borrow this,
+        url: borrow Url,
+        total: Deadline,
+    ) -> Result<Box<dyn Transport + Send>, Failure> {
+        let slots = match (await this.pool.slots(url)) {
+            Ok(s) => s,
+            Err(e) => { return Err(Failure { error: e, resendable: false }); },
+        };
+        // Wait for a free slot, as long as the request may last.
+        let got = if (total.isNever()) await slots.recvAsync() else await Async.deadline(
+            total.instant(),
+            AsyncError.TimedOut,
+            async () => await slots.recvAsync(),
+        );
+        match (got) {
+            Ok(Some(_)) => {}
+            Ok(null) => { return Err(Failure { error: ClientError.Shutdown, resendable: false }); }
+            Err(e) => { return Err(Failure { error: ClientError.Net(NetErrors.fromAsync(e)), resendable: false }); }
+        }
+        match (await this.connect(url, total)) {
+            Ok(c) => { return Ok(c); }
+            Err(e) => {
+                let freed = slots.trySend(0);
+                return Err(Failure { error: e, resendable: true }); // nothing was sent
+            }
+        }
+    }
+
+    async fn connect(borrow this, url: borrow Url, total: Deadline) -> Result<Box<dyn Transport + Send>, ClientError> {
+        if (url.isSecure() && this.tlsMissing()) {
+            return Err(ClientError.NoTls);
+        }
+        let deadline = Deadline.after(this.options.connectMs).earlier(total);
+        let host = match (StringView.fromUtf8(url.hostName())) {
+            Some(h) => h,
+            null => { return Err(ClientError.BadUrl(UrlError.BadHost)); },
+        };
+        let resolved = if (deadline.isNever()) await this.resolver.resolve(host, url.port()) else await Async.deadline(
+            deadline.instant(),
+            NetError.TimedOut,
+            async () => await this.resolver.resolve(host, url.port()),
+        );
+        let addresses = net(resolved)?;
+        let ordered = net(interleave(addresses))?;
+        let stream = net(await happyEyeballs(ordered, this.dialer, this.options.connectionAttemptDelayMs, deadline))?;
+        match (borrow this.tls) {
+            Some(c) => {
+                if (url.isSecure()) {
+                    return net(await c.connect(stream, host, Deadline.after(this.options.tlsMs).earlier(total)));
+                }
+            }
+            null => {}
+        }
+        match (Box.create(stream)) {
+            Ok(b) => {
+                let d: Box<dyn Transport + Send> = b;
+                return Ok(d);
+            }
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+        }
+    }
+
+    fn tlsMissing(borrow this) -> bool => match (borrow this.tls) {
+        Some(_) => false,
+        null => true,
+    };
+
+    /// Writes the head and the body, counting the bytes the transport accepted into `written`.
+    async fn writeRequest(
+        borrow this,
+        conn: borrow mut Box<dyn Transport + Send>,
+        url: borrow Url,
+        method: Method,
+        request: borrow ClientRequest,
+        strip: bool,
+        body: borrow mut dyn BodySource,
+        written: borrow mut u64,
+    ) -> Result<void, ClientError> {
+        var authority = Vector<u8>.create();
+        match (url.authority(mut authority)) {
+            Ok() => {}
+            Err(e) => { return Err(ClientError.BadUrl(e)); }
+        }
+        var head = Vector<u8>.create();
+        var w = RequestWriter.start(mut head, Methods.text(method).bytes(), url.target(), authority.view());
+        for (i in 0..request.names.length) {
+            let name = request.names[i].view();
+            // Across origins, credentials stay behind (§3.7).
+            if (strip && (Ascii.equalsIgnoringCase(name, "authorization") || Ascii.equalsIgnoringCase(name, "cookie") ||
+                Ascii.equalsIgnoringCase(name, "proxy-authorization"))) {
+                continue;
+            }
+            w.field(mut head, name, request.values[i].view());
+        }
+        let length = body.length();
+        let declareZero = Methods.same(method, Method.Post) || Methods.same(method, Method.Put) ||
+            Methods.same(method, Method.Patch);
+        if (!w.finish(mut head, length, declareZero)) {
+            return Err(ClientError.BadRequest);
+        }
+        await sendCounted(conn, head.view(), written)?;
+        var chunk = [0u8; 16384];
+        match (length) {
+            Some(n) => {
+                var sent: u64 = 0;
+                while (sent < n) {
+                    let got = net(await body.read(mut chunk[..]))?;
+                    if (got == 0) {
+                        return Err(ClientError.BadRequest); // shorter than it said
+                    }
+                    await sendCounted(conn, chunk[0..got], written)?;
+                    sent += got as u64;
+                }
+            }
+            null => {
+                var size = [0u8; 24];
+                loop {
+                    let got = net(await body.read(mut chunk[8..]))?;
+                    let start = chunkHeader(got, mut size);
+                    await sendCounted(conn, size[start..], written)?;
+                    if (got == 0) {
+                        break; // "0\r\n\r\n": the last chunk and no trailers
+                    }
+                    await sendCounted(conn, chunk[8..8 + got], written)?;
+                    await sendCounted(conn, "\r\n".bytes(), written)?;
+                }
+            }
+        }
+        return Ok();
+    }
+}
+
+/// Writes all of `bytes`, adding to `written` what each step of the transport accepted, so a failure knows whether
+/// any byte of the request went out.
+async fn sendCounted(
+    conn: borrow mut Box<dyn Transport + Send>,
+    bytes: Slice<u8>,
+    written: borrow mut u64,
+) -> Result<void, ClientError> {
+    var at: usize = 0;
+    while (at < bytes.length) {
+        let parts = IoParts.of(bytes[at..]);
+        let n = net(await conn.writeVectored(borrow parts))?;
+        if (n == 0) {
+            return Err(ClientError.Net(NetError.Closed));
+        }
+        at += n;
+        written += n as u64;
+    }
+    return Ok();
+}
+
+/// The chunk-size line for `n` bytes (and, for 0, the last chunk with its empty trailer section) at the end of `out`;
+/// where it starts.
+fn chunkHeader(n: usize, out: borrow mut [u8; 24]) -> usize {
+    var end: usize = 24;
+    if (n == 0) {
+        out[19] = 48;
+        out[20] = 13;
+        out[21] = 10;
+        out[22] = 13;
+        out[23] = 10;
+        return 19;
+    }
+    out[22] = 13;
+    out[23] = 10;
+    end = 22;
+    var v = n;
+    while (v > 0) {
+        end -= 1;
+        let d = truncate<u8>(v % 16);
+        out[end] = if (d < 10) 48 + d else 87 + d;
+        v /= 16;
+    }
+    return end;
+}
+
+/// Reads until a final response head (1xx heads skipped) is in `head`; bytes after it go to `carry`.
+async fn readHead(
+    conn: borrow mut Box<dyn Transport + Send>,
+    method: Method,
+    head: borrow mut Vector<u8>,
+    carry: borrow mut OwnedBuffer,
+    deadline: Deadline,
+    limits: Limits,
+) -> Result<void, ClientError> {
+    var scanner = HeadScanner.create();
+    var buf = [0u8; 4096];
+    loop {
+        match (scanner.scan(head.view(), limits)) {
+            Ok(true) => {
+                let end = scanner.end();
+                let p = match (parseResponseHead(head.view(), scanner.start(), end, method, limits)) {
+                    Ok(p) => p,
+                    Err(e) => { return Err(ClientError.Protocol(e)); },
+                };
+                let status = p.status;
+                if (status == 101) {
+                    return Err(ClientError.Protocol(ProtocolError.BadStatusLine)); // never asked for
+                }
+                if (status >= 200) {
+                    // Keep the head only; move the rest to `carry`.
+                    let all = head.view();
+                    match (carry.append(all[end..])) {
+                        Ok() => {}
+                        Err(e) => { return Err(ClientError.Net(e)); }
+                    }
+                    head.truncate(end);
+                    return Ok();
+                }
+                // An interim response: drop it and scan for the next head.
+                var rest = Vector<u8>.create();
+                let all = head.view();
+                copyBytes(mut rest, all[end..])?;
+                head.clear();
+                copyBytes(head, rest.view())?;
+                scanner = HeadScanner.create();
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => { return Err(ClientError.Protocol(e)); }
+        }
+        let n = net(await readBoxed(conn, mut buf[..], deadline))?;
+        if (n == 0) {
+            return Err(ClientError.Net(NetError.Closed));
+        }
+        copyBytes(head, buf[0..n])?;
+    }
+}
+
+/// Reads from a pooled connection by `deadline` (`Transports.readWithin` for a `Box<dyn Transport + Send>`).
+async fn readBoxed(
+    conn: borrow mut Box<dyn Transport + Send>,
+    into: SliceMut<u8>,
+    deadline: Deadline,
+) -> Result<usize, NetError> {
+    if (deadline.isNever()) {
+        return await conn.read(into);
+    }
+    if (deadline.isExpired()) {
+        return Err(NetError.TimedOut);
+    }
+    return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await conn.read(into));
+}
+
+/// Frees a slot when dropped while `live`.
+struct Held {
+    slots: Channel<u8>;
+    live: bool;
+
+    drop {
+        if (this.live) {
+            let freed = this.slots.trySend(0);
+        }
+    }
+}
+
+/// A response: its head, and its body to read. Read it to the end and `finish`, to give the connection back to the
+/// pool; dropped otherwise, it closes the connection.
+@noncopy
+public struct ClientResponse {
+    private limits: Limits;
+    private maxDrain: u64;
+    private address: Url;
+    /// The connection while the response has it (at most one: a vector, so `finish` can move it out with `pop`).
+    private conn: Vector<Live>;
+    private slots: Channel<u8>;
+    private head: Vector<u8>;
+    private code: u16;
+    private framing: ResponseBody;
+    private left: u64;
+    private decoder: ChunkDecoder;
+    private carry: OwnedBuffer;
+    private done: bool;
+    private keepAlive: bool;
+    private readDeadline: Deadline;
+
+    /// The status code.
+    public fn status(borrow this) -> u16 => this.code;
+
+    /// The URL that answered (after redirects).
+    public fn url(borrow this) -> borrow Url => borrow this.address;
+
+    /// A copy of the first value of field `name`, if present.
+    public fn header(borrow this, name: StringView) -> Vector<u8>? {
+        let h = this.head.view();
+        let parsed = match (parseResponseHead(h, 0, h.length, Method.Get, this.limits)) {
+            Ok(p) => p,
+            Err(_) => { return null; },
+        };
+        let value = match (parsed.headers.getNamed(name)) {
+            Some(v) => v,
+            null => { return null; },
+        };
+        var out = Vector<u8>.create();
+        match (copyBytes(mut out, value)) {
+            Ok() => { return Some(out); }
+            Err(_) => { return null; }
+        }
+    }
+
+    /// The `location` resolved against `base`, for a redirect.
+    fn location(borrow this, base: borrow Url) -> Url? {
+        let value = match (this.header("location")) {
+            Some(v) => v,
+            null => { return null; },
+        };
+        return match (base.resolve(value.view())) {
+            Ok(u) => Some(u),
+            Err(_) => null,
+        };
+    }
+
+    /// Body bytes into `buffer`: at least one, or 0 at the end.
+    public async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, ClientError> {
+        if (this.done || buffer.length == 0) {
+            return Ok(0);
+        }
+        loop {
+            match (this.framing) {
+                ResponseBody.Empty => {
+                    this.done = true;
+                    return Ok(0);
+                }
+                ResponseBody.Length(_) => {
+                    if (this.carry.isEmpty() && await this.fill()? == 0) {
+                        return Err(ClientError.Net(NetError.Closed)); // shorter than its length
+                    }
+                    let ready = this.carry.readable();
+                    var n = if (buffer.length < ready.length) buffer.length else ready.length;
+                    if (n as u64 > this.left) {
+                        n = truncate<usize>(this.left);
+                    }
+                    for (i in 0..n) {
+                        buffer[i] = ready[i];
+                    }
+                    consumed(mut this.carry, n)?;
+                    this.left -= n as u64;
+                    if (this.left == 0) {
+                        this.done = true;
+                    }
+                    return Ok(n);
+                }
+                ResponseBody.Chunked => {
+                    if (this.carry.isEmpty() && await this.fill()? == 0) {
+                        return Err(ClientError.Net(NetError.Closed));
+                    }
+                    let input = this.carry.readable();
+                    let step = match (this.decoder.decode(input, buffer.length)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            this.keepAlive = false;
+                            return Err(ClientError.Protocol(e));
+                        },
+                    };
+                    for (i in 0..step.dataLength) {
+                        buffer[i] = input[step.dataStart + i];
+                    }
+                    consumed(mut this.carry, step.consumed)?;
+                    if (step.finished) {
+                        this.done = true;
+                    }
+                    if (step.dataLength > 0) {
+                        return Ok(step.dataLength);
+                    }
+                    if (step.finished) {
+                        return Ok(0);
+                    }
+                }
+                ResponseBody.UntilClose => {
+                    if (this.carry.isEmpty() && await this.fill()? == 0) {
+                        this.done = true;
+                        return Ok(0);
+                    }
+                    let ready = this.carry.readable();
+                    let n = if (buffer.length < ready.length) buffer.length else ready.length;
+                    for (i in 0..n) {
+                        buffer[i] = ready[i];
+                    }
+                    consumed(mut this.carry, n)?;
+                    return Ok(n);
+                }
+            }
+        }
+    }
+
+    /// The whole body into `into`, up to `limit` bytes (`Net(LimitExceeded)` past it).
+    public async fn readToEnd(borrow mut this, into: borrow mut Vector<u8>, limit: usize) -> Result<void, ClientError> {
+        var buf = [0u8; 8192];
+        loop {
+            let n = await this.read(mut buf[..])?;
+            if (n == 0) {
+                return Ok();
+            }
+            if (into.length + n > limit) {
+                return Err(ClientError.Net(NetError.LimitExceeded));
+            }
+            copyBytes(into, buf[0..n])?;
+        }
+    }
+
+    /// Reads what is left of the body (up to the client's drain limit) and gives a reusable connection back to
+    /// `client`'s pool (the client that sent the request); otherwise the connection closes.
+    public async fn finish(borrow mut this, client: borrow Client) -> Result<void, ClientError> {
+        var drained: u64 = 0;
+        var buf = [0u8; 4096];
+        while (!this.done && drained <= this.maxDrain) {
+            let n = await this.read(mut buf[..])?;
+            drained += n as u64;
+        }
+        if (!this.done || !this.keepAlive || !this.carry.isEmpty()) {
+            return Ok(); // the connection closes when the response is dropped
+        }
+        match (this.conn.pop()) {
+            Some(live) => { await client.pool.give(this.address, live.conn); }
+            null => {}
+        }
+        return Ok();
+    }
+
+    /// Reads more of the body into `carry`; 0 at the end of the stream.
+    async fn fill(borrow mut this) -> Result<usize, ClientError> {
+        this.carry.compact();
+        if (this.conn.length == 0) {
+            return Ok(0);
+        }
+        let n = net(await readBoxed(mut this.conn[0].conn, this.carry.spare(), this.readDeadline))?;
+        if (n > 0) {
+            match (this.carry.commit(n)) {
+                Ok() => {}
+                Err(e) => { return Err(ClientError.Net(e)); }
+            }
+        }
+        return Ok(n);
+    }
+
+    drop {
+        if (this.conn.length > 0) {
+            let freed = this.slots.trySend(0); // the connection closes with the response
+        }
+    }
+}
+
+/// A connection a response holds.
+struct Live {
+    conn: Box<dyn Transport + Send>;
+}
+
+/// A vector holding `conn`.
+fn one(conn: Box<dyn Transport + Send>) -> Result<Vector<Live>, Failure> {
+    var v = Vector<Live>.create(); // a struct, since `Vector<Box<dyn Transport + Send>>.create()` does not parse (B14)
+    match (v.push(Live { conn: conn })) {
+        Ok() => { return Ok(v); }
+        Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); }
+    }
+}
+
+fn consumed(carry: borrow mut OwnedBuffer, n: usize) -> Result<void, ClientError> {
+    match (carry.consume(n)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(ClientError.Net(e)); }
+    }
+}
+
+fn isEnded(e: ClientError) -> bool => match (e) {
+    ClientError.Net(NetError.Closed) => true,
+    ClientError.Net(NetError.Reset) => true,
+    _ => false,
+};
+
+fn net<T>(r: Result<T, NetError>) -> Result<T, ClientError> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(e) => { return Err(ClientError.Net(e)); }
+    }
+}
+
+fn copyBytes(to: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, ClientError> {
+    for (b in bytes) {
+        match (to.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+        }
+    }
+    return Ok();
+}
+
+fn urlCopy(u: borrow Url) -> Result<Url, ClientError> {
+    match (u.copy()) {
+        Ok(c) => { return Ok(c); }
+        Err(e) => { return Err(ClientError.BadUrl(e)); }
+    }
+}
+
+fn boxed<T>(r: Result<Box<T>, AllocError>) -> Result<Box<T>, ClientError> {
+    match (r) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+    }
+}

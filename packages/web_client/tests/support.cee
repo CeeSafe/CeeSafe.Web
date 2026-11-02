@@ -1,0 +1,218 @@
+// Helpers for web_client's tests: a fixed resolver and a dialer of scripted mock connections (Web ADR 0009 §3.5),
+// so every test is deterministic, also under the interpreter's virtual clock.
+import web_core;
+import web_transport;
+import web_http;
+
+fn v4(last: u8) -> SocketAddress => SocketAddress.V4([10u8, 0, 0, last], 80);
+
+fn v6(last: u8) -> SocketAddress {
+    var b = [0u8; 16];
+    b[0] = 0x20;
+    b[1] = 0x01;
+    b[15] = last;
+    return SocketAddress.V6(b, 80, 0);
+}
+
+fn sameAddress(a: SocketAddress, b: SocketAddress) -> bool => match (a) {
+    SocketAddress.V4(x, p) => match (b) {
+        SocketAddress.V4(y, q) => p == q && x[3] == y[3],
+        _ => false,
+    },
+    SocketAddress.V6(x, p, _) => match (b) {
+        SocketAddress.V6(y, q, _) => p == q && x[15] == y[15],
+        _ => false,
+    },
+};
+
+/// Resolves every name to `addresses`, or fails with `NotFound` when `fail`; counts its calls.
+struct FixedResolver {
+    first: SocketAddress;
+    second: SocketAddress?;
+    fail: bool;
+    calls: AtomicU64;
+}
+
+impl Resolver for FixedResolver {
+    async fn resolve(borrow this, host: StringView, port: u16) -> Result<Vector<SocketAddress>, NetError> {
+        this.calls.fetchAdd(1);
+        if (this.fail) {
+            return Err(NetError.Io(IoError.NotFound));
+        }
+        var v = Vector<SocketAddress>.create();
+        match (v.push(this.first)) {
+            Ok() => {}
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+        match (this.second) {
+            Some(a) => {
+                match (v.push(a)) {
+                    Ok() => {}
+                    Err(_) => { return Err(NetError.OutOfMemory); }
+                }
+            }
+            null => {}
+        }
+        return Ok(v);
+    }
+}
+
+/// Dials scripted connections in order. An attempt to `slow` takes `slowMs`; one to `failing` fails at once.
+struct MockDialer {
+    scripts: Channel<MockTransport>;
+    slow: SocketAddress?;
+    slowMs: u64;
+    failing: SocketAddress?;
+    dials: AtomicU64;
+}
+
+struct MockJob {
+    scripts: Channel<MockTransport>;
+    delayMs: u64;
+    fail: bool;
+}
+
+impl DialJob for MockJob {
+    async fn dial(borrow mut this) -> Result<PlainStream, NetError> {
+        if (this.delayMs > 0) {
+            match (await Timer.sleep(this.delayMs)) {
+                Ok() => {}
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+        }
+        if (this.fail) {
+            return Err(NetError.Reset);
+        }
+        match (await this.scripts.recvAsync()) {
+            Ok(Some(m)) => { return Ok(PlainStream.mock(m)); }
+            Ok(null) => { return Err(NetError.Closed); }
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+}
+
+impl Dialer for MockDialer {
+    @effects(alloc)
+    fn job(borrow this, address: SocketAddress) -> Result<Box<dyn DialJob>, NetError> {
+        let slow = match (this.slow) {
+            Some(a) => sameAddress(a, address),
+            null => false,
+        };
+        let failing = match (this.failing) {
+            Some(a) => sameAddress(a, address),
+            null => false,
+        };
+        let job = MockJob { scripts: this.scripts.clone(), delayMs: if (slow) this.slowMs else 0, fail: failing };
+        match (Box.create(job)) {
+            Ok(b) => {
+                let d: Box<dyn DialJob> = b;
+                return Ok(d);
+            }
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+}
+
+/// A scripted connection: `text` is everything the server sends.
+fn script(text: StringView) -> Result<MockTransport, TestFailure> {
+    match (MockTransport.create(text.bytes())) {
+        Ok(m) => { return Ok(m); }
+        Err(_) => { return Err(TestFailure.create("a mock")); }
+    }
+}
+
+/// A client over a resolver giving `first` (and `second`) and a dialer of `scripts`.
+fn mockClient(
+    options: ClientOptions,
+    scripts: borrow Channel<MockTransport>,
+    first: SocketAddress,
+    second: SocketAddress?,
+    slow: SocketAddress?,
+    failing: SocketAddress?,
+    dnsFails: bool,
+) -> Result<Client, TestFailure> {
+    let resolver = FixedResolver { first: first, second: second, fail: dnsFails, calls: AtomicU64.create(0) };
+    let dialer = MockDialer { scripts: scripts.clone(), slow: slow, slowMs: 1000, failing: failing, dials: AtomicU64.create(0) };
+    let r: Box<dyn Resolver> = testBox(Box.create(resolver))?;
+    let d: Box<dyn Dialer> = testBox(Box.create(dialer))?;
+    match (Client.withNetwork(options, null, r, d)) {
+        Ok(c) => { return Ok(c); }
+        Err(_) => { return Err(TestFailure.create("a client")); }
+    }
+}
+
+fn testBox<T>(r: Result<Box<T>, AllocError>) -> Result<Box<T>, TestFailure> {
+    match (r) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(TestFailure.create("a box")); }
+    }
+}
+
+fn scriptsOf(n: usize) -> Result<Channel<MockTransport>, TestFailure> {
+    match (Channel<MockTransport>.create(n)) {
+        Ok(c) => { return Ok(c); }
+        Err(_) => { return Err(TestFailure.create("a channel")); }
+    }
+}
+
+fn queue(scripts: borrow Channel<MockTransport>, m: MockTransport) -> Result<void, TestFailure> {
+    match (scripts.trySend(m)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TestFailure.create("the queue is full")); }
+    }
+}
+
+/// How many scripts are left (used up from the front by dials).
+async fn left(scripts: borrow Channel<MockTransport>) -> u64 {
+    scripts.close();
+    var n: u64 = 0;
+    loop {
+        match (await scripts.recvAsync()) {
+            Ok(Some(_)) => { n += 1; }
+            _ => { return n; }
+        }
+    }
+}
+
+fn request(method: Method, url: StringView) -> Result<ClientRequest, TestFailure> {
+    match (ClientRequest.create(method, url)) {
+        Ok(r) => { return Ok(r); }
+        Err(_) => { return Err(TestFailure.create("a request")); }
+    }
+}
+
+fn body(text: StringView) -> Result<BytesBody, TestFailure> {
+    match (BytesBody.of(text.bytes())) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(TestFailure.create("a body")); }
+    }
+}
+
+/// The response's status and body, finished; or the error's description.
+async fn outcome(client: borrow Client, r: Result<ClientResponse, ClientError>, into: borrow mut Vector<u8>) -> u16 {
+    var response = match (r) {
+        Ok(x) => x,
+        Err(e) => {
+            let d = ClientErrors.describe(e);
+            for (b in d.bytes()) {
+                let pushed = into.push(b);
+            }
+            return 0;
+        },
+    };
+    match (await response.readToEnd(into, 1048576)) {
+        Ok() => {}
+        Err(_) => { return 1; }
+    }
+    match (await response.finish(client)) {
+        Ok() => {}
+        Err(_) => { return 2; }
+    }
+    return response.status();
+}
+
+fn quick() -> ClientOptions {
+    var o = ClientOptions.defaults();
+    o.firstByteMs = 2000;
+    return o;
+}

@@ -1,0 +1,208 @@
+// The connection pool (Web ADR 0009 §3.4): per origin, idle connections and a semaphore of slots. A connection holds
+// one of its origin's slots from its connect until it is closed, idle or not; `maxPerOrigin` slots exist. Behind an
+// AsyncMutex, so concurrent requests share it (the connections are `Send`, §2).
+import web_core;
+import web_transport;
+import web_http;
+
+struct Idle {
+    conn: Box<dyn Transport + Send>;
+    since: u64;
+}
+
+struct Origin {
+    secure: bool;
+    host: Vector<u8>;
+    port: u16;
+    idle: Vector<Idle>;
+    /// The semaphore: a token per free slot.
+    slots: Channel<u8>;
+    /// Requests and retries, for the retry budget.
+    requests: u64;
+    retries: u64;
+}
+
+struct PoolState {
+    origins: Vector<Origin>;
+    closed: bool;
+}
+
+/// A taken connection: a pooled one (a reuse race is possible) or a slot for a new one.
+enum Taken {
+    Reused(Box<dyn Transport + Send>),
+    Slot,
+}
+
+struct ConnectionPool {
+    state: AsyncMutex<PoolState>;
+    maxPerOrigin: u32;
+    maxIdle: u32;
+    idleTimeoutMs: u64;
+
+    fn create(options: borrow ClientOptions) -> Result<ConnectionPool, ClientError> {
+        let state = PoolState { origins: Vector<Origin>.create(), closed: false };
+        match (AsyncMutex<PoolState>.create(state)) {
+            Ok(m) => {
+                return Ok(ConnectionPool {
+                    state: m,
+                    maxPerOrigin: if (options.maxPerOrigin == 0) 1 else options.maxPerOrigin,
+                    maxIdle: options.maxIdlePerOrigin,
+                    idleTimeoutMs: options.idleTimeoutMs,
+                });
+            }
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+        }
+    }
+
+    /// The origin's slot semaphore (made on first use), its newest idle connection if one is fresh enough, and the
+    /// request counted for the retry budget. Idle connections past the timeout are closed and their slots freed.
+    async fn idleFor(borrow this, url: borrow Url) -> Result<Box<dyn Transport + Send>?, ClientError> {
+        var guard = locked(await this.state.lock())?;
+        let s = guard.data();
+        if (s.closed) {
+            return Err(ClientError.Shutdown);
+        }
+        let i = this.originIndex(s, url)?;
+        let o = borrow mut s.origins[i];
+        o.requests += 1;
+        let now = Timer.now();
+        while (o.idle.length > 0) {
+            let idle = match (o.idle.pop()) {
+                Some(x) => x,
+                null => { break; },
+            };
+            if (now - idle.since <= this.idleTimeoutMs) {
+                return Ok(Some(idle.conn));
+            }
+            let freed = o.slots.trySend(0); // the expired connection closes here
+        }
+        return Ok(null);
+    }
+
+    /// A clone of the origin's slot semaphore.
+    async fn slots(borrow this, url: borrow Url) -> Result<Channel<u8>, ClientError> {
+        var guard = locked(await this.state.lock())?;
+        let s = guard.data();
+        if (s.closed) {
+            return Err(ClientError.Shutdown);
+        }
+        let i = this.originIndex(s, url)?;
+        return Ok(s.origins[i].slots.clone());
+    }
+
+    /// Returns a reusable connection; closed instead (its slot freed) when the pool is shut down or full of idle ones.
+    async fn give(borrow this, url: borrow Url, conn: Box<dyn Transport + Send>) {
+        var guard = match (await this.state.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; },
+        };
+        let s = guard.data();
+        let i = match (this.originIndex(s, url)) {
+            Ok(i) => i,
+            Err(_) => { return; },
+        };
+        let o = borrow mut s.origins[i];
+        if (s.closed || o.idle.length >= this.maxIdle as usize) {
+            let freed = o.slots.trySend(0);
+            return;
+        }
+        match (o.idle.push(Idle { conn: conn, since: Timer.now() })) {
+            Ok() => {}
+            Err(_) => { let freed = o.slots.trySend(0); }
+        }
+    }
+
+    /// Whether the origin's retry budget allows one more retry; it is spent if so.
+    async fn mayRetry(borrow this, url: borrow Url, policy: borrow RetryPolicy) -> bool {
+        var guard = match (await this.state.lock()) {
+            Ok(g) => g,
+            Err(_) => { return false; },
+        };
+        let s = guard.data();
+        let i = match (this.originIndex(s, url)) {
+            Ok(i) => i,
+            Err(_) => { return false; },
+        };
+        let o = borrow mut s.origins[i];
+        let earned = policy.budgetInitial as u64 + o.requests * policy.budgetPercent as u64 / 100;
+        if (o.retries >= earned) {
+            return false;
+        }
+        o.retries += 1;
+        return true;
+    }
+
+    /// Closes every idle connection; later requests fail with `Shutdown`.
+    async fn shutdown(borrow this) {
+        var guard = match (await this.state.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; },
+        };
+        let s = guard.data();
+        s.closed = true;
+        for (i in 0..s.origins.length) {
+            let o = borrow mut s.origins[i];
+            while (o.idle.length > 0) {
+                let dropped = o.idle.pop();
+                let freed = o.slots.trySend(0);
+            }
+            o.slots.close(); // waiters for a slot wake and see the shutdown
+        }
+    }
+
+    /// The origin's index, made if new.
+    fn originIndex(borrow this, s: borrow mut PoolState, url: borrow Url) -> Result<usize, ClientError> {
+        for (i in 0..s.origins.length) {
+            let o = borrow s.origins[i];
+            if (o.secure == url.isSecure() && o.port == url.port() && same(o.host.view(), url.host())) {
+                return Ok(i);
+            }
+        }
+        let slots = match (Channel<u8>.create(this.maxPerOrigin as usize)) {
+            Ok(c) => c,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        for (k in 0..this.maxPerOrigin) {
+            let filled = slots.trySend(0);
+        }
+        var host = Vector<u8>.create();
+        for (b in url.host()) {
+            match (host.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+            }
+        }
+        let o = Origin {
+            secure: url.isSecure(),
+            host: host,
+            port: url.port(),
+            idle: Vector<Idle>.create(),
+            slots: slots,
+            requests: 0,
+            retries: 0,
+        };
+        match (s.origins.push(o)) {
+            Ok() => { return Ok(s.origins.length - 1); }
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+        }
+    }
+}
+
+fn locked<T>(r: Result<T, AsyncError>) -> Result<T, ClientError> {
+    match (r) {
+        Ok(g) => { return Ok(g); }
+        Err(e) => { return Err(ClientError.Net(NetErrors.fromAsync(e))); }
+    }
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}

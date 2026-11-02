@@ -1,0 +1,261 @@
+// web_client over mock connections (Web ADR 0009 §5): the M5 exit gate's deterministic cases. Expected outcomes follow
+// from §3.4-3.8's rules, not from a run.
+import web_core;
+import web_transport;
+import web_http;
+
+fn ok2() -> StringView => "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+
+@test
+async fn a_get_and_its_body() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(4)?;
+    queue(scripts, script("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nx-a: 1\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    var got = Vector<u8>.create();
+    var response = match (await client.get("http://example.test/a")) {
+        Ok(r) => r,
+        Err(e) => { return Check.fail(ClientErrors.describe(e)); },
+    };
+    Check.equalU64(200, response.status() as u64)?;
+    match (response.header("x-a")) {
+        Some(v) => { Check.equalBytes("1".bytes(), v.view())?; }
+        null => { return Check.fail("x-a"); }
+    }
+    match (await response.readToEnd(mut got, 1024)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the body"); }
+    }
+    Check.equalBytes("hello world".bytes(), got.view())?;
+    return Ok();
+}
+
+/// The gate: a POST whose connection fails after `k` bytes, for every `k` up to the whole request, is never sent
+/// twice: one connection is used, and the error is the client's answer.
+@test
+async fn no_post_is_replayed_after_a_partial_write() -> Result<void, TestFailure> {
+    // "POST /items HTTP/1.1\r\nhost: example.test\r\ncontent-length: 4\r\n\r\nbody": 67 bytes.
+    for (k in 0..68u32) {
+        let scripts = scriptsOf(2)?;
+        queue(scripts, script(ok2())?.withWriteFailureAfter(k as usize))?;
+        queue(scripts, script(ok2())?)?;
+        let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+        let post = request(Method.Post, "http://example.test/items")?;
+        var payload = body("body")?;
+        let r = await client.send(post, mut payload);
+        let failed = match (r) {
+            Ok(_) => false,
+            Err(_) => true,
+        };
+        Check.isTrue(failed || k >= 67, "the failure is the answer")?;
+        Check.equalU64(1, await left(scripts))?; // the second connection was never dialed
+    }
+    return Ok();
+}
+
+/// A GET whose first connection fails before any byte is written is sent again; after a byte, it is not.
+@test
+async fn a_get_is_retried_only_when_nothing_went_out() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(2)?;
+    queue(scripts, script(ok2())?.withWriteFailureAfter(0))?;
+    queue(scripts, script(ok2())?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    var got = Vector<u8>.create();
+    Check.equalU64(200, await outcome(client, await client.get("http://example.test/"), mut got) as u64)?;
+    Check.equalU64(0, await left(scripts))?;
+
+    let more = scriptsOf(2)?;
+    queue(more, script(ok2())?.withWriteFailureAfter(5))?;
+    queue(more, script(ok2())?)?;
+    let other = mockClient(quick(), more, v4(1), null, null, null, false)?;
+    var none = Vector<u8>.create();
+    Check.equalU64(0, await outcome(other, await other.get("http://example.test/"), mut none) as u64)?;
+    Check.equalU64(1, await left(more))?;
+    return Ok();
+}
+
+/// A pooled connection the server closed while idle: a GET is sent again on a new connection (a reuse race); a POST
+/// is not, and fails.
+@test
+async fn a_server_close_during_reuse() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(3)?;
+    queue(scripts, script(ok2())?)?; // one response, then the server's end
+    queue(scripts, script(ok2())?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    var a = Vector<u8>.create();
+    Check.equalU64(200, await outcome(client, await client.get("http://example.test/1"), mut a) as u64)?;
+    var b = Vector<u8>.create();
+    Check.equalU64(200, await outcome(client, await client.get("http://example.test/2"), mut b) as u64)?;
+    Check.equalU64(0, await left(scripts))?; // the GET used the second connection
+
+    let posts = scriptsOf(3)?;
+    queue(posts, script(ok2())?)?;
+    queue(posts, script(ok2())?)?;
+    let other = mockClient(quick(), posts, v4(1), null, null, null, false)?;
+    var c = Vector<u8>.create();
+    Check.equalU64(200, await outcome(other, await other.get("http://example.test/1"), mut c) as u64)?;
+    let post = request(Method.Post, "http://example.test/items")?;
+    var payload = body("x")?;
+    let r = await other.send(post, mut payload);
+    let failed = match (r) {
+        Ok(_) => false,
+        Err(_) => true,
+    };
+    Check.isTrue(failed, "the POST fails")?;
+    Check.equalU64(1, await left(posts))?;
+    return Ok();
+}
+
+@test
+async fn dns_failure_dials_nothing() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(1)?;
+    queue(scripts, script(ok2())?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, true)?;
+    var got = Vector<u8>.create();
+    Check.equalU64(0, await outcome(client, await client.get("http://nowhere.test/"), mut got) as u64)?;
+    Check.equalU64(1, await left(scripts))?;
+    return Ok();
+}
+
+@test
+async fn timeouts() -> Result<void, TestFailure> {
+    // First byte: a server that never answers.
+    let silent = scriptsOf(1)?;
+    queue(silent, script("")?.withHang())?;
+    var o = quick();
+    o.firstByteMs = 300;
+    o.retry = RetryPolicy.never();
+    let client = mockClient(o, silent, v4(1), null, null, null, false)?;
+    let started = Timer.now();
+    var got = Vector<u8>.create();
+    Check.equalU64(0, await outcome(client, await client.get("http://example.test/"), mut got) as u64)?;
+    Check.equalBytes("timed out".bytes(), got.view())?;
+    Check.isTrue(Timer.now() - started < 1500, "at the first-byte deadline")?;
+    // Connect: the only address is slow (1 s) and the connect timeout 200 ms.
+    let slow = scriptsOf(1)?;
+    queue(slow, script(ok2())?)?;
+    var c = quick();
+    c.connectMs = 200;
+    c.retry = RetryPolicy.never();
+    let late = mockClient(c, slow, v4(1), null, Some(v4(1)), null, false)?;
+    var none = Vector<u8>.create();
+    Check.equalU64(0, await outcome(late, await late.get("http://example.test/"), mut none) as u64)?;
+    Check.equalBytes("timed out".bytes(), none.view())?;
+    return Ok();
+}
+
+/// Happy Eyeballs: the first address (IPv6) is slow, so the second (IPv4) starts after 250 ms and wins; a failing
+/// first address lets the second start at once.
+@test
+async fn happy_eyeballs() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(2)?;
+    queue(scripts, script(ok2())?)?;
+    let client = mockClient(quick(), scripts, v6(1), Some(v4(2)), Some(v6(1)), null, false)?;
+    let started = Timer.now();
+    var got = Vector<u8>.create();
+    Check.equalU64(200, await outcome(client, await client.get("http://example.test/"), mut got) as u64)?;
+    let took = Timer.now() - started;
+    Check.isTrue(took >= 250 && took < 1000, "the second attempt won after the delay, before the slow one")?;
+
+    let more = scriptsOf(2)?;
+    queue(more, script(ok2())?)?;
+    let quick2 = mockClient(quick(), more, v6(1), Some(v4(2)), null, Some(v6(1)), false)?;
+    let again = Timer.now();
+    var b = Vector<u8>.create();
+    Check.equalU64(200, await outcome(quick2, await quick2.get("http://example.test/"), mut b) as u64)?;
+    Check.isTrue(Timer.now() - again < 250, "a failure starts the next attempt at once")?;
+    return Ok();
+}
+
+@test
+fn addresses_alternate_families() -> Result<void, TestFailure> {
+    var list = Vector<SocketAddress>.create();
+    for (a in [v6(1), v6(2), v6(3), v4(4), v4(5)]) {
+        match (list.push(a)) {
+            Ok() => {}
+            Err(_) => { return Check.fail("push"); }
+        }
+    }
+    let ordered = match (interleave(list)) {
+        Ok(o) => o,
+        Err(_) => { return Check.fail("interleave"); },
+    };
+    // RFC 8305 §4: v6, v4, v6, v4, v6.
+    var expected = [1u8, 4, 2, 5, 3];
+    for (i in 0..5u32) {
+        let last = match (ordered[i as usize]) {
+            SocketAddress.V4(b, _) => b[3],
+            SocketAddress.V6(b, _, _) => b[15],
+        };
+        Check.equalU64(expected[i as usize] as u64, last as u64)?;
+    }
+    return Ok();
+}
+
+/// 303 turns a POST into a GET at the new location; a cross-origin redirect is followed on a new connection.
+@test
+async fn redirects() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(3)?;
+    queue(scripts, script("HTTP/1.1 303 See Other\r\nlocation: /done\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")?)?;
+    queue(scripts, script("HTTP/1.1 301 Moved\r\nlocation: http://other.test/x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")?)?;
+    queue(scripts, script(ok2())?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    let post = request(Method.Post, "http://example.test/form")?;
+    var payload = body("a=1")?;
+    var response = match (await client.send(post, mut payload)) {
+        Ok(r) => r,
+        Err(e) => { return Check.fail(ClientErrors.describe(e)); },
+    };
+    Check.equalU64(200, response.status() as u64)?;
+    var final = Vector<u8>.create();
+    match (response.url().text(mut final)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("url"); }
+    }
+    Check.equalBytes("http://other.test/x".bytes(), final.view())?;
+    Check.equalU64(0, await left(scripts))?;
+    // The limit: a loop of redirects stops after maxRedirects and returns the last 3xx.
+    let loops = scriptsOf(3)?;
+    for (i in 0..3) {
+        queue(loops, script("HTTP/1.1 302 Found\r\nlocation: /again\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")?)?;
+    }
+    var o = quick();
+    o.maxRedirects = 2;
+    let limited = mockClient(o, loops, v4(1), null, null, null, false)?;
+    var got = Vector<u8>.create();
+    Check.equalU64(302, await outcome(limited, await limited.get("http://example.test/"), mut got) as u64)?;
+    return Ok();
+}
+
+/// A shut-down client refuses new requests.
+@test
+async fn shutdown() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(2)?;
+    queue(scripts, script(ok2())?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    await client.shutdown();
+    var got = Vector<u8>.create();
+    Check.equalU64(0, await outcome(client, await client.get("http://example.test/"), mut got) as u64)?;
+    Check.equalBytes("client shut down".bytes(), got.view())?;
+    Check.equalU64(1, await left(scripts))?;
+    return Ok();
+}
+
+@test
+fn bad_requests() -> Result<void, TestFailure> {
+    let bad = match (ClientRequest.create(Method.Get, "ftp://x/")) {
+        Err(ClientError.BadUrl(_)) => true,
+        _ => false,
+    };
+    Check.isTrue(bad, "ftp")?;
+    var r = request(Method.Get, "http://example.test/")?;
+    let injected = match (r.header("x-a", "1\r\nx-b: 2".bytes())) {
+        Err(ClientError.BadRequest) => true,
+        _ => false,
+    };
+    Check.isTrue(injected, "CR LF in a value")?;
+    let framing = match (r.header("Content-Length", "5".bytes())) {
+        Err(ClientError.BadRequest) => true,
+        _ => false,
+    };
+    return Check.isTrue(framing, "framing is the client's");
+}

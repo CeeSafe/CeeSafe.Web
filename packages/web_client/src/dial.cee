@@ -1,0 +1,258 @@
+// Connecting (Web ADR 0009 §3.5): resolve, order the addresses (RFC 8305 §4), and race staggered attempts (§5). The
+// resolver and the dialer are interfaces, so tests run deterministically over mocks.
+import web_core;
+import web_transport;
+
+/// Names to addresses.
+public interface Resolver {
+    async fn resolve(borrow this, host: StringView, port: u16) -> Result<Vector<SocketAddress>, NetError>;
+}
+
+/// The system's resolver (lib/std's AsyncDns, CeeSafe ADR 0048). An IP literal resolves to itself without DNS.
+public struct SystemResolver {}
+
+impl Resolver for SystemResolver {
+    async fn resolve(borrow this, host: StringView, port: u16) -> Result<Vector<SocketAddress>, NetError> {
+        match (await AsyncDns.resolve(host, port)) {
+            Ok(list) => {
+                if (list.length == 0) {
+                    return Err(NetError.Io(IoError.NotFound));
+                }
+                return Ok(list);
+            }
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+}
+
+/// One connection attempt, owned by the task that runs it.
+public interface DialJob {
+    async fn dial(borrow mut this) -> Result<PlainStream, NetError>;
+}
+
+/// Makes connection attempts.
+public interface Dialer {
+    /// An attempt to connect to `address`. It only allocates, so async code may call it.
+    @effects(alloc)
+    fn job(borrow this, address: SocketAddress) -> Result<Box<dyn DialJob>, NetError>;
+}
+
+/// TCP.
+public struct TcpDialer {}
+
+struct TcpJob {
+    address: SocketAddress;
+}
+
+impl DialJob for TcpJob {
+    async fn dial(borrow mut this) -> Result<PlainStream, NetError> =>
+        Ok(PlainStream.tcp(await TcpTransport.connectTo(this.address)?));
+}
+
+impl Dialer for TcpDialer {
+    @effects(alloc)
+    fn job(borrow this, address: SocketAddress) -> Result<Box<dyn DialJob>, NetError> {
+        match (Box.create(TcpJob { address: address })) {
+            Ok(b) => {
+                let d: Box<dyn DialJob> = b;
+                return Ok(d);
+            }
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+    }
+}
+
+/// The addresses in RFC 8305 §4's order: alternating families, starting with the first address's family.
+public fn interleave(addresses: borrow Vector<SocketAddress>) -> Result<Vector<SocketAddress>, NetError> {
+    var first = Vector<SocketAddress>.create();
+    var second = Vector<SocketAddress>.create();
+    let firstIsV6 = addresses.length > 0 && isV6(addresses[0]);
+    for (i in 0..addresses.length) {
+        let a = addresses[i];
+        let r = if (isV6(a) == firstIsV6) first.push(a) else second.push(a);
+        match (r) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+    }
+    var out = Vector<SocketAddress>.create();
+    var i: usize = 0;
+    while (i < first.length || i < second.length) {
+        if (i < first.length) {
+            pushAddress(mut out, first[i])?;
+        }
+        if (i < second.length) {
+            pushAddress(mut out, second[i])?;
+        }
+        i += 1;
+    }
+    return Ok(out);
+}
+
+fn pushAddress(out: borrow mut Vector<SocketAddress>, a: SocketAddress) -> Result<void, NetError> {
+    match (out.push(a)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+    }
+}
+
+fn isV6(a: SocketAddress) -> bool => match (a) {
+    SocketAddress.V6(_, _, _) => true,
+    _ => false,
+};
+
+/// What an attempt ended with.
+enum Attempt {
+    Connected(PlainStream),
+    Failed(NetError),
+}
+
+/// Happy Eyeballs v2 over `addresses` (already in order): an attempt starts every `delayMs`, or as soon as the one
+/// before failed; the first to connect wins and the others are cancelled. The last failure if every attempt fails;
+/// `TimedOut` at `deadline`.
+public async fn happyEyeballs(
+    addresses: borrow Vector<SocketAddress>,
+    dialer: borrow dyn Dialer,
+    delayMs: u64,
+    deadline: Deadline,
+) -> Result<PlainStream, NetError> {
+    let n = addresses.length;
+    if (n == 0) {
+        return Err(NetError.Io(IoError.NotFound));
+    }
+    // Every attempt reports in `outcomes`; a failure also kicks the next attempt to start at once.
+    let outcomes = channel<Attempt>(n)?;
+    let kicks = channel<u8>(n)?;
+    var jobs = Vector<Box<dyn DialJob>>.create(); // last address first: `pop` takes them in order
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        match (jobs.push(dialer.job(addresses[i])?)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+    }
+    if (deadline.isExpired()) {
+        return Err(NetError.TimedOut);
+    }
+    let r: Result<Raced<PlainStream?>, NetError> = await Async.deadline(
+        deadline.instant(),
+        NetError.TimedOut,
+        async () => await Async.race(
+            async () => await startAll(mut jobs, outcomes, kicks, delayMs),
+            async () => await firstConnected(outcomes, n),
+        ),
+    );
+    let won = r?;
+    match (won.value) {
+        Some(s) => { return Ok(s); }
+        null => { return Err(NetError.Closed); }
+    }
+}
+
+/// Starts every job, each after the delay or the previous one's failure; then waits to be cancelled (the other arm
+/// of the race decides).
+async fn startAll(
+    jobs: borrow mut Vector<Box<dyn DialJob>>,
+    outcomes: borrow Channel<Attempt>,
+    kicks: borrow Channel<u8>,
+    delayMs: u64,
+) -> Result<PlainStream?, NetError> {
+    let limit = truncate<u32>(jobs.length);
+    await Async.tasks(limit, NetError.OutOfMemory, async (set) => await spawnAll(set, jobs, outcomes, kicks, delayMs))?;
+    loop {
+        match (await Timer.sleep(3600000)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+}
+
+async fn spawnAll(
+    set: borrow TaskSet<NetError>,
+    jobs: borrow mut Vector<Box<dyn DialJob>>,
+    outcomes: borrow Channel<Attempt>,
+    kicks: borrow Channel<u8>,
+    delayMs: u64,
+) -> Result<void, NetError> {
+    loop {
+        var job = match (jobs.pop()) {
+            Some(j) => j,
+            null => { return Ok(); },
+        };
+        let report = outcomes.clone();
+        let kick = kicks.clone();
+        await set.spawn(async move () => await attempt(mut job, report, kick))?;
+        if (jobs.length > 0) {
+            await delayOrKick(delayMs, kicks)?;
+        }
+    }
+}
+
+/// Runs one attempt and reports it.
+async fn attempt(
+    job: borrow mut Box<dyn DialJob>,
+    report: borrow Channel<Attempt>,
+    kick: borrow Channel<u8>,
+) -> Result<void, NetError> {
+    let r = await job.dial();
+    match (r) {
+        Ok(s) => {
+            let sent = report.trySend(Attempt.Connected(s));
+        }
+        Err(e) => {
+            let sent = report.trySend(Attempt.Failed(e));
+            let kicked = kick.trySend(0);
+        }
+    }
+    return Ok();
+}
+
+/// Waits `delayMs`, or less if an attempt fails meanwhile.
+async fn delayOrKick(delayMs: u64, kicks: borrow Channel<u8>) -> Result<void, NetError> {
+    let wait: Result<Raced<bool>, NetError> = await Async.race(
+        async () => await sleepMs(delayMs),
+        async () => await kicked(kicks),
+    );
+    let done = wait?;
+    return Ok();
+}
+
+async fn sleepMs(ms: u64) -> Result<bool, NetError> {
+    match (await Timer.sleep(ms)) {
+        Ok() => { return Ok(true); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn kicked(kicks: borrow Channel<u8>) -> Result<bool, NetError> {
+    match (await kicks.recvAsync()) {
+        Ok(_) => { return Ok(true); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+/// The first connection reported, or the last failure once all `n` failed.
+async fn firstConnected(outcomes: borrow Channel<Attempt>, n: usize) -> Result<PlainStream?, NetError> {
+    var failed: usize = 0;
+    var last = NetError.Closed;
+    while (failed < n) {
+        match (await outcomes.recvAsync()) {
+            Ok(Some(Attempt.Connected(s))) => { return Ok(Some(s)); }
+            Ok(Some(Attempt.Failed(e))) => {
+                failed += 1;
+                last = e;
+            }
+            Ok(null) => { return Err(last); }
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
+    }
+    return Err(last);
+}
+
+fn channel<T: Send>(n: usize) -> Result<Channel<T>, NetError> {
+    match (Channel<T>.create(n)) {
+        Ok(c) => { return Ok(c); }
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+    }
+}

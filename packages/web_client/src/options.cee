@@ -1,0 +1,93 @@
+// The client's options (Web ADR 0009 §3.4, §3.6-3.8).
+import web_core;
+import web_http;
+
+/// When a failed attempt may be sent again (Web ADR 0009 §3.8). Retrying needs all of: an idempotent method or an
+/// `Idempotency-Key`; no byte of the request written, or a reuse race; a body that can replay; and room in
+/// `maxAttempts` and the origin's budget.
+public struct RetryPolicy {
+    /// Attempts per request, the first included (1: never retry).
+    public maxAttempts: u32;
+    /// Retries allowed per 100 requests to an origin (the budget's rate).
+    public budgetPercent: u32;
+    /// Retries an origin may use before its requests have earned any.
+    public budgetInitial: u32;
+
+    /// 2 attempts; 10 % of requests, plus 3 to start.
+    public fn defaults() -> RetryPolicy => RetryPolicy { maxAttempts: 2, budgetPercent: 10, budgetInitial: 3 };
+
+    /// Never retry.
+    public fn never() -> RetryPolicy => RetryPolicy { maxAttempts: 1, budgetPercent: 0, budgetInitial: 0 };
+}
+
+/// A client's bounds and timeouts. Times are milliseconds; 0 for `totalMs` means none.
+public struct ClientOptions {
+    /// DNS and every connection attempt.
+    public connectMs: u64;
+    /// The TLS handshake (the connector's deadline).
+    public tlsMs: u64;
+    /// From the request's last byte to the response head.
+    public firstByteMs: u64;
+    /// The whole `send`: redirects and retries included (0: none).
+    public totalMs: u64;
+    /// Between Happy Eyeballs attempts (RFC 8305 §5: 250 ms).
+    public connectionAttemptDelayMs: u64;
+    /// Connections per origin, in use or idle.
+    public maxPerOrigin: u32;
+    /// Idle connections kept per origin.
+    public maxIdlePerOrigin: u32;
+    /// An idle connection older than this is closed instead of reused.
+    public idleTimeoutMs: u64;
+    /// Redirects followed per request.
+    public maxRedirects: u32;
+    /// Body bytes `finish` reads to make a connection reusable; past this it closes the connection instead.
+    public maxDrainBytes: u64;
+    /// Response heads: line, size and field count (web_http's `Limits`).
+    public limits: Limits;
+    public retry: RetryPolicy;
+
+    /// 10 s to connect and to handshake, 30 s to the first byte, no total; 250 ms between attempts; 8 connections
+    /// per origin, 4 idle for 30 s; 10 redirects; 64 KiB drained.
+    public fn defaults() -> ClientOptions => ClientOptions {
+        connectMs: 10000,
+        tlsMs: 10000,
+        firstByteMs: 30000,
+        totalMs: 0,
+        connectionAttemptDelayMs: 250,
+        maxPerOrigin: 8,
+        maxIdlePerOrigin: 4,
+        idleTimeoutMs: 30000,
+        maxRedirects: 10,
+        maxDrainBytes: 65536,
+        limits: Limits.defaults(),
+        retry: RetryPolicy.defaults(),
+    };
+}
+
+/// Why a request failed.
+public enum ClientError {
+    /// The URL was refused.
+    BadUrl(UrlError),
+    /// A request field was refused (a CR or LF in a value, a framing field set by hand).
+    BadRequest,
+    /// An https URL on a client without a connector.
+    NoTls,
+    /// The network or TLS failed; `TimedOut` for every timeout.
+    Net(NetError),
+    /// The server broke HTTP/1.1.
+    Protocol(ProtocolError),
+    /// The client was shut down.
+    Shutdown,
+}
+
+/// Descriptions.
+public struct ClientErrors {
+    public fn describe(e: borrow ClientError) -> StringView => match (e) {
+        ClientError.BadUrl(_) => "bad URL",
+        ClientError.BadRequest => "bad request field",
+        ClientError.NoTls => "https without a TLS connector",
+        ClientError.Net(n) => NetErrors.describe(n),
+        ClientError.Protocol(p) => ProtocolErrors.describe(p),
+        ClientError.Shutdown => "client shut down",
+    };
+}
