@@ -1,0 +1,252 @@
+// The PROXY protocol (Web ADR 0012 §3.6). Expected values come from HAProxy's proxy-protocol.txt: its v1 examples and
+// worst-case line (§2.1), and v2's layout (§2.2) built byte by byte here.
+import web_core;
+import web_transport;
+
+fn v2(command: u8, family: u8, body: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
+    var h = Vector<u8>.create();
+    let sig = [13u8, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10];
+    for (b in sig) {
+        grow(h.push(b))?;
+    }
+    grow(h.push(command))?;
+    grow(h.push(family))?;
+    grow(h.push(truncate<u8>(body.length >> 8)))?;
+    grow(h.push(truncate<u8>(body.length)))?;
+    for (b in body) {
+        grow(h.push(b))?;
+    }
+    return Ok(h);
+}
+
+fn grow(r: Result<void, AllocError>) -> Result<void, TestFailure> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+/// Feeds `header` to `ProxyProtocol.more` as reads of `step` bytes (0: exactly what it asks for), checking it never
+/// asks past the header's end, and parses it.
+fn readAndParse(header: Slice<u8>, step: usize) -> Result<ProxyHeader, ProxyError> {
+    var got: usize = 0;
+    loop {
+        let want = ProxyProtocol.more(header[0..got])?;
+        if (want == 0) {
+            return ProxyProtocol.parse(header[0..got]);
+        }
+        if (got + want > header.length) {
+            return Err(ProxyError.Malformed); // it asked for a byte past the header: the test fails below
+        }
+        got += if (step == 0 || step > want) want else step;
+    }
+}
+
+fn isProxied(r: Result<ProxyHeader, ProxyError>, from: StringView, fromPort: u16, to: StringView, toPort: u16) -> Result<void, TestFailure> {
+    match (r) {
+        Ok(ProxyHeader.Proxied(a, b)) => {
+            var x = Vector<u8>.create();
+            var y = Vector<u8>.create();
+            grow(ipText(a, mut x))?;
+            grow(ipText(b, mut y))?;
+            Check.equalBytes(from.bytes(), x.view())?;
+            Check.equalBytes(to.bytes(), y.view())?;
+            Check.equalU64(fromPort as u64, a.port() as u64)?;
+            return Check.equalU64(toPort as u64, b.port() as u64);
+        }
+        Ok(ProxyHeader.Local) => { return Check.fail("LOCAL"); }
+        Err(_) => { return Check.fail("refused"); }
+    }
+}
+
+@test
+fn version_1() -> Result<void, TestFailure> {
+    for (step in 0..3usize) {
+        isProxied(readAndParse("PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535\r\n".bytes(), step),
+            "255.255.255.255", 65535, "255.255.255.255", 65535)?;
+        // §2.1's worst case: 104 bytes.
+        let worst = "PROXY TCP6 ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff 65535 65535\r\n";
+        Check.equalU64(104, worst.bytes().length as u64)?;
+        isProxied(readAndParse(worst.bytes(), step), "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 65535,
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 65535)?;
+        isProxied(readAndParse("PROXY TCP4 192.168.0.1 192.168.0.11 56324 443\r\n".bytes(), step), "192.168.0.1",
+            56324, "192.168.0.11", 443)?;
+        match (readAndParse("PROXY UNKNOWN\r\n".bytes(), step)) {
+            Ok(ProxyHeader.Local) => {}
+            _ => { return Check.fail("UNKNOWN"); }
+        }
+        match (readAndParse("PROXY UNKNOWN ffff::1 ffff::2 1 2\r\n".bytes(), step)) {
+            Ok(ProxyHeader.Local) => {}
+            _ => { return Check.fail("UNKNOWN with addresses"); }
+        }
+    }
+    for (k in 0..7u32) {
+        let bad = match (k) {
+            0 => "PROXY TCP4 192.168.0.1  192.168.0.11 56324 443\r\n",
+            1 => "PROXY TCP4 192.168.0.1 192.168.0.11 056324 443\r\n",
+            2 => "PROXY TCP4 ::1 ::2 1 2\r\n",
+            3 => "PROXY TCP6 192.168.0.1 192.168.0.11 1 2\r\n",
+            4 => "PROXY TCP4 192.168.0.1 192.168.0.11 65536 443\r\n",
+            5 => "PROXY TCP4 192.168.0.1 192.168.0.11 1\r\n",
+            _ => "PROXY UDP4 192.168.0.1 192.168.0.11 1 2\r\n",
+        };
+        match (readAndParse(bad.bytes(), 0)) {
+            Err(_) => {}
+            Ok(_) => { return Check.fail("a malformed v1 header was accepted"); }
+        }
+    }
+    var long = Vector<u8>.create();
+    for (b in "PROXY UNKNOWN ".bytes()) {
+        grow(long.push(b))?;
+    }
+    for (i in 0..120u32) {
+        grow(long.push(120))?;
+    }
+    match (readAndParse(long.view(), 1)) {
+        Err(ProxyError.TooLong) => {}
+        _ => { return Check.fail("past 107 bytes"); }
+    }
+    match (ProxyProtocol.more("GET / HTTP/1.1\r\n".bytes())) {
+        Err(ProxyError.NotProxy) => { return Ok(); }
+        _ => { return Check.fail("not a PROXY header"); }
+    }
+}
+
+@test
+fn version_2() -> Result<void, TestFailure> {
+    // PROXY (0x21), TCP over IPv4 (0x11): 192.0.2.1:51234 to 198.51.100.2:443.
+    let four = [192u8, 0, 2, 1, 198, 51, 100, 2, 0xC8, 0x22, 0x01, 0xBB];
+    for (step in 0..3usize) {
+        let h = v2(0x21, 0x11, four[..])?;
+        isProxied(readAndParse(h.view(), step), "192.0.2.1", 51234, "198.51.100.2", 443)?;
+    }
+    // The same with a TLV after the addresses (PP2_TYPE_AUTHORITY, 0x02, "a.test"): skipped, and read exactly.
+    var withTlv = Vector<u8>.create();
+    for (b in four) {
+        grow(withTlv.push(b))?;
+    }
+    for (b in [0x02u8, 0x00, 0x06, 97, 46, 116, 101, 115, 116]) {
+        grow(withTlv.push(b))?;
+    }
+    let tlv = v2(0x21, 0x11, withTlv.view())?;
+    isProxied(readAndParse(tlv.view(), 1), "192.0.2.1", 51234, "198.51.100.2", 443)?;
+    // TCP over IPv6 (0x21): 2001:db8::1:443 to 2001:db8::2:8443.
+    var six = Vector<u8>.create();
+    for (k in 0..2u8) {
+        for (b in [0x20u8, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) {
+            grow(six.push(b))?;
+        }
+        grow(six.push(k + 1))?;
+    }
+    for (b in [0x01u8, 0xBB, 0x20, 0xFB]) {
+        grow(six.push(b))?;
+    }
+    let h6 = v2(0x21, 0x21, six.view())?;
+    isProxied(readAndParse(h6.view(), 0), "2001:db8::1", 443, "2001:db8::2", 8443)?;
+    // LOCAL (0x20), AF_UNSPEC (0x00), and AF_UNIX: the socket's own addresses.
+    let unix = [0u8; 216];
+    for (k in 0..3u32) {
+        let h = match (k) {
+            0 => v2(0x20, 0x00, "".bytes())?,
+            1 => v2(0x21, 0x00, "".bytes())?,
+            _ => v2(0x21, 0x31, unix[..])?,
+        };
+        match (readAndParse(h.view(), 0)) {
+            Ok(ProxyHeader.Local) => {}
+            _ => { return Check.fail("LOCAL, UNSPEC or UNIX"); }
+        }
+    }
+    // Version 1 in the nibble, a short address block, and a length past the bound.
+    let wrongVersion = v2(0x11, 0x11, four[..])?;
+    let short = v2(0x21, 0x11, four[0..8])?;
+    let big = [0u8; 5000];
+    let huge = v2(0x21, 0x11, big[..])?;
+    match (readAndParse(wrongVersion.view(), 0)) {
+        Err(_) => {}
+        Ok(_) => { return Check.fail("version 1 in a v2 header"); }
+    }
+    match (readAndParse(short.view(), 0)) {
+        Err(_) => {}
+        Ok(_) => { return Check.fail("a short address block"); }
+    }
+    match (readAndParse(huge.view(), 0)) {
+        Err(ProxyError.TooLong) => { return Ok(); }
+        _ => { return Check.fail("past the bound"); }
+    }
+}
+
+fn address(text: StringView, port: u16) -> Result<SocketAddress, TestFailure> {
+    match (SocketAddresses.parseIp(text, port)) {
+        Some(a) => { return Ok(a); }
+        null => { return Err(TestFailure.create("an address")); }
+    }
+}
+
+fn acceptor(trusted: StringView) -> Result<ProxyProtocolAcceptor, TestFailure> {
+    var t = TrustedProxies.none();
+    match (t.add(trusted)) {
+        Ok(true) => {}
+        _ => { return Err(TestFailure.create("a block")); }
+    }
+    let inner: Box<dyn Acceptor> = match (Box.create(PlainAcceptor {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("a box")); },
+    };
+    return Ok(ProxyProtocolAcceptor.create(inner, t, 1000));
+}
+
+fn stream(text: StringView, peer: StringView, chunk: usize) -> Result<PlainStream, TestFailure> {
+    let m = match (MockTransport.create(text.bytes())) {
+        Ok(m) => m,
+        Err(_) => { return Err(TestFailure.create("a mock")); },
+    };
+    let from = address(peer, 40000)?;
+    let local = address("10.0.0.1", 443)?;
+    return Ok(PlainStream.mock(m.withChunk(chunk).withAddresses(Some(from), Some(local))));
+}
+
+/// From a trusted balancer, the header's addresses become the connection's, and the bytes after it are untouched, at
+/// every read size; an untrusted source, and a trusted one without a header, are closed.
+@test
+async fn the_acceptor() -> Result<void, TestFailure> {
+    let a = acceptor("10.0.0.0/8")?;
+    let request = "PROXY TCP4 203.0.113.7 10.0.0.1 51000 443\r\nGET / HTTP/1.1\r\n";
+    for (chunk in 1..20usize) {
+        var conn = match (await a.accept(stream(request, "10.0.0.5", chunk)?, Deadline.after(1000))) {
+            Ok(c) => c,
+            Err(e) => { return Check.fail(NetErrors.describe(e)); },
+        };
+        match (conn.peerAddress()) {
+            Some(p) => {
+                var text = Vector<u8>.create();
+                grow(ipText(p, mut text))?;
+                Check.equalBytes("203.0.113.7".bytes(), text.view())?;
+                Check.equalU64(51000, p.port() as u64)?;
+            }
+            null => { return Check.fail("no peer address"); }
+        }
+        var rest = Vector<u8>.create();
+        var buf = [0u8; 64];
+        loop {
+            let n = match (await conn.read(mut buf[..])) {
+                Ok(n) => n,
+                Err(_) => { return Check.fail("a read"); },
+            };
+            if (n == 0) {
+                break;
+            }
+            for (b in buf[0..n]) {
+                grow(rest.push(b))?;
+            }
+        }
+        Check.equalBytes("GET / HTTP/1.1\r\n".bytes(), rest.view())?;
+    }
+    match (await a.accept(stream(request, "198.51.100.9", 64)?, Deadline.after(1000))) {
+        Err(_) => {}
+        Ok(_) => { return Check.fail("an untrusted source was served"); }
+    }
+    match (await a.accept(stream("GET / HTTP/1.1\r\n\r\n", "10.0.0.5", 64)?, Deadline.after(1000))) {
+        Err(_) => { return Ok(); }
+        Ok(_) => { return Check.fail("a trusted source without a header was served"); }
+    }
+}

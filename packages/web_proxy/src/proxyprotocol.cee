@@ -1,0 +1,331 @@
+// The PROXY protocol, versions 1 and 2 (HAProxy's proxy-protocol.txt; Web ADR 0012 §3.6): a load balancer in front
+// of the listener sends the client's addresses before anything else on the connection. `ProxyProtocol` parses a header
+// (sans-I/O); `ProxyProtocolAcceptor` reads one from a trusted source, exactly and no further, before the inner
+// acceptor's TLS handshake, and makes the connection report the header's addresses.
+import web_core;
+import web_transport;
+
+/// What a header says.
+public enum ProxyHeader {
+    /// The connection's real source and destination.
+    Proxied(SocketAddress, SocketAddress),
+    /// v2's LOCAL command (the balancer's own connection, a health check), or v1's UNKNOWN, or a family other than
+    /// IPv4 and IPv6: the socket's own addresses stand.
+    Local,
+}
+
+/// Why a header was refused.
+public enum ProxyError {
+    /// The bytes do not start like a PROXY header.
+    NotProxy,
+    /// They start like one but break its grammar.
+    Malformed,
+    /// Longer than v1's 107 bytes, or v2's header past `ProxyProtocol.maxV2Bytes`.
+    TooLong,
+}
+
+/// v2's signature (§2.2): `\r\n\r\n\0\r\nQUIT\n`.
+fn signature() -> [u8; 12] => [13u8, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10];
+
+/// Parsing.
+public struct ProxyProtocol {
+    /// The bytes a v2 header may take with its TLVs; past this it is refused (the spec lets a receiver bound it).
+    public fn maxV2Bytes() -> usize => 4096;
+
+    /// How many more bytes the header needs after `got`, the bytes read so far: 0 when it is complete. Reading exactly
+    /// this many never takes a byte past the header. With nothing read it is 15, the shortest header of either
+    /// version ("PROXY UNKNOWN\r\n"; v2's is 16).
+    public fn more(got: Slice<u8>) -> Result<usize, ProxyError> {
+        if (got.length == 0) {
+            return Ok(15);
+        }
+        if (got[0] == 80) {
+            // v1: "PROXY " ... "\r\n", 107 bytes at most (§2.1).
+            let p = "PROXY ".bytes();
+            for (i in 0..(if (got.length < p.length) got.length else p.length)) {
+                if (got[i] != p[i]) {
+                    return Err(ProxyError.NotProxy);
+                }
+            }
+            if (got.length >= 2 && got[got.length - 2] == 13 && got[got.length - 1] == 10) {
+                return Ok(0);
+            }
+            if (got.length >= 107) {
+                return Err(ProxyError.TooLong);
+            }
+            return Ok(1);
+        }
+        let sig = signature();
+        for (i in 0..(if (got.length < 12) got.length else 12usize)) {
+            if (got[i] != sig[i]) {
+                return Err(ProxyError.NotProxy);
+            }
+        }
+        if (got.length < 16) {
+            return Ok(16 - got.length);
+        }
+        let total = 16 + ((got[14] as usize) << 8 | got[15] as usize);
+        if (total > ProxyProtocol.maxV2Bytes()) {
+            return Err(ProxyError.TooLong);
+        }
+        return Ok(if (got.length >= total) 0 else total - got.length);
+    }
+
+    /// The header in `header`, which `more` says is complete.
+    public fn parse(header: Slice<u8>) -> Result<ProxyHeader, ProxyError> {
+        if (header.length > 0 && header[0] == 80) {
+            return parseV1(header);
+        }
+        return parseV2(header);
+    }
+}
+
+/// v1 (§2.1): `PROXY TCP4|TCP6 <src> <dst> <srcport> <dstport>\r\n`, single spaces; or `PROXY UNKNOWN...\r\n`.
+fn parseV1(header: Slice<u8>) -> Result<ProxyHeader, ProxyError> {
+    if (header.length < 15 || header[header.length - 2] != 13 || header[header.length - 1] != 10) {
+        return Err(ProxyError.Malformed);
+    }
+    let line = header[6..header.length - 2];
+    var starts = [0usize; 6];
+    var ends = [0usize; 6];
+    var n: usize = 0;
+    var start: usize = 0;
+    for (i in 0..line.length + 1) {
+        if (i < line.length && line[i] != 32) {
+            continue;
+        }
+        if (n == 6 || i == start) {
+            return Err(ProxyError.Malformed); // too many fields, or two spaces in a row
+        }
+        starts[n] = start;
+        ends[n] = i;
+        n += 1;
+        start = i + 1;
+    }
+    let family = line[starts[0]..ends[0]];
+    if (equalsText(family, "UNKNOWN")) {
+        return Ok(ProxyHeader.Local); // the rest of the line is ignored (§2.1)
+    }
+    let v6 = equalsText(family, "TCP6");
+    if ((!v6 && !equalsText(family, "TCP4")) || n != 5) {
+        return Err(ProxyError.Malformed);
+    }
+    let sourcePort = headerPort(line[starts[3]..ends[3]])?;
+    let destinationPort = headerPort(line[starts[4]..ends[4]])?;
+    let source = addressOf(line[starts[1]..ends[1]], sourcePort, v6)?;
+    let destination = addressOf(line[starts[2]..ends[2]], destinationPort, v6)?;
+    return Ok(ProxyHeader.Proxied(source, destination));
+}
+
+/// An address of the family the header named, without a zone.
+fn addressOf(text: Slice<u8>, port: u16, v6: bool) -> Result<SocketAddress, ProxyError> {
+    let t = match (StringView.fromUtf8(text)) {
+        Some(t) => t,
+        null => { return Err(ProxyError.Malformed); },
+    };
+    let a = match (SocketAddresses.parseIp(t, port)) {
+        Some(a) => a,
+        null => { return Err(ProxyError.Malformed); },
+    };
+    return match (a) {
+        SocketAddress.V4(_, _) => if (v6) Err(ProxyError.Malformed) else Ok(a),
+        SocketAddress.V6(_, _, scope) => if (!v6 || scope != 0) Err(ProxyError.Malformed) else Ok(a),
+    };
+}
+
+/// A port: 0 to 65535 in decimal, without a leading zero (§2.1).
+fn headerPort(text: Slice<u8>) -> Result<u16, ProxyError> {
+    if (text.length == 0 || text.length > 5 || (text.length > 1 && text[0] == 48)) {
+        return Err(ProxyError.Malformed);
+    }
+    var n: u32 = 0;
+    for (b in text) {
+        if (b < 48 || b > 57) {
+            return Err(ProxyError.Malformed);
+        }
+        n = n * 10 + (b - 48) as u32;
+    }
+    if (n > 65535) {
+        return Err(ProxyError.Malformed);
+    }
+    return Ok(truncate<u16>(n));
+}
+
+/// v2 (§2.2): the signature, version 2 and a command, the family and transport, the length, the addresses, TLVs.
+fn parseV2(header: Slice<u8>) -> Result<ProxyHeader, ProxyError> {
+    if (header.length < 16) {
+        return Err(ProxyError.Malformed);
+    }
+    let sig = signature();
+    for (i in 0..12usize) {
+        if (header[i] != sig[i]) {
+            return Err(ProxyError.NotProxy);
+        }
+    }
+    if (header[12] >> 4 != 2) {
+        return Err(ProxyError.Malformed); // version 2 only
+    }
+    let command = header[12] & 15;
+    let length = (header[14] as usize) << 8 | header[15] as usize;
+    if (header.length != 16 + length) {
+        return Err(ProxyError.Malformed);
+    }
+    if (command == 0) {
+        return Ok(ProxyHeader.Local); // LOCAL: whatever follows is ignored
+    }
+    if (command != 1) {
+        return Err(ProxyError.Malformed);
+    }
+    let family = header[13] >> 4;
+    let body = header[16..];
+    if (family == 1) {
+        if (length < 12) {
+            return Err(ProxyError.Malformed);
+        }
+        var source = [0u8; 4];
+        var destination = [0u8; 4];
+        for (k in 0..4usize) {
+            source[k] = body[k];
+            destination[k] = body[4 + k];
+        }
+        return Ok(
+            ProxyHeader.Proxied(
+                SocketAddress.V4(source, port16(body, 8)),
+                SocketAddress.V4(destination, port16(body, 10)),
+            ),
+        );
+    }
+    if (family == 2) {
+        if (length < 36) {
+            return Err(ProxyError.Malformed);
+        }
+        var source = [0u8; 16];
+        var destination = [0u8; 16];
+        for (k in 0..16usize) {
+            source[k] = body[k];
+            destination[k] = body[16 + k];
+        }
+        return Ok(ProxyHeader.Proxied(
+            SocketAddress.V6(source, port16(body, 32), 0),
+            SocketAddress.V6(destination, port16(body, 34), 0),
+        ));
+    }
+    return Ok(ProxyHeader.Local); // AF_UNSPEC or AF_UNIX: no addresses to use
+}
+
+fn port16(b: Slice<u8>, at: usize) -> u16 => (b[at] as u16) << 8 | b[at + 1] as u16;
+
+fn equalsText(a: Slice<u8>, text: StringView) -> bool {
+    let t = text.bytes();
+    if (a.length != t.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != t[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// An acceptor for a listener behind a balancer that speaks the PROXY protocol (Web ADR 0012 §3.6).
+///
+/// - A source not in `trusted` is closed before anything is read (the owner's choice, §6.4).
+/// - From a trusted source the header is read within `headerMs`, exactly: never a byte of what follows.
+/// - Then `inner` accepts the stream (a TLS handshake, or none), and the connection reports the header's addresses
+///   as its peer's and its own, so the context, logs and `clientOf` see the real client.
+/// - A header that is missing, malformed or late closes the connection.
+public struct ProxyProtocolAcceptor {
+    private inner: Box<dyn Acceptor>;
+    private trusted: TrustedProxies;
+    private headerMs: u64;
+
+    /// An acceptor that reads a PROXY header from `trusted` sources within `headerMs`, then accepts with `inner`.
+    public fn create(inner: Box<dyn Acceptor>, trusted: TrustedProxies, headerMs: u64) -> ProxyProtocolAcceptor =>
+        ProxyProtocolAcceptor { inner: inner, trusted: trusted, headerMs: headerMs };
+}
+
+impl Acceptor for ProxyProtocolAcceptor {
+    async fn accept(borrow this, stream: PlainStream, deadline: Deadline) -> Result<Box<dyn Transport>, NetError> {
+        var s = stream;
+        let source = match (s.peerAddress()) {
+            Some(a) => a,
+            null => { return Err(NetError.Closed); },
+        };
+        if (!this.trusted.trusts(source)) {
+            return Err(NetError.Closed);
+        }
+        let headerDeadline = Deadline.after(this.headerMs).earlier(deadline);
+        var header = [0u8; 4096];
+        var got: usize = 0;
+        loop {
+            let want = match (ProxyProtocol.more(header[0..got])) {
+                Ok(n) => n,
+                Err(_) => { return Err(NetError.Closed); },
+            };
+            if (want == 0) {
+                break;
+            }
+            let n = await Transports.readWithin(mut s, mut header[got..got + want], headerDeadline)?;
+            if (n == 0) {
+                return Err(NetError.Closed);
+            }
+            got += n;
+        }
+        let said = match (ProxyProtocol.parse(header[0..got])) {
+            Ok(h) => h,
+            Err(_) => { return Err(NetError.Closed); },
+        };
+        let local = s.localAddress();
+        let conn = await this.inner.accept(s, deadline)?;
+        return match (said) {
+            ProxyHeader.Local => Ok(conn),
+            ProxyHeader.Proxied(from, to) => relabelled(conn, Some(from), Some(to)),
+        };
+    }
+}
+
+/// `conn`, reporting `peer` and `local` as its addresses.
+fn relabelled(
+    conn: Box<dyn Transport>,
+    peer: SocketAddress?,
+    local: SocketAddress?,
+) -> Result<Box<dyn Transport>, NetError> {
+    match (Box.create(Relabelled { inner: conn, peer: peer, local: local })) {
+        Ok(b) => {
+            let d: Box<dyn Transport> = b;
+            return Ok(d);
+        }
+        Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+    }
+}
+
+/// A transport that reports other addresses than its own: the PROXY header's.
+struct Relabelled {
+    inner: Box<dyn Transport>;
+    peer: SocketAddress?;
+    local: SocketAddress?;
+}
+
+impl Transport for Relabelled {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> => await this.inner.read(buffer);
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> => await this.inner.write(bytes);
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> =>
+        await this.inner.writeVectored(parts);
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => await this.inner.shutdownWrite();
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => this.peer;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => this.local;
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => this.inner.alpn();
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => this.inner.peerIdentity(into);
+}

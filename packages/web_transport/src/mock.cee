@@ -34,6 +34,8 @@ public struct MockTransport {
     private protocol: Alpn;
     /// Where each byte written is also sent, for a test that has handed the transport away.
     private copyTo: Channel<u8>?;
+    private peer: SocketAddress?;
+    private local: SocketAddress?;
 
     /// A transport whose peer sends `input` and then ends its side.
     public fn create(input: Slice<u8>) -> Result<MockTransport, AllocError> {
@@ -58,7 +60,17 @@ public struct MockTransport {
             shut: false,
             protocol: Alpn.None,
             copyTo: null,
+            peer: null,
+            local: null,
         });
+    }
+
+    /// The addresses `peerAddress` and `localAddress` report (null by default).
+    public fn withAddresses(this, peer: SocketAddress?, local: SocketAddress?) -> MockTransport {
+        var m = this;
+        m.peer = peer;
+        m.local = local;
+        return m;
     }
 
     /// Every byte written is also sent to `copies` (dropped if it is full), so a test can see what was written after
@@ -295,10 +307,10 @@ impl Transport for MockTransport {
     fn alpn(borrow this) -> Alpn => this.protocol;
 
     @effects()
-    fn peerAddress(borrow this) -> SocketAddress? => null;
+    fn peerAddress(borrow this) -> SocketAddress? => this.peer;
 
     @effects()
-    fn localAddress(borrow this) -> SocketAddress? => null;
+    fn localAddress(borrow this) -> SocketAddress? => this.local;
 
     @effects(alloc)
     fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
