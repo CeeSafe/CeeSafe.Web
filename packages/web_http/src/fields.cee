@@ -62,6 +62,50 @@ public struct HeaderBlock {
         Ascii.equalsIgnoringCase(name, "authorization") || Ascii.equalsIgnoringCase(name, "proxy-authorization") ||
             Ascii.equalsIgnoringCase(name, "cookie") || Ascii.equalsIgnoringCase(name, "set-cookie");
 
+    /// Appends the fields of an HTTP/1.1 field section, `name:value` lines each ending in CR LF, as the chunked
+    /// decoder checked them (RFC 9112 §7.1.2): names lowercased, values without their leading and trailing whitespace
+    /// (RFC 9110 §5.5).
+    public fn pushLines(borrow mut this, lines: Slice<u8>) -> Result<void, AllocError> {
+        var lower = Vector<u8>.create();
+        var start: usize = 0;
+        for (i in 0..lines.length) {
+            if (lines[i] != 10) {
+                continue;
+            }
+            let end = if (i > start && lines[i - 1] == 13) i - 1 else i;
+            var colon = start;
+            while (colon < end && lines[colon] != 58) {
+                colon += 1;
+            }
+            if (colon < end) {
+                lower.clear();
+                for (c in lines[start..colon]) {
+                    lower.push(if (c >= 65 && c <= 90) c + 32 else c)?;
+                }
+                var from = colon + 1;
+                while (from < end && (lines[from] == 32 || lines[from] == 9)) {
+                    from += 1;
+                }
+                var to = end;
+                while (to > from && (lines[to - 1] == 32 || lines[to - 1] == 9)) {
+                    to -= 1;
+                }
+                let name = lower.view();
+                this.push(name, lines[from..to], HeaderBlock.sensitiveByDefault(name))?;
+            }
+            start = i + 1;
+        }
+        return Ok();
+    }
+
+    /// Appends a copy of every field of `other`.
+    public fn pushAll(borrow mut this, other: borrow HeaderBlock) -> Result<void, AllocError> {
+        for (i in 0..other.count()) {
+            this.push(other.name(i), other.value(i), other.span(i).sensitive)?;
+        }
+        return Ok();
+    }
+
     /// Appends a field.
     public fn push(borrow mut this, name: Slice<u8>, value: Slice<u8>, sensitive: bool) -> Result<void, AllocError> {
         let nameAt = this.bytes.length;

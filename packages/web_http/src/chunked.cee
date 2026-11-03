@@ -1,7 +1,7 @@
 // The chunked transfer coding (RFC 9112 §7.1), sans-I/O: a byte-by-byte state machine that never buffers. Data comes
 // back as a range of the caller's input. Limits: chunk sizes past 15 hex digits, extensions (every byte between the
 // size and its CRLF) past `maxChunkExtensionBytes`, trailers past `maxTrailerBytes` and a body past `maxBodyBytes` are errors. Trailer fields
-// are checked and discarded.
+// are checked and come back as a range of the input, as data does, for the caller to keep (Web ADR 0012 §3.10).
 
 /// What one `ChunkDecoder.decode` call found.
 public struct ChunkStep {
@@ -12,6 +12,10 @@ public struct ChunkStep {
     public dataLength: usize;
     /// The last chunk and the trailer section have been read: the body is complete.
     public finished: bool;
+    /// Trailer section bytes at `input[trailerStart..trailerStart + trailerLength]`: whole or partial `name:value`
+    /// lines, each ending in CR LF, without the empty line that ends the section (length 0: none in this step).
+    public trailerStart: usize;
+    public trailerLength: usize;
 }
 
 enum ChunkState {
@@ -70,6 +74,8 @@ public struct ChunkDecoder {
     /// arrive. A `room` of 0 decodes framing only and stops at data.
     public fn decode(borrow mut this, input: Slice<u8>, room: usize) -> Result<ChunkStep, ProtocolError> {
         var i: usize = 0;
+        var tFrom: usize = 0;
+        var tEnd: usize = 0;
         while (i < input.length) {
             let b = input[i];
             match (this.state) {
@@ -130,7 +136,16 @@ public struct ChunkDecoder {
                 ChunkState.Data => {
                     let fits = if (input.length - i < room) input.length - i else room;
                     if (fits == 0) {
-                        return Ok(ChunkStep { consumed: i, dataStart: i, dataLength: 0, finished: false });
+                        return Ok(
+                            ChunkStep {
+                                consumed: i,
+                                dataStart: i,
+                                dataLength: 0,
+                                finished: false,
+                                trailerStart: tFrom,
+                                trailerLength: tEnd - tFrom,
+                            },
+                        );
                     }
                     let available = fits as u64;
                     let n = if (this.left < available) this.left else available;
@@ -139,7 +154,16 @@ public struct ChunkDecoder {
                         this.state = ChunkState.DataCr;
                     }
                     let length = truncate<usize>(n);
-                    return Ok(ChunkStep { consumed: i + length, dataStart: i, dataLength: length, finished: false });
+                    return Ok(
+                        ChunkStep {
+                            consumed: i + length,
+                            dataStart: i,
+                            dataLength: length,
+                            finished: false,
+                            trailerStart: tFrom,
+                            trailerLength: tEnd - tFrom,
+                        },
+                    );
                 }
                 ChunkState.DataCr => {
                     if (b != 13) {
@@ -161,10 +185,18 @@ public struct ChunkDecoder {
                             return Err(ProtocolError.BadTrailer);
                         }
                         this.countTrailer()?;
+                        if (tEnd == 0) {
+                            tFrom = i;
+                        }
+                        tEnd = i + 1;
                         this.state = ChunkState.TrailerName;
                     }
                 }
                 ChunkState.TrailerName => {
+                    if (tEnd == 0) {
+                        tFrom = i;
+                    }
+                    tEnd = i + 1;
                     if (b == 58) {
                         this.state = ChunkState.TrailerValue;
                     } else if (!Ascii.isTokenChar(b)) {
@@ -173,6 +205,10 @@ public struct ChunkDecoder {
                     this.countTrailer()?;
                 }
                 ChunkState.TrailerValue => {
+                    if (tEnd == 0) {
+                        tFrom = i;
+                    }
+                    tEnd = i + 1;
                     if (b == 13) {
                         this.state = ChunkState.TrailerLf;
                     } else {
@@ -183,6 +219,10 @@ public struct ChunkDecoder {
                     }
                 }
                 ChunkState.TrailerLf => {
+                    if (tEnd == 0) {
+                        tFrom = i;
+                    }
+                    tEnd = i + 1;
                     if (b != 10) {
                         return Err(ProtocolError.BadTrailer);
                     }
@@ -193,15 +233,42 @@ public struct ChunkDecoder {
                         return Err(ProtocolError.BadChunk);
                     }
                     this.state = ChunkState.Done;
-                    return Ok(ChunkStep { consumed: i + 1, dataStart: 0, dataLength: 0, finished: true });
+                    return Ok(
+                        ChunkStep {
+                            consumed: i + 1,
+                            dataStart: 0,
+                            dataLength: 0,
+                            finished: true,
+                            trailerStart: tFrom,
+                            trailerLength: tEnd - tFrom,
+                        },
+                    );
                 }
                 ChunkState.Done => {
-                    return Ok(ChunkStep { consumed: i, dataStart: 0, dataLength: 0, finished: true });
+                    return Ok(
+                        ChunkStep {
+                            consumed: i,
+                            dataStart: 0,
+                            dataLength: 0,
+                            finished: true,
+                            trailerStart: tFrom,
+                            trailerLength: tEnd - tFrom,
+                        },
+                    );
                 }
             }
             i += 1;
         }
-        return Ok(ChunkStep { consumed: i, dataStart: 0, dataLength: 0, finished: this.isFinished() });
+        return Ok(
+            ChunkStep {
+                consumed: i,
+                dataStart: 0,
+                dataLength: 0,
+                finished: this.isFinished(),
+                trailerStart: tFrom,
+                trailerLength: tEnd - tFrom,
+            },
+        );
     }
 
     fn countTrailer(borrow mut this) -> Result<void, ProtocolError> {

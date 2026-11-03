@@ -69,6 +69,9 @@ public struct Exchange<region r> {
     private keep: bool;
     private done: bool;
     private upgraded: bool;
+    /// The request's trailer section: its lines as they arrive (HTTP/1.1), then its fields once the body has ended.
+    private trailerLines: Vector<u8>;
+    private trailerFields: HeaderBlock;
 
     /// An exchange for `request`, whose body is framed by `framing`. `carry` holds the bytes received after the head;
     /// `out` the responses not yet sent; `pending` and `response` are reset here. `keepAlive` is the request's own
@@ -133,6 +136,8 @@ public struct Exchange<region r> {
             keep: keepAlive,
             done: false,
             upgraded: false,
+            trailerLines: Vector<u8>.create(),
+            trailerFields: HeaderBlock.create(),
         };
     }
 
@@ -181,6 +186,8 @@ public struct Exchange<region r> {
             keep: false,
             done: false,
             upgraded: false,
+            trailerLines: Vector<u8>.create(),
+            trailerFields: HeaderBlock.create(),
         };
     }
 
@@ -204,6 +211,7 @@ public struct Exchange<region r> {
             let n = await this.stream.readBody(buffer)?;
             if (n == 0) {
                 this.body = BodyState.Done;
+                grown(this.stream.copyTrailers(mut this.trailerFields))?;
             }
             return Ok(n);
         }
@@ -248,9 +256,14 @@ public struct Exchange<region r> {
                     for (i in 0..step.dataLength) {
                         buffer[i] = input[step.dataStart + i];
                     }
+                    for (i in 0..step.trailerLength) {
+                        grown(this.trailerLines.push(input[step.trailerStart + i]))?;
+                    }
                     this.consumeCarry(step.consumed)?;
                     if (step.finished) {
                         this.body = BodyState.Done;
+                        grown(this.trailerFields.pushLines(this.trailerLines.view()))?;
+                        this.trailerLines.clear();
                     }
                     if (step.dataLength > 0) {
                         return Ok(step.dataLength);
@@ -264,6 +277,11 @@ public struct Exchange<region r> {
             }
         }
     }
+
+    /// The request's trailer fields (RFC 9110 §6.5): empty until `read` has returned 0, and empty if the request had
+    /// none. Over HTTP/1.1 they come from a chunked body's trailer section; over HTTP/2 from the HEADERS that ended the
+    /// stream (RFC 9113 §8.1). Names are lowercase.
+    public fn trailers(borrow this) -> borrow HeaderBlock => borrow this.trailerFields;
 
     /// Reads the rest of the body into `into`. `Status(413)` if it would exceed `into`'s room.
     public async fn readToEnd(borrow mut this, into: borrow mut OwnedBuffer) -> Result<void, HandlerError> {

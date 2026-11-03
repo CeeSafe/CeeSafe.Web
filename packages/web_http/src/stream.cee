@@ -17,6 +17,10 @@ public interface StreamSink {
     /// Promises a pushed response to a GET for `path` on this request's authority: false if the client does not
     /// accept pushes or the connection cannot make one now.
     async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError>;
+
+    /// Appends the request's trailer fields to `into`, once `readBody` has returned 0 (none if the request had none).
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError>;
 }
 
 /// The sink of an HTTP/1.1 exchange, which has no stream: every call is `Internal`, and nothing is pushed.
@@ -32,6 +36,9 @@ impl StreamSink for NoStream {
         Err(HandlerError.Internal);
 
     async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError> => Ok(false);
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> => Ok();
 }
 
 /// The transport of a stream's exchange, which has none of its own: reads end, writes fail.

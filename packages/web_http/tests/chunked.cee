@@ -144,3 +144,49 @@ fn trailers() -> Result<void, TestFailure> {
     }, "'A: 12' is 5")?;
     return Ok();
 }
+
+/// The trailer section comes back as ranges of the input, whole at every split, without the empty line that ends it;
+/// `HeaderBlock.pushLines` then gives its fields, names lowercased and values trimmed (RFC 9110 §5.5).
+@test
+fn trailer_bytes_at_every_split() -> Result<void, TestFailure> {
+    let text = "5\r\nhello\r\n0\r\nGrpc-Status: 0\r\nx-checksum:\t abc \r\n\r\nNEXT";
+    let input = text.bytes();
+    let expected = "Grpc-Status: 0\r\nx-checksum:\t abc \r\n";
+    let limits = Limits.defaults();
+    for (split in 0..input.length + 1) {
+        var d = ChunkDecoder.create(limits);
+        var lines = Vector<u8>.create();
+        var at: usize = 0;
+        var available = split;
+        var finished = false;
+        while (!finished) {
+            let step = match (d.decode(input[at..available], 64)) {
+                Ok(s) => s,
+                Err(_) => { return Check.fail("a valid body"); },
+            };
+            for (i in 0..step.trailerLength) {
+                match (lines.push(input[at + step.trailerStart + i])) {
+                    Ok() => {}
+                    Err(_) => { return Check.fail("out of memory"); }
+                }
+            }
+            at += step.consumed;
+            finished = step.finished;
+            if (!finished && at == available) {
+                available = input.length;
+            }
+        }
+        Check.equalU64((input.length - 4) as u64, at as u64)?; // "NEXT" is the next request's
+        Check.equalBytes(expected.bytes(), lines.view())?;
+    }
+    var fields = HeaderBlock.create();
+    match (fields.pushLines(expected.bytes())) {
+        Ok() => {}
+        Err(_) => { return Check.fail("out of memory"); }
+    }
+    Check.equalU64(2, fields.count() as u64)?;
+    Check.equalBytes("grpc-status".bytes(), fields.name(0))?;
+    Check.equalBytes("0".bytes(), fields.value(0))?;
+    Check.equalBytes("x-checksum".bytes(), fields.name(1))?;
+    return Check.equalBytes("abc".bytes(), fields.value(1));
+}

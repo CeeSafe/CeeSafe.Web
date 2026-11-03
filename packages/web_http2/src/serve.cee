@@ -30,7 +30,8 @@ enum Outgoing {
 /// Request body for a stream's task.
 enum BodyPart {
     Data(Vector<u8>),
-    End,
+    /// The body's end, with the request's trailer fields (empty if none).
+    End(HeaderBlock),
 }
 
 /// The connection's side of one stream.
@@ -42,6 +43,8 @@ struct Link {
     backlog: Vector<u8>;
     ended: bool;
     endSent: bool;
+    /// The trailers to send with the end (at most one block: a vector, so `deliver` can move it out with `pop`).
+    trailers: Vector<HeaderBlock>;
     want: u32;
     outstanding: i64;
     scheme: Vector<u8>;
@@ -158,9 +161,15 @@ async fn run(
                     }
                 }
                 H2Event.Trailers(id) => {
+                    let taken = head;
+                    head = HeaderBlock.create();
                     match (links.getMut(id)) {
                         Some(link) => {
                             link.ended = true;
+                            match (link.trailers.push(taken)) {
+                                Ok() => {}
+                                Err(_) => { return Err(NetError.OutOfMemory); }
+                            }
                             deliver(link)?;
                         }
                         null => {}
@@ -274,6 +283,7 @@ fn startStream(
         backlog: Vector<u8>.create(),
         ended: !hasBody,
         endSent: false,
+        trailers: Vector<HeaderBlock>.create(),
         want: 0,
         outstanding: 0,
         scheme: scheme,
@@ -440,8 +450,19 @@ fn deliver(link: borrow mut Link) -> Result<void, NetError> {
         }
     }
     if (link.ended && !link.endSent) {
-        match (link.body.trySend(BodyPart.End)) {
+        let trailers = match (link.trailers.pop()) {
+            Some(t) => t,
+            null => HeaderBlock.create(),
+        };
+        match (link.body.trySend(BodyPart.End(trailers))) {
             Ok() => { link.endSent = true; }
+            Err(BodyPart.End(back)) => {
+                // full: kept for the next try
+                match (link.trailers.push(back)) {
+                    Ok() => {}
+                    Err(_) => { return Err(NetError.OutOfMemory); }
+                }
+            }
             Err(_) => {}
         }
     }
@@ -527,6 +548,7 @@ struct StreamPort {
     current: Vector<u8>;
     at: usize;
     ended: bool;
+    trailers: HeaderBlock;
 }
 
 impl StreamSink for StreamPort {
@@ -550,7 +572,10 @@ impl StreamSink for StreamPort {
                     this.current = bytes;
                     this.at = 0;
                 }
-                Ok(Some(BodyPart.End)) => { this.ended = true; }
+                Ok(Some(BodyPart.End(trailers))) => {
+                    this.ended = true;
+                    this.trailers = trailers;
+                }
                 Ok(null) => { return Err(HandlerError.Io(NetError.Reset)); } // the stream was reset
                 Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
             }
@@ -606,6 +631,10 @@ impl StreamSink for StreamPort {
             Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
         }
     }
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> =>
+        into.pushAll(this.trailers);
 }
 
 async fn post(outgoing: borrow Channel<Outgoing>, m: Outgoing) -> Result<void, HandlerError> {
@@ -741,6 +770,7 @@ async fn serveStream(
         current: Vector<u8>.create(),
         at: 0,
         ended: false,
+        trailers: HeaderBlock.create(),
     };
     var none = NoTransport {};
     var carry = match (OwnedBuffer.create(16)) {

@@ -84,7 +84,8 @@ impl Transport for Client {
 }
 
 /// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css";
-/// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends.
+/// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends;
+/// `/trailers`: reads the body, then answers each trailer as `name=value;`.
 struct Site {}
 
 impl Application for Site {
@@ -111,6 +112,23 @@ impl Application for Site {
                 }
             }
             return await exchange.send(Status.ok(), body.view());
+        }
+        if (Ascii.equals(path.bytes(), "/trailers")) {
+            var buf = [0u8; 64];
+            while (await exchange.read(mut buf[..])? > 0) {}
+            var listed = Vector<u8>.create();
+            let t = exchange.trailers();
+            for (i in 0..t.count()) {
+                for (b in t.name(i)) {
+                    listedOk(listed.push(b))?;
+                }
+                listedOk(listed.push(61))?;
+                for (b in t.value(i)) {
+                    listedOk(listed.push(b))?;
+                }
+                listedOk(listed.push(59))?;
+            }
+            return await exchange.send(Status.ok(), listed.view());
         }
         if (Ascii.equals(path.bytes(), "/push")) {
             let pushed = await exchange.push("/style.css")?;
@@ -288,6 +306,22 @@ async fn a_body_echoed_and_two_streams_interleaved() -> Result<void, TestFailure
     return Check.isTrue(contains(log.view(), "data 1 f1 abcdef; "), "stream 1's body echoed");
 }
 
+/// A request's trailers (HEADERS with END_STREAM after its DATA, RFC 9113 §8.1) reach the handler once it has read
+/// the body.
+@test
+async fn request_trailers_reach_the_handler() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let post = blockOf(":method: POST\n:scheme: https\n:path: /trailers\n:authority: example.test\n")?;
+    let trailers = blockOf("x-t: 1\nx-checksum: abc\n")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, post.view())?;
+    frame(mut bytes, FrameTypes.data(), 0, 1, "abc".bytes())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, trailers.view())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    return Check.isTrue(contains(log.view(), "data 1 f1 x-t=1;x-checksum=abc;; "), "the trailers listed");
+}
+
 @test
 async fn a_push_promise() -> Result<void, TestFailure> {
     var bytes = Vector<u8>.create();
@@ -332,4 +366,11 @@ fn contains(hay: Slice<u8>, needle: StringView) -> bool {
         }
     }
     return false;
+}
+
+fn listedOk(r: Result<void, AllocError>) -> Result<void, HandlerError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
 }

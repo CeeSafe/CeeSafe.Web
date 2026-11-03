@@ -88,6 +88,7 @@ impl Transport for Script {
 /// - `/ignore`: answers "ok" without reading the body;
 /// - `/fail`: fails with 404;
 /// - `/big`: 20000 bytes of `x`, length not declared; `/bigknown`: the same, declared;
+/// - `/trailers`: reads the body, then answers `/trailers:` and each trailer as `name=value;`;
 /// - anything else: reads the body and answers `<path>:<body>`.
 /// Its hook adds `x-hook: 1` to every response.
 struct App {
@@ -131,6 +132,23 @@ impl Application for App {
             Err(_) => { return Err(HandlerError.Internal); },
         };
         await exchange.readToEnd(mut body)?;
+        if (Ascii.equals(p, "/trailers")) {
+            var listed = Vector<u8>.create();
+            let t = exchange.trailers();
+            for (i in 0..t.count()) {
+                for (b in t.name(i)) {
+                    grownTest(listed.push(b))?;
+                }
+                grownTest(listed.push(61))?;
+                for (b in t.value(i)) {
+                    grownTest(listed.push(b))?;
+                }
+                grownTest(listed.push(59))?;
+            }
+            await exchange.write(p)?;
+            await exchange.write(":".bytes())?;
+            return await exchange.write(listed.view());
+        }
         await exchange.write(p)?;
         await exchange.write(":".bytes())?;
         await exchange.write(body.readable())?;
@@ -168,4 +186,11 @@ fn quiet() -> Limits {
     var l = Limits.defaults();
     l.sendDate = false;
     return l;
+}
+
+fn grownTest(r: Result<void, AllocError>) -> Result<void, HandlerError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
 }
