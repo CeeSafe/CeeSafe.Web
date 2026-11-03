@@ -17,6 +17,7 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0009](0009-http-client.md) | The HTTP client: engine, pool, Happy Eyeballs, redirects, retries | Accepted 2026-11-02 | M5 on |
 | [0010](0010-websockets.md) | WebSockets: the engine, the upgrade, the session, permessage-deflate, the client | Accepted 2026-11-03 | M6 |
 | [0011](0011-http2.md) | HTTP/2: HPACK, frames, streams as tasks, flow control, push, the flood guards | Accepted 2026-11-03 | M7 |
+| [0012](0012-reverse-proxy.md) | The reverse proxy, and what M7 left open | Proposed 2026-11-03 | M8 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 
