@@ -55,6 +55,13 @@ public struct HeaderBlock {
     /// All the names and values, which the spans index.
     public fn allBytes(borrow this) -> Slice<u8> => this.bytes.view();
 
+    /// Whether a field named `name` (lowercase) is sent "never indexed" unless its sender says otherwise: credentials
+    /// and cookies, whose values an attacker who shares the connection could otherwise probe through the
+    /// compression context (RFC 7541 §7.1.3; Web ADR 0012 §3.10).
+    public fn sensitiveByDefault(name: Slice<u8>) -> bool =>
+        Ascii.equalsIgnoringCase(name, "authorization") || Ascii.equalsIgnoringCase(name, "proxy-authorization") ||
+            Ascii.equalsIgnoringCase(name, "cookie") || Ascii.equalsIgnoringCase(name, "set-cookie");
+
     /// Appends a field.
     public fn push(borrow mut this, name: Slice<u8>, value: Slice<u8>, sensitive: bool) -> Result<void, AllocError> {
         let nameAt = this.bytes.length;

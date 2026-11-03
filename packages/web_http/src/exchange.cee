@@ -564,7 +564,8 @@ public struct Exchange<region r> {
             for (c in line[0..colon]) {
                 grown(lower.push(if (c >= 65 && c <= 90) c + 32 else c))?;
             }
-            grown(fields.push(lower.view(), line[colon + 2..], false))?;
+            let name = lower.view();
+            grown(fields.push(name, line[colon + 2..], HeaderBlock.sensitiveByDefault(name)))?;
         }
         match (length) {
             Some(n) => {

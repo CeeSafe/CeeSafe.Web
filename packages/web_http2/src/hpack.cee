@@ -1,5 +1,5 @@
-// HPACK (RFC 7541): the decoder, with the dynamic table and size updates, and an encoder that uses the static table
-// only (Web ADR 0011). Sans-I/O: blocks in, fields out.
+// HPACK (RFC 7541): the decoder and the encoder, each with its dynamic table and size updates (Web ADR 0011, Web ADR
+// 0012 §3.10). Sans-I/O: blocks in, fields out, and fields in, blocks out.
 import web_http;
 
 /// Why a header block could not be decoded. Every one is a connection error, COMPRESSION_ERROR (RFC 9113 §4.3), except
@@ -317,11 +317,144 @@ fn readString(block: Slice<u8>, at: borrow mut usize, out: borrow mut Vector<u8>
     }
 }
 
-/// Encodes header fields with the static table and string literals (Web ADR 0011): never touching the dynamic table,
-/// it never needs a size update, whatever the peer's SETTINGS_HEADER_TABLE_SIZE.
+/// Encodes header fields (§6), keeping a dynamic table in step with the peer's decoder (Web ADR 0012 §3.10).
+///
+/// - A field found whole in the static or dynamic table is sent as an index (§6.1).
+/// - Otherwise its value is sent as a literal, with the name's index if a table has the name, and the field is added to
+///   the dynamic table (§6.2.1) when it costs at most half the table, so one large field does not flush the rest.
+/// - A `sensitive` field is never indexed (§6.2.3, §7.1.3), and its value is never looked up in the dynamic table.
+/// - When the table's size changes (`setLimit`), the next block starts with dynamic table size updates (§4.2, §6.3):
+///   the smallest size since the last block, then the new size.
+@noncopy
 public struct HpackEncoder {
-    /// Appends one field to `out`: an exact static match as an indexed field; otherwise the value literal (Huffman-coded
-    /// when shorter), with the name's static index if it has one, without indexing, or never indexed if `sensitive`.
+    private table: DynamicTable;
+    /// Our own bound on the table, whatever the peer allows.
+    private cap: u32;
+    /// The size the next block announces, and the smallest since the last block.
+    private target: u32;
+    private smallest: u32;
+    private pending: bool;
+    private huffman: bool;
+
+    /// An encoder whose table starts at 4 096 bytes (SETTINGS_HEADER_TABLE_SIZE's initial value, RFC 9113 §6.5.2) and
+    /// never grows past `cap`. Below 4 096, the first block announces `cap`.
+    public fn create(cap: u32) -> Result<HpackEncoder, AllocError> {
+        let start = if (cap < 4096) cap else 4096u32;
+        var table = DynamicTable.create(if (cap > 4096) cap else 4096u32)?;
+        table.maxSize = 4096;
+        var e = HpackEncoder {
+            table: table,
+            cap: cap,
+            target: 4096,
+            smallest: 4096,
+            pending: false,
+            huffman: true,
+        };
+        e.setLimit(start);
+        return Ok(e);
+    }
+
+    /// The same encoder without Huffman coding: string literals are sent as they are (RFC 7541 Appendix C.3 and C.5).
+    public fn withoutHuffman(this) -> HpackEncoder {
+        var e = this;
+        e.huffman = false;
+        return e;
+    }
+
+    /// The peer's SETTINGS_HEADER_TABLE_SIZE: the table may use up to this much (and up to `cap`) from the next block.
+    public fn setLimit(borrow mut this, peerLimit: u32) {
+        let size = if (peerLimit < this.cap) peerLimit else this.cap;
+        if (!this.pending) {
+            if (size == this.table.maxSize) {
+                return;
+            }
+            this.pending = true;
+            this.smallest = size;
+        } else if (size < this.smallest) {
+            this.smallest = size;
+        }
+        this.target = size;
+    }
+
+    /// The table's current size in bytes, as §4.1 counts it.
+    public fn tableSize(borrow this) -> u32 => this.table.size;
+
+    /// The table's current maximum size.
+    public fn tableLimit(borrow this) -> u32 => this.table.maxSize;
+
+    /// Starts a block in `out`: the size updates owed since the last block, if any.
+    public fn begin(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        if (!this.pending) {
+            return Ok();
+        }
+        this.pending = false;
+        if (this.smallest < this.target) {
+            writeInteger(out, 0x20, 5, this.smallest as u64)?;
+            this.table.resize(this.smallest);
+        }
+        writeInteger(out, 0x20, 5, this.target as u64)?;
+        this.table.resize(this.target);
+        this.smallest = this.target;
+        return Ok();
+    }
+
+    /// Appends one field to `out` (after `begin`).
+    public fn encode(
+        borrow mut this,
+        name: Slice<u8>,
+        value: Slice<u8>,
+        sensitive: bool,
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, AllocError> {
+        let text = staticText();
+        let t = text.bytes();
+        let nameAt = STATIC_NAME_AT;
+        let nameLen = STATIC_NAME_LEN;
+        let valueAt = STATIC_VALUE_AT;
+        let valueLen = STATIC_VALUE_LEN;
+        var nameIndex: u64 = 0;
+        for (i in 1..62usize) {
+            if (!same(t[nameAt[i] as usize..nameAt[i] as usize + nameLen[i] as usize], name)) {
+                continue;
+            }
+            if (nameIndex == 0) {
+                nameIndex = i as u64;
+            }
+            if (!sensitive && same(t[valueAt[i] as usize..valueAt[i] as usize + valueLen[i] as usize], value)) {
+                return writeInteger(out, 0x80, 7, i as u64);
+            }
+        }
+        for (d in 1..this.table.count + 1) {
+            let s = this.table.at(d);
+            if (!same(this.table.slots[s].name.view(), name)) {
+                continue;
+            }
+            if (nameIndex == 0) {
+                nameIndex = 61 + d as u64;
+            }
+            if (!sensitive && same(this.table.slots[s].value.view(), value)) {
+                return writeInteger(out, 0x80, 7, 61 + d as u64);
+            }
+        }
+        let cost = entrySize(name.length, value.length);
+        if (sensitive || cost > this.table.maxSize / 2) {
+            writeInteger(out, if (sensitive) 0x10 else 0x00, 4, nameIndex)?;
+        } else {
+            writeInteger(out, 0x40, 6, nameIndex)?;
+        }
+        if (nameIndex == 0) {
+            writeLiteral(out, name, this.huffman)?;
+        }
+        writeLiteral(out, value, this.huffman)?;
+        if (!sensitive && cost <= this.table.maxSize / 2) {
+            this.table.insert(name, value)?;
+        }
+        return Ok();
+    }
+
+    /// Appends one field to `out` without a table: an exact static match as an index; otherwise the value as a literal
+    /// (Huffman-coded unless longer), with the name's static index if it has one, without indexing, or never indexed if
+    /// `sensitive`. For tests and clients that keep no encoder state.
     public fn field(
         name: Slice<u8>,
         value: Slice<u8>,
@@ -381,10 +514,20 @@ public fn writeInteger(out: borrow mut Vector<u8>, flags: u8, n: u32, value: u64
     return out.push(truncate<u8>(rest));
 }
 
-/// Appends a string literal (§5.2), Huffman-coded when that is shorter.
+/// Appends a string literal (§5.2), Huffman-coded when `huffman` and that is shorter.
+fn writeLiteral(out: borrow mut Vector<u8>, bytes: Slice<u8>, huffman: bool) -> Result<void, AllocError> {
+    if (huffman) {
+        return writeString(out, bytes);
+    }
+    writeInteger(out, 0x00, 7, bytes.length as u64)?;
+    return appendAll(out, bytes);
+}
+
+/// Appends a string literal (§5.2), Huffman-coded unless that is longer (as RFC 7541 C.6.2 codes "307", 3 bytes
+/// either way).
 fn writeString(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
     let coded = Huffman.encodedLength(bytes);
-    if (coded < bytes.length) {
+    if (coded <= bytes.length) {
         writeInteger(out, 0x80, 7, coded as u64)?;
         return Huffman.encode(bytes, out);
     }

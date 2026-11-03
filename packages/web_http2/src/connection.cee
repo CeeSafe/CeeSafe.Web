@@ -39,15 +39,19 @@ public struct H2Guards {
     public intervalMs: u64;
     /// Acknowledgements (SETTINGS, PING) the peer may have us owe before the output is written.
     public maxOwedAcks: u32;
+    /// The most our HPACK encoder's dynamic table holds, whatever the peer's SETTINGS_HEADER_TABLE_SIZE allows (memory
+    /// per connection; Web ADR 0012 §3.10).
+    public encoderTableBytes: u32;
 
     /// Guards for a server whose header lists may be `maxHeaderListSize` bytes: header blocks up to twice that, 200
-    /// resets and 1 000 empty frames a second, 1 000 owed acknowledgements.
+    /// resets and 1 000 empty frames a second, 1 000 owed acknowledgements, an encoder table of 4 096 bytes.
     public fn defaults(maxHeaderListSize: u32) -> H2Guards => H2Guards {
         maxBlockBytes: maxHeaderListSize * 2,
         resetsPerInterval: 200,
         emptyFramesPerInterval: 1000,
         intervalMs: 1000,
         maxOwedAcks: 1000,
+        encoderTableBytes: 4096,
     };
 }
 
@@ -91,6 +95,7 @@ public struct H2Connection {
     private peer: H2Settings;
     private guards: H2Guards;
     private decoder: HpackDecoder;
+    private encoder: HpackEncoder;
     private streams: HashMap<u32, Stream>;
     private out: Vector<u8>;
     private scratch: Vector<u8>;
@@ -124,11 +129,16 @@ public struct H2Connection {
             Ok(d) => d,
             Err(e) => { return Err(e); },
         };
+        let encoder = match (HpackEncoder.create(guards.encoderTableBytes)) {
+            Ok(e) => e,
+            Err(e) => { return Err(e); },
+        };
         return Ok(H2Connection {
             local: local,
             peer: H2Settings.initial(),
             guards: guards,
             decoder: decoder,
+            encoder: encoder,
             streams: HashMap<u32, Stream>.create(),
             out: Vector<u8>.create(),
             scratch: Vector<u8>.create(),
@@ -638,7 +648,8 @@ public struct H2Connection {
             let value = read32(payload, at + 2);
             at += 6;
             if (id == SettingIds.headerTableSize()) {
-                this.peer.headerTableSize = value; // our encoder never indexes, so any size will do
+                this.peer.headerTableSize = value;
+                this.encoder.setLimit(value); // announced at the start of our next block (RFC 7541 §4.2)
             } else if (id == SettingIds.enablePush()) {
                 if (value > 1) {
                     return Err(ErrorCodes.protocolError());
@@ -889,9 +900,12 @@ public struct H2Connection {
             return Err(ErrorCodes.streamClosed());
         }
         this.scratch.clear();
+        if (failed(this.encoder.begin(mut this.scratch))) {
+            return Err(ErrorCodes.internalError());
+        }
         for (i in 0..fields.count()) {
             if (failed(
-                HpackEncoder.field(fields.name(i), fields.value(i), fields.span(i).sensitive, mut this.scratch),
+                this.encoder.encode(fields.name(i), fields.value(i), fields.span(i).sensitive, mut this.scratch),
             )) {
                 return Err(ErrorCodes.internalError());
             }
@@ -1001,8 +1015,13 @@ public struct H2Connection {
         let id = this.nextPush;
         this.nextPush += 2;
         this.scratch.clear();
+        if (failed(this.encoder.begin(mut this.scratch))) {
+            return Err(ErrorCodes.internalError());
+        }
         for (i in 0..request.count()) {
-            if (failed(HpackEncoder.field(request.name(i), request.value(i), false, mut this.scratch))) {
+            if (failed(
+                this.encoder.encode(request.name(i), request.value(i), request.span(i).sensitive, mut this.scratch),
+            )) {
                 return Err(ErrorCodes.internalError());
             }
         }
