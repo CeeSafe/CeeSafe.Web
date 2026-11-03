@@ -4,11 +4,14 @@
 import web_core;
 import web_http;
 
-/// A scripted client: it sends `input`, then waits until `closeAtMs` and ends the stream.
+/// A scripted client: it sends `input`, then waits until `closeAtMs` and ends the stream. If `drainAtMs` is not 0, the
+/// server's drain starts then (through `drain`, a handle to the connection's).
 struct Client {
     input: Vector<u8>;
     at: usize;
     closeAtMs: u64;
+    drainAtMs: u64;
+    drain: Drain;
     output: Vector<u8>;
 }
 
@@ -27,10 +30,18 @@ impl Transport for Client {
         }
         loop {
             let now = Timer.now();
+            if (this.drainAtMs != 0 && now >= this.drainAtMs) {
+                this.drain.start();
+                this.drainAtMs = 0;
+            }
             if (now >= this.closeAtMs) {
                 return Ok(0);
             }
-            match (await Timer.sleep(this.closeAtMs - now)) {
+            var until = this.closeAtMs;
+            if (this.drainAtMs != 0 && this.drainAtMs < until) {
+                until = this.drainAtMs;
+            }
+            match (await Timer.sleep(until - now)) {
                 Ok() => {}
                 Err(_) => { return Err(NetError.Cancelled); }
             }
@@ -72,7 +83,8 @@ impl Transport for Client {
     fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
 }
 
-/// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css".
+/// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css";
+/// `/slow`: "slow" after 300 ms; `/big`: 100 000 bytes of `x`, in ten sends.
 struct Site {}
 
 impl Application for Site {
@@ -107,6 +119,22 @@ impl Application for Site {
         if (Ascii.equals(path.bytes(), "/style.css")) {
             return await exchange.send(Status.ok(), "css".bytes());
         }
+        if (Ascii.equals(path.bytes(), "/slow")) {
+            match (await Timer.sleep(300)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+            return await exchange.send(Status.ok(), "slow".bytes());
+        }
+        if (Ascii.equals(path.bytes(), "/big")) {
+            var chunk = [0x78u8; 10000];
+            exchange.setStatus(Status.ok());
+            exchange.setContentLength(100000);
+            for (i in 0..10) {
+                await exchange.write(chunk[..])?;
+            }
+            return Ok();
+        }
         return await exchange.send(Status.ok(), "hello".bytes());
     }
 
@@ -115,12 +143,28 @@ impl Application for Site {
 }
 
 /// Serves the scripted client's `input` with `Site`, the client leaving after `closeAfterMs`; what the server wrote.
-async fn served(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> {
+async fn served(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
+    await servedDraining(input, closeAfterMs, 0);
+
+/// `served`, with the server's drain started after `drainAfterMs` (0: never).
+async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterMs: u64) -> Result<Vector<u8>, TestFailure> {
     var copy = Vector<u8>.create();
     for (b in input.view()) {
         grew(copy.push(b))?;
     }
-    var client = Client { input: copy, at: 0, closeAtMs: Timer.now() + closeAfterMs, output: Vector<u8>.create() };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let start = Timer.now();
+    var client = Client {
+        input: copy,
+        at: 0,
+        closeAtMs: start + closeAfterMs,
+        drainAtMs: if (drainAfterMs == 0) 0u64 else start + drainAfterMs,
+        drain: drain.share(),
+        output: Vector<u8>.create(),
+    };
     let site: Box<dyn Application + Send> = match (Box.create(Site {})) {
         Ok(b) => b,
         Err(_) => { return Err(TestFailure.create("a box")); },
@@ -128,10 +172,6 @@ async fn served(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8
     let app = match (Arc<Box<dyn Application + Send>>.create(site)) {
         Ok(a) => a,
         Err(_) => { return Err(TestFailure.create("an arc")); },
-    };
-    let drain = match (Drain.create()) {
-        Ok(d) => d,
-        Err(_) => { return Err(TestFailure.create("a drain")); },
     };
     let context = ConnectionContext.create(1, Timer.now(), drain);
     var limits = Limits.defaults();

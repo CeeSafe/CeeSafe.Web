@@ -1,0 +1,579 @@
+// A mutational fuzzer for web_http2's engine (Web ADR 0011 §5: the connection state machine and HPACK under the
+// sanitizers). Built natively with ASan and UBSan; CEESAFE_ALLOC_REPORT=1 checks that nothing leaks.
+//
+//   CW_FUZZ_SECONDS (default 60), CW_FUZZ_SEED (default 1)
+//
+// Each case starts from a valid client conversation (preface, SETTINGS, requests split over HEADERS and CONTINUATION,
+// padded and plain DATA, WINDOW_UPDATE, PING, PRIORITY, RST_STREAM) and damages it. Invariants, none needing the code
+// under test as its own oracle:
+//  1. the engine gives the same events, the same connection error and the same output fed whole or in random pieces;
+//  2. its output is whole frames, none longer than SETTINGS_MAX_FRAME_SIZE's default, 16 384 (RFC 9113 §4.2);
+//  3. requests come on odd streams, each above the last (§5.1.1);
+//  4. each request's fields pass §8.2-§8.3's rules, checked here apart from `Requests`: lowercase names, pseudo-fields
+//     first and known, one `:method`, and `:scheme` and a non-empty `:path` unless CONNECT, no connection-specific
+//     field, `te` only "trailers";
+//  5. with nothing consumed, a stream never gets more DATA than its 65 535-byte window, nor the connection more than
+//     the window it opened (§6.9);
+//  6. HPACK: random fields encoded then decoded come back the same, and Huffman too (RFC 7541 §5.2, §6);
+//     damaged blocks never panic, and decode the same way twice.
+// A broken invariant prints the input in hex and exits 1; a panic or a sanitizer report ends the run by itself.
+import web_core;
+import web_http;
+import web_http2;
+
+/// What the cases reached, printed at the end so a clean run shows its coverage.
+struct Seen {
+    requests: u64;
+    data: u64;
+    resets: u64;
+    connectionErrors: u64;
+}
+
+/// xorshift64*.
+struct Rng {
+    s: u64;
+    fn next(borrow mut this) -> u64 {
+        this.s = this.s ^ (this.s >> 12);
+        this.s = this.s ^ (this.s << 25);
+        this.s = this.s ^ (this.s >> 27);
+        return this.s.wrappingMul(2685821657736338717);
+    }
+    fn below(borrow mut this, n: u64) -> u64 => if (n == 0) 0 else this.next() % n;
+}
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    var v: u64 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57) {
+            return otherwise;
+        }
+        v = v * 10 + (b - 48) as u64;
+    }
+    return v;
+}
+
+fn fail(what: StringView, input: Slice<u8>) {
+    Console.writeLine("fuzz_h2: invariant broken:");
+    Console.writeLine(what);
+    var line = Vector<u8>.create();
+    let digits = "0123456789abcdef".bytes();
+    for (b in input) {
+        let a = line.push(digits[(b >> 4) as usize]);
+        let c = line.push(digits[(b & 15) as usize]);
+    }
+    match (StringView.fromUtf8(line.view())) {
+        Some(t) => { Console.writeLine(t); }
+        null => {}
+    }
+    Process.exit(1);
+}
+
+fn put(out: borrow mut Vector<u8>, b: u8) {
+    let r = out.push(b);
+}
+
+fn putAll(out: borrow mut Vector<u8>, bytes: Slice<u8>) {
+    for (b in bytes) {
+        put(out, b);
+    }
+}
+
+fn put32(out: borrow mut Vector<u8>, v: u32) {
+    put(out, truncate<u8>(v >> 24));
+    put(out, truncate<u8>(v >> 16));
+    put(out, truncate<u8>(v >> 8));
+    put(out, truncate<u8>(v));
+}
+
+/// A frame (RFC 9113 §4.1).
+fn frame(out: borrow mut Vector<u8>, kind: u8, flags: u8, stream: u32, payload: Slice<u8>) {
+    let n = truncate<u32>(payload.length);
+    put(out, truncate<u8>(n >> 16));
+    put(out, truncate<u8>(n >> 8));
+    put(out, truncate<u8>(n));
+    put(out, kind);
+    put(out, flags);
+    put32(out, stream);
+    putAll(out, payload);
+}
+
+/// A request's header block from our encoder (static table only), with a random extra field now and then.
+fn requestBlock(rng: borrow mut Rng, method: StringView, path: StringView) -> Vector<u8> {
+    var b = Vector<u8>.create();
+    let m = HpackEncoder.field(":method".bytes(), method.bytes(), false, mut b);
+    let s = HpackEncoder.field(":scheme".bytes(), "https".bytes(), false, mut b);
+    let p = HpackEncoder.field(":path".bytes(), path.bytes(), false, mut b);
+    let a = HpackEncoder.field(":authority".bytes(), "example.test".bytes(), false, mut b);
+    if (rng.below(2) == 0) {
+        let u = HpackEncoder.field("user-agent".bytes(), "fuzz".bytes(), rng.below(4) == 0, mut b);
+    }
+    if (rng.below(3) == 0) {
+        let c = HpackEncoder.field("content-type".bytes(), "text/plain".bytes(), false, mut b);
+    }
+    return b;
+}
+
+/// The client's side of a conversation that the engine accepts whole: what each case damages.
+fn seed(rng: borrow mut Rng, out: borrow mut Vector<u8>) {
+    let preface = clientPreface();
+    putAll(out, preface.bytes());
+    // SETTINGS: header table 4096 (0x1), push off (0x2), initial window 65 535 (0x4).
+    var settings = Vector<u8>.create();
+    let raw = [0u8, 1, 0, 0, 16, 0, 0, 2, 0, 0, 0, 0, 0, 4, 0, 0, 255, 255];
+    putAll(mut settings, raw[..]);
+    frame(out, 4, 0, 0, settings.view());
+    var id: u32 = 1;
+    let streams = 1 + rng.below(5);
+    for (k in 0..streams) {
+        let post = rng.below(2) == 0;
+        let short = rng.below(2) == 0;
+        let block = requestBlock(rng, if (post) "POST" else "GET", if (short) "/" else "/a/b?c=d");
+        let all = block.view();
+        let flagsEnd: u8 = if (post) 0u8 else 1u8;
+        if (rng.below(3) == 0 && all.length > 2) {
+            // HEADERS then CONTINUATION (§6.10).
+            let cut = 1 + rng.below((all.length - 1) as u64) as usize;
+            frame(out, 1, flagsEnd, id, all[0..cut]);
+            frame(out, 9, 4, id, all[cut..]);
+        } else {
+            frame(out, 1, flagsEnd | 4, id, all);
+        }
+        if (post) {
+            var body = Vector<u8>.create();
+            // Now and then a body past the stream's 65 535-byte window (§6.9.2), in frames of at most 16 384.
+            let big = rng.below(16) == 0;
+            let n = if (big) 60000 + rng.below(10000) else rng.below(40);
+            for (i in 0..n) {
+                put(mut body, truncate<u8>(97 + rng.below(26)));
+            }
+            if (big) {
+                let whole = body.view();
+                var at: usize = 0;
+                while (at < whole.length) {
+                    var end = at + 16384;
+                    if (end > whole.length) {
+                        end = whole.length;
+                    }
+                    frame(out, 0, if (end == whole.length) 1u8 else 0u8, id, whole[at..end]);
+                    at = end;
+                }
+            } else if (rng.below(2) == 0) {
+                // PADDED (0x8): a pad length, the data, the padding (§6.1).
+                var padded = Vector<u8>.create();
+                let pad = rng.below(8);
+                put(mut padded, truncate<u8>(pad));
+                putAll(mut padded, body.view());
+                for (i in 0..pad) {
+                    put(mut padded, 0);
+                }
+                frame(out, 0, 1 | 8, id, padded.view());
+            } else {
+                frame(out, 0, 1, id, body.view());
+            }
+        }
+        match (rng.below(5)) {
+            0 => {
+                var ping = Vector<u8>.create();
+                put32(mut ping, truncate<u32>(rng.next()));
+                put32(mut ping, 7);
+                frame(out, 6, 0, 0, ping.view());
+            }
+            1 => {
+                var inc = Vector<u8>.create();
+                put32(mut inc, 1 + truncate<u32>(rng.below(1000)));
+                frame(out, 8, 0, 0, inc.view());
+            }
+            2 => {
+                var prio = Vector<u8>.create();
+                put32(mut prio, 0);
+                put(mut prio, 16);
+                frame(out, 2, 0, id, prio.view());
+            }
+            3 => {
+                var rst = Vector<u8>.create();
+                put32(mut rst, 8);
+                frame(out, 3, 0, id, rst.view());
+            }
+            _ => {}
+        }
+        id += 2;
+    }
+}
+
+/// Damage: bit flips, random bytes, truncation, a duplicated or dropped frame-sized slice, a changed length or type.
+fn mutate(rng: borrow mut Rng, data: borrow mut Vector<u8>) {
+    let rounds = 1 + rng.below(4);
+    for (r in 0..rounds) {
+        if (data.length == 0) {
+            return;
+        }
+        let at = rng.below(data.length as u64) as usize;
+        match (rng.below(6)) {
+            0 => { data[at] = data[at] ^ (1u8 << truncate<u32>(rng.below(8))); }
+            1 => { data[at] = truncate<u8>(rng.next()); }
+            2 => { data.truncate(at); }
+            3 => {
+                // Repeat a stretch at the end.
+                let n = 1 + rng.below(32) as usize;
+                var copy = Vector<u8>.create();
+                var i = at;
+                while (i < data.length && i < at + n) {
+                    put(mut copy, data[i]);
+                    i += 1;
+                }
+                putAll(data, copy.view());
+            }
+            4 => { data[at] = 0; }
+            _ => { data[at] = 0xFF; }
+        }
+    }
+}
+
+fn append(log: borrow mut Vector<u8>, text: StringView) {
+    putAll(log, text.bytes());
+}
+
+fn number(log: borrow mut Vector<u8>, n: u64) {
+    var digits = [0u8; 20];
+    var k: usize = 0;
+    var v = n;
+    loop {
+        digits[k] = truncate<u8>(48 + v % 10);
+        k += 1;
+        v = v / 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    while (k > 0) {
+        k -= 1;
+        put(log, digits[k]);
+    }
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn equalsText(a: Slice<u8>, text: StringView) -> bool => same(a, text.bytes());
+
+/// §8.2-§8.3's rules for a request's fields, apart from `Requests` (invariant 4).
+fn wellFormed(head: borrow HeaderBlock) -> bool {
+    var regular = false;
+    var methods: u32 = 0;
+    var schemes: u32 = 0;
+    var paths: u32 = 0;
+    var connect = false;
+    var emptyPath = false;
+    for (i in 0..head.count()) {
+        let name = head.name(i);
+        let value = head.value(i);
+        if (name.length == 0) {
+            return false;
+        }
+        for (b in name) {
+            if (b >= 65 && b <= 90) {
+                return false; // uppercase (§8.2.1)
+            }
+        }
+        if (name[0] == 58) {
+            if (regular) {
+                return false; // a pseudo-field after a regular one (§8.3)
+            }
+            if (equalsText(name, ":method")) {
+                methods += 1;
+                connect = equalsText(value, "CONNECT");
+            } else if (equalsText(name, ":scheme")) {
+                schemes += 1;
+            } else if (equalsText(name, ":path")) {
+                paths += 1;
+                emptyPath = value.length == 0;
+            } else if (!equalsText(name, ":authority")) {
+                return false; // unknown, or a response's (§8.3)
+            }
+        } else {
+            regular = true;
+            if (equalsText(
+                name,
+                "connection",
+            ) || equalsText(name, "keep-alive") || equalsText(name, "proxy-connection") ||
+                equalsText(name, "transfer-encoding") || equalsText(name, "upgrade")) {
+                return false; // connection-specific (§8.2.2)
+            }
+            if (equalsText(name, "te") && !equalsText(value, "trailers")) {
+                return false;
+            }
+        }
+    }
+    if (methods != 1) {
+        return false;
+    }
+    if (connect) {
+        return schemes == 0 && paths == 0;
+    }
+    return schemes == 1 && paths == 1 && !emptyPath;
+}
+
+/// Feeds `input` to a fresh server engine in pieces (whole if `whole`), checking invariants 2-5 as it goes; the log
+/// of events and frames out, for invariant 1.
+fn run(input: Slice<u8>, rng: borrow mut Rng, whole: bool, log: borrow mut Vector<u8>, seen: borrow mut Seen) {
+    let connectionWindow: u32 = 1048576;
+    var engine = match (H2Connection.create(H2Settings.server(16384), H2Guards.defaults(16384))) {
+        Ok(e) => e,
+        Err(_) => { return; },
+    };
+    match (engine.start(connectionWindow)) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    var buffer = match (OwnedBuffer.create(input.length + 16)) {
+        Ok(b) => b,
+        Err(_) => { return; },
+    };
+    var head = HeaderBlock.create();
+    var data = Vector<u8>.create();
+    var lastRequest: u32 = 0;
+    var perStream = [0u64; 64];
+    var total: u64 = 0;
+    var at: usize = 0;
+    var ended = false;
+    while (at < input.length && !ended) {
+        let n = if (whole) input.length - at else 1 + rng.below((input.length - at) as u64) as usize;
+        match (buffer.append(input[at..at + n])) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+        at += n;
+        loop {
+            head.clear();
+            data.clear();
+            match (engine.next(mut buffer, mut head, mut data, 0)) {
+                Ok(H2Event.NeedMore) => { break; }
+                Ok(H2Event.Request(id, end)) => {
+                    if (id % 2 == 0 || id <= lastRequest) {
+                        fail("a request on an even stream, or not above the last (RFC 9113 §5.1.1)", input);
+                    }
+                    lastRequest = id;
+                    seen.requests += 1;
+                    if (!wellFormed(head)) {
+                        fail("a request whose fields break RFC 9113 §8.2-§8.3", input);
+                    }
+                    append(log, "req ");
+                    number(log, id as u64);
+                    append(log, if (end) " end; " else "; ");
+                }
+                Ok(H2Event.Data(id, end)) => {
+                    total += data.length as u64;
+                    seen.data += 1;
+                    if (id < 128) {
+                        perStream[(id / 2) as usize] += data.length as u64;
+                        if (perStream[(id / 2) as usize] > 65535) {
+                            fail("a stream got more DATA than its window (RFC 9113 §6.9)", input);
+                        }
+                    }
+                    if (total > connectionWindow as u64) {
+                        fail("the connection got more DATA than its window (RFC 9113 §6.9)", input);
+                    }
+                    append(log, "data ");
+                    number(log, id as u64);
+                    append(log, " ");
+                    number(log, data.length as u64);
+                    append(log, if (end) " end; " else "; ");
+                }
+                Ok(H2Event.Trailers(id)) => {
+                    append(log, "trailers ");
+                    number(log, id as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.TooLarge(id)) => {
+                    append(log, "toolarge ");
+                    number(log, id as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.Reset(id, code)) => {
+                    append(log, "reset ");
+                    number(log, id as u64);
+                    append(log, " ");
+                    number(log, code as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.StreamError(id, code)) => {
+                    seen.resets += 1;
+                    append(log, "error ");
+                    number(log, id as u64);
+                    append(log, " ");
+                    number(log, code as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.WindowOpened(id)) => {
+                    append(log, "window ");
+                    number(log, id as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.GoAway(last, code)) => {
+                    append(log, "goaway ");
+                    number(log, last as u64);
+                    append(log, " ");
+                    number(log, code as u64);
+                    append(log, "; ");
+                }
+                Err(code) => {
+                    append(log, "conn ");
+                    seen.connectionErrors += 1;
+                    number(log, code as u64);
+                    let g = engine.goAway(code);
+                    ended = true;
+                    break;
+                }
+            }
+        }
+    }
+    // Invariant 2: whole frames, none over 16 384.
+    let out = engine.output();
+    var k: usize = 0;
+    while (k + 9 <= out.length) {
+        let length = (out[k] as usize << 16) | (out[k + 1] as usize << 8) | out[k + 2] as usize;
+        if (length > 16384) {
+            fail("a frame longer than SETTINGS_MAX_FRAME_SIZE (RFC 9113 §4.2)", input);
+        }
+        k += 9 + length;
+    }
+    if (k != out.length) {
+        fail("output that is not whole frames", input);
+    }
+    append(log, " | ");
+    putAll(log, out);
+}
+
+fn engineCase(rng: borrow mut Rng, seen: borrow mut Seen) {
+    var input = Vector<u8>.create();
+    seed(rng, mut input);
+    if (rng.below(8) != 0) {
+        mutate(rng, mut input);
+    }
+    var whole = Vector<u8>.create();
+    var pieces = Vector<u8>.create();
+    run(input.view(), rng, true, mut whole, seen);
+    var again = Seen { requests: 0, data: 0, resets: 0, connectionErrors: 0 };
+    run(input.view(), rng, false, mut pieces, mut again);
+    if (!same(whole.view(), pieces.view())) {
+        fail("different events or output fed whole and in pieces", input.view());
+    }
+}
+
+fn hpackCase(rng: borrow mut Rng) {
+    // Random fields: names of lowercase letters and '-', values of any octet.
+    var fields = HeaderBlock.create();
+    let count = 1 + rng.below(8);
+    for (k in 0..count) {
+        var name = Vector<u8>.create();
+        let nl = 1 + rng.below(12);
+        for (i in 0..nl) {
+            put(mut name, if (rng.below(8) == 0) 45u8 else truncate<u8>(97 + rng.below(26)));
+        }
+        var value = Vector<u8>.create();
+        let vl = rng.below(24);
+        for (i in 0..vl) {
+            put(mut value, truncate<u8>(rng.next()));
+        }
+        let p = fields.push(name.view(), value.view(), rng.below(4) == 0);
+    }
+    var block = Vector<u8>.create();
+    for (i in 0..fields.count()) {
+        let e = HpackEncoder.field(fields.name(i), fields.value(i), false, mut block);
+    }
+    var decoder = match (HpackDecoder.create(4096, 1 << 20)) {
+        Ok(d) => d,
+        Err(_) => { return; },
+    };
+    var back = HeaderBlock.create();
+    match (decoder.decode(block.view(), mut back)) {
+        Ok() => {}
+        Err(_) => { fail("our own block did not decode (RFC 7541 §6)", block.view()); }
+    }
+    if (back.count() != fields.count()) {
+        fail("a different number of fields back (RFC 7541)", block.view());
+    }
+    for (i in 0..fields.count()) {
+        if (!same(back.name(i), fields.name(i)) || !same(back.value(i), fields.value(i))) {
+            fail("a field came back changed (RFC 7541)", block.view());
+        }
+    }
+    // Huffman alone (RFC 7541 §5.2, Appendix B).
+    var huff = Vector<u8>.create();
+    var text = Vector<u8>.create();
+    let tl = rng.below(40);
+    for (i in 0..tl) {
+        put(mut text, truncate<u8>(rng.next()));
+    }
+    let h = Huffman.encode(text.view(), mut huff);
+    if (huff.length != Huffman.encodedLength(text.view())) {
+        fail("Huffman's length is not the encoding's", text.view());
+    }
+    var plain = Vector<u8>.create();
+    match (Huffman.decode(huff.view(), mut plain)) {
+        Ok(true) => {}
+        _ => { fail("a Huffman encoding did not decode", huff.view()); }
+    }
+    if (!same(plain.view(), text.view())) {
+        fail("Huffman did not give the text back", huff.view());
+    }
+    // Damaged: never a panic, and the same twice.
+    mutate(rng, mut block);
+    var d1 = match (HpackDecoder.create(4096, 1 << 20)) {
+        Ok(d) => d,
+        Err(_) => { return; },
+    };
+    var d2 = match (HpackDecoder.create(4096, 1 << 20)) {
+        Ok(d) => d,
+        Err(_) => { return; },
+    };
+    var o1 = HeaderBlock.create();
+    var o2 = HeaderBlock.create();
+    let r1 = match (d1.decode(block.view(), mut o1)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+    let r2 = match (d2.decode(block.view(), mut o2)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+    if (r1 != r2 || o1.count() != o2.count()) {
+        fail("a damaged block decoded two ways", block.view());
+    }
+}
+
+fn main() {
+    let seconds = setting("CW_FUZZ_SECONDS", 60);
+    var rng = Rng { s: setting("CW_FUZZ_SEED", 1).wrappingMul(2654435761).wrappingAdd(1) };
+    let started = Timer.now();
+    var cases: u64 = 0;
+    var seen = Seen { requests: 0, data: 0, resets: 0, connectionErrors: 0 };
+    while (Timer.now() - started < seconds * 1000) {
+        engineCase(mut rng, mut seen);
+        hpackCase(mut rng);
+        cases += 1;
+    }
+    Console.writeLine("fuzz_h2: clean");
+    Console.writeLine(cases);
+    Console.write("requests ");
+    Console.write(seen.requests);
+    Console.write(", data ");
+    Console.write(seen.data);
+    Console.write(", stream errors ");
+    Console.write(seen.resets);
+    Console.write(", connection errors ");
+    Console.writeLine(seen.connectionErrors);
+}
