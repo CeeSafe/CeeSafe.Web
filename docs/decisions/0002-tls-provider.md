@@ -263,11 +263,29 @@ routing can be built. It is built on this branch.
    - So the routing costs a release build nothing measurable, and it keeps one code path.
 3. **The fuzz harness** compiles the shim without the CeeSafe runtime. `-DWT_STANDALONE` leaves OpenSSL its own
    allocator there.
-4. **Blocked: OpenSSL's one-time initialisation cannot survive a failed allocation** (upstream **U17**).
-   - In `alpn_is_the_servers_choice`, `ceesafec test --sweep alloc` fails at points 1-5 and 12-14 (status 137, no
-     output). The other sampled points pass.
-   - Each failing point is inside `ossl_init_base`, `ossl_init_load_crypto_nodelete` or `do_err_strings_init`.
-   - `CRYPTO_malloc`'s failure path raises an error, which calls `OPENSSL_init_crypto` inside the `pthread_once`
-     already running. macOS aborts that (`_os_once_gate_recursive_abort`); Linux would deadlock.
-   - The fix needs CeeSafe: an allocator number that is counted but never failed, under which the shim runs
-     `OPENSSL_init_ssl` first. Until then this stays on the branch, and main keeps amendment 2.1.
+4. **OpenSSL's one-time initialisation cannot survive a failed allocation**, so it runs under
+   `CEE_ALLOC_FOREIGN_INIT` (CeeSafe ADR 0061, ceesafec 0.10.1; upstream U17).
+   - Under `CEE_ALLOC_FOREIGN`, the allocation sweep failed at points 1-5 and 12-14 of `alpn_is_the_servers_choice`
+     (status 137, no output). Each was inside `ossl_init_base`, `ossl_init_load_crypto_nodelete` or
+     `do_err_strings_init`.
+   - The cause: `CRYPTO_malloc`'s failure path raises an error, which calls `OPENSSL_init_crypto` inside the
+     `pthread_once` already running. macOS aborts that; Linux would deadlock.
+   - Now `wt_cfg_new`'s once-only setup calls `OPENSSL_init_ssl` itself, right after `CRYPTO_set_mem_functions`. A
+     thread-local flag sends those allocations to the new number, and every later one goes to `CEE_ALLOC_FOREIGN`.
+5. **Runs (2026-11-03, macOS arm64, ceesafec 0.10.1 from CeeSafe `1de2747`):**
+   - `ceesafec test`: 14 passed.
+   - The cancellation sweep: 618 runs, none failed.
+   - The allocation sweep with ASan and UBSan: 2800 runs, 4 failed (timeouts, item 6), all in `handshake_and_echo`.
+     The points that crashed before now pass.
+6. **Open: `handshake_and_echo` hangs at some failed allocations.** At points 13169-13175, out of about 13,180, the
+   test sometimes times out: 1 run in 2 to 15 at one point. Attempt numbers vary between runs by a few, so the
+   allocation that fails varies too.
+   - A traced hang: the server's echo `SSL_write_ex` fails (`SSL_ERROR_SSL`), its transport is poisoned, and the
+     server drops it.
+   - The client is then left waiting in `read`. Its socket stays ESTABLISHED with empty queues, while the server's
+     end of the connection is gone from the kernel.
+   - A plain-TCP program that closes with unread data the same way always wakes the reader with a reset. So this is
+     not CeeSafe's reactor, and why no FIN or reset reached the client is not yet explained.
+   - The test's reads have no deadline, so a lost peer hangs it.
+
+   Until this is understood, the routing stays on this branch.
