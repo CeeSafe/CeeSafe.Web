@@ -9,7 +9,7 @@ on:
   pull_request:
 
 env:
-  CEESAFE_VERSION: v0.10.3 # M7's minimum (docs/toolchain.md)
+  CEESAFE_VERSION: v0.10.3 # main's minimum (docs/toolchain.md)
 
 jobs:
   test:
