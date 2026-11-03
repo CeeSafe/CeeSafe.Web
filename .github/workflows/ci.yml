@@ -21,7 +21,10 @@ jobs:
         include:
           - os: macos-14
             sanitize: true
-          - os: ubuntu-22.04
+          # The sweeps run on 24.04 (OpenSSL 3.0.13): 22.04's OpenSSL 3.0.2 leaks its own global state when an
+          # allocation fails, which LeakSanitizer reports (Web ADR 0002 amendment 5.8). 22.04 still runs every test
+          # below, with io_uring.
+          - os: ubuntu-24.04
             sanitize: true
           - os: ubuntu-22.04
             reactor: uring

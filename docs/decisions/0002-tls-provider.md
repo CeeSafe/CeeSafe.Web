@@ -306,3 +306,9 @@ CeeSafe 0.10.0 adds `CEE_ALLOC_FOREIGN` and `ceesafe/foreign.h` (CeeSafe ADR 006
      2790 runs, none failed. `-Werror` stops on OpenSSL's own `sha.h`, as in M4.
    - The macOS sweeps, and `python3 tools/run_tests.py --sanitize --alloc-sweep --cancel-sweep`: in
      `docs/milestones/M4.md`.
+8. **CI's sanitizer job runs on Ubuntu 24.04 (the owner's choice, 2026-11-03).** On GitHub's `ubuntu-22.04` runner
+   (OpenSSL 3.0.2), `web_tls`'s allocation sweep failed 9 of 2800 runs. LeakSanitizer reported blocks that the
+   one-time setup (item 6) had allocated, which a later failed allocation made OpenSSL drop without freeing. The same
+   happened in an `ubuntu:22.04` container. The same sweep, also with LeakSanitizer, found nothing in 2800 runs with
+   OpenSSL 3.0.13 (`ubuntu:24.04`) or 3.0.22 (Debian 12): an OpenSSL bug, fixed by 3.0.13. Ubuntu 22.04 still runs
+   every test in CI (the io_uring job), without the sweeps; nothing is suppressed.
