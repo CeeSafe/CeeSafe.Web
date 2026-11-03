@@ -107,6 +107,8 @@ public struct H2Connection {
     private block: Vector<u8>;
     /// Streams closed lately (a ring): frames on them are ignored or STREAM_CLOSED, not PROTOCOL_ERROR.
     private closed: [u32; 64];
+    /// Why each of `closed` closed: `Closes.weReset`, `Closes.peerReset` or `Closes.ended` (§5.1, closed).
+    private closedHow: [u8; 64];
     private closedAt: usize;
     private intervalStart: u64;
     private resets: u32;
@@ -141,6 +143,7 @@ public struct H2Connection {
             blockEndStream: false,
             block: Vector<u8>.create(),
             closed: [0u32; 64],
+            closedHow: [0u8; 64],
             closedAt: 0,
             intervalStart: 0,
             resets: 0,
@@ -347,8 +350,15 @@ public struct H2Connection {
                 if (id > this.lastStream) {
                     return Err(ErrorCodes.protocolError()); // DATA on an idle stream (§5.1)
                 }
-                if (this.recentlyClosed(id)) {
-                    return Ok(null); // in flight when we reset or closed it
+                // §5.1, closed: after our RST_STREAM, frames already in flight are ignored; after the peer's, DATA is a
+                // stream error; after the peer's END_STREAM, a connection error. Of a stream closed long ago, a stream
+                // error.
+                let how = this.howClosed(id);
+                if (how == Closes.weReset()) {
+                    return Ok(null);
+                }
+                if (how == Closes.ended()) {
+                    return Err(ErrorCodes.streamClosed());
                 }
                 return this.streamError(id, ErrorCodes.streamClosed());
             }
@@ -565,7 +575,7 @@ public struct H2Connection {
             return Err(ErrorCodes.enhanceYourCalm());
         }
         this.writeRst(id, code)?;
-        this.remember(id);
+        this.remember(id, Closes.weReset());
         return Ok(null);
     }
 
@@ -600,7 +610,7 @@ public struct H2Connection {
         if (this.resets > this.guards.resetsPerInterval) {
             return Err(ErrorCodes.enhanceYourCalm()); // rapid reset (CVE-2023-44487)
         }
-        this.close(id);
+        this.close(id, Closes.peerReset());
         return Ok(Some(H2Event.Reset(id, read32(payload, 0))));
     }
 
@@ -749,9 +759,9 @@ public struct H2Connection {
     fn streamError(borrow mut this, id: u32, code: u32) -> Result<H2Event?, u32> {
         this.writeRst(id, code)?;
         if (this.streams.contains(id)) {
-            this.close(id);
+            this.close(id, Closes.weReset());
         } else {
-            this.remember(id);
+            this.remember(id, Closes.weReset());
         }
         return Ok(Some(H2Event.StreamError(id, code)));
     }
@@ -777,11 +787,11 @@ public struct H2Connection {
             null => {}
         }
         if (closeIt) {
-            this.close(id);
+            this.close(id, Closes.ended());
         }
     }
 
-    fn close(borrow mut this, id: u32) {
+    fn close(borrow mut this, id: u32, how: u8) {
         match (this.streams.remove(id)) {
             Some(s) => {
                 if (s.counted) {
@@ -792,21 +802,25 @@ public struct H2Connection {
             }
             null => {}
         }
-        this.remember(id);
+        this.remember(id, how);
     }
 
-    fn remember(borrow mut this, id: u32) {
+    fn remember(borrow mut this, id: u32, how: u8) {
         this.closed[this.closedAt] = id;
+        this.closedHow[this.closedAt] = how;
         this.closedAt = (this.closedAt + 1) % 64;
     }
 
-    fn recentlyClosed(borrow this, id: u32) -> bool {
-        for (c in this.closed) {
-            if (c == id) {
-                return true;
+    fn recentlyClosed(borrow this, id: u32) -> bool => this.howClosed(id) != Closes.unknown();
+
+    /// Why `id` closed, if it is among the last 64 closed: a `Closes` value.
+    fn howClosed(borrow this, id: u32) -> u8 {
+        for (i in 0..this.closed.length) {
+            if (this.closed[i] == id) {
+                return this.closedHow[i];
             }
         }
-        return false;
+        return Closes.unknown();
     }
 
     /// Bytes read (or never to be read) on `id` (0: the connection only): a WINDOW_UPDATE once half a window is due.
@@ -939,7 +953,7 @@ public struct H2Connection {
             null => {}
         }
         if (closeIt) {
-            this.close(id);
+            this.close(id, Closes.ended());
         }
     }
 
@@ -949,7 +963,7 @@ public struct H2Connection {
             return Ok();
         }
         this.writeRst(id, code)?;
-        this.close(id);
+        this.close(id, Closes.weReset());
         return Ok();
     }
 
@@ -1046,3 +1060,18 @@ fn failed(r: Result<void, AllocError>) -> bool => match (r) {
     Ok() => false,
     Err(_) => true,
 };
+
+/// Why a stream closed, for frames that arrive after (§5.1, closed).
+struct Closes {
+    /// Not among the streams remembered.
+    fn unknown() -> u8 => 0;
+
+    /// We sent RST_STREAM: frames in flight are ignored.
+    fn weReset() -> u8 => 1;
+
+    /// The peer sent RST_STREAM: its later frames are a stream error.
+    fn peerReset() -> u8 => 2;
+
+    /// Both sides ended, the peer with END_STREAM: its later DATA or HEADERS are a connection error.
+    fn ended() -> u8 => 3;
+}

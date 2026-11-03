@@ -318,6 +318,38 @@ fn closed_and_half_closed_streams_rfc9113_5_1() -> Result<void, TestFailure> {
 }
 
 @test
+fn closed_by_whom_rfc9113_5_1() -> Result<void, TestFailure> {
+    let get = getBlock("/")?;
+    // §5.1, closed: "An endpoint that receives any frame other than PRIORITY after receiving a RST_STREAM MUST treat
+    // that as a stream error (Section 5.4.2) of type STREAM_CLOSED" (0x5).
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, get.view())?;
+    frameHex(mut bytes, FrameTypes.rstStream(), 0, 1, "00000008")?;
+    frame(mut bytes, FrameTypes.data(), 0, 1, "late".bytes())?;
+    is("req 1; reset 1 8; error 1 5; ", feed(mut c, bytes.view())?)?;
+    is("settings 0 f1; rst 1 code 5; ", sent(mut c)?)?;
+    // "... an endpoint that receives any frames after receiving a frame with the END_STREAM flag set MUST treat that
+    // as a connection error (Section 5.4.1) of type STREAM_CLOSED": the request ended, the response ended, then DATA.
+    var d = server()?;
+    var ended = Vector<u8>.create();
+    preface(mut ended)?;
+    frame(mut ended, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    is("req 1 end; ", feed(mut d, ended.view())?)?;
+    var response = HeaderBlock.create();
+    grew(response.push(":status".bytes(), "200".bytes(), false))?;
+    match (d.sendHeaders(1, response, true)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("headers"); }
+    }
+    Check.equalU64(0, d.activeStreams() as u64)?;
+    var late = Vector<u8>.create();
+    frame(mut late, FrameTypes.data(), 0, 1, "late".bytes())?;
+    return is("conn 5", feed(mut d, late.view())?);
+}
+
+@test
 fn header_blocks_rfc9113_6_10() -> Result<void, TestFailure> {
     let get = getBlock("/")?;
     let all = get.view();

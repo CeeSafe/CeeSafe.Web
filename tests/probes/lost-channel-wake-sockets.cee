@@ -1,0 +1,134 @@
+// B16 probe (docs/ceesafe-upstream-work.md): does NOT reproduce the lost wake on its own (2026-11-03, 0.10.1).
+// A lost channel wake (CeeSafe.Web M7): N TCP connections over loopback. Per connection, a server task loops: it
+// waits in race(socket read, race(channel recv, sleep 1000)) as web_http2's connection task does. A byte from the
+// client wins the read; the server then spawns a child (in its own task set) that sends one message on the channel,
+// and waits again: now the message must win, and the read is cancelled. Then it answers the client with one byte.
+// A wait that the 1000 ms timer ends is a lost wake.
+enum Woke {
+    Read(usize),
+    Message(u32),
+    Timer,
+}
+
+async fn wake(conn: borrow AsyncTcpStream, buf: SliceMut<u8>, ch: borrow Channel<u32>) -> Result<Woke, AsyncError> {
+    let raced: Result<Raced<Woke>, AsyncError> = await Async.race(
+        async () => {
+            let n = await conn.read(buf)?;
+            return Ok(Woke.Read(n));
+        },
+        async () => {
+            let inner: Result<Raced<Woke>, AsyncError> = await Async.race(
+                async () => {
+                    match (await ch.recvAsync()) {
+                        Ok(Some(m)) => { return Ok(Woke.Message(m)); }
+                        Ok(null) => { return Err(AsyncError.Cancelled); }
+                        Err(e) => { return Err(e); }
+                    }
+                },
+                async () => {
+                    await Timer.sleep(1000)?;
+                    return Ok(Woke.Timer);
+                },
+            );
+            return Ok(inner?.value);
+        },
+    );
+    return Ok(raced?.value);
+}
+
+async fn server(conn: borrow AsyncTcpStream, rounds: u32, lost: borrow Arc<AtomicU64>) -> Result<void, AsyncError> {
+    let ch = Channel<u32>.create(16)!;
+    var buf = [0u8; 16];
+    let r = await Async.tasks(16, AsyncError.Cancelled, async (set) => {
+        var i: u32 = 0;
+        while (i < rounds) {
+            match (await wake(conn, mut buf[..], ch)?) {
+                Woke.Read(0) => { return Ok(); }
+                Woke.Read(_) => {
+                    let tx = ch.clone();
+                    let started = set.trySpawn(async move () => {
+                        match (await tx.sendAsync(i)) {
+                            Ok() => {}
+                            Err(_) => {}
+                        }
+                        return Ok();
+                    });
+                }
+                Woke.Message(_) => {
+                    await conn.write("x".bytes())?;
+                    i += 1;
+                }
+                Woke.Timer => {
+                    lost.get().fetchAdd(1);
+                    match (ch.tryRecv()) {
+                        Some(_) => {
+                            await conn.write("x".bytes())?;
+                            i += 1;
+                        }
+                        null => {}
+                    }
+                }
+            }
+        }
+        return Ok();
+    });
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(e); }
+    }
+}
+
+async fn client(port: u16, rounds: u32) -> Result<void, AsyncError> {
+    let conn = await AsyncTcpStream.connect("127.0.0.1", port)?;
+    var buf = [0u8; 1];
+    for (i in 0..rounds) {
+        await conn.write("y".bytes())?;
+        let n = await conn.read(mut buf[..])?;
+        if (n == 0) {
+            return Ok();
+        }
+    }
+    return Ok();
+}
+
+async fn trial(n: u32, rounds: u32, port: u16) -> Result<u64, AsyncError> {
+    let listener = match (AsyncTcpListener.bind("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(_) => { return Err(AsyncError.Cancelled); },
+    };
+    let lost = Arc<AtomicU64>.create(AtomicU64.create(0))!;
+    let r = await Async.tasks(1024, AsyncError.Cancelled, async (set) => {
+        for (k in 0..n) {
+            let started = set.trySpawn(async move () => await client(port, rounds));
+        }
+        for (k in 0..n) {
+            let conn = await listener.accept()?;
+            let l = lost.clone();
+            let started = set.trySpawn(async move () => await server(conn, rounds, l));
+        }
+        return Ok();
+    });
+    match (r) {
+        Ok() => { return Ok(lost.get().load()); }
+        Err(e) => { return Err(e); }
+    }
+}
+
+fn main() {
+    var port: u16 = 18600;
+    for (n in [1u32, 10, 20, 30, 50]) {
+        let t0 = Timer.now();
+        match (Async.run(trial(n, 20, port))) {
+            Ok(lost) => {
+                Console.write("connections ");
+                Console.write(n);
+                Console.write(": lost wakes ");
+                Console.write(lost);
+                Console.write(", ms ");
+                Console.writeLine(Timer.now() - t0);
+            }
+            Err(_) => { Console.writeLine("error"); }
+        }
+        port += 1;
+    }
+}

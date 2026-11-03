@@ -778,6 +778,49 @@ prints the area.
 app.get();` and then `let application: borrow dyn Application = sendable;`. That is two lines, not a workaround: no
 wrapper, no `unsafe`.
 
+## B16 — Bug: a task parked in `recvAsync` inside a race misses a send, under ~30 connections   *(found 2026-11-03, M7, ceesafec 0.10.1, macOS 27 arm64 (kqueue); open)*
+
+**Symptom:** with HTTP/2, `examples/server` under `h2load -c N -m 1 http://127.0.0.1:PORT/hello/x`:
+
+| N connections | req/s | longest request |
+|---|---|---|
+| 1 (100 streams) | 37 540 | 3.9 ms |
+| 20 | 10 063 | 3.9 ms |
+| 30 | 150 | 1.01 s |
+| 50 | 208 | 1.02 s |
+
+HTTP/1.1 on the same server at 100 connections is 42 076 req/s, with the longest request at 55 ms.
+
+**Where:**
+- web_http2's connection task waits in `race(conn.read, race(outgoing.recvAsync(), Timer.sleep(1000)))`
+  (`packages/web_http2/src/serve.cee`, `wake`).
+- An instrumented build checked, each time the timer won with streams open, whether a message was already in
+  `outgoing`. It was, in all 259 cases out of 1 500 requests at N = 30. The stream task's `sendAsync` had returned,
+  but the parked `recvAsync` was not woken.
+- Capping the timer at 50 ms lowers the longest request to 56 ms (N = 30) and 106 ms (N = 50), so only the timer
+  rescues the wait.
+- The executor is single-threaded, so this is not a wake from another thread. The channel path is
+  `cee_chan_changed` → `cee_wake_task` (a CAS on `t->woken`), and the woken task is found through `wake_list` in
+  `cee_wait` (`runtime/hosted/ceesafe_rt_async.c`).
+- The threshold is between 20 and 30 connections. The kqueue change queue (64 entries, flushed early with
+  `cee_kqueue_call` when full, the B4 fix) is a suspect: the same race arms the socket's read and is cancelled on
+  every message.
+
+**Not reproduced alone (2026-11-03):**
+- `tests/probes/lost-channel-wake-sockets.cee`: 50 loopback connections, each with the same race, and a child in a
+  task set that sends after each read. No lost wake in 1 000 rounds.
+- The same probe without sockets: none either.
+- The driver's stream task does more between sends (several channels, a reset race, `Exchange`).
+
+**Repro:**
+- `(cd examples/server && ceesafec build && CW_PORT=18458 ./out/server)`
+- then `h2load -n 3000 -c 30 -m 1 http://127.0.0.1:18458/hello/x`
+
+**Effect on CeeSafe.Web:**
+- HTTP/2 is correct: h2load 100 000 requests with 0 failed, and h2spec 145/145 over TLS.
+- Past ~20 connections, requests stall up to 1 s.
+- Not worked around: the 1 s timer stays as the backstop it was meant to be.
+
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/async-deadline-void-bug.cee`:
