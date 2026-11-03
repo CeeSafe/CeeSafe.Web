@@ -1262,9 +1262,12 @@ public struct H2Connection {
         return Ok(id);
     }
 
+    /// Whether either side has sent GOAWAY: no new stream.
+    public fn isGoingAway(borrow this) -> bool => this.goingAway;
+
     /// Client role: how many more streams the peer allows now (SETTINGS_MAX_CONCURRENT_STREAMS less those open).
     public fn streamsLeft(borrow this) -> u32 =>
-        if (this.goingAway ||
+        if (this.goingAway || this.nextOwn > 0x7FFFFFFF ||
             this.active >= this.peer.maxConcurrentStreams) 0 else this.peer.maxConcurrentStreams - this.active;
 
     /// Queues GOAWAY with `code` and the last stream the client opened; new streams are ignored from now on.

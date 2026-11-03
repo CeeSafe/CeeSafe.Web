@@ -46,6 +46,9 @@ public struct ClientOptions {
     /// Response heads: line, size and field count (web_http's `Limits`).
     public limits: Limits;
     public retry: RetryPolicy;
+    /// HTTP/2 over cleartext by prior knowledge (RFC 9113 §3.3) for `http` URLs; HTTPS uses HTTP/2 when the connector
+    /// negotiates ALPN `h2`. Either needs `Client.run` (Web ADR 0012 §7).
+    public http2Cleartext: bool;
 
     /// 10 s to connect and to handshake, 30 s to the first byte, no total; 250 ms between attempts; 8 connections
     /// per origin, 4 idle for 30 s; 10 redirects; 64 KiB drained.
@@ -62,6 +65,7 @@ public struct ClientOptions {
         maxDrainBytes: 65536,
         limits: Limits.defaults(),
         retry: RetryPolicy.defaults(),
+        http2Cleartext: false,
     };
 }
 
@@ -81,6 +85,9 @@ public enum ClientError {
     Shutdown,
     /// A WebSocket server's answer failed RFC 6455 §4.1's checks (or it did not switch).
     WebSocket(HandshakeFailure),
+    /// A connection speaks HTTP/2 (ALPN `h2`, or prior knowledge) but `Client.run` is not running to read it (Web ADR
+    /// 0012 §7).
+    Http2NotRunning,
 }
 
 /// Descriptions.
@@ -93,6 +100,7 @@ public struct ClientErrors {
         ClientError.Net(n) => NetErrors.describe(n),
         ClientError.Protocol(p) => ProtocolErrors.describe(p),
         ClientError.Shutdown => "client shut down",
+        ClientError.Http2NotRunning => "HTTP/2 needs Client.run",
         ClientError.WebSocket(HandshakeFailure.NotSwitched(_)) => "the server did not switch to WebSocket",
         ClientError.WebSocket(HandshakeFailure.Upgrade) => "the server's answer is not a WebSocket upgrade",
         ClientError.WebSocket(HandshakeFailure.Accept) => "the server's Sec-WebSocket-Accept is wrong",

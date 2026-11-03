@@ -1,0 +1,158 @@
+// web_client over HTTP/2 (Web ADR 0012 §7), against scripted servers: what a server sends is frames built here, with
+// RFC 9113's layouts and RFC 7541's static table; what the client must do follows from those RFCs.
+import web_core;
+import web_transport;
+import web_http;
+import web_http2;
+
+fn frameTo(out: borrow mut Vector<u8>, kind: u8, flags: u8, stream: u32, payload: Slice<u8>) -> Result<void, TestFailure> {
+    match (Frames.writeHeader(out, truncate<u32>(payload.length), kind, flags, stream)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("a frame")); }
+    }
+    for (b in payload) {
+        match (out.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("a frame")); }
+        }
+    }
+    return Ok();
+}
+
+/// A header block of `name: value` lines, encoded without the dynamic table.
+fn block(lines: StringView) -> Result<Vector<u8>, TestFailure> {
+    var b = Vector<u8>.create();
+    let t = lines.bytes();
+    var start: usize = 0;
+    for (i in 0..t.length) {
+        if (t[i] != 10) {
+            continue;
+        }
+        var cut = start + 1;
+        while (!(t[cut] == 58 && t[cut + 1] == 32)) {
+            cut += 1;
+        }
+        match (HpackEncoder.field(t[start..cut], t[cut + 2..i], false, mut b)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("a block")); }
+        }
+        start = i + 1;
+    }
+    return Ok(b);
+}
+
+/// A client speaking HTTP/2 by prior knowledge to the scripted connections in `scripts`.
+fn h2Client(scripts: borrow Channel<MockTransport>) -> Result<Client, TestFailure> {
+    var o = quick();
+    o.http2Cleartext = true;
+    return mockClient(o, scripts, v4(1), null, null, null, false);
+}
+
+/// Two GETs share one connection (streams 1 and 3): the responses, a body split over DATA frames, and trailers.
+@test
+async fn two_requests_share_a_connection() -> Result<void, TestFailure> {
+    var server = Vector<u8>.create();
+    frameTo(mut server, FrameTypes.settings(), 0, 0, "".bytes())?;
+    let ok = block(":status: 200\nx-a: 1\n")?;
+    let trailers = block("x-checksum: abc\n")?;
+    frameTo(mut server, FrameTypes.headers(), FrameFlags.endHeaders(), 1, ok.view())?;
+    frameTo(mut server, FrameTypes.headers(), FrameFlags.endHeaders(), 3, ok.view())?;
+    frameTo(mut server, FrameTypes.data(), 0, 1, "hel".bytes())?;
+    frameTo(mut server, FrameTypes.data(), FrameFlags.endStream(), 3, "three".bytes())?;
+    frameTo(mut server, FrameTypes.data(), 0, 1, "lo".bytes())?;
+    frameTo(mut server, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, trailers.view())?;
+    let copies = match (Channel<u8>.create(65536)) {
+        Ok(c) => c,
+        Err(_) => { return Check.fail("a channel"); },
+    };
+    let scripts = scriptsOf(1)?;
+    var mock = match (MockTransport.create(server.view())) {
+        Ok(m) => m,
+        Err(_) => { return Check.fail("a mock"); },
+    };
+    queue(scripts, mock.withPause(100).withCopiesTo(copies))?;
+    let client = h2Client(scripts)?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a drain"); },
+    };
+    var first = Vector<u8>.create();
+    var second = Vector<u8>.create();
+    var failure: ClientError? = null;
+    var trailerOk = false;
+    var both = false;
+    let raced: Result<Raced<bool>, NetError> = await Async.race(
+        async () => {
+            await client.run(drain)?;
+            return Ok(false);
+        },
+        async () => {
+            let rs: Result<void, ClientError> = await Async.scope(ClientError.Shutdown, (s) => {
+                s.spawn(async () => {
+                    var r = await client.get("http://example.test/one")?;
+                    await r.readToEnd(mut first, 64)?;
+                    trailerOk = r.isHttp2() && r.trailers().count() == 1 && Ascii.equals(r.trailers().value(0), "abc");
+                    return Ok();
+                });
+                s.spawn(async () => {
+                    var r = await client.get("http://example.test/two")?;
+                    match (r.header("x-a")) {
+                        Some(v) => { both = Ascii.equals(v.view(), "1") && r.status() == 200; }
+                        null => {}
+                    }
+                    await r.readToEnd(mut second, 64)?;
+                    return Ok();
+                });
+            });
+            match (rs) {
+                Ok() => { return Ok(true); }
+                Err(e) => {
+                    failure = Some(e);
+                    return Ok(false);
+                }
+            }
+        },
+    );
+    match (raced) {
+        Ok(won) => {
+            match (failure) {
+                Some(e) => { return Check.fail(ClientErrors.describe(e)); }
+                null => {}
+            }
+            Check.isTrue(won.value, "both requests answered")?;
+        }
+        Err(e) => { return Check.fail(NetErrors.describe(e)); }
+    }
+    Check.equalBytes("hello".bytes(), first.view())?;
+    Check.equalBytes("three".bytes(), second.view())?;
+    Check.isTrue(trailerOk, "the trailers of stream 1")?;
+    Check.isTrue(both, "the head of stream 3")?;
+    // What the client sent: the connection preface first (RFC 9113 §3.4), on one connection.
+    var sent = Vector<u8>.create();
+    loop {
+        match (copies.tryRecv()) {
+            Some(b) => {
+                match (sent.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Check.fail("out of memory"); }
+                }
+            }
+            null => { break; }
+        }
+    }
+    let all = sent.view();
+    return Check.isTrue(all.length > 24 && Ascii.equals(all[0..24], "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), "the client preface");
+}
+
+/// Without `run`, a connection that speaks HTTP/2 is refused rather than left unread.
+@test
+async fn http2_without_run_is_refused() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(1)?;
+    queue(scripts, script("")?)?;
+    let client = h2Client(scripts)?;
+    match (await client.get("http://example.test/")) {
+        Err(ClientError.Http2NotRunning) => { return Ok(); }
+        Err(e) => { return Check.fail(ClientErrors.describe(e)); }
+        Ok(_) => { return Check.fail("answered without run"); }
+    }
+}
