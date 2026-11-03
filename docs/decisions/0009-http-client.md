@@ -155,7 +155,7 @@ A POST without `Idempotency-Key` is never retried, whatever failed. The transpor
 - **Client (web_client), deterministic, over a mock dialer:**
   - **No replay after a partial write:** a POST at every write split. For each byte offset where the connection
     fails, the server side sees at most one request, and the client returns the error.
-  - **DNS failure:** `Err(NotFound)`, with no dial.
+  - **DNS failure:** `Err(HostNotFound)` (`Err(NotFound)` before ceesafec 0.10.0, upstream U15), with no dial.
   - **Timeouts:** each one, with the interpreter's virtual clock.
   - **Shutdown:** a pool shut down with requests in flight.
   - **Reuse races:** a server that closes an idle connection makes a GET retry, and a POST fail.

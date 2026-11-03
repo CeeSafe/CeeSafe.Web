@@ -50,7 +50,7 @@ def main() -> int:
         native += ["--cflag", "-fsanitize=address,undefined", "--cflag", "-fno-omit-frame-pointer"]
     modes = [("native", native)]
     if not args.no_interp:
-        modes.append(("interp", ["--interp"]))
+        modes.append(("interp", ["--interp", "--timeout", str(args.timeout)]))  # SHA-1's 1M-byte vector: ~60 s
     if args.alloc_sweep:
         modes.append(("alloc sweep", native + ["--sweep", "alloc"]))
     if args.cancel_sweep:

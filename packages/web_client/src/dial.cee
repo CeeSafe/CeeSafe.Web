@@ -16,7 +16,7 @@ impl Resolver for SystemResolver {
         match (await AsyncDns.resolve(host, port)) {
             Ok(list) => {
                 if (list.length == 0) {
-                    return Err(NetError.Io(IoError.NotFound));
+                    return Err(NetError.Io(IoError.HostNotFound));
                 }
                 return Ok(list);
             }
@@ -118,7 +118,7 @@ public async fn happyEyeballs(
 ) -> Result<PlainStream, NetError> {
     let n = addresses.length;
     if (n == 0) {
-        return Err(NetError.Io(IoError.NotFound));
+        return Err(NetError.Io(IoError.HostNotFound));
     }
     // Every attempt reports in `outcomes`; a failure also kicks the next attempt to start at once.
     let outcomes = channel<Attempt>(n)?;

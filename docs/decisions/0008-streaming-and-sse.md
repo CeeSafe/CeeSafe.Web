@@ -143,3 +143,26 @@ balancers.
   heartbeat.
 - The cancel sweep and the allocation-failure sweep over `web_sse`'s tests (`tools/run_tests.py`).
 - `examples/sse`: a counter stream that resumes from `Last-Event-ID`, and a flood stream for the slow-client gate.
+
+## 6. Amendment 1 (2026-11-03, on ceesafec 0.10.0: U13)
+
+CeeSafe 0.10.0 adds `Channel.tryRecv` and `isClosed` (CeeSafe ADR 0060; upstream U13). So the two things §3.3,
+§3.4 and §4 left for later are done, and no signature changed except as noted.
+
+1. **`Overflow.DropOldest`.** On a full queue, `publish` takes the oldest event out (`tryRecv`) and tries again, until
+   its event is in. It never waits.
+   - Another producer can take the room first; each pass then drops one more of the oldest events, and the loop ends
+     once a send gets in.
+   - A closed queue is `Err(Closed)`, checked first with `isClosed`.
+   - `QueueError.Unsupported` is gone: it named only this policy.
+2. **One flush for a burst.** After an event wakes the stream, it writes that event and every event already queued
+   behind it (`EventQueue.tryNext`), then flushes once. The bytes are the same; there are fewer socket writes and,
+   in HTTP/1.1, fewer chunks.
+   - A burst is at most the queue's capacity (`EventQueue.capacity()`). A producer that refills the queue as fast as
+     it drains cannot hold back the flush.
+3. **Tests:**
+   - `overflow_policies` publishes four events into a queue of two under `DropOldest` and reads the last two, then
+     the end.
+   - `events_then_the_end` expects two events queued before the stream starts in one chunk (`2e`: 11 + 35 bytes,
+     computed in Python).
+

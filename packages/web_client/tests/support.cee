@@ -25,7 +25,7 @@ fn sameAddress(a: SocketAddress, b: SocketAddress) -> bool => match (a) {
     },
 };
 
-/// Resolves every name to `addresses`, or fails with `NotFound` when `fail`; counts its calls.
+/// Resolves every name to `addresses`, or fails with `HostNotFound` when `fail`; counts its calls.
 struct FixedResolver {
     first: SocketAddress;
     second: SocketAddress?;
@@ -37,7 +37,7 @@ impl Resolver for FixedResolver {
     async fn resolve(borrow this, host: StringView, port: u16) -> Result<Vector<SocketAddress>, NetError> {
         this.calls.fetchAdd(1);
         if (this.fail) {
-            return Err(NetError.Io(IoError.NotFound));
+            return Err(NetError.Io(IoError.HostNotFound));
         }
         var v = Vector<SocketAddress>.create();
         match (v.push(this.first)) {

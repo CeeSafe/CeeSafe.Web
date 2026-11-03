@@ -183,7 +183,8 @@ def main():
     out = fetch("http://127.0.0.1:1/hello")
     check("connection refused", out and out[0].startswith("fetch: failed:"), out)
     out = fetch("http://name.invalid/hello")
-    check("DNS failure", out and out[0].startswith("fetch: failed:"), out)
+    # CeeSafe 0.10.0 (ADR 0060, upstream U15): a name that does not resolve is IoError.HostNotFound.
+    check("DNS failure", out and out[0] == "fetch: failed: Host not found", out)
 
     # TLS against Python's ssl (a TLS stack the client did not come from), verified as localhost by the test CA.
     t_log = Log()

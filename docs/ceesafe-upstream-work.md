@@ -2,8 +2,30 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.10.0 (released 2026-11-03, tag `v0.10.0` = CeeSafe `e551d82`)
+
+All four items are in CeeSafe's ADR 0060 (`spec/decisions/0060-web-random-tryrecv-foreign-host.md`, implemented in
+`8ac40d8`). Checked from this repository on 2026-11-03 (macOS arm64): every package checks and is formatted on 0.10.0
+with no source change (no `match` over `IoError` lacks a `_`).
+
+| Item | Status | What landed |
+|---|---|---|
+| **U16** random bytes from the OS | **released** | `Random.fill(into: SliceMut<u8>) -> Result<void, IoError>` (lib/std, hosted, no effects): `getrandom` (or `/dev/urandom`), `arc4random_buf`, `BCryptGenRandom` with the system's preferred RNG, read on every call; `Unsupported` on CosmoOS userland. A 4-byte fill: 0.04–0.05 µs on macOS, 0.57 µs on Debian 12, under 0.16 µs on Windows 11 ARM64, so no user-space CSPRNG. The interpreter answers a fixed SplitMix64 sequence (not secret). |
+| **U13** `Channel.tryRecv` | **released** | `tryRecv(borrow this) -> T?` and `isClosed(borrow this) -> bool`, both without effects. Drained means `isClosed()`, then `tryRecv() == null`, in that order. |
+| **U14** C allocations fault-injected, not leak-checked | **released** | `CEE_ALLOC_FOREIGN` (2) with `ceesafe_alloc`, `ceesafe_realloc` and `ceesafe_free`, declared in `ceesafe/foreign.h`, which ceesafec writes into every build (`#include "ceesafe/foreign.h"`; every C file, `include-dirs` ones too, already had the build directory on its include path). They follow `malloc`/`realloc`/`free` on NULL, count and fail in one sequence with CeeSafe's, and blocks held at exit are reported as `ceesafe alloc: foreign held=<k>`, never as a leak. |
+| **U15** DNS failure reads as a missing file | **released** | `IoError.HostNotFound` (after `Unsupported`), message "Host not found", for `EAI_NONAME`, `EAI_NODATA`, `EAI_ADDRFAMILY`, `WSAHOST_NOT_FOUND`, `WSANO_DATA` and an answer with no address. **Source change:** a `match` naming every `IoError` variant without `_` needs the new arm. |
+
+| Item | Used by | Checked by |
+|---|---|---|
+| **U16** | the WebSocket client (M6 stage 4): the 16-byte `Sec-WebSocket-Key` and a masking key per frame | `tests/interop/ws_client.py` (keys are base64 of 16 bytes and differ per connection; every frame has its own key), Autobahn's fuzzingserver 517 cases (`docs/milestones/M6.md`) |
+| **U13** | `web_sse`: `Overflow.DropOldest`, and one flush for the events already queued | `web_sse`'s `overflow_policies` and `events_then_the_end` (one chunk for two queued events) |
+| **U15** | `web_client`: a DNS failure is `Net(Io(HostNotFound))`; its empty-answer cases too | `tests/interop/client.py`: `fetch http://name.invalid/` prints `fetch: failed: Host not found` |
+| **U14** | not yet: OpenSSL's allocations through `CEE_ALLOC_FOREIGN` work (a TLS fetch counts 13,602 attempts, `foreign held=8139` at exit), but the allocation sweep crashes in OpenSSL's one-time initialisation: **U17** | branch `u14-openssl-alloc` |
+
+Open: **U17** (below), which keeps U14's use on a branch.
 
 ## Status at 0.9.4 (released 2026-11-03, tag `v0.9.4` = CeeSafe `92776f7`)
 
@@ -690,6 +712,35 @@ fork).
 **Effect on CeeSafe.Web until then:** the WebSocket client stays on a branch. Servers need no randomness, so the
 rest of M6 goes on.
 
+## U17 — C allocations that are counted but never failed, for a C library's one-time initialisation   *(found 2026-11-03 adopting U14; blocks OpenSSL's allocations in the sweep, not a milestone)*
+
+**Gap:** with OpenSSL allocating through `CEE_ALLOC_FOREIGN` (`CRYPTO_set_mem_functions`), `ceesafec test --sweep
+alloc` over `web_tls` fails at the first points of every test: allocations 1-5 and 12-14 of `alpn_is_the_servers_choice`
+end with status 137 and no output. They are OpenSSL's one-time initialisation, which cannot survive a failed
+allocation. In OpenSSL 3.6.4 (macOS, Homebrew), `CRYPTO_malloc`'s failure path raises an error, and raising an error
+calls `OPENSSL_init_crypto` again inside the `pthread_once` that is running it:
+
+```text
+_os_once_gate_recursive_abort ← pthread_once ← CRYPTO_THREAD_run_once ← OPENSSL_init_crypto ← ossl_err_get_state_int
+← ERR_new ← CRYPTO_malloc ← CRYPTO_zalloc ← CRYPTO_THREAD_lock_new ← ossl_init_base ← pthread_once ← … ← SSL_CTX_new_ex
+← wt_cfg_new
+```
+
+macOS aborts the recursion (status 137 under the harness); on Linux a recursive `pthread_once` deadlocks. The other
+points (6-11 and 15 onwards, sampled to 200 runs) pass: OpenSSL handles allocation failure everywhere else.
+
+**Needed by:** Web ADR 0002 §3.5 and §6.1 (the owner's choice: OpenSSL's out-of-memory paths in the allocation
+sweep). The shim would run OpenSSL's initialisation (`OPENSSL_init_ssl`) once, under the new number, before anything
+else, and route every later allocation through `CEE_ALLOC_FOREIGN`.
+
+**Wanted:** a second allocator number for C, for example `CEE_ALLOC_FOREIGN_INIT`, in `ceesafe/foreign.h`:
+- counted with `CEE_ALLOC_FOREIGN`'s held blocks (the same "foreign held" line, never a leak), so a block may be
+  reallocated or freed under either number;
+- never fault-injected, and not counted as an attempt, so `CEESAFE_FAIL_ALLOC_AT`'s numbering stays the program's own.
+
+**Effect on CeeSafe.Web until then:** OpenSSL keeps its own allocator (Web ADR 0002 amendment 2.1); the routing waits
+on the branch `u14-openssl-alloc`.
+
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/async-deadline-void-bug.cee`:
@@ -749,7 +800,8 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.9.1** (released 2026-11-02) | B8 fixed; U12 | the `Date` field |
 | **0.9.2** (released 2026-11-02) | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
 | **0.9.4** (released 2026-11-03) | B13, B14, B15 fixed; T3 | `web_client` (M5) |
-| next | U16 (blocks the WebSocket client, M6); U13, U14, U15 | `web_sse`'s `DropOldest` and batched flushes (M3); OpenSSL's allocations in the leak check; DNS failures described as such |
+| **0.10.0** (released 2026-11-03) | U16, U13, U14, U15 | the WebSocket client (M6); `web_sse`'s `DropOldest` and batched flushes (M3); DNS failures described as such |
+| next | U17 | OpenSSL's allocations in the allocation sweep (U14's use) |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

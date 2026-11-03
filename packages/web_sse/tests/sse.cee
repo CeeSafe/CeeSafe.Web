@@ -34,11 +34,27 @@ async fn overflow_policies() -> Result<void, TestFailure> {
         _ => false,
     };
     Check.isTrue(isBad, "capacity 0")?;
-    let unsupported = match (EventQueue.create(4, Overflow.DropOldest)) {
-        Err(QueueError.Unsupported) => true,
+
+    // DropOldest: the third and fourth events push out the first two, and publish never waits.
+    let o = queued(EventQueue.create(2, Overflow.DropOldest))?;
+    Check.isTrue(o.tryNext() == null, "empty: tryNext answers at once")?;
+    Check.isTrue(isOk(await o.publish(event("1")?)), "first")?;
+    Check.isTrue(isOk(await o.publish(event("2")?)), "second")?;
+    Check.isTrue(isOk(await o.publish(event("3")?)), "third drops 1")?;
+    Check.isTrue(isOk(await o.publish(event("4")?)), "fourth drops 2")?;
+    Check.isTrue(await nextIs(o, "3"), "3 kept")?;
+    o.close();
+    let late = match (await o.publish(event("5")?)) {
+        Err(PublishError.Closed) => true,
         _ => false,
     };
-    Check.isTrue(unsupported, "DropOldest waits for U13")?;
+    Check.isTrue(late, "closed")?;
+    match (o.tryNext()) {
+        Some(e) => { Check.isTrue(Ascii.equals(e.data(), "4"), "4 kept")?; }
+        null => { return Check.fail("4 kept"); }
+    }
+    Check.isTrue(o.tryNext() == null, "drained")?;
+    Check.isTrue(await isEnd(o), "then the end")?;
 
     // Disconnect: the third event finds the queue full, closes it, and the two queued still come out.
     let d = queued(EventQueue.create(2, Overflow.Disconnect))?;
@@ -91,7 +107,8 @@ async fn overflow_policies() -> Result<void, TestFailure> {
     return Ok();
 }
 
-/// Two events, then the queue ends: the head, one chunk per event, the last chunk.
+/// Two events queued before the stream starts, then the queue ends: the head, both events in one chunk (one flush for
+/// the events already queued), the last chunk.
 @test
 async fn events_then_the_end() -> Result<void, TestFailure> {
     var conn = peer(null);
@@ -103,7 +120,7 @@ async fn events_then_the_end() -> Result<void, TestFailure> {
     let end = await streamed(mut conn, q, StreamOptions.defaults(), Silent {})?;
     Check.isTrue(isFinished(end), "finished")?;
     Check.equalBytes(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\ntransfer-encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n23\r\nevent: tick\nid: 7\ndata: a\ndata: b\n\n\r\n0\r\n\r\n".bytes(),
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\ntransfer-encoding: chunked\r\n\r\n2e\r\ndata: one\n\nevent: tick\nid: 7\ndata: a\ndata: b\n\n\r\n0\r\n\r\n".bytes(),
         conn.output.view(),
     )?;
     return Ok();

@@ -99,7 +99,7 @@ public struct EventStream {
                 },
                 Wake.Ended => { return Ok(StreamEnd.Finished); },
                 Wake.Beat => await send(exchange, Events.heartbeat().bytes()),
-                Wake.Next(e) => await sendEvent(exchange, e, mut scratch),
+                Wake.Next(e) => await sendBatch(exchange, queue, e, mut scratch),
             };
             match (sent) {
                 Ok() => {}
@@ -118,15 +118,36 @@ fn start(exchange: borrow mut Exchange) -> Result<void, HandlerError> {
     return Ok();
 }
 
-/// Encodes `e` into `scratch`, then sends it.
-async fn sendEvent(
+/// Writes `first` and the events already queued behind it, at most the queue's capacity in all, then flushes once:
+/// one socket write (one chunk) for a burst instead of one per event. The bound keeps a producer that refills the
+/// queue as fast as it drains from holding the flush back.
+async fn sendBatch(
+    exchange: borrow mut Exchange,
+    queue: borrow EventQueue,
+    first: Event,
+    scratch: borrow mut Vector<u8>,
+) -> Result<void, HandlerError> {
+    await writeEvent(exchange, first, scratch)?;
+    var n: usize = 1;
+    while (n < queue.capacity()) {
+        match (queue.tryNext()) {
+            Some(e) => { await writeEvent(exchange, e, scratch)?; }
+            null => { break; }
+        }
+        n += 1;
+    }
+    return await exchange.flush();
+}
+
+/// Encodes `e` into `scratch`, then writes it without flushing.
+async fn writeEvent(
     exchange: borrow mut Exchange,
     e: Event,
     scratch: borrow mut Vector<u8>,
 ) -> Result<void, HandlerError> {
     scratch.clear();
     match (Events.encode(e, scratch)) {
-        Ok() => { return await send(exchange, scratch.view()); }
+        Ok() => { return await exchange.write(scratch.view()); }
         Err(_) => { return Err(HandlerError.Internal); }
     }
 }
