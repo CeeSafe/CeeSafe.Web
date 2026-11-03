@@ -243,10 +243,11 @@ certificate store.
    - expired.badssl.com and wrong.host.badssl.com are refused;
    - web_tls's 14 tests pass on Windows, macOS and Debian.
 
-## 11. Amendment 5 (2026-11-03, on ceesafec 0.10.0: U14; on the branch `u14-openssl-alloc` until U17)
+## 11. Amendment 5 (2026-11-03, on ceesafec 0.10.1: U14 and U17)
 
-CeeSafe 0.10.0 adds `CEE_ALLOC_FOREIGN` and `ceesafe/foreign.h` (CeeSafe ADR 0060; upstream U14), so §3.5 and §6.1's
-routing can be built. It is built on this branch.
+CeeSafe 0.10.0 adds `CEE_ALLOC_FOREIGN` and `ceesafe/foreign.h` (CeeSafe ADR 0060; upstream U14), and 0.10.1 adds
+`CEE_ALLOC_FOREIGN_INIT` (ADR 0061; upstream U17). So §3.5 and §6.1's routing is built, and it replaces amendment
+2.1. It was developed on the branch `u14-openssl-alloc`, which waited for U17 and then for item 5's finding.
 
 1. **The routing.**
    - `wt_cfg_new`, the first thing the shim makes, sets `CRYPTO_set_mem_functions` once (`CRYPTO_THREAD_run_once`,
@@ -272,20 +273,22 @@ routing can be built. It is built on this branch.
      `pthread_once` already running. macOS aborts that; Linux would deadlock.
    - Now `wt_cfg_new`'s once-only setup calls `OPENSSL_init_ssl` itself, right after `CRYPTO_set_mem_functions`. A
      thread-local flag sends those allocations to the new number, and every later one goes to `CEE_ALLOC_FOREIGN`.
-5. **Runs (2026-11-03, macOS arm64, ceesafec 0.10.1 from CeeSafe `1de2747`):**
+5. **A peer that is never told.** At points 13169-13175 of about 13,180, `handshake_and_echo` sometimes hung: 1 run
+   in 2 to 15 under ASan, 1 in 180 without it.
+   - The server's echo `SSL_write_ex` failed (`SSL_ERROR_SSL`), and the server dropped its poisoned transport with
+     the client's bytes still unread. Its close was therefore a reset.
+   - `tcpdump` on `lo0` (2026-11-03) shows the reset right behind the server's last data segment, carrying that
+     segment's end as its sequence number.
+   - In the runs that ended, the client's kernel accepted the reset. In the hung run it rejected it, and the socket
+     stayed ESTABLISHED: the reset was out of sequence by the time it was handled, apparently processed before the
+     data segment just ahead of it (RFC 5961 drops it).
+   - The closed server never sent it again, so the client's read, which had no deadline, waited for ever.
+   - A plain-TCP program that closes the same way woke the reader 72 times out of 72, so CeeSafe's reactor is not at
+     fault, and neither is the shim.
+   - **Fix:** the test's reads are bounded by 10 s (`bounded` in `tests/support.cee`), as every read of a real client
+     or server is: a lost peer now fails the test instead of hanging it. `web_client` and the connection server
+     already bound every read.
+6. **Runs (2026-11-03, macOS arm64, ceesafec 0.10.1, the release):**
    - `ceesafec test`: 14 passed.
-   - The cancellation sweep: 618 runs, none failed.
-   - The allocation sweep with ASan and UBSan: 2800 runs, 4 failed (timeouts, item 6), all in `handshake_and_echo`.
-     The points that crashed before now pass.
-6. **Open: `handshake_and_echo` hangs at some failed allocations.** At points 13169-13175, out of about 13,180, the
-   test sometimes times out: 1 run in 2 to 15 at one point. Attempt numbers vary between runs by a few, so the
-   allocation that fails varies too.
-   - A traced hang: the server's echo `SSL_write_ex` fails (`SSL_ERROR_SSL`), its transport is poisoned, and the
-     server drops it.
-   - The client is then left waiting in `read`. Its socket stays ESTABLISHED with empty queues, while the server's
-     end of the connection is gone from the kernel.
-   - A plain-TCP program that closes with unread data the same way always wakes the reader with a reset. So this is
-     not CeeSafe's reactor, and why no FIN or reset reached the client is not yet explained.
-   - The test's reads have no deadline, so a lost peer hangs it.
-
-   Until this is understood, the routing stays on this branch.
+   - The allocation sweep with ASan and UBSan: 2800 runs, none failed.
+   - The cancellation sweep: 660 runs, none failed.

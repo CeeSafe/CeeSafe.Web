@@ -171,6 +171,13 @@ async fn run(s: borrow Setup) -> Result<Outcome, TestFailure> {
     return Ok(out);
 }
 
+/// A read bounded by 10 s, as every read of a real client or server is. A peer that closes abortively right after
+/// sending can leave this end never told: on macOS's loopback the reset can be handled before the data just ahead of
+/// it, is then out of sequence and dropped (RFC 5961), and the closed peer never sends it again (captured with tcpdump,
+/// 2026-11-03; Web ADR 0002 amendment 5.6). Without a bound, such a test waits for ever instead of failing.
+async fn bounded(t: borrow mut TlsTransport, buf: SliceMut<u8>) -> Result<usize, NetError> =>
+    await Async.deadline(Deadline.after(10000).instant(), NetError.TimedOut, async () => await t.read(buf));
+
 /// Accepts one connection, handshakes, then echoes until the client's end.
 async fn serve(
     listener: borrow Listener,
@@ -184,7 +191,7 @@ async fn serve(
     alpn = t.alpn();
     var buf = [0u8; 4096];
     loop {
-        let n = await t.read(mut buf[..])?;
+        let n = await bounded(mut t, mut buf[..])?;
         if (n == 0) {
             sawEnd = true;
             return Ok();
@@ -237,7 +244,7 @@ async fn client(
         // Read what came back so far, so neither side's buffers fill.
         var buf = [0u8; 4096];
         while (back.length < at) {
-            let n = await t.read(mut buf[..])?;
+            let n = await bounded(mut t, mut buf[..])?;
             if (n == 0) {
                 return Err(NetError.Closed);
             }
@@ -259,7 +266,7 @@ async fn client(
     echoed = same;
     await t.shutdownWrite()?;
     var buf = [0u8; 16];
-    let last = await t.read(mut buf[..])?; // the server's end, once it has seen ours
+    let last = await bounded(mut t, mut buf[..])?; // the server's end, once it has seen ours
     return Ok();
 }
 
