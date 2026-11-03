@@ -1043,6 +1043,15 @@ public struct H2Connection {
         }
     }
 
+    /// Queues a PING (§6.7) carrying `data`. The driver sends one to probe a client that has stopped sending: writing
+    /// it to a peer that has gone makes the peer's TCP reset the connection, so a later write fails.
+    public fn ping(borrow mut this, data: [u8; 8]) -> Result<void, u32> {
+        match (Frames.writePing(mut this.out, data, false)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(ErrorCodes.internalError()); }
+        }
+    }
+
     /// Queues GOAWAY with `code` and the last stream the client opened; new streams are ignored from now on.
     public fn goAway(borrow mut this, code: u32) -> Result<void, u32> {
         this.goingAway = true;

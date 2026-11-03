@@ -139,6 +139,51 @@ async fn a_hundred_streams_drained() -> Result<void, TestFailure> {
 }
 
 @test
+async fn half_closed_client_gets_every_response() -> Result<void, TestFailure> {
+    // Three 300 ms requests, then the client shuts down its sending side after 50 ms but keeps reading (TCP's
+    // half-close). The server sends GOAWAY (no stream can start), answers all three, then ends the connection.
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let slow = getBlock("/slow")?;
+    for (k in 0..3u32) {
+        frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 2 * k + 1, slow.view())?;
+    }
+    let start = Timer.now();
+    let out = await servedHalfClosed(bytes, 50, 0)?;
+    let took = Timer.now() - start;
+    let t = tally(out)?;
+    Check.isTrue(t.goAways >= 1, "GOAWAY")?;
+    Check.equalU64(5, t.lastStream as u64)?;
+    for (k in 0..3usize) {
+        let id = 2 * k + 1;
+        Check.equalU64(1, t.heads[id] as u64)?;
+        Check.equalU64(4, t.bytes[id])?; // "slow"
+        Check.isTrue(t.ended[id], "each stream ended")?;
+    }
+    return Check.isTrue(took < 5000, "the connection ended once the streams were done");
+}
+
+@test
+async fn half_closed_client_that_goes_is_found_by_a_probe() -> Result<void, TestFailure> {
+    // Ten handlers wait 10 s. The client half-closes at 50 ms and goes at 500 ms, with nothing written meanwhile. A
+    // PING each idle second probes it; the first write after it went fails, and the connection ends with its streams
+    // cancelled, long before the handlers' 10 s.
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let stall = getBlock("/stall")?;
+    for (k in 0..10u32) {
+        frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 2 * k + 1, stall.view())?;
+    }
+    let start = Timer.now();
+    let out = await servedHalfClosed(bytes, 50, 500)?;
+    let took = Timer.now() - start;
+    let t = tally(out)?;
+    Check.isTrue(t.goAways >= 1, "GOAWAY before the client went")?;
+    Check.equalU64(0, t.heads[1] as u64)?;
+    return Check.isTrue(took < 4000, "a probe found the client gone");
+}
+
+@test
 async fn a_response_held_to_a_small_window() -> Result<void, TestFailure> {
     // SETTINGS_INITIAL_WINDOW_SIZE = 1000 (identifier 0x4): /big may send 1 000 bytes of its 100 000 and must then wait
     // for WINDOW_UPDATE, which never comes (§6.9.2). The stream does not end.

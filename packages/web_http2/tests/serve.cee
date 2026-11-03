@@ -4,12 +4,16 @@
 import web_core;
 import web_http;
 
-/// A scripted client: it sends `input`, then waits until `closeAtMs` and ends the stream. If `drainAtMs` is not 0, the
-/// server's drain starts then (through `drain`, a handle to the connection's).
+/// A scripted client: it sends `input`, then waits until `closeAtMs` and ends the stream. From `goneAtMs` (by default
+/// `closeAtMs`) it has gone, so a write fails as it would after the peer's TCP reset; a `halfClosed` client has only
+/// shut down its sending side, and reads until `goneAtMs` (0: always). If `drainAtMs` is not 0, the server's drain starts then (through `drain`, a handle to the
+/// connection's).
 struct Client {
     input: Vector<u8>;
     at: usize;
     closeAtMs: u64;
+    halfClosed: bool;
+    goneAtMs: u64;
     drainAtMs: u64;
     drain: Drain;
     output: Vector<u8>;
@@ -49,6 +53,10 @@ impl Transport for Client {
     }
 
     async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        let gone = if (this.halfClosed) this.goneAtMs else this.closeAtMs;
+        if (gone != 0 && Timer.now() >= gone) {
+            return Err(NetError.Reset);
+        }
         for (b in bytes) {
             match (this.output.push(b)) {
                 Ok() => {}
@@ -169,10 +177,23 @@ impl Application for Site {
 
 /// Serves the scripted client's `input` with `Site`, the client leaving after `closeAfterMs`; what the server wrote.
 async fn served(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedDraining(input, closeAfterMs, 0);
+    await servedAs(input, closeAfterMs, 0, false, 0);
 
 /// `served`, with the server's drain started after `drainAfterMs` (0: never).
-async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterMs: u64) -> Result<Vector<u8>, TestFailure> {
+async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
+    await servedAs(input, closeAfterMs, drainAfterMs, false, 0);
+
+/// `served`, with a client that half-closes after `closeAfterMs` and keeps reading until `goneAfterMs` (0: always).
+async fn servedHalfClosed(input: borrow Vector<u8>, closeAfterMs: u64, goneAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
+    await servedAs(input, closeAfterMs, 0, true, goneAfterMs);
+
+async fn servedAs(
+    input: borrow Vector<u8>,
+    closeAfterMs: u64,
+    drainAfterMs: u64,
+    halfClosed: bool,
+    goneAfterMs: u64,
+) -> Result<Vector<u8>, TestFailure> {
     var copy = Vector<u8>.create();
     for (b in input.view()) {
         grew(copy.push(b))?;
@@ -186,6 +207,8 @@ async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterM
         input: copy,
         at: 0,
         closeAtMs: start + closeAfterMs,
+        halfClosed: halfClosed,
+        goneAtMs: if (goneAfterMs == 0) 0u64 else start + goneAfterMs,
         drainAtMs: if (drainAfterMs == 0) 0u64 else start + drainAfterMs,
         drain: drain.share(),
         output: Vector<u8>.create(),

@@ -122,6 +122,11 @@ async fn run(
     var total: i64 = 0; // credit granted and not yet used, across streams
     var lastActive = Timer.now();
     var leaving = false;
+    // The client has stopped sending (a read of 0): a half-close (RFC 9293 §3.6), or it has gone. Either way no stream
+    // can start, so GOAWAY goes out and nothing more is read. The streams in flight finish, writing their responses to
+    // a client that may still read them (Web ADR 0012 §3.10). Each idle second a PING probes it: a client that has gone
+    // answers with a TCP reset, so a later write fails, and that failure is this connection's normal end.
+    var peerDone = false;
     loop {
         // Every complete frame in the input.
         loop {
@@ -193,14 +198,20 @@ async fn run(
                 null => { break; }
             }
         }
-        await writeOutput(conn, engine, limits)?;
+        match (await writeOutput(conn, engine, limits)) {
+            Ok() => {}
+            Err(e) => { return Err(if (peerDone) NetError.Closed else e); }
+        }
         if (links.length() > 0) {
             lastActive = Timer.now();
         }
         // The end: the client left, or the server drains, once no stream is left.
         if (connection.isDraining() && !leaving) {
             engineOk(engine.goAway(ErrorCodes.noError()))?;
-            await writeOutput(conn, engine, limits)?;
+            match (await writeOutput(conn, engine, limits)) {
+                Ok() => {}
+                Err(e) => { return Err(if (peerDone) NetError.Closed else e); }
+            }
             leaving = true;
         }
         if (leaving && links.length() == 0) {
@@ -214,13 +225,23 @@ async fn run(
         }
         input.compact();
         let waitMs = if (links.length() == 0) lastActive + limits.idleTimeoutMs - now else 1000;
-        match (await wake(conn, input, outgoing, if (waitMs > 1000) 1000 else waitMs)) {
-            Ok(Wake.Read(0)) => { return Err(NetError.Closed); } // the client closed
+        match (await wake(conn, input, outgoing, if (waitMs > 1000) 1000 else waitMs, !peerDone)) {
+            Ok(Wake.Read(0)) => {
+                peerDone = true;
+                if (!leaving) {
+                    engineOk(engine.goAway(ErrorCodes.noError()))?;
+                    leaving = true;
+                }
+            }
             Ok(Wake.Read(n)) => { input.commit(n)?; }
             Ok(Wake.Message(m)) => {
                 await handle(set, connection, app, limits, engine, links, outgoing, m, mut total)?;
             }
-            Ok(Wake.Timer) => {}
+            Ok(Wake.Timer) => {
+                if (peerDone && links.length() > 0) {
+                    engineOk(engine.ping([0u8; 8]))?;
+                }
+            }
             Err(e) => { return Err(e); }
         }
     }
@@ -500,36 +521,43 @@ async fn writeOutput(
     return Ok();
 }
 
-/// One wait: bytes from the client, a stream's message, or `waitMs` passing.
+/// One wait: bytes from the client (when `reading`), a stream's message, or `waitMs` passing.
 async fn wake(
     conn: borrow mut dyn Transport,
     input: borrow mut OwnedBuffer,
     outgoing: borrow Channel<Outgoing>,
     waitMs: u64,
+    reading: bool,
 ) -> Result<Wake, NetError> {
+    if (!reading) {
+        return await quietWake(outgoing, waitMs);
+    }
     let raced: Result<Raced<Wake>, NetError> = await Async.race(
         async () => {
             let n = await conn.read(input.spare())?;
             return Ok(Wake.Read(n));
         },
+        async () => await quietWake(outgoing, waitMs),
+    );
+    let won = raced?;
+    return Ok(won.value);
+}
+
+/// One wait without reading: a stream's message, or `waitMs` passing.
+async fn quietWake(outgoing: borrow Channel<Outgoing>, waitMs: u64) -> Result<Wake, NetError> {
+    let raced: Result<Raced<Wake>, NetError> = await Async.race(
         async () => {
-            let inner: Result<Raced<Wake>, NetError> = await Async.race(
-                async () => {
-                    match (await outgoing.recvAsync()) {
-                        Ok(Some(m)) => { return Ok(Wake.Message(m)); }
-                        Ok(null) => { return Err(NetError.Closed); }
-                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
-                    }
-                },
-                async () => {
-                    match (await Timer.sleep(waitMs)) {
-                        Ok() => { return Ok(Wake.Timer); }
-                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
-                    }
-                },
-            );
-            let won = inner?;
-            return Ok(won.value);
+            match (await outgoing.recvAsync()) {
+                Ok(Some(m)) => { return Ok(Wake.Message(m)); }
+                Ok(null) => { return Err(NetError.Closed); }
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+        },
+        async () => {
+            match (await Timer.sleep(waitMs)) {
+                Ok() => { return Ok(Wake.Timer); }
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
         },
     );
     let won = raced?;
