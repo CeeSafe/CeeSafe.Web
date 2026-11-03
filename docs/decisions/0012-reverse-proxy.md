@@ -368,3 +368,42 @@ Tests, with oracles outside the code:
    - The gateway did not get a response in time, which is RFC 9110 §15.6.5's case.
    - nginx does the same.
    - A refused connection stays 502.
+
+## 7. Amendment 1 (2026-11-04, stage 2; the owner chose A): who reads a shared HTTP/2 connection
+
+**What §3.9 left out.** An HTTP/2 connection carries many requests at once. Something has to read it all the time:
+- to hand each response's frames to its request;
+- to answer PING and SETTINGS;
+- to see GOAWAY.
+
+On the server that is the connection task, in the connection's task set (Web ADR 0011 §3.2). A `Client` is a plain
+value whose methods are async. It has no task of its own, and CeeSafe has none to give it: "There are no detached
+tasks" (CeeSafe ADR 0053 §1; spec §40.5).
+
+| | A. `client.run(drain)`, run by the application (proposed) | B. The waiting request reads for everyone | C. A session per origin, held by its caller |
+|---|---|---|---|
+| Shape | `Client.run` is an async fn that the application runs beside its work, in the same scope, as `proxy.monitor` (§3.1). It owns a task set with one connection task per HTTP/2 connection. Requests reach those tasks through bounded channels, as the server's streams do. | No new task. Whichever request is waiting holds the connection, reads it, and passes other streams' frames on through channels. | `client.http2(origin, async (session) => …)`: the connection lives as long as the closure. |
+| HTTP/2 when not run | the client stays HTTP/1.1 (HTTP/2 is opt-in: `ClientOptions.http2`, with `run`) | always | only inside the closure |
+| PING, SETTINGS, GOAWAY between requests | answered | not read until the next request comes | answered while the session lives |
+| Cancellation | a request's cancellation resets its stream; the connection task carries on | a cancelled reader must hand its role to another request mid-read: new and delicate | as A |
+| The proxy | `proxy.run(drain)` runs the health monitor and `client.run` together | nothing to run | the proxy holds one session per backend for its lifetime: A in all but name |
+| Code | the server driver's pattern, reused (channels, a task set, `StreamPort`'s client twin) | a new pattern with no precedent here | as A, less general |
+
+**Decision: A** (the owner, 2026-11-04).
+- **The engine** (`web_http2`, sans-I/O) gains a client role, `H2Connection.client(…)`:
+  - it sends the client preface, with SETTINGS_ENABLE_PUSH = 0;
+  - it opens odd streams;
+  - it checks responses (`:status`, no request pseudo-fields, RFC 9113 §8.3.2);
+  - it refuses PUSH_PROMISE (§8.4).
+
+  The stream states, flow control and guards stay shared with the server role.
+- **The driver** (`web_client`) works like this:
+  - `Client.run` spawns a connection task for each HTTP/2 connection the pool opens.
+  - `send` asks the pool for an origin's HTTP/2 connection (ALPN `h2` on `https`, prior knowledge on an `http` backend
+    that asks for it).
+  - Each stream task talks to its connection task through the channels.
+  - A connection at the peer's SETTINGS_MAX_CONCURRENT_STREAMS makes the pool open another.
+  - After GOAWAY, a request on a stream above the last stream ID is sent again on a new connection, since GOAWAY
+    promises it was not processed (RFC 9113 §6.8).
+- **The `ClientResponse`** gets a stream variant, as `Exchange` did (Web ADR 0011 §3.2), so a caller reads both
+  protocols the same way.
