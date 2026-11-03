@@ -56,4 +56,5 @@ The language facts the ADRs rely on are checked by the programs in `tests/probes
 | 0012 §6.4 | An untrusted source on a PROXY-protocol listener? | closed |
 | 0012 §6.5 | Forwarding fields by default? | both `Forwarded` and `X-Forwarded-*` |
 | 0012 §6.6 | A connect timeout? | 504 |
+| 0012 (M8, h2spec §8.1.2.6) | Hold responses until a declared-length body ends? | no: early responses stay, and §8.1.2.6 #1 and #2 are a recorded h2spec timing case (`docs/milestones/M8.md`) |
 
