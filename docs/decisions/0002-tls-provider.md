@@ -288,7 +288,21 @@ CeeSafe 0.10.0 adds `CEE_ALLOC_FOREIGN` and `ceesafe/foreign.h` (CeeSafe ADR 006
    - **Fix:** the test's reads are bounded by 10 s (`bounded` in `tests/support.cee`), as every read of a real client
      or server is: a lost peer now fails the test instead of hanging it. `web_client` and the connection server
      already bound every read.
-6. **Runs (2026-11-03, macOS arm64, ceesafec 0.10.1, the release):**
-   - `ceesafec test`: 14 passed.
-   - The allocation sweep with ASan and UBSan: 2800 runs, none failed.
-   - The cancellation sweep: 660 runs, none failed.
+6. **OpenSSL's global setup runs whole, outside the sweep.** On Debian (OpenSSL 3.0.22, gcc 12), LeakSanitizer, which
+   ASan on macOS does not run by default, failed 60 of 2800 sweep runs. Each failure was a leak inside OpenSSL,
+   after a failed allocation in OpenSSL's name table.
+   - OpenSSL fills that table one kind of algorithm at a time, at the first use of each: `EVP_CIPHER_fetch` from
+     `SSL_CTX_new_ex`, `EVP_SIGNATURE_fetch`, `OSSL_DECODER_do_all_provided` for the first PEM key, and so on. It
+     leaks the entry it was adding when an allocation fails there.
+   - That is one-time setup too. So, still under `CEE_ALLOC_FOREIGN_INIT`, the shim's setup walks every kind once:
+     ciphers, digests, MACs, KDFs, RNGs, key managers, signatures, key exchanges, KEMs, asymmetric ciphers, decoders
+     and encoders, each with its `*_do_all_provided`. It then makes and frees one configuration.
+   - Doing only the configuration left 4 failures (decoders, signatures). Walking every kind left none.
+7. **Runs (2026-11-03, ceesafec 0.10.1, the release, with the shim as merged):**
+   - **macOS arm64 (OpenSSL 3.6.4):** 14 tests, also with `-Wall -Wextra -Werror`.
+   - **Debian 12 x86_64 (OpenSSL 3.0.22, gcc 12):** 14 tests with `-Wall -Wextra -Werror`. The allocation sweep with
+     ASan, UBSan and LeakSanitizer: 2800 runs, none failed. The cancellation sweep: 615 runs, none failed.
+   - **Windows 11 ARM64 (OpenSSL 4.1.0, clang 23):** 14 tests, with no warning under `-Wall`. The allocation sweep:
+     2790 runs, none failed. `-Werror` stops on OpenSSL's own `sha.h`, as in M4.
+   - The macOS sweeps, and `python3 tools/run_tests.py --sanitize --alloc-sweep --cancel-sweep`: in
+     `docs/milestones/M4.md`.

@@ -12,7 +12,10 @@
  * Every exported function is in the ADR's table.
  */
 #include <openssl/core_names.h>
+#include <openssl/decoder.h>
+#include <openssl/encoder.h>
 #include <openssl/err.h>
+#include <openssl/kdf.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
@@ -339,6 +342,20 @@ static void foreign_free(void *p, const char *file, int line) {
     ceesafe_free(p, CEE_ALLOC_FOREIGN);
 }
 
+/* Callbacks for the *_do_all_provided walks below: fetching is the point, so they do nothing. */
+static void each_cipher(EVP_CIPHER *x, void *arg) { (void)x; (void)arg; }
+static void each_md(EVP_MD *x, void *arg) { (void)x; (void)arg; }
+static void each_mac(EVP_MAC *x, void *arg) { (void)x; (void)arg; }
+static void each_kdf(EVP_KDF *x, void *arg) { (void)x; (void)arg; }
+static void each_rand(EVP_RAND *x, void *arg) { (void)x; (void)arg; }
+static void each_keymgmt(EVP_KEYMGMT *x, void *arg) { (void)x; (void)arg; }
+static void each_signature(EVP_SIGNATURE *x, void *arg) { (void)x; (void)arg; }
+static void each_keyexch(EVP_KEYEXCH *x, void *arg) { (void)x; (void)arg; }
+static void each_kem(EVP_KEM *x, void *arg) { (void)x; (void)arg; }
+static void each_asym(EVP_ASYM_CIPHER *x, void *arg) { (void)x; (void)arg; }
+static void each_decoder(OSSL_DECODER *x, void *arg) { (void)x; (void)arg; }
+static void each_encoder(OSSL_ENCODER *x, void *arg) { (void)x; (void)arg; }
+
 static CRYPTO_ONCE route_once = CRYPTO_ONCE_STATIC_INIT;
 
 /* OpenSSL accepts allocation functions only before its first allocation; a configuration is the first thing the shim
@@ -351,6 +368,23 @@ static void route_allocations(void) {
     }
     initialising = 1;
     (void)OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+    /* OpenSSL finishes its global setup lazily: the default provider at the first fetch, and its table of algorithm
+       names one kind at a time, at the first use of each (ciphers, digests, signatures, decoders, …). OpenSSL 3.0.22
+       leaks the entries it was adding when an allocation fails there (Web ADR 0002 amendment 5.7). So the setup walks
+       every kind once, here, outside the sweep, then makes and frees one configuration. */
+    EVP_CIPHER_do_all_provided(NULL, each_cipher, NULL);
+    EVP_MD_do_all_provided(NULL, each_md, NULL);
+    EVP_MAC_do_all_provided(NULL, each_mac, NULL);
+    EVP_KDF_do_all_provided(NULL, each_kdf, NULL);
+    EVP_RAND_do_all_provided(NULL, each_rand, NULL);
+    EVP_KEYMGMT_do_all_provided(NULL, each_keymgmt, NULL);
+    EVP_SIGNATURE_do_all_provided(NULL, each_signature, NULL);
+    EVP_KEYEXCH_do_all_provided(NULL, each_keyexch, NULL);
+    EVP_KEM_do_all_provided(NULL, each_kem, NULL);
+    EVP_ASYM_CIPHER_do_all_provided(NULL, each_asym, NULL);
+    OSSL_DECODER_do_all_provided(NULL, each_decoder, NULL);
+    OSSL_ENCODER_do_all_provided(NULL, each_encoder, NULL);
+    SSL_CTX_free(SSL_CTX_new(TLS_method()));
     initialising = 0;
 }
 #endif

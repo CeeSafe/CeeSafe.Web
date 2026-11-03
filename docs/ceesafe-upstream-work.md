@@ -2,8 +2,18 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.10.1", "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.10.1 (released 2026-11-03, tag `v0.10.1` = CeeSafe `1de2747`)
+
+| Item | Status | Checked by |
+|---|---|---|
+| **U17** C allocations counted but never failed | **released**: CeeSafe ADR 0061 (`6b365fe`), `CEE_ALLOC_FOREIGN_INIT` (3) in `ceesafe/foreign.h`: never failed, not an attempt, held with `CEE_ALLOC_FOREIGN`'s blocks | CeeSafe's `tools/foreign_alloc_check.py` (a mutant runtime fails it) and contract suite; here: OpenSSL's initialisation under it, `web_tls`'s allocation sweep with ASan and UBSan, 2800 runs, none failed (Web ADR 0002 amendment 5) |
+| **U14** (its use) | **done** on main: OpenSSL allocates through `CEE_ALLOC_FOREIGN` | as U17 |
+
+Nothing is open upstream. One hang found while adopting U14 was not CeeSafe's: a reset lost on macOS's loopback,
+which left a test's unbounded read waiting (Web ADR 0002 amendment 5.5; the test's reads are now bounded).
 
 ## Status at 0.10.0 (released 2026-11-03, tag `v0.10.0` = CeeSafe `e551d82`)
 
@@ -23,9 +33,7 @@ with no source change (no `match` over `IoError` lacks a `_`).
 | **U16** | the WebSocket client (M6 stage 4): the 16-byte `Sec-WebSocket-Key` and a masking key per frame | `tests/interop/ws_client.py` (keys are base64 of 16 bytes and differ per connection; every frame has its own key), Autobahn's fuzzingserver 517 cases (`docs/milestones/M6.md`) |
 | **U13** | `web_sse`: `Overflow.DropOldest`, and one flush for the events already queued | `web_sse`'s `overflow_policies` and `events_then_the_end` (one chunk for two queued events) |
 | **U15** | `web_client`: a DNS failure is `Net(Io(HostNotFound))`; its empty-answer cases too | `tests/interop/client.py`: `fetch http://name.invalid/` prints `fetch: failed: Host not found` |
-| **U14** | not yet: OpenSSL's allocations through `CEE_ALLOC_FOREIGN` work (a TLS fetch counts 13,602 attempts, `foreign held=8139` at exit), but the allocation sweep crashes in OpenSSL's one-time initialisation: **U17** | branch `u14-openssl-alloc` |
-
-Open: **U17** (below), which keeps U14's use on a branch.
+| **U14** | OpenSSL's allocations through `CEE_ALLOC_FOREIGN` (a TLS fetch counts 13,602 attempts, `foreign held=8139` at exit); the allocation sweep crashed in OpenSSL's one-time initialisation, which needed **U17** (0.10.1) | "Status at 0.10.1" |
 
 ## Status at 0.9.4 (released 2026-11-03, tag `v0.9.4` = CeeSafe `92776f7`)
 
@@ -712,7 +720,7 @@ fork).
 **Effect on CeeSafe.Web until then:** the WebSocket client stays on a branch. Servers need no randomness, so the
 rest of M6 goes on.
 
-## U17 — C allocations that are counted but never failed, for a C library's one-time initialisation   *(found 2026-11-03 adopting U14; blocks OpenSSL's allocations in the sweep, not a milestone)*
+## U17 — C allocations that are counted but never failed, for a C library's one-time initialisation   *(found 2026-11-03 adopting U14; released in 0.10.1 as ADR 0061)*
 
 **Gap:** with OpenSSL allocating through `CEE_ALLOC_FOREIGN` (`CRYPTO_set_mem_functions`), `ceesafec test --sweep
 alloc` over `web_tls` fails at the first points of every test: allocations 1-5 and 12-14 of `alpn_is_the_servers_choice`
@@ -801,7 +809,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.9.2** (released 2026-11-02) | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
 | **0.9.4** (released 2026-11-03) | B13, B14, B15 fixed; T3 | `web_client` (M5) |
 | **0.10.0** (released 2026-11-03) | U16, U13, U14, U15 | the WebSocket client (M6); `web_sse`'s `DropOldest` and batched flushes (M3); DNS failures described as such |
-| next | U17 | OpenSSL's allocations in the allocation sweep (U14's use) |
+| **0.10.1** (released 2026-11-03) | U17 | OpenSSL's allocations in the allocation sweep (U14's use, M4) |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).
