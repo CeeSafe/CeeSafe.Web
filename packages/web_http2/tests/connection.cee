@@ -129,6 +129,11 @@ fn feedAt(c: borrow mut H2Connection, bytes: Slice<u8>, nowMs: u64) -> Result<Ve
                 number(mut log, id as u64)?;
                 append(mut log, if (end) " end; " else "; ")?;
             }
+            Ok(H2Event.Response(id, end)) => {
+                append(mut log, "resp ")?;
+                number(mut log, id as u64)?;
+                append(mut log, if (end) " end; " else "; ")?;
+            }
             Ok(H2Event.Data(id, end)) => {
                 append(mut log, "data ")?;
                 number(mut log, id as u64)?;
@@ -636,4 +641,199 @@ fn endsWith(hay: Slice<u8>, tail: StringView) -> bool {
         }
     }
     return true;
+}
+
+// ---- The client role (Web ADR 0012 §7) ----
+
+fn client() -> Result<H2Connection, TestFailure> {
+    var c = match (H2Connection.client(H2Settings.client(16384), H2Guards.defaults(16384))) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("a connection")); },
+    };
+    grew(c.start(1048576))?;
+    return Ok(c);
+}
+
+/// A request head for `path`, as a client sends it (§8.3.1).
+fn requestHead(method: StringView, path: StringView) -> Result<HeaderBlock, TestFailure> {
+    var h = HeaderBlock.create();
+    grew(h.push(":method".bytes(), method.bytes(), false))?;
+    grew(h.push(":scheme".bytes(), "https".bytes(), false))?;
+    grew(h.push(":path".bytes(), path.bytes(), false))?;
+    grew(h.push(":authority".bytes(), "example.test".bytes(), false))?;
+    return Ok(h);
+}
+
+fn opened(c: borrow mut H2Connection, method: StringView, end: bool) -> Result<u32, TestFailure> {
+    let h = requestHead(method, "/")?;
+    match (c.openRequest(h, end, Ascii.equals(method.bytes(), "HEAD"))) {
+        Ok(id) => { return Ok(id); }
+        Err(code) => { return Err(TestFailure.create("a stream refused")); }
+    }
+}
+
+/// The server's preface: an empty SETTINGS frame (§3.4).
+fn serverPreface(bytes: borrow mut Vector<u8>) -> Result<void, TestFailure> =>
+    frame(bytes, FrameTypes.settings(), 0, 0, "".bytes());
+
+/// The client's preface is the connection preface string, then SETTINGS with SETTINGS_ENABLE_PUSH = 0 (§3.4, §6.5.2,
+/// §8.4); its streams are odd and rising (§5.1.1); its request decodes to what it sent.
+@test
+fn client_preface_and_requests_rfc9113_3_4() -> Result<void, TestFailure> {
+    var c = client()?;
+    let out = c.output();
+    let p = clientPreface();
+    let want = p.bytes();
+    Check.equalBytes(want, out[0..want.length])?;
+    let settings = match (Frames.parseHeader(out[want.length..])) {
+        Some(h) => h,
+        null => { return Check.fail("SETTINGS after the preface"); },
+    };
+    Check.equalU64(FrameTypes.settings() as u64, settings.kind as u64)?;
+    let payload = out[want.length + 9..want.length + 9 + settings.length as usize];
+    var push: u64 = 99;
+    var at: usize = 0;
+    while (at + 6 <= payload.length) {
+        if (payload[at] == 0 && payload[at + 1] == 2) {
+            push = read32(payload, at + 2) as u64;
+        }
+        at += 6;
+    }
+    Check.equalU64(0, push)?;
+    c.outputWritten();
+    Check.equalU64(1, opened(mut c, "GET", true)? as u64)?;
+    Check.equalU64(3, opened(mut c, "GET", true)? as u64)?;
+    let out2 = c.output();
+    let first = match (Frames.parseHeader(out2)) {
+        Some(h) => h,
+        null => { return Check.fail("HEADERS"); },
+    };
+    Check.equalU64(FrameTypes.headers() as u64, first.kind as u64)?;
+    Check.equalU64(5, first.flags as u64)?; // END_STREAM | END_HEADERS
+    var d = match (HpackDecoder.create(4096, 65536)) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a decoder"); },
+    };
+    var fields = HeaderBlock.create();
+    match (d.decode(out2[9..9 + first.length as usize], mut fields)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("our request block"); }
+    }
+    Check.equalBytes(":method".bytes(), fields.name(0))?;
+    Check.equalBytes("GET".bytes(), fields.value(0))?;
+    return Check.equalBytes("example.test".bytes(), fields.value(3));
+}
+
+/// A response: interim 1xx heads are skipped (§8.1), then the final head, its DATA and its trailers.
+@test
+fn client_responses_rfc9113_8_1() -> Result<void, TestFailure> {
+    var c = client()?;
+    let id = opened(mut c, "GET", true)?;
+    var bytes = Vector<u8>.create();
+    serverPreface(mut bytes)?;
+    let early = blockOf(":status: 103\nlink: </s.css>\n")?;
+    let head = blockOf(":status: 200\ncontent-length: 5\n")?;
+    let trailers = blockOf("x-checksum: abc\n")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), id, early.view())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), id, head.view())?;
+    frame(mut bytes, FrameTypes.data(), 0, id, "hello".bytes())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), id, trailers.view())?;
+    is("resp 1; data 1 5; trailers 1; ", feed(mut c, bytes.view())?)?;
+    // A HEAD response's content-length describes no content (RFC 9110 §9.3.2); a 204 likewise.
+    let headId = opened(mut c, "HEAD", true)?;
+    var more = Vector<u8>.create();
+    frame(mut more, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), headId, head.view())?;
+    return is("resp 3 end; ", feed(mut c, more.view())?);
+}
+
+/// Malformed responses are stream errors of type PROTOCOL_ERROR (§8.1.1): no `:status`, a request pseudo-field, 101
+/// (§8.6), a 1xx with END_STREAM, DATA before the head, and DATA longer than `content-length`.
+@test
+fn client_malformed_responses_rfc9113_8_1_1() -> Result<void, TestFailure> {
+    for (k in 0..6u32) {
+        var c = client()?;
+        let id = opened(mut c, "GET", true)?;
+        var bytes = Vector<u8>.create();
+        serverPreface(mut bytes)?;
+        let block = blockOf(match (k) {
+            0 => "x-a: 1\n",
+            1 => ":status: 200\n:path: /\n",
+            2 => ":status: 101\n",
+            3 => ":status: 100\n",
+            4 => ":status: 200\n",
+            _ => ":status: 200\ncontent-length: 2\n",
+        })?;
+        if (k == 4) {
+            frame(mut bytes, FrameTypes.data(), 0, id, "x".bytes())?;
+            is("error 1 1; ", feed(mut c, bytes.view())?)?;
+            continue;
+        }
+        frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | (if (k == 3) FrameFlags.endStream() else 0u8),
+            id, block.view())?;
+        if (k == 5) {
+            frame(mut bytes, FrameTypes.data(), FrameFlags.endStream(), id, "abc".bytes())?;
+            is("resp 1; error 1 1; ", feed(mut c, bytes.view())?)?;
+            continue;
+        }
+        is("error 1 1; ", feed(mut c, bytes.view())?)?;
+    }
+    return Ok();
+}
+
+/// A server cannot open streams: PUSH_PROMISE when push is disabled, and HEADERS on an even stream or one never
+/// opened, are connection errors of type PROTOCOL_ERROR (§5.1, §8.4).
+@test
+fn client_refuses_server_streams_rfc9113_8_4() -> Result<void, TestFailure> {
+    let head = blockOf(":status: 200\n")?;
+    for (k in 0..3u32) {
+        var c = client()?;
+        let id = opened(mut c, "GET", true)?;
+        var bytes = Vector<u8>.create();
+        serverPreface(mut bytes)?;
+        if (k == 0) {
+            var promise = Vector<u8>.create();
+            grew(promise.push(0))?;
+            grew(promise.push(0))?;
+            grew(promise.push(0))?;
+            grew(promise.push(2))?;
+            for (b in head.view()) {
+                grew(promise.push(b))?;
+            }
+            frame(mut bytes, FrameTypes.pushPromise(), FrameFlags.endHeaders(), id, promise.view())?;
+        } else {
+            frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), if (k == 1) 2u32 else 5u32, head.view())?;
+        }
+        is("conn 1", feed(mut c, bytes.view())?)?;
+    }
+    return Ok();
+}
+
+/// SETTINGS_MAX_CONCURRENT_STREAMS from the server bounds the streams we open (§5.1.2): past it, and after GOAWAY,
+/// `openRequest` refuses, so the driver opens another connection.
+@test
+fn client_stream_limit_and_goaway_rfc9113_5_1_2() -> Result<void, TestFailure> {
+    var c = client()?;
+    var bytes = Vector<u8>.create();
+    frameHex(mut bytes, FrameTypes.settings(), 0, 0, "000300000001")?; // SETTINGS_MAX_CONCURRENT_STREAMS = 1
+    is("", feed(mut c, bytes.view())?)?;
+    Check.equalU64(1, c.streamsLeft() as u64)?;
+    let id = opened(mut c, "GET", true)?;
+    Check.equalU64(0, c.streamsLeft() as u64)?;
+    let h = requestHead("GET", "/")?;
+    match (c.openRequest(h, true, false)) {
+        Err(code) => { Check.equalU64(ErrorCodes.refusedStream() as u64, code as u64)?; }
+        Ok(_) => { return Check.fail("past the server's limit"); }
+    }
+    var done = Vector<u8>.create();
+    let ok = blockOf(":status: 204\n")?;
+    frame(mut done, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), id, ok.view())?;
+    is("resp 1 end; ", feed(mut c, done.view())?)?;
+    Check.equalU64(1, c.streamsLeft() as u64)?;
+    var away = Vector<u8>.create();
+    frameHex(mut away, FrameTypes.goAway(), 0, 0, "0000000100000000")?;
+    is("goaway 1 0; ", feed(mut c, away.view())?)?;
+    match (c.openRequest(h, true, false)) {
+        Err(code) => { return Check.equalU64(ErrorCodes.refusedStream() as u64, code as u64); }
+        Ok(_) => { return Check.fail("after GOAWAY"); }
+    }
 }

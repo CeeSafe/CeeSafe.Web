@@ -180,6 +180,7 @@ async fn run(
                         null => {}
                     }
                 }
+                H2Event.Response(_, _) => {} // client role only
                 H2Event.TooLarge(id) => {
                     var fields = HeaderBlock.create();
                     alloc(fields.push(":status".bytes(), "431".bytes(), false))?;
