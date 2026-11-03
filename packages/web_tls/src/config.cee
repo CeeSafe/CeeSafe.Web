@@ -57,7 +57,8 @@ public struct TlsConfig {
         return Ok();
     }
 
-    /// Trusts the system's default CA locations (OpenSSL's).
+    /// Trusts the system's roots: OpenSSL's default CA locations, and on Windows the system's certificate store
+    /// (OpenSSL 3.2 or later there).
     /// Safety: as `trustPem`.
     public fn trustSystem(borrow mut this) -> Result<void, TlsSetupError> {
         if (unsafe { wt_cfg_trust_default(this.raw) } != 1) {

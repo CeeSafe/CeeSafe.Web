@@ -2,8 +2,20 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.9.4 (released 2026-11-03, tag `v0.9.4` = CeeSafe `92776f7`)
+
+| Item | Status | Checked by |
+|---|---|---|
+| **B15** async calls through `dyn I` and `dyn I + Send`: C does not compile | **fixed** (`992b1eb`) | `tests/probes/dyn-send-async-frames-bug.cee` builds and prints 3; `web_client`'s 12 tests natively, with ASan + UBSan and both sweeps (macOS, Debian 12), and on Windows 11 ARM64 |
+| **B14** `dyn I + Send` as a type argument does not parse in an expression | **fixed** (`992b1eb`) | `tests/probes/dyn-send-type-argument-bug.cee` prints 1; `web_client` dropped its wrapper struct |
+| **B13** an `Async.scope` whose error type has a drop: C does not compile | **fixed** (`992b1eb`) | `tests/probes/scope-droppable-error-bug.cee` builds and prints 3 |
+| **T3** Windows: the runtime warns under `-Wsign-conversion` | **fixed** (`992b1eb`) | `examples/https`, `examples/fetch` and the web_tls tests build without a warning on Windows 11 ARM64 (clang 23) |
+
+M5 (`web_client`) is unblocked and done on 0.9.4 (`docs/milestones/M5.md`). Still open: **U13** and **U14** (wanted,
+blocking nothing) and **U15** (below, wanted).
 
 ## Status at 0.9.2 (released 2026-11-02, tag `v0.9.2` = CeeSafe `47474db`)
 
@@ -578,14 +590,14 @@ fault-injected like the others, but not reported by the leak check (or reported 
 
 **Effect on CeeSafe.Web until then:** OpenSSL keeps its own allocator in every build (Web ADR 0002 amendment 2.1).
 
-## T3 — Windows: the runtime warns under `-Wsign-conversion`   *(found 2026-11-02, 0.9.2, Windows 11 ARM64, clang 23)*
+## T3 — Windows: the runtime warns under `-Wsign-conversion`   *(found 2026-11-02, 0.9.2, Windows 11 ARM64, clang 23; fixed in 0.9.4)*
 
 **Observed:** every native build on Windows prints four warnings from the runtime: `implicit conversion changes
 signedness: 'unsigned long' to 'long'` at `ceesafe_rt_io.c` (3) and `ceesafe_rt_async.c:2592`, each an
 `ioctlsocket(…, FIONBIO, …)`: the SDK's `FIONBIO` macro is an `unsigned long` expression and `ioctlsocket` takes a
 `long`. **Wanted:** a cast (`(long)FIONBIO`), so builds on Windows are quiet. Cosmetic.
 
-## B14 — Bug: `dyn I + Send` as a type argument does not parse in an expression   *(found 2026-11-02, 0.9.2)*
+## B14 — Bug: `dyn I + Send` as a type argument does not parse in an expression   *(found 2026-11-02, 0.9.2; fixed in 0.9.4)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/dyn-send-type-argument-bug.cee`:
 `var v = Vector<Box<dyn Job + Send>>.create();` is `N0103: comparison operators cannot be chained`. The same type
@@ -593,7 +605,7 @@ parses in a declaration (`var v: Vector<Box<dyn Job + Send>>`, a field). **Expec
 **Effect on CeeSafe.Web:** `web_client` wraps the box in a struct (`Live { conn: Box<dyn Transport + Send> }`), which
 spells the same thing.
 
-## B15 — Bug: async calls through both `dyn I` and `dyn I + Send` give C that does not compile   *(found 2026-11-02, 0.9.2)*
+## B15 — Bug: async calls through both `dyn I` and `dyn I + Send` give C that does not compile   *(found 2026-11-02, 0.9.2; fixed in 0.9.4)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/dyn-send-async-frames-bug.cee`: one function awaits `j.run()` with
 `j: borrow mut dyn Job`, another with `j: borrow mut Box<dyn Job + Send>`.
@@ -611,7 +623,7 @@ a program is enough: changing `Connector.connect` to return one broke every nati
 waits too (it is on `m5-client`). Its 11 tests pass in the interpreter; native, the
 sanitizers and the sweeps wait. The client is on branch `m5-client`.
 
-## B13 — Bug: an `Async.scope` whose error type has a drop gives C that does not compile   *(found 2026-11-02, 0.9.2)*
+## B13 — Bug: an `Async.scope` whose error type has a drop gives C that does not compile   *(found 2026-11-02, 0.9.2; fixed in 0.9.4)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/scope-droppable-error-bug.cee`:
 
@@ -638,6 +650,18 @@ found (`web_sse`'s tests).
 
 **Effect on CeeSafe.Web:** tests use a copyable error type for scopes (`NetError`, as M1's tests already did). Library
 code is not affected so far: its scopes use `NetError` or `HandlerError`.
+
+## U15 — A name that does not resolve reads as a missing file   *(found 2026-11-03, M5; wanted, not blocking)*
+
+**Gap:** `AsyncDns.resolve` maps `EAI_NONAME` (and `EAI_NODATA`, `EAI_ADDRFAMILY`) to `-ENOENT`
+(`runtime/hosted/ceesafe_rt_async.c:4192`), which becomes `IoError.NotFound`. Its description is the platform's
+`ENOENT` text, so `examples/fetch` with `http://name.invalid/` prints `fetch: failed: No such file or directory`.
+
+**Wanted:** a resolver failure a program can tell apart and describe: an `IoError` kind for "no such host" (for
+example `IoError.HostNotFound`, described as "host not found"), or a description of `NotFound` that suits a name.
+
+**Effect on CeeSafe.Web until then:** the client reports a DNS failure as `Net(Io(NotFound))`, described as a missing
+file. Web ADR 0009 §5's check ("DNS failure dials nothing") passes either way.
 
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
@@ -697,7 +721,8 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.9.0** (released 2026-11-02) | U6, U7, U9, U10, U11 | M9 sendfile, M10 HTTP/3; `web_server` without delegating impls |
 | **0.9.1** (released 2026-11-02) | B8 fixed; U12 | the `Date` field |
 | **0.9.2** (released 2026-11-02) | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
-| next | B15 fixed (blocks M5); B13, B14 fixed; U13, U14, T3 | `web_sse`'s `DropOldest` and batched flushes (M3); scopes with `TestFailure` in tests |
+| **0.9.4** (released 2026-11-03) | B13, B14, B15 fixed; T3 | `web_client` (M5) |
+| next | U13, U14, U15 | `web_sse`'s `DropOldest` and batched flushes (M3); OpenSSL's allocations in the leak check; DNS failures described as such |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

@@ -1,0 +1,204 @@
+// An HTTP client with web_client (Web ADR 0009), for the client interop checks (tests/interop/client.py).
+// Sends CW_METHOD (GET, the default, or POST) to CW_URL, with CW_BODY as a POST's body, CW_REPEAT times (default 1)
+// over one client, so later requests may reuse a pooled connection. https URLs are verified against the roots in
+// CW_CA (PEM), or the system's without it. For each request it prints the status, the final URL and the body:
+//
+//   fetch: 200 http://127.0.0.1:8080/final
+//   <the body>
+//
+// or `fetch: failed: <reason>`.
+import web_core;
+import web_transport;
+import web_http;
+import web_tls;
+import web_client;
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    var v: u64 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57) {
+            return otherwise;
+        }
+        v = v * 10 + (b - 48) as u64;
+    }
+    return v;
+}
+
+async fn readFile(path: StringView, out: borrow mut Vector<u8>) -> Result<void, NetError> {
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(e) => { return Err(NetErrors.fromAsync(e)); },
+    };
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (await AsyncFiles.read(mut file, mut chunk[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(NetErrors.fromAsync(e)); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        for (i in 0..n) {
+            match (out.push(chunk[i])) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+    }
+}
+
+fn append(line: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, NetError> {
+    for (b in text) {
+        match (line.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+    return Ok();
+}
+
+async fn say(text: StringView) -> Result<void, NetError> {
+    match (await AsyncConsole.writeLine(text)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn sayBytes(bytes: Slice<u8>) -> Result<void, NetError> {
+    match (StringView.fromUtf8(bytes)) {
+        Some(text) => { return await say(text); }
+        null => { return await say("fetch: (not UTF-8)"); }
+    }
+}
+
+/// The https connector: the roots in CW_CA, or the system's.
+async fn connector() -> Result<Box<dyn Connector>, NetError> {
+    var config = match (TlsConfig.client()) {
+        Ok(c) => c,
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
+    };
+    match (Environment.variable("CW_CA")) {
+        Some(path) => {
+            var ca = Vector<u8>.create();
+            await readFile(path, mut ca)?;
+            match (config.trustPem(ca.view())) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+            }
+        }
+        null => {
+            match (config.trustSystem()) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+            }
+        }
+    }
+    var protocols = [Alpn.Http11];
+    match (config.setAlpn(protocols[..])) {
+        Ok() => {}
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+    }
+    let tls = match (TlsConnector.create(config)) {
+        Ok(t) => t,
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
+    };
+    match (Box.create(tls)) {
+        Ok(b) => {
+            let d: Box<dyn Connector> = b;
+            return Ok(d);
+        }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}
+
+/// One request and its report; a client error is reported, not returned.
+async fn once(client: borrow Client, url: StringView, post: bool, payload: StringView) -> Result<void, NetError> {
+    let request = match (ClientRequest.create(if (post) Method.Post else Method.Get, url)) {
+        Ok(r) => r,
+        Err(e) => { return await failed(e); },
+    };
+    var body = match (BytesBody.of(payload.bytes())) {
+        Ok(b) => b,
+        Err(e) => { return await failed(e); },
+    };
+    var none = NoBody {};
+    let sent = if (post) await client.send(request, mut body) else await client.send(request, mut none);
+    var response = match (sent) {
+        Ok(r) => r,
+        Err(e) => { return await failed(e); },
+    };
+    var content = Vector<u8>.create();
+    match (await response.readToEnd(mut content, 16777216)) {
+        Ok() => {}
+        Err(e) => { return await failed(e); }
+    }
+    match (await response.finish(client)) {
+        Ok() => {}
+        Err(e) => { return await failed(e); }
+    }
+    var line = Vector<u8>.create();
+    append(mut line, "fetch: ".bytes())?;
+    var digits = [0u8; 3];
+    var status = response.status();
+    for (k in 0..digits.length) {
+        digits[digits.length - 1 - k] = 48 + truncate<u8>(status % 10);
+        status /= 10;
+    }
+    append(mut line, digits[..])?;
+    append(mut line, " ".bytes())?;
+    var location = Vector<u8>.create();
+    match (response.url().text(mut location)) {
+        Ok() => {}
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+    append(mut line, location.view())?;
+    await sayBytes(line.view())?;
+    return await sayBytes(content.view());
+}
+
+async fn failed(e: ClientError) -> Result<void, NetError> {
+    var line = Vector<u8>.create();
+    append(mut line, "fetch: failed: ".bytes())?;
+    append(mut line, ClientErrors.describe(e).bytes())?;
+    return await sayBytes(line.view());
+}
+
+async fn run() -> Result<void, NetError> {
+    let url = match (Environment.variable("CW_URL")) {
+        Some(u) => u,
+        null => { return await say("fetch: set CW_URL"); },
+    };
+    let post = match (Environment.variable("CW_METHOD")) {
+        Some(m) => m == "POST",
+        null => false,
+    };
+    let payload = match (Environment.variable("CW_BODY")) {
+        Some(b) => b,
+        null => "",
+    };
+    let tls = await connector()?;
+    let client = match (Client.create(ClientOptions.defaults(), Some(tls))) {
+        Ok(c) => c,
+        Err(e) => { return await failed(e); },
+    };
+    let repeat = setting("CW_REPEAT", 1);
+    for (i in 0..repeat) {
+        await once(client, url, post, payload)?;
+    }
+    await client.shutdown();
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok() => {}
+        Err(e) => {
+            Console.writeLine("fetch: failed:");
+            Console.writeLine(NetErrors.describe(e));
+        }
+    }
+}

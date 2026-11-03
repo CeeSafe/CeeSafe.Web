@@ -221,3 +221,24 @@ Exceeding any limit closes the connection with an alert where possible.
 6. **New shim functions**, added to §3.2's table: `wt_cfg_add_name`, `wt_cfg_reload`, `wt_cfg_rotate_tickets`,
    `wt_cfg_client_auth`, `wt_ctx_session`, `wt_session_free`, `wt_ctx_offer_session`, `wt_ctx_resumed`,
    `wt_peer_subject` and `wt_peer_names`. `wt_peer_cert_der` now returns only a verified certificate.
+
+## 10. Amendment 4 (2026-11-03, M5: the system's roots on Windows)
+
+Found by running `examples/fetch` on Windows 11 ARM64 (OpenSSL 4.1.0): `trustSystem` rejected example.com, because
+OpenSSL's default verify locations on Windows are a directory under its install that nothing fills, not the system's
+certificate store.
+
+1. **`wt_cfg_trust_default`** now also loads the Windows store, through OpenSSL's own `org.openssl.winstore://`
+   loader (`SSL_CTX_load_verify_store`, OpenSSL 3.2 and later). Unix is unchanged: OpenSSL's default bundle or
+   directory.
+2. **On Windows, OpenSSL 3.2 or later** is required for `trustSystem`. With an older OpenSSL it trusts only the
+   default locations, as before. `trustPem` works with every version.
+3. **A limit we cannot lift from OpenSSL:** Windows installs some roots only when its own TLS stack (Schannel) first
+   needs one, and OpenSSL's loader reads only the roots already in the store. On the test VM, www.google.com
+   verified at once, but example.com (SSL.com and Comodo roots) only after `curl.exe` (Schannel) had fetched it. A
+   server whose root is not yet installed fails with `TlsReason.Certificate`. A deployment that must not depend on
+   that passes its roots with `trustPem`.
+4. Checked on 2026-11-03 (docs/milestones/M5.md):
+   - with the system's roots, `examples/fetch` gets www.google.com, and example.com after the root is installed;
+   - expired.badssl.com and wrong.host.badssl.com are refused;
+   - web_tls's 14 tests pass on Windows, macOS and Debian.

@@ -175,3 +175,20 @@ A POST without `Idempotency-Key` is never retried, whatever failed. The transpor
    Recommended: become GET, since that is what servers expect.
 3. **Scope of v0.2.** HTTP/1.1 only; HTTP/2 joins the client with M7 (Web ADR 0004: chosen by ALPN). Proxies, cookies
    and decompression are later. Recommended: yes.
+
+## 7. Amendment 1 (2026-11-03, M5 built and merged on ceesafec 0.9.4)
+
+1. **Shutdown's error.** §3.4 says requests in flight end with `Err(Closed)`. As built, they end with
+   `Err(ClientError.Shutdown)`, the error a request started after the shutdown also gets. That way a caller can tell
+   a shutdown from a peer's close (`Net(Closed)`). A response already being read keeps its connection to the end,
+   and `finish` then closes the connection instead of pooling it. Tested by `shutdown_with_requests_in_flight`.
+2. **CeeSafe B15 and B14** (`docs/ceesafe-upstream-work.md`) held the client on a branch until 0.9.4 fixed them.
+   `Connector` returns `Box<dyn Transport + Send>` (§2). A response holds its connection as a
+   `Vector<Box<dyn Transport + Send>>` of at most one, with no wrapper struct.
+3. **Interop (§5)** ran against:
+   - Python's `http.server`, plain and over Python's `ssl`;
+   - `examples/https` (web_server over web_tls);
+   - public hosts with the system's roots, on macOS, Debian 12 and Windows 11.
+
+   nginx is not installed on the test machines. `examples/fetch` is the client example.
+4. **The system's roots on Windows** needed a change in web_tls (Web ADR 0002 amendment 4).

@@ -269,6 +269,41 @@ static int alpn_select(SSL *ssl, const unsigned char **out, unsigned char *outle
 
 /* ---- Configurations (one SSL_CTX, shared by many connections; OpenSSL 3 makes that thread-safe) ---- */
 
+/* The functions web_tls calls (src/ffi.cee), declared before their definitions (gcc's -Wmissing-prototypes). */
+SSL_CTX *wt_cfg_new(int32_t server);
+void wt_cfg_free(SSL_CTX *ctx);
+int32_t wt_cfg_use_pem(SSL_CTX *ctx, const uint8_t *chain, size_t chain_len, const uint8_t *key, size_t key_len);
+int32_t wt_cfg_trust_pem(SSL_CTX *ctx, const uint8_t *pem, size_t len);
+int32_t wt_cfg_trust_default(SSL_CTX *ctx);
+int32_t wt_cfg_set_alpn(SSL_CTX *ctx, const uint8_t *wire, size_t len);
+int32_t wt_cfg_add_name(SSL_CTX *front, const uint8_t *name, size_t name_len, const uint8_t *chain, size_t chain_len,
+                        const uint8_t *key, size_t key_len);
+int32_t wt_cfg_reload(SSL_CTX *front, const uint8_t *chain, size_t chain_len, const uint8_t *key, size_t key_len);
+int32_t wt_cfg_rotate_tickets(SSL_CTX *front);
+int32_t wt_cfg_client_auth(SSL_CTX *front, int32_t required, const uint8_t *pem, size_t len);
+SSL_SESSION *wt_ctx_session(wt_ctx *c);
+void wt_session_free(SSL_SESSION *s);
+int32_t wt_ctx_offer_session(wt_ctx *c, SSL_SESSION *s);
+int32_t wt_ctx_resumed(wt_ctx *c);
+wt_ctx *wt_ctx_new(SSL_CTX *cfg, int32_t server, const uint8_t *host, size_t host_len);
+void wt_ctx_free(wt_ctx *c);
+int64_t wt_feed(wt_ctx *c, const uint8_t *in, size_t len);
+int64_t wt_take(wt_ctx *c, uint8_t *out, size_t cap);
+uint64_t wt_pending(wt_ctx *c);
+int32_t wt_handshake(wt_ctx *c);
+int64_t wt_read(wt_ctx *c, uint8_t *out, size_t cap);
+int64_t wt_write(wt_ctx *c, const uint8_t *in, size_t len);
+int32_t wt_shutdown(wt_ctx *c);
+int64_t wt_alpn(wt_ctx *c, uint8_t *out, size_t cap);
+int64_t wt_sni(wt_ctx *c, uint8_t *out, size_t cap);
+int64_t wt_peer_cert_der(wt_ctx *c, uint8_t *out, size_t cap);
+int64_t wt_peer_subject(wt_ctx *c, uint8_t *out, size_t cap);
+int64_t wt_peer_names(wt_ctx *c, uint8_t *out, size_t cap);
+int32_t wt_version(wt_ctx *c);
+int32_t wt_reason(wt_ctx *c);
+uint64_t wt_error(wt_ctx *c, uint8_t *out, size_t cap, size_t *len);
+size_t wt_openssl_version(uint8_t *out, size_t cap);
+
 /* A server (server != 0) or client configuration with the settings of Web ADR 0002 §3.3; NULL on failure. */
 SSL_CTX *wt_cfg_new(int32_t server) {
     SSL_CTX *ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
@@ -396,9 +431,20 @@ int32_t wt_cfg_trust_pem(SSL_CTX *ctx, const uint8_t *pem, size_t len) {
     return added;
 }
 
-/* Trusts the system's default CA locations. 1 on success. */
+/* Trusts the system's default CA locations: OpenSSL's defaults (a bundle or directory on Unix), and on Windows the
+ * system's certificate store too, which OpenSSL's defaults do not reach (its winstore loader, OpenSSL 3.2 and later;
+ * Web ADR 0002 amendment 4). 1 on success. */
 int32_t wt_cfg_trust_default(SSL_CTX *ctx) {
-    return SSL_CTX_set_default_verify_paths(ctx) ? 1 : 0;
+    if (!SSL_CTX_set_default_verify_paths(ctx)) {
+        return 0;
+    }
+#if defined(_WIN32) && OPENSSL_VERSION_NUMBER >= 0x30200000L
+    if (!SSL_CTX_load_verify_store(ctx, "org.openssl.winstore://")) {
+        ERR_clear_error();
+        return 0;
+    }
+#endif
+    return 1;
 }
 
 /* The ALPN protocols, in wire form (each a length byte and the name), in preference order. 1 on success. */
@@ -904,11 +950,11 @@ int64_t wt_peer_names(wt_ctx *c, uint8_t *out, size_t cap) {
     int64_t result = 0;
     if (names != NULL && b != NULL) {
         for (int i = 0; i < sk_GENERAL_NAME_num(names); i++) {
-            const GENERAL_NAME *g = sk_GENERAL_NAME_value(names, i);
+            GENERAL_NAME *g = sk_GENERAL_NAME_value(names, i);
             if (i > 0) {
                 BIO_puts(b, ", ");
             }
-            GENERAL_NAME_print(b, (GENERAL_NAME *)g); /* "DNS:…", "IP Address:…", "email:…", "URI:…" */
+            GENERAL_NAME_print(b, g); /* "DNS:…", "IP Address:…", "email:…", "URI:…" */
         }
         char *text = NULL;
         long n = BIO_get_mem_data(b, &text);

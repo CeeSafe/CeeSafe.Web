@@ -612,7 +612,7 @@ public struct ClientResponse {
     private maxDrain: u64;
     private address: Url;
     /// The connection while the response has it (at most one: a vector, so `finish` can move it out with `pop`).
-    private conn: Vector<Live>;
+    private conn: Vector<Box<dyn Transport + Send>>;
     private slots: Channel<u8>;
     private head: Vector<u8>;
     private code: u16;
@@ -761,7 +761,7 @@ public struct ClientResponse {
             return Ok(); // the connection closes when the response is dropped
         }
         match (this.conn.pop()) {
-            Some(live) => { await client.pool.give(this.address, live.conn); }
+            Some(conn) => { await client.pool.give(this.address, conn); }
             null => {}
         }
         return Ok();
@@ -773,7 +773,7 @@ public struct ClientResponse {
         if (this.conn.length == 0) {
             return Ok(0);
         }
-        let n = net(await readBoxed(mut this.conn[0].conn, this.carry.spare(), this.readDeadline))?;
+        let n = net(await readBoxed(mut this.conn[0], this.carry.spare(), this.readDeadline))?;
         if (n > 0) {
             match (this.carry.commit(n)) {
                 Ok() => {}
@@ -790,15 +790,10 @@ public struct ClientResponse {
     }
 }
 
-/// A connection a response holds.
-struct Live {
-    conn: Box<dyn Transport + Send>;
-}
-
 /// A vector holding `conn`.
-fn one(conn: Box<dyn Transport + Send>) -> Result<Vector<Live>, Failure> {
-    var v = Vector<Live>.create(); // a struct, since `Vector<Box<dyn Transport + Send>>.create()` does not parse (B14)
-    match (v.push(Live { conn: conn })) {
+fn one(conn: Box<dyn Transport + Send>) -> Result<Vector<Box<dyn Transport + Send>>, Failure> {
+    var v = Vector<Box<dyn Transport + Send>>.create();
+    match (v.push(conn)) {
         Ok() => { return Ok(v); }
         Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); }
     }

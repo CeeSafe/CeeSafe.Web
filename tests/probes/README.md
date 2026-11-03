@@ -32,9 +32,9 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `generic-impl-this-dyn-bug.cee` | builds and prints `7` since 0.9.2; before, the C named `Wrap<S>` uninstantiated | CeeSafe bug B12; `impl<S> ConnectionHandler for Server<S>` | 0007 |
 | `generic-dyn-box-flow-bug.cee` | prints `2` since 0.9.1; with 0.8.0 and 0.9.0, N0272 on `Generic<S>.add` storing a `Box<dyn Handler<S>>` (the non-generic twin was accepted) | CeeSafe bug B8, fixed in 0.9.1 | 0007 |
 | `sse-race-exchange.cee` | prints `3`, `2`, `closed`, interpreted and native | one task races a `borrow mut` method of the exchange against a channel and a timer, then writes after the race | 0008 §1 |
-| `dyn-send-type-argument-bug.cee` | **should** check and print `1`; N0103 on `Vector<Box<dyn Job + Send>>.create()` | CeeSafe bug B14; `web_client`'s held connection | 0009 |
-| `dyn-send-async-frames-bug.cee` | **should** build and print `3`; `--interp` does, the C defines the dyn-call frame twice | CeeSafe bug B15; blocks `web_client` natively | 0009 |
-| `scope-droppable-error-bug.cee` | **should** build and print `3`; `--interp` does, the C calls the error's drop function before declaring it | CeeSafe bug B13; scopes in `web_sse`'s tests | 0008 |
+| `dyn-send-type-argument-bug.cee` | checks and prints `1` since 0.9.4; before, N0103 on `Vector<Box<dyn Job + Send>>.create()` | CeeSafe bug B14; `web_client`'s held connection | 0009 |
+| `dyn-send-async-frames-bug.cee` | builds and prints `3` since 0.9.4; before, the C defined the dyn-call frame twice | CeeSafe bug B15; blocks `web_client` natively | 0009 |
+| `scope-droppable-error-bug.cee` | builds and prints `3` since 0.9.4; before, the C called the error's drop function before declaring it | CeeSafe bug B13; scopes in `web_sse`'s tests | 0008 |
 
 ## Runs
 
@@ -48,5 +48,6 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.7.0 (release) | B1–B4 probes fixed: each gives its intended result in the interpreter and natively with `-Werror`; `wake-waiters-livelock-bug` 20/20 natively (kqueue). The `-fail` probes still fail with the same codes. New `async-deadline-void-bug` reproduces B6 |
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.8.0 (release) | `async-deadline-void-bug` prints `ok` (interpreter, and natively with `-Werror`): B6 fixed |
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.9.2 (release) | B9–B12 probes fixed: each prints its expected value, interpreted and native. New: `sse-race-exchange` as expected; `scope-droppable-error-bug` reproduces B13 (interpreter prints `3`, native build fails with 3 C errors) |
+| 2026-11-03 | `~/.ceesafe/bin/ceesafec` 0.9.4 (release) | B13, B14 and B15 probes fixed: each prints its expected value, interpreted and native |
 
 `impl-generic-fail.cee` does not parse, so `ceesafec fmt --check` reports it; the other probes are formatted.

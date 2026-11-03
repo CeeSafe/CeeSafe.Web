@@ -241,6 +241,57 @@ async fn shutdown() -> Result<void, TestFailure> {
 }
 
 @test
+async fn shutdown_with_requests_in_flight() -> Result<void, TestFailure> {
+    // Web ADR 0009 §3.4: one slot. A holds it with its body unread; B waits for it. The shutdown ends B with
+    // `Shutdown`; A still reads its own connection to the end, which is then closed rather than pooled.
+    let scripts = scriptsOf(3)?;
+    queue(scripts, script(ok2())?)?;
+    queue(scripts, script(ok2())?)?;
+    var options = quick();
+    options.maxPerOrigin = 1;
+    let client = mockClient(options, scripts, v4(1), null, null, null, false)?;
+    var a = match (await client.get("http://example.test/a")) {
+        Ok(r) => r,
+        Err(e) => { return Check.fail(ClientErrors.describe(e)); },
+    };
+    let raced: Result<Raced<u32>, NetError> = await Async.race(
+        async () => match (await client.get("http://example.test/b")) {
+            Err(ClientError.Shutdown) => Ok(1u32),
+            Ok(_) => Ok(2u32),
+            Err(_) => Ok(3u32),
+        },
+        async () => {
+            let waited = await Timer.sleep(50);
+            await client.shutdown();
+            let after = await Timer.sleep(60000);
+            return Ok(0u32);
+        },
+    );
+    match (raced) {
+        Ok(r) => {
+            Check.equalU64(0, r.winner as u64)?; // B ended; the shutdown arm was still sleeping
+            Check.equalU64(1, r.value as u64)?;
+        }
+        Err(_) => { return Check.fail("the race"); }
+    }
+    var got = Vector<u8>.create();
+    match (await a.readToEnd(mut got, 1024)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("A's body after the shutdown"); }
+    }
+    Check.equalBytes("ok".bytes(), got.view())?;
+    match (await a.finish(client)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("A's finish"); }
+    }
+    var c = Vector<u8>.create();
+    Check.equalU64(0, await outcome(client, await client.get("http://example.test/c"), mut c) as u64)?;
+    Check.equalBytes("client shut down".bytes(), c.view())?;
+    Check.equalU64(1, await left(scripts))?; // B and C dialled nothing
+    return Ok();
+}
+
+@test
 fn bad_requests() -> Result<void, TestFailure> {
     let bad = match (ClientRequest.create(Method.Get, "ftp://x/")) {
         Err(ClientError.BadUrl(_)) => true,

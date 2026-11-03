@@ -22,6 +22,12 @@ async fn acceptLoop(listener: borrow Listener, served: borrow mut u32) -> Result
     loop {
         let stream = await listener.accept()?;
         var conn = await acceptor.accept(stream, Deadline.never())?;
+        // Each connection holds its worker a while, so the others must accept meanwhile. Without it, on Linux one
+        // worker can drain the whole backlog before another wakes (seen on Debian 12, 2026-11-03).
+        match (await Timer.sleep(20)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAsync(e)); }
+        }
         await workerEcho(mut conn)?;
         served += 1;
     }
