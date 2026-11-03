@@ -5,7 +5,8 @@ import web_transport;
 import web_http;
 import web_http1;
 
-/// A request: a method, a URL and fields. Framing fields and `host` are the client's to write.
+/// A request: a method, a URL and fields. Framing fields and `host` are the client's to write; `setAuthority` changes
+/// the `host` it writes.
 @noncopy
 public struct ClientRequest {
     private verb: Method;
@@ -13,6 +14,8 @@ public struct ClientRequest {
     private names: Vector<Vector<u8>>;
     private values: Vector<Vector<u8>>;
     private keyed: bool;
+    /// The authority sent as `host` instead of the URL's (empty: the URL's).
+    private authorityText: Vector<u8>;
 
     /// A request for `url` (absolute http or https). `Method.Extension` is refused: it has no token to send.
     public fn create(method: Method, url: StringView) -> Result<ClientRequest, ClientError> {
@@ -30,6 +33,7 @@ public struct ClientRequest {
             names: Vector<Vector<u8>>.create(),
             values: Vector<Vector<u8>>.create(),
             keyed: false,
+            authorityText: Vector<u8>.create(),
         });
     }
 
@@ -61,6 +65,24 @@ public struct ClientRequest {
             Ok() => { return Ok(); }
             Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
         }
+    }
+
+    /// Sends `authority` (`host[:port]`, RFC 9110 §7.2) as `host` instead of the URL's, while the URL still chooses
+    /// where the request goes: a reverse proxy keeps the client's `host` this way (Web ADR 0012 §3.5). A redirect to
+    /// another origin goes back to that origin's own authority. Empty, or a byte that cannot be in an authority
+    /// (whitespace, a control, `/`, `?`, `#`, `@`), is `BadRequest`.
+    public fn setAuthority(borrow mut this, authority: Slice<u8>) -> Result<void, ClientError> {
+        if (authority.length == 0) {
+            return Err(ClientError.BadRequest);
+        }
+        for (b in authority) {
+            if (b <= 32 || b >= 127 || b == 47 || b == 63 || b == 35 || b == 64) {
+                return Err(ClientError.BadRequest);
+            }
+        }
+        this.authorityText.clear();
+        copyBytes(mut this.authorityText, authority)?;
+        return Ok();
     }
 
     /// The request's method.
@@ -203,13 +225,22 @@ public struct Client {
         var none = NoBody {};
         loop {
             attempts += 1;
-            let r = if (withBody) await this.attempt(url, method, request, strip, body, total) else await this.attempt(
+            let r = if (withBody) await this.attempt(
+                url,
+                method,
+                request,
+                strip,
+                body,
+                total,
+                "".bytes(),
+            ) else await this.attempt(
                 url,
                 method,
                 request,
                 strip,
                 mut none,
                 total,
+                "".bytes(),
             );
             match (r) {
                 Ok(response) => {
@@ -266,6 +297,36 @@ public struct Client {
         return await handshake(conn, address, options, total, this.options.limits);
     }
 
+    /// Sends `request` asking to switch to `protocol` (RFC 9110 §7.8: `connection: upgrade` and `upgrade: protocol`,
+    /// which the client writes in place of the request's own). No redirect is followed and nothing is retried. A 101
+    /// gives the connection, which leaves the pool, as `Switched`; any other answer is an ordinary response.
+    /// `protocol` is one or more `name[/version]` tokens separated by commas; anything else is `BadRequest`.
+    public async fn upgrade(
+        borrow this,
+        request: borrow ClientRequest,
+        protocol: Slice<u8>,
+        body: borrow mut dyn BodySource,
+    ) -> Result<Upgraded, ClientError> {
+        if (protocol.length == 0) {
+            return Err(ClientError.BadRequest);
+        }
+        for (b in protocol) {
+            if (!Ascii.isTokenChar(b) && b != 47 && b != 44 && b != 32) {
+                return Err(ClientError.BadRequest);
+            }
+        }
+        let total = if (this.options.totalMs == 0) Deadline.never() else Deadline.after(this.options.totalMs);
+        let url = urlCopy(request.url())?;
+        let response = match (await this.attempt(url, request.method(), request, false, body, total, protocol)) {
+            Ok(r) => r,
+            Err(f) => { return Err(f.error); },
+        };
+        if (response.status() != 101) {
+            return Ok(Upgraded.Answered(response));
+        }
+        return Ok(Upgraded.Switched(response.switched()?));
+    }
+
     /// Closes the idle connections; requests that start afterwards fail with `Shutdown`.
     public async fn shutdown(borrow this) {
         await this.pool.shutdown();
@@ -280,6 +341,7 @@ public struct Client {
         strip: bool,
         body: borrow mut dyn BodySource,
         total: Deadline,
+        upgrade: Slice<u8>,
     ) -> Result<ClientResponse, Failure> {
         let pooled = match (await this.pool.idleFor(url)) {
             Ok(p) => p,
@@ -303,7 +365,7 @@ public struct Client {
         // From here the connection owns a slot: a failure releases it when `conn` is dropped (Held).
         var held = Held { slots: slots, live: true };
         var written: u64 = 0;
-        match (await this.writeRequest(mut conn, url, method, request, strip, body, mut written)) {
+        match (await this.writeRequest(mut conn, url, method, request, strip, body, mut written, upgrade)) {
             Ok() => {}
             Err(e) => { return Err(Failure { error: e, resendable: written == 0 }); }
         }
@@ -313,7 +375,15 @@ public struct Client {
             Ok(b) => b,
             Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
         };
-        match (await readHead(mut conn, method, mut head, mut carry, firstByte, this.options.limits)) {
+        match (await readHead(
+            mut conn,
+            method,
+            mut head,
+            mut carry,
+            firstByte,
+            this.options.limits,
+            upgrade.length > 0,
+        )) {
             Ok() => {}
             Err(e) => {
                 // A pooled connection that ended before any response byte lost a race with the server closing it.
@@ -440,11 +510,16 @@ public struct Client {
         strip: bool,
         body: borrow mut dyn BodySource,
         written: borrow mut u64,
+        upgrade: Slice<u8>,
     ) -> Result<void, ClientError> {
         var authority = Vector<u8>.create();
-        match (url.authority(mut authority)) {
-            Ok() => {}
-            Err(e) => { return Err(ClientError.BadUrl(e)); }
+        if (request.authorityText.length > 0 && !strip) {
+            copyBytes(mut authority, request.authorityText.view())?;
+        } else {
+            match (url.authority(mut authority)) {
+                Ok() => {}
+                Err(e) => { return Err(ClientError.BadUrl(e)); }
+            }
         }
         var head = Vector<u8>.create();
         var w = RequestWriter.start(mut head, Methods.text(method).bytes(), url.target(), authority.view());
@@ -455,7 +530,16 @@ public struct Client {
                 Ascii.equalsIgnoringCase(name, "proxy-authorization"))) {
                 continue;
             }
+            // An upgrade's own `connection` and `upgrade` are the client's to write.
+            if (upgrade.length > 0 && (Ascii.equalsIgnoringCase(name, "connection") ||
+                Ascii.equalsIgnoringCase(name, "upgrade"))) {
+                continue;
+            }
             w.field(mut head, name, request.values[i].view());
+        }
+        if (upgrade.length > 0) {
+            w.field(mut head, "connection".bytes(), "upgrade".bytes());
+            w.field(mut head, "upgrade".bytes(), upgrade);
         }
         let length = body.length();
         let declareZero = Methods.same(method, Method.Post) || Methods.same(method, Method.Put) ||
@@ -548,6 +632,7 @@ async fn readHead(
     carry: borrow mut OwnedBuffer,
     deadline: Deadline,
     limits: Limits,
+    switching: bool,
 ) -> Result<void, ClientError> {
     var scanner = HeadScanner.create();
     var buf = [0u8; 4096];
@@ -560,10 +645,10 @@ async fn readHead(
                     Err(e) => { return Err(ClientError.Protocol(e)); },
                 };
                 let status = p.status;
-                if (status == 101) {
+                if (status == 101 && !switching) {
                     return Err(ClientError.Protocol(ProtocolError.BadStatusLine)); // never asked for
                 }
-                if (status >= 200) {
+                if (status >= 200 || status == 101) {
                     // Keep the head only; move the rest to `carry`.
                     let all = head.view();
                     match (carry.append(all[end..])) {
@@ -606,6 +691,31 @@ async fn readBoxed(
         return Err(NetError.TimedOut);
     }
     return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await conn.read(into));
+}
+
+/// What `Client.upgrade` got: the connection switched, or an ordinary answer.
+public enum Upgraded {
+    Switched(Switched),
+    Answered(ClientResponse),
+}
+
+/// A connection after `101 Switching Protocols`: the bytes are the new protocol's, both ways.
+@noncopy
+public struct Switched {
+    private conn: Box<dyn Transport + Send>;
+    private head: Vector<u8>;
+    private earlyBytes: OwnedBuffer;
+    private limits: Limits;
+
+    /// Appends a copy of the 101's fields to `into` (`ClientResponse.fields`).
+    public fn fields(borrow this, into: borrow mut HeaderBlock) -> Result<void, ClientError> =>
+        fieldsOf(this.head.view(), this.limits, into);
+
+    /// The bytes the server sent after its 101 that were read with it: the new protocol's first, before any read.
+    public fn early(borrow this) -> Slice<u8> => this.earlyBytes.readable();
+
+    /// The connection, to read and write the new protocol.
+    public fn transport(borrow mut this) -> borrow mut Box<dyn Transport + Send> => borrow mut this.conn;
 }
 
 /// Frees a slot when dropped while `live`.
@@ -663,6 +773,33 @@ public struct ClientResponse {
             Err(_) => { return null; }
         }
     }
+
+    /// The connection after a 101, out of the pool: its slot is freed, since a switched connection is no request.
+    fn switched(this) -> Result<Switched, ClientError> {
+        var r = this;
+        let conn = match (r.conn.pop()) {
+            Some(c) => c,
+            null => { return Err(ClientError.Net(NetError.Closed)); },
+        };
+        let freed = r.slots.trySend(0);
+        var head = Vector<u8>.create();
+        copyBytes(mut head, r.head.view())?;
+        let rest = r.carry.readable();
+        var early = match (OwnedBuffer.create(if (rest.length == 0) 1 else rest.length)) {
+            Ok(b) => b,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        match (early.append(rest)) {
+            Ok() => {}
+            Err(e) => { return Err(ClientError.Net(e)); }
+        }
+        return Ok(Switched { conn: conn, head: head, earlyBytes: early, limits: r.limits });
+    }
+
+    /// Appends a copy of every response field to `into`, in order, names lowercased (Web ADR 0012 §3.5: a proxy relays
+    /// them).
+    public fn fields(borrow this, into: borrow mut HeaderBlock) -> Result<void, ClientError> =>
+        fieldsOf(this.head.view(), this.limits, into);
 
     /// The `location` resolved against `base`, for a redirect.
     fn location(borrow this, base: borrow Url) -> Url? {
@@ -857,4 +994,29 @@ fn boxed<T>(r: Result<Box<T>, AllocError>) -> Result<Box<T>, ClientError> {
         Ok(b) => { return Ok(b); }
         Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
     }
+}
+
+fn pushedOk(r: Result<void, AllocError>) -> Result<void, ClientError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+    }
+}
+
+/// The fields of the response head `h`, appended to `into`, names lowercased.
+fn fieldsOf(h: Slice<u8>, limits: Limits, into: borrow mut HeaderBlock) -> Result<void, ClientError> {
+    let parsed = match (parseResponseHead(h, 0, h.length, Method.Get, limits)) {
+        Ok(p) => p,
+        Err(e) => { return Err(ClientError.Protocol(e)); },
+    };
+    var lower = Vector<u8>.create();
+    for (i in 0..parsed.headers.count()) {
+        lower.clear();
+        for (c in parsed.headers.nameBytes(i)) {
+            pushedOk(lower.push(if (c >= 65 && c <= 90) c + 32 else c))?;
+        }
+        let name = lower.view();
+        pushedOk(into.push(name, parsed.headers.value(i), HeaderBlock.sensitiveByDefault(name)))?;
+    }
+    return Ok();
 }

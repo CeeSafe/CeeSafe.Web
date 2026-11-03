@@ -32,6 +32,8 @@ public struct MockTransport {
     private poisoned: bool;
     private shut: bool;
     private protocol: Alpn;
+    /// Where each byte written is also sent, for a test that has handed the transport away.
+    private copyTo: Channel<u8>?;
 
     /// A transport whose peer sends `input` and then ends its side.
     public fn create(input: Slice<u8>) -> Result<MockTransport, AllocError> {
@@ -55,7 +57,16 @@ public struct MockTransport {
             poisoned: false,
             shut: false,
             protocol: Alpn.None,
+            copyTo: null,
         });
+    }
+
+    /// Every byte written is also sent to `copies` (dropped if it is full), so a test can see what was written after
+    /// handing the transport to a pool.
+    public fn withCopiesTo(this, copies: borrow Channel<u8>) -> MockTransport {
+        var m = this;
+        m.copyTo = Some(copies.clone());
+        return m;
     }
 
     /// Each read returns at most `n` bytes (n ≥ 1; 0 is taken as 1).
@@ -179,7 +190,13 @@ public struct MockTransport {
             return Err(NetError.Reset);
         }
         match (this.out.push(b)) {
-            Ok() => { return Ok(); }
+            Ok() => {
+                match (borrow this.copyTo) {
+                    Some(c) => { let copied = c.trySend(b); }
+                    null => {}
+                }
+                return Ok();
+            }
             Err(_) => {
                 this.poisoned = true;
                 return Err(NetError.OutOfMemory);
