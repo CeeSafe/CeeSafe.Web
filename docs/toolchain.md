@@ -17,6 +17,7 @@ that needs an unreleased compiler is not merged to main.
 | M4 TLS, OpenSSL's allocations in the sweep | **0.10.1** | U14 (`CEE_ALLOC_FOREIGN`, ADR 0060) and U17 (`CEE_ALLOC_FOREIGN_INIT`, ADR 0061) | done (Web ADR 0002 amendment 5) |
 | M5 client | 0.9.4 | U5 DNS (ADR 0048), released in 0.8.0; B15 (`dyn I + Send` async frames), fixed in 0.9.4; U15 (`HostNotFound`, 0.10.0) only for the message | done (`docs/milestones/M5.md`) |
 | M6 WebSockets | **0.10.0** | nothing new for the server (0.9.4); the client needs U16 (`Random.fill`, ADR 0060) | done (`docs/milestones/M6.md`) |
+| M7 HTTP/2 | **0.10.3** | B16 (a wake lost on kqueue past ~30 connections), fixed in 0.10.2; B17 (cancellation and the wake list quadratic in parked tasks, CeeSafe ADR 0062), fixed in 0.10.3 | in progress, branch `m7-http2` (`docs/milestones/M7.md`) |
 | M9 sendfile | 0.9.0 | U7 (ADR 0051) | released |
 | M10 HTTP/3 | 0.9.0 | U6 UDP (ADR 0050) | released |
 
@@ -24,10 +25,13 @@ that needs an unreleased compiler is not merged to main.
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.10.1** (release, tag `v0.10.1` = CeeSafe `1de2747`; osx-arm64, SHA256 and signature checked) | the toolchain for main; `ceesafec test` runs the tests and both sweeps |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.10.3** (release, tag `v0.10.3` = CeeSafe `94a4a92`; osx-arm64, SHA256 and signature checked) | the toolchain for main and `m7-http2`; `ceesafec test` runs the tests and both sweeps |
 | `/root/cw-m5/ceesafec-0.9.4/ceesafec` on the Debian x86_64 host | **0.9.4** (release, linux-x64, SHA256 checked) | M5's Debian runs |
 | `%USERPROFILE%\.ceesafe\bin\ceesafec.exe` on the Windows 11 ARM64 VM | **0.9.4** (release, win-arm64, SHA256 checked) | M4/M5's Windows runs |
 | `/root/cw-fuzz/ceesafec-0.8.0/ceesafec`, `/root/cw-tls/ceesafec-0.9.2/ceesafec` on the Debian host | 0.8.0, 0.9.2 | the HTTP and TLS fuzz campaigns only |
+
+0.10.3 (B16, B17, CeeSafe ADR 0062) is M7's minimum: the HTTP/2 server needs both fixes past ~30 connections and
+~2 000 streams. CI on `m7-http2` pins it; main keeps 0.10.1 until M7 merges.
 
 0.10.1 (U17, CeeSafe ADR 0061) is `web_tls`'s minimum: its shim uses `CEE_ALLOC_FOREIGN_INIT`. So it is main's minimum.
 CI installs the latest release from `https://ceesafe.github.io/CeeSafe/install.sh` (the CeeSafe organisation's

@@ -778,7 +778,7 @@ prints the area.
 app.get();` and then `let application: borrow dyn Application = sendable;`. That is two lines, not a workaround: no
 wrapper, no `unsafe`.
 
-## B16 — Bug: a wake lost when a full kqueue change queue drains the wake pipe   *(found 2026-11-03, M7, ceesafec 0.10.1, macOS (kqueue); fixed on CeeSafe branch `b16-kqueue-drained-wake` (454ac74), not yet released)*
+## B16 — Bug: a wake lost when a full kqueue change queue drains the wake pipe   *(found 2026-11-03, M7, ceesafec 0.10.1, macOS (kqueue); fixed in 0.10.2)*
 
 **Cause (found 2026-11-03, in the CeeSafe repo):**
 - A channel's send wakes its parked receiver: it sets the receiver's `woken` flag and writes one byte to the
@@ -842,7 +842,7 @@ HTTP/1.1 on the same server at 100 connections is 42 076 req/s, with the longest
 - Past ~20 connections, requests stall up to 1 s.
 - Not worked around: the 1 s timer stays as the backstop it was meant to be.
 
-## B17 — Performance: every finished race walks every parked task   *(found 2026-11-03, M7, ceesafec 0.10.1 with B16's fix; open)*
+## B17 — Performance: every finished race walks every parked task   *(found 2026-11-03, M7, ceesafec 0.10.1 with B16's fix; fixed in 0.10.3 by CeeSafe ADR 0062)*
 
 **Symptom:** after B16's fix, HTTP/2 throughput falls with the number of concurrent streams. `h2load -n 20000`
 against `examples/server`:
@@ -872,6 +872,16 @@ the cost is proportional to what is cancelled. That is a runtime design change: 
 
 **Effect on CeeSafe.Web until then:** correct at any load (h2load 100 000/100 000), but past about 2 000 concurrent
 streams on one executor, latency grows.
+
+**Fixed (CeeSafe ADR 0062, released in 0.10.3):**
+- Each scope lists its children, and each task the scopes it owns, so a cancellation visits only the cancelled
+  scope's tasks.
+- On the way, `cee_wait` takes woken tasks in one pass and sorts them, where it walked the wake list once per woken
+  task. That was the second quadratic cost, about 40 % of a no-inline profile.
+- `examples/server` under `h2load` (ADR 0062 §7):
+  - 50 × 100 streams: 3 562 → 70 956 req/s, mean 1.40 s → 70 ms;
+  - 10 × 100: 21 944 → 75 812 req/s;
+  - 100 × 1: 10 698 → 37 297 req/s.
 
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
