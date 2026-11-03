@@ -1,0 +1,175 @@
+// Choosing backends (Web ADR 0012 §3.2, §3.3). Expected values: SipHash's paper (Aumasson and Bernstein 2012,
+// Appendix A) and its reference implementation's first vector; nginx's smooth weighted round robin sequence for
+// weights 5, 1, 1 (a a b a c a a, from nginx's change introducing it); rendezvous hashing's defining property; and
+// §3.3's rules for ejection and panic mode.
+import web_core;
+
+fn keyOf(start: u8) -> [u8; 16] {
+    var k = [0u8; 16];
+    for (i in 0..16usize) {
+        k[i] = start + truncate<u8>(i);
+    }
+    return k;
+}
+
+@test
+fn siphash_paper_vectors() -> Result<void, TestFailure> {
+    let key = keyOf(0);
+    var message = [0u8; 15];
+    for (i in 0..15usize) {
+        message[i] = truncate<u8>(i);
+    }
+    Check.equalU64(0xa129ca6149be45e5, sipHash(key, message[..], 2, 4))?; // Appendix A
+    return Check.equalU64(0x726fdb47dd0e0e31, sipHash(key, message[0..0], 2, 4)); // vectors.h, the empty message
+}
+
+fn balancer(policy: Policy, weights: Slice<u32>, health: HealthOptions) -> Result<Balancer, TestFailure> {
+    var b = Balancer.create(policy, health, keyOf(7), 42);
+    let names = "abcdefgh".bytes();
+    for (i in 0..weights.length) {
+        match (b.add(names[i..i + 1], weights[i])) {
+            Ok(_) => {}
+            Err(_) => { return Err(TestFailure.create("out of memory")); }
+        }
+    }
+    return Ok(b);
+}
+
+fn picked(b: borrow mut Balancer, key: Slice<u8>, now: u64, avoid: usize?) -> Result<usize, TestFailure> {
+    match (b.pick(key, now, avoid)) {
+        Some(i) => { return Ok(i); }
+        null => { return Err(TestFailure.create("no backend")); }
+    }
+}
+
+@test
+fn smooth_weighted_round_robin() -> Result<void, TestFailure> {
+    let weights = [5u32, 1, 1];
+    var b = balancer(Policy.RoundRobin, weights[..], HealthOptions.defaults())?;
+    var order = Vector<u8>.create();
+    for (n in 0..14u32) {
+        let i = picked(mut b, "".bytes(), 0, null)?;
+        b.finished(i, Outcome.Answered, 0);
+        match (order.push(97 + truncate<u8>(i))) {
+            Ok() => {}
+            Err(_) => { return Check.fail("out of memory"); }
+        }
+    }
+    return Check.equalBytes("aabacaaaabacaa".bytes(), order.view());
+}
+
+@test
+fn rendezvous_moves_only_the_removed_backends_keys() -> Result<void, TestFailure> {
+    let five = [1u32, 1, 1, 1, 1];
+    var all = balancer(Policy.ConsistentHash, five[..], HealthOptions.defaults())?;
+    var health = HealthOptions.defaults();
+    health.unhealthyAfter = 1;
+    var fewer = balancer(Policy.ConsistentHash, five[..], health)?;
+    fewer.checked(2, false); // backend c gone
+    var counts = [0u32; 5];
+    var moved: u32 = 0;
+    var key = [0u8; 4];
+    for (n in 0..2000u32) {
+        key[0] = truncate<u8>(n);
+        key[1] = truncate<u8>(n >> 8);
+        let before = picked(mut all, key[..], 0, null)?;
+        let after = picked(mut fewer, key[..], 0, null)?;
+        counts[before] += 1;
+        if (before != 2) {
+            Check.equalU64(before as u64, after as u64)?; // a key whose backend stayed does not move
+        } else {
+            Check.isTrue(after != 2, "the removed backend's keys go elsewhere")?;
+            moved += 1;
+        }
+    }
+    for (c in counts) {
+        Check.isTrue(c > 300 && c < 500, "about a fifth each")?;
+    }
+    return Check.isTrue(moved == counts[2], "only c's keys moved");
+}
+
+@test
+fn least_requests_by_two_choices() -> Result<void, TestFailure> {
+    let three = [1u32, 1, 1];
+    var b = balancer(Policy.LeastRequests, three[..], HealthOptions.defaults())?;
+    // Thirty requests that stay in flight: two choices keep the backends within a few of each other.
+    for (n in 0..30u32) {
+        let i = picked(mut b, "".bytes(), 0, null)?;
+    }
+    for (i in 0..3usize) {
+        Check.isTrue(b.inFlight(i) >= 7 && b.inFlight(i) <= 13, "balanced in flight")?;
+    }
+    return Ok();
+}
+
+@test
+fn ejection_backoff_and_the_half_cap() -> Result<void, TestFailure> {
+    var health = HealthOptions.defaults();
+    health.consecutiveFailures = 3;
+    health.baseEjectionMs = 1000;
+    health.maxEjectionMs = 3000;
+    let four = [1u32, 1, 1, 1];
+    var b = balancer(Policy.RoundRobin, four[..], health)?;
+    for (n in 0..3u32) {
+        b.finished(0, Outcome.Failed, 0);
+    }
+    Check.isTrue(!b.usable(0, 999) && b.usable(0, 1000), "ejected for 1 s")?;
+    for (n in 0..3u32) {
+        b.finished(0, Outcome.Failed, 1000);
+    }
+    Check.isTrue(!b.usable(0, 2999) && b.usable(0, 3000), "then 2 s")?;
+    for (n in 0..3u32) {
+        b.finished(0, Outcome.Failed, 3000);
+    }
+    Check.isTrue(!b.usable(0, 5999) && b.usable(0, 6000), "then capped at 3 s")?;
+    b.finished(0, Outcome.Answered, 6000);
+    for (n in 0..3u32) {
+        b.finished(0, Outcome.Failed, 6000);
+    }
+    Check.isTrue(b.usable(0, 7000), "an answer after the ejection resets the backoff")?;
+    // A 5xx counts only when configured; an answer resets the count.
+    b.finished(1, Outcome.ServerError, 0);
+    b.finished(1, Outcome.ServerError, 0);
+    b.finished(1, Outcome.ServerError, 0);
+    Check.isTrue(b.usable(1, 0), "5xx not counted by default")?;
+    // At most half at once: with 0 ejected until 7000, ejecting 1 and 2 is allowed, a third is not.
+    let pair = [1u32, 1];
+    var two = balancer(Policy.RoundRobin, pair[..], health)?;
+    for (n in 0..3u32) {
+        two.finished(0, Outcome.Failed, 0);
+        two.finished(1, Outcome.Failed, 0);
+    }
+    Check.isTrue(!two.usable(0, 0), "one of two ejected")?;
+    return Check.isTrue(two.usable(1, 0), "not both");
+}
+
+@test
+fn panic_mode_and_retries_elsewhere() -> Result<void, TestFailure> {
+    var health = HealthOptions.defaults();
+    health.unhealthyAfter = 1;
+    let pair = [1u32, 1];
+    var b = balancer(Policy.RoundRobin, pair[..], health)?;
+    // A retry goes to the other backend; if only the avoided one is usable, back to it.
+    let first = picked(mut b, "".bytes(), 0, null)?;
+    let retry = picked(mut b, "".bytes(), 0, Some(first))?;
+    Check.isTrue(retry != first, "a retry goes elsewhere")?;
+    b.checked(1 - first, false);
+    Check.equalU64(first as u64, picked(mut b, "".bytes(), 0, Some(first))? as u64)?;
+    // Nothing usable: panic mode uses them anyway; without it, no backend (503).
+    b.checked(first, false);
+    let anyway = picked(mut b, "".bytes(), 0, null)?;
+    Check.isTrue(anyway < 2, "panic mode")?;
+    health.panicMode = false;
+    var strict = balancer(Policy.RoundRobin, pair[..], health)?;
+    strict.checked(0, false);
+    strict.checked(1, false);
+    match (strict.pick("".bytes(), 0, null)) {
+        Some(_) => { return Check.fail("a backend without panic mode"); }
+        null => {}
+    }
+    // Active checks: healthyAfter good results bring one back.
+    strict.checked(0, true);
+    Check.isTrue(!strict.usable(0, 0), "one good check is not enough")?;
+    strict.checked(0, true);
+    return Check.isTrue(strict.usable(0, 0), "two are");
+}

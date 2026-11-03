@@ -1,0 +1,409 @@
+// Choosing a backend (Web ADR 0012 §3.2, §3.3): smooth weighted round robin, least requests by the power of two
+// choices, and rendezvous hashing over a key; passive health (consecutive failures eject a backend, for longer each
+// time, never more than half at once) and active health (thresholds of consecutive check results); panic mode when no
+// backend is usable. Sans-I/O: the caller passes the time and locks it.
+
+/// SipHash-c-d (Aumasson and Bernstein, "SipHash: a fast short-input PRF", 2012): `c` compression and `d`
+/// finalization rounds, 64-bit output, keyed with `key` (little-endian, §2). The proxy uses SipHash-1-3.
+public fn sipHash(key: [u8; 16], data: Slice<u8>, c: u32, d: u32) -> u64 {
+    let k0 = le64(key[..], 0);
+    let k1 = le64(key[..], 8);
+    var v0 = k0 ^ 0x736f6d6570736575;
+    var v1 = k1 ^ 0x646f72616e646f6d;
+    var v2 = k0 ^ 0x6c7967656e657261;
+    var v3 = k1 ^ 0x7465646279746573;
+    let whole = data.length / 8 * 8;
+    var at: usize = 0;
+    while (at < whole) {
+        let m = le64(data, at);
+        v3 ^= m;
+        for (r in 0..c) {
+            sipRound(mut v0, mut v1, mut v2, mut v3);
+        }
+        v0 ^= m;
+        at += 8;
+    }
+    var last = (data.length as u64 & 0xFF) << 56;
+    for (k in 0..data.length - whole) {
+        last |= (data[whole + k] as u64) << (8 * k as u64);
+    }
+    v3 ^= last;
+    for (r in 0..c) {
+        sipRound(mut v0, mut v1, mut v2, mut v3);
+    }
+    v0 ^= last;
+    v2 ^= 0xFF;
+    for (r in 0..d) {
+        sipRound(mut v0, mut v1, mut v2, mut v3);
+    }
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+fn sipRound(v0: borrow mut u64, v1: borrow mut u64, v2: borrow mut u64, v3: borrow mut u64) {
+    v0 = v0.wrappingAdd(v1);
+    v1 = rotl(v1, 13);
+    v1 ^= v0;
+    v0 = rotl(v0, 32);
+    v2 = v2.wrappingAdd(v3);
+    v3 = rotl(v3, 16);
+    v3 ^= v2;
+    v0 = v0.wrappingAdd(v3);
+    v3 = rotl(v3, 21);
+    v3 ^= v0;
+    v2 = v2.wrappingAdd(v1);
+    v1 = rotl(v1, 17);
+    v1 ^= v2;
+    v2 = rotl(v2, 32);
+}
+
+fn rotl(x: u64, b: u64) -> u64 => (x << b) | (x >> (64 - b));
+
+fn le64(b: Slice<u8>, at: usize) -> u64 {
+    var v: u64 = 0;
+    for (k in 0..8usize) {
+        v |= (b[at + k] as u64) << (8 * k as u64);
+    }
+    return v;
+}
+
+/// How a backend is chosen.
+public enum Policy {
+    /// Smooth weighted round robin, as nginx does it.
+    RoundRobin,
+    /// Of two backends drawn at random by weight, the one with fewer requests in flight.
+    LeastRequests,
+    /// Rendezvous (highest random weight) hashing over the request's key: a backend's removal moves only its keys.
+    ConsistentHash,
+}
+
+/// How a request went, for passive health.
+public enum Outcome {
+    /// An answer (any status, unless `countServerErrors` and 5xx).
+    Answered,
+    /// A 5xx answer.
+    ServerError,
+    /// No answer: refused, reset, a TLS failure, a malformed response, a timeout.
+    Failed,
+}
+
+/// Passive and active health settings (Web ADR 0012 §3.3).
+public struct HealthOptions {
+    /// Consecutive failures that eject a backend.
+    public consecutiveFailures: u32;
+    /// The first ejection's length; each one in a row doubles it, up to `maxEjectionMs`.
+    public baseEjectionMs: u64;
+    public maxEjectionMs: u64;
+    /// Whether a 5xx counts as a failure.
+    public countServerErrors: bool;
+    /// When no backend is usable, use them all anyway rather than fail every request.
+    public panicMode: bool;
+    /// Active checks: consecutive good results that mark a backend healthy, and bad ones that mark it unhealthy.
+    public healthyAfter: u32;
+    public unhealthyAfter: u32;
+
+    /// 5 failures; 30 s, doubling to 5 min; 5xx not counted; panic mode on; 2 good and 3 bad checks.
+    public fn defaults() -> HealthOptions => HealthOptions {
+        consecutiveFailures: 5,
+        baseEjectionMs: 30000,
+        maxEjectionMs: 300000,
+        countServerErrors: false,
+        panicMode: true,
+        healthyAfter: 2,
+        unhealthyAfter: 3,
+    };
+}
+
+/// One backend's standing.
+struct BackendState {
+    /// Its identity for hashing (its URL's text): stable whatever the list's order.
+    name: Vector<u8>;
+    weight: u32;
+    /// Smooth round robin's current weight.
+    current: i64;
+    inFlight: u64;
+    failures: u32;
+    /// Ejections in a row (the backoff's exponent).
+    ejections: u32;
+    ejectedUntil: u64;
+    healthy: bool;
+    goodChecks: u32;
+    badChecks: u32;
+}
+
+/// The backends of one upstream and how to choose among them.
+public struct Balancer {
+    private backends: Vector<BackendState>;
+    private policy: Policy;
+    private health: HealthOptions;
+    private hashKey: [u8; 16];
+    private rng: u64;
+
+    /// An empty balancer. `hashKey` keys the consistent hash (random, so clients cannot choose colliding keys);
+    /// `seed` drives least-requests' draws.
+    public fn create(policy: Policy, health: HealthOptions, hashKey: [u8; 16], seed: u64) -> Balancer => Balancer {
+        backends: Vector<BackendState>.create(),
+        policy: policy,
+        health: health,
+        hashKey: hashKey,
+        rng: if (seed == 0) 0x9E3779B97F4A7C15 else seed,
+    };
+
+    /// Adds a backend named `name` (its URL) with `weight` (at least 1); its index is the count before.
+    public fn add(borrow mut this, name: Slice<u8>, weight: u32) -> Result<usize, AllocError> {
+        var copy = Vector<u8>.create();
+        for (b in name) {
+            copy.push(b)?;
+        }
+        this.backends.push(BackendState {
+            name: copy,
+            weight: if (weight == 0) 1u32 else weight,
+            current: 0,
+            inFlight: 0,
+            failures: 0,
+            ejections: 0,
+            ejectedUntil: 0,
+            healthy: true,
+            goodChecks: 0,
+            badChecks: 0,
+        })?;
+        return Ok(this.backends.length - 1);
+    }
+
+    /// How many backends.
+    public fn count(borrow this) -> usize => this.backends.length;
+
+    /// Requests in flight to backend `i`.
+    public fn inFlight(borrow this, i: usize) -> u64 => this.backends[i].inFlight;
+
+    /// Whether backend `i` is usable at `nowMs`: healthy by the active checks, and not ejected.
+    public fn usable(borrow this, i: usize, nowMs: u64) -> bool =>
+        this.backends[i].healthy && nowMs >= this.backends[i].ejectedUntil;
+
+    /// The backend for a request with hash key `key` (consistent hash only) at `nowMs`, other than `avoid` if another
+    /// is usable (a retry goes elsewhere); null when none is usable and panic mode is off. The request counts as in
+    /// flight on it until `finished`.
+    public fn pick(borrow mut this, key: Slice<u8>, nowMs: u64, avoid: usize?) -> usize? {
+        var usableCount: usize = 0;
+        for (i in 0..this.backends.length) {
+            if (this.usable(i, nowMs) && !isAvoided(i, avoid)) {
+                usableCount += 1;
+            }
+        }
+        var all = false;
+        if (usableCount == 0) {
+            // Only the avoided one is usable: a retry may go back to it rather than nowhere.
+            for (i in 0..this.backends.length) {
+                if (this.usable(i, nowMs)) {
+                    usableCount += 1;
+                }
+            }
+            if (usableCount > 0) {
+                return this.chosen(this.choose(key, nowMs, false, null));
+            }
+            if (!this.health.panicMode || this.backends.length == 0) {
+                return null;
+            }
+            all = true; // panic mode: every backend, ejected or not
+        }
+        return this.chosen(this.choose(key, nowMs, all, if (all) null else avoid));
+    }
+
+    fn chosen(borrow mut this, i: usize?) -> usize? {
+        match (i) {
+            Some(k) => { this.backends[k].inFlight += 1; }
+            null => {}
+        }
+        return i;
+    }
+
+    fn eligible(borrow this, i: usize, nowMs: u64, all: bool, avoid: usize?) -> bool =>
+        (all || this.usable(i, nowMs)) && !isAvoided(i, avoid);
+
+    fn choose(borrow mut this, key: Slice<u8>, nowMs: u64, all: bool, avoid: usize?) -> usize? {
+        match (this.policy) {
+            Policy.RoundRobin => {
+                // nginx's smooth weighted round robin: each raises its current weight by its weight; the highest wins and
+                // falls back by the total.
+                var total: i64 = 0;
+                var best: usize? = null;
+                var bestCurrent: i64 = 0;
+                for (i in 0..this.backends.length) {
+                    if (!this.eligible(i, nowMs, all, avoid)) {
+                        continue;
+                    }
+                    let b = borrow mut this.backends[i];
+                    b.current += b.weight as i64;
+                    total += b.weight as i64;
+                    let higher = match (best) {
+                        Some(_) => b.current > bestCurrent,
+                        null => true,
+                    };
+                    if (higher) {
+                        best = Some(i);
+                        bestCurrent = b.current;
+                    }
+                }
+                match (best) {
+                    Some(k) => { this.backends[k].current -= total; }
+                    null => {}
+                }
+                return best;
+            }
+            Policy.LeastRequests => {
+                let first = this.drawn(nowMs, all, avoid, null)?;
+                let second = match (this.drawn(nowMs, all, avoid, Some(first))) {
+                    Some(s) => s,
+                    null => { return Some(first); },
+                };
+                return Some(if (this.backends[second].inFlight < this.backends[first].inFlight) second else first);
+            }
+            Policy.ConsistentHash => {
+                // Rendezvous hashing, weighted by giving a backend `weight` names: the highest hash of key and name wins.
+                var best: usize? = null;
+                var bestScore: u64 = 0;
+                var input = Vector<u8>.create();
+                for (i in 0..this.backends.length) {
+                    if (!this.eligible(i, nowMs, all, avoid)) {
+                        continue;
+                    }
+                    for (j in 0..this.backends[i].weight) {
+                        input.clear();
+                        match (fill(mut input, key, this.backends[i].name.view(), j)) {
+                            Ok() => {}
+                            Err(_) => { return null; }
+                        }
+                        let score = sipHash(this.hashKey, input.view(), 1, 3);
+                        let better = match (best) {
+                            Some(_) => score > bestScore,
+                            null => true,
+                        };
+                        if (better) {
+                            best = Some(i);
+                            bestScore = score;
+                        }
+                    }
+                }
+                return best;
+            }
+        }
+    }
+
+    /// A backend drawn at random in proportion to its weight, other than `except`; null if none is eligible.
+    fn drawn(borrow mut this, nowMs: u64, all: bool, avoid: usize?, except: usize?) -> usize? {
+        var total: u64 = 0;
+        for (i in 0..this.backends.length) {
+            if (this.eligible(i, nowMs, all, avoid) && !isAvoided(i, except)) {
+                total += this.backends[i].weight as u64;
+            }
+        }
+        if (total == 0) {
+            return null;
+        }
+        var r = this.next() % total;
+        for (i in 0..this.backends.length) {
+            if (!this.eligible(i, nowMs, all, avoid) || isAvoided(i, except)) {
+                continue;
+            }
+            let w = this.backends[i].weight as u64;
+            if (r < w) {
+                return Some(i);
+            }
+            r -= w;
+        }
+        return null;
+    }
+
+    /// splitmix64 (Steele, Lea and Flood, 2014).
+    fn next(borrow mut this) -> u64 {
+        this.rng = this.rng.wrappingAdd(0x9E3779B97F4A7C15);
+        var z = this.rng;
+        z = (z ^ (z >> 30)).wrappingMul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrappingMul(0x94D049BB133111EB);
+        return z ^ (z >> 31);
+    }
+
+    /// A request to backend `i` is over, with `outcome`, at `nowMs` (passive health, §3.3). Consecutive failures past
+    /// the threshold eject it for `baseEjectionMs` × 2^n (n: ejections in a row), up to `maxEjectionMs`, unless half the
+    /// backends (rounded down) are ejected already.
+    public fn finished(borrow mut this, i: usize, outcome: Outcome, nowMs: u64) {
+        if (this.backends[i].inFlight > 0) {
+            this.backends[i].inFlight -= 1;
+        }
+        let failed = match (outcome) {
+            Outcome.Answered => false,
+            Outcome.ServerError => this.health.countServerErrors,
+            Outcome.Failed => true,
+        };
+        if (!failed) {
+            this.backends[i].failures = 0;
+            if (nowMs >= this.backends[i].ejectedUntil) {
+                this.backends[i].ejections = 0;
+            }
+            return;
+        }
+        this.backends[i].failures += 1;
+        if (this.backends[i].failures < this.health.consecutiveFailures) {
+            return;
+        }
+        var ejected: usize = 0;
+        for (k in 0..this.backends.length) {
+            if (k != i && nowMs < this.backends[k].ejectedUntil) {
+                ejected += 1;
+            }
+        }
+        if (ejected + 1 > this.backends.length / 2) {
+            return; // at most half at once
+        }
+        var length = this.health.baseEjectionMs;
+        for (n in 0..this.backends[i].ejections) {
+            length *= 2;
+            if (length >= this.health.maxEjectionMs) {
+                break;
+            }
+        }
+        if (length > this.health.maxEjectionMs) {
+            length = this.health.maxEjectionMs;
+        }
+        this.backends[i].ejectedUntil = nowMs + length;
+        this.backends[i].ejections += 1;
+        this.backends[i].failures = 0;
+    }
+
+    /// An active check of backend `i` came back `good` or not (§3.3): `healthyAfter` good results in a row mark it
+    /// healthy, `unhealthyAfter` bad ones unhealthy.
+    public fn checked(borrow mut this, i: usize, good: bool) {
+        let b = borrow mut this.backends[i];
+        if (good) {
+            b.goodChecks += 1;
+            b.badChecks = 0;
+            if (b.goodChecks >= this.health.healthyAfter) {
+                b.healthy = true;
+            }
+        } else {
+            b.badChecks += 1;
+            b.goodChecks = 0;
+            if (b.badChecks >= this.health.unhealthyAfter) {
+                b.healthy = false;
+            }
+        }
+    }
+}
+
+fn isAvoided(i: usize, avoid: usize?) -> bool => match (avoid) {
+    Some(a) => a == i,
+    null => false,
+};
+
+/// The hash input: the key, a separator that cannot be in a URL, the backend's name and its replica number.
+fn fill(out: borrow mut Vector<u8>, key: Slice<u8>, name: Slice<u8>, replica: u32) -> Result<void, AllocError> {
+    for (b in key) {
+        out.push(b)?;
+    }
+    out.push(0)?;
+    for (b in name) {
+        out.push(b)?;
+    }
+    out.push(0)?;
+    out.push(truncate<u8>(replica))?;
+    return out.push(truncate<u8>(replica >> 8));
+}
