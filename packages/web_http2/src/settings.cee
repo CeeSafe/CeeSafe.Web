@@ -1,0 +1,38 @@
+// HTTP/2 settings (RFC 9113 §6.5.2): what an endpoint announces, the protocol's initial values, and the server's
+// defaults (Web ADR 0011 §3.3).
+
+/// One endpoint's settings.
+public struct H2Settings {
+    /// SETTINGS_HEADER_TABLE_SIZE: the HPACK dynamic table the sender's decoder allows.
+    public headerTableSize: u32;
+    /// SETTINGS_ENABLE_PUSH: whether the sender accepts PUSH_PROMISE (only a client's value means anything).
+    public enablePush: bool;
+    /// SETTINGS_MAX_CONCURRENT_STREAMS: the streams the sender lets its peer open at once.
+    public maxConcurrentStreams: u32;
+    /// SETTINGS_INITIAL_WINDOW_SIZE: each new stream's flow-control window, in bytes.
+    public initialWindowSize: u32;
+    /// SETTINGS_MAX_FRAME_SIZE: the largest frame payload the sender accepts.
+    public maxFrameSize: u32;
+    /// SETTINGS_MAX_HEADER_LIST_SIZE: the largest header list the sender accepts (§6.5.2's measure).
+    public maxHeaderListSize: u32;
+
+    /// The values an endpoint assumes until its peer's SETTINGS arrive (§6.5.2): no limit is "unlimited".
+    public fn initial() -> H2Settings => H2Settings {
+        headerTableSize: 4096,
+        enablePush: true,
+        maxConcurrentStreams: 0xFFFFFFFF,
+        initialWindowSize: 65535,
+        maxFrameSize: 16384,
+        maxHeaderListSize: 0xFFFFFFFF,
+    };
+
+    /// What the server announces (Web ADR 0011 §3.3), with `maxHeaderListSize` from the server's limits.
+    public fn server(maxHeaderListSize: u32) -> H2Settings => H2Settings {
+        headerTableSize: 4096,
+        enablePush: false,
+        maxConcurrentStreams: 100,
+        initialWindowSize: 65535,
+        maxFrameSize: 16384,
+        maxHeaderListSize: maxHeaderListSize,
+    };
+}

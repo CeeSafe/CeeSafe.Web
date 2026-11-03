@@ -1,0 +1,1028 @@
+import web_core;
+
+// The HTTP/2 connection, server side (RFC 9113 §3-6; Web ADR 0011 §3.1): frames in, events out; the frames the
+// protocol owes (acknowledgements, WINDOW_UPDATE, RST_STREAM) and the ones the driver asks for go to an output buffer.
+// Sans-I/O: the driver reads and writes, and passes the time in for the guards.
+
+/// What the connection found in its input.
+public enum H2Event {
+    /// No complete frame yet: read more.
+    NeedMore,
+    /// A request's head is in `head`: its stream, and whether the request has no body (END_STREAM).
+    Request(u32, bool),
+    /// Body bytes for a stream are in `data`, and whether they are its last.
+    Data(u32, bool),
+    /// A trailer section is in `head`, ending the stream's body.
+    Trailers(u32),
+    /// The request's header list was over SETTINGS_MAX_HEADER_LIST_SIZE: answer 431 on the stream.
+    TooLarge(u32),
+    /// The peer reset a stream (with its error code): cancel its handler.
+    Reset(u32, u32),
+    /// The connection reset a stream for a stream error (RST_STREAM already queued): cancel its handler.
+    StreamError(u32, u32),
+    /// The peer's window grew, for a stream or (0) the connection: queued DATA may go out.
+    WindowOpened(u32),
+    /// The peer is going away (its last stream, and its error code).
+    GoAway(u32, u32),
+}
+
+/// The guards' budgets (Web ADR 0011 §3.4).
+public struct H2Guards {
+    /// A header block's largest encoded size, across HEADERS and CONTINUATIONs.
+    public maxBlockBytes: u32;
+    /// Streams the peer may reset (or we refuse) per interval, past which the connection ends (CVE-2023-44487).
+    public resetsPerInterval: u32;
+    /// Empty DATA frames and zero-increment updates the peer may send per interval.
+    public emptyFramesPerInterval: u32;
+    public intervalMs: u64;
+    /// Acknowledgements (SETTINGS, PING) the peer may have us owe before the output is written.
+    public maxOwedAcks: u32;
+
+    public fn defaults(maxHeaderListSize: u32) -> H2Guards => H2Guards {
+        maxBlockBytes: maxHeaderListSize * 2,
+        resetsPerInterval: 200,
+        emptyFramesPerInterval: 1000,
+        intervalMs: 1000,
+        maxOwedAcks: 1000,
+    };
+}
+
+enum StreamState {
+    /// A promised stream (§8.4), before its response starts.
+    ReservedLocal,
+    Open,
+    /// The client has ended its side (END_STREAM received).
+    HalfClosedRemote,
+    /// We have ended ours.
+    HalfClosedLocal,
+}
+
+struct Stream {
+    state: StreamState;
+    /// The peer's window for this stream: what we may still send.
+    sendWindow: i64;
+    /// Ours: what the peer may still send.
+    receiveWindow: i64;
+    /// Bytes read (or discarded) not yet given back with a WINDOW_UPDATE.
+    unacked: u32;
+    contentLength: u64?;
+    received: u64;
+    /// Counts toward SETTINGS_MAX_CONCURRENT_STREAMS (a client's stream that is not closed).
+    counted: bool;
+}
+
+/// A header block being collected across HEADERS and CONTINUATIONs.
+enum BlockKind {
+    None,
+    Request,
+    Trailers,
+    /// For a stream we will not serve (refused, or after GOAWAY): decoded only to keep HPACK in step.
+    Discard,
+}
+
+/// The server's side of one HTTP/2 connection.
+@noncopy
+public struct H2Connection {
+    private local: H2Settings;
+    private peer: H2Settings;
+    private guards: H2Guards;
+    private decoder: HpackDecoder;
+    private streams: HashMap<u32, Stream>;
+    private out: Vector<u8>;
+    private scratch: Vector<u8>;
+    private prefaceRead: bool;
+    private settingsSeen: bool;
+    private goingAway: bool;
+    /// The highest stream the client has opened.
+    private lastStream: u32;
+    private nextPush: u32;
+    private active: u32;
+    private connectionSend: i64;
+    private connectionReceive: i64;
+    private connectionUnacked: u32;
+    private blockStream: u32;
+    private blockKind: BlockKind;
+    private blockEndStream: bool;
+    private block: Vector<u8>;
+    /// Streams closed lately (a ring): frames on them are ignored or STREAM_CLOSED, not PROTOCOL_ERROR.
+    private closed: [u32; 64];
+    private closedAt: usize;
+    private intervalStart: u64;
+    private resets: u32;
+    private emptyFrames: u32;
+    private owedAcks: u32;
+
+    /// A connection that announces `local`; `start` queues the server's preface.
+    public fn create(local: H2Settings, guards: H2Guards) -> Result<H2Connection, AllocError> {
+        let decoder = match (HpackDecoder.create(local.headerTableSize, local.maxHeaderListSize as u64)) {
+            Ok(d) => d,
+            Err(e) => { return Err(e); },
+        };
+        return Ok(H2Connection {
+            local: local,
+            peer: H2Settings.initial(),
+            guards: guards,
+            decoder: decoder,
+            streams: HashMap<u32, Stream>.create(),
+            out: Vector<u8>.create(),
+            scratch: Vector<u8>.create(),
+            prefaceRead: false,
+            settingsSeen: false,
+            goingAway: false,
+            lastStream: 0,
+            nextPush: 2,
+            active: 0,
+            connectionSend: 65535,
+            connectionReceive: 65535,
+            connectionUnacked: 0,
+            blockStream: 0,
+            blockKind: BlockKind.None,
+            blockEndStream: false,
+            block: Vector<u8>.create(),
+            closed: [0u32; 64],
+            closedAt: 0,
+            intervalStart: 0,
+            resets: 0,
+            emptyFrames: 0,
+            owedAcks: 0,
+        });
+    }
+
+    /// Queues the server's preface (§3.4): its SETTINGS, and a WINDOW_UPDATE raising the connection's window to
+    /// `connectionWindow`.
+    public fn start(borrow mut this, connectionWindow: u32) -> Result<void, AllocError> {
+        var ids = [
+            SettingIds.headerTableSize(),
+            SettingIds.maxConcurrentStreams(),
+            SettingIds.initialWindowSize(),
+            SettingIds.maxFrameSize(),
+            SettingIds.maxHeaderListSize(),
+        ];
+        var values = [
+            this.local.headerTableSize,
+            this.local.maxConcurrentStreams,
+            this.local.initialWindowSize,
+            this.local.maxFrameSize,
+            this.local.maxHeaderListSize,
+        ];
+        Frames.writeSettings(mut this.out, ids[..], values[..])?;
+        if (connectionWindow > 65535) {
+            Frames.writeWindowUpdate(mut this.out, 0, connectionWindow - 65535)?;
+            this.connectionReceive = connectionWindow as i64;
+        }
+        return Ok();
+    }
+
+    /// The bytes to write to the peer.
+    public fn output(borrow this) -> Slice<u8> => this.out.view();
+
+    /// The output was written.
+    public fn outputWritten(borrow mut this) {
+        this.out.clear();
+        this.owedAcks = 0;
+    }
+
+    /// The highest stream the client opened (GOAWAY's last stream).
+    public fn lastStreamId(borrow this) -> u32 => this.lastStream;
+
+    /// The client's streams not yet closed.
+    public fn activeStreams(borrow this) -> u32 => this.active;
+
+    /// The peer's settings, as they stand.
+    public fn peerSettings(borrow this) -> H2Settings => this.peer;
+
+    /// The next event from `input` (consumed as frames are handled): a request's head and trailers go to `head`, body
+    /// bytes to `data`. `Err(code)` is a connection error: send `goAway(code)`, write the output, and close.
+    public fn next(
+        borrow mut this,
+        input: borrow mut OwnedBuffer,
+        head: borrow mut HeaderBlock,
+        data: borrow mut Vector<u8>,
+        nowMs: u64,
+    ) -> Result<H2Event, u32> {
+        if (nowMs >= this.intervalStart + this.guards.intervalMs) {
+            this.intervalStart = nowMs;
+            this.resets = 0;
+            this.emptyFrames = 0;
+        }
+        loop {
+            if (!this.prefaceRead) {
+                let preface = clientPreface();
+                let want = preface.bytes();
+                let ready = input.readable();
+                let n = if (ready.length < want.length) ready.length else want.length;
+                for (i in 0usize..n) {
+                    if (ready[i] != want[i]) {
+                        return Err(ErrorCodes.protocolError()); // §3.4
+                    }
+                }
+                if (n < want.length) {
+                    return Ok(H2Event.NeedMore);
+                }
+                consume(input, want.length)?;
+                this.prefaceRead = true;
+            }
+            let ready = input.readable();
+            let h = match (Frames.parseHeader(ready)) {
+                Some(h) => h,
+                null => { return Ok(H2Event.NeedMore); },
+            };
+            if (h.length > this.local.maxFrameSize) {
+                return Err(ErrorCodes.frameSizeError()); // §4.2
+            }
+            if (ready.length < 9 + h.length as usize) {
+                return Ok(H2Event.NeedMore);
+            }
+            let payload = ready[9..9 + h.length as usize];
+            let result = this.frame(h, payload, head, data);
+            consume(input, 9 + h.length as usize)?;
+            match (result) {
+                Ok(Some(e)) => { return Ok(e); }
+                Ok(null) => {}
+                Err(code) => { return Err(code); }
+            }
+        }
+    }
+
+    /// One frame (its payload complete): an event, or null to go on reading.
+    fn frame(
+        borrow mut this,
+        h: FrameHeader,
+        payload: Slice<u8>,
+        head: borrow mut HeaderBlock,
+        data: borrow mut Vector<u8>,
+    ) -> Result<H2Event?, u32> {
+        if (!this.settingsSeen && (h.kind != FrameTypes.settings() || h.flags & FrameFlags.ack() != 0)) {
+            return Err(ErrorCodes.protocolError()); // the preface's first frame is SETTINGS (§3.4)
+        }
+        if (this.blockStream != 0 && (h.kind != FrameTypes.continuation() || h.stream != this.blockStream)) {
+            return Err(ErrorCodes.protocolError()); // a header block is contiguous (§4.3, §6.10)
+        }
+        let kind = h.kind;
+        if (kind == FrameTypes.data()) {
+            return this.dataFrame(h, payload, data);
+        } else if (kind == FrameTypes.headers()) {
+            return this.headersFrame(h, payload, head);
+        } else if (kind == FrameTypes.continuation()) {
+            if (this.blockStream == 0) {
+                return Err(ErrorCodes.protocolError()); // no header block to continue (§6.10)
+            }
+            return this.blockFragment(payload, h.flags & FrameFlags.endHeaders() != 0, head);
+        } else if (kind == FrameTypes.priority()) {
+            return this.priorityFrame(h, payload);
+        } else if (kind == FrameTypes.rstStream()) {
+            return this.rstStreamFrame(h, payload);
+        } else if (kind == FrameTypes.settings()) {
+            return this.settingsFrame(h, payload);
+        } else if (kind == FrameTypes.pushPromise()) {
+            return Err(ErrorCodes.protocolError()); // a client cannot push (§8.4)
+        } else if (kind == FrameTypes.ping()) {
+            return this.pingFrame(h, payload);
+        } else if (kind == FrameTypes.goAway()) {
+            if (h.stream != 0) {
+                return Err(ErrorCodes.protocolError()); // §6.8
+            }
+            if (payload.length < 8) {
+                return Err(ErrorCodes.frameSizeError());
+            }
+            this.goingAway = true;
+            return Ok(Some(H2Event.GoAway(read32(payload, 0) & 0x7FFFFFFF, read32(payload, 4))));
+        } else if (kind == FrameTypes.windowUpdate()) {
+            return this.windowUpdateFrame(h, payload);
+        }
+        return Ok(null); // an unknown type is ignored (§5.5)
+    }
+
+    fn dataFrame(
+        borrow mut this,
+        h: FrameHeader,
+        payload: Slice<u8>,
+        data: borrow mut Vector<u8>,
+    ) -> Result<H2Event?, u32> {
+        if (h.stream == 0) {
+            return Err(ErrorCodes.protocolError()); // §6.1
+        }
+        let content = unpad(h.flags, payload)?;
+        let length = truncate<i64>(payload.length);
+        this.connectionReceive -= length;
+        if (this.connectionReceive < 0) {
+            return Err(ErrorCodes.flowControlError()); // §6.9
+        }
+        let end = h.flags & FrameFlags.endStream() != 0;
+        if (content.length == 0 && !end) {
+            this.emptyFrames += 1;
+            if (this.emptyFrames > this.guards.emptyFramesPerInterval) {
+                return Err(ErrorCodes.enhanceYourCalm());
+            }
+        }
+        let id = h.stream;
+        let known = match (this.streams.get(id)) {
+            Some(s) => Some(s.state),
+            null => null,
+        };
+        match (known) {
+            null => {
+                // Not a live stream: give the connection's window back either way.
+                this.giveBack(0, payload.length)?;
+                if (id > this.lastStream) {
+                    return Err(ErrorCodes.protocolError()); // DATA on an idle stream (§5.1)
+                }
+                if (this.recentlyClosed(id)) {
+                    return Ok(null); // in flight when we reset or closed it
+                }
+                return this.streamError(id, ErrorCodes.streamClosed());
+            }
+            Some(StreamState.ReservedLocal) => { return Err(ErrorCodes.protocolError()); }
+            Some(StreamState.HalfClosedRemote) => {
+                this.giveBack(0, payload.length)?;
+                return this.streamError(id, ErrorCodes.streamClosed()); // §5.1
+            }
+            _ => {}
+        }
+        var overflow = false;
+        var mismatch = false;
+        match (this.streams.getMut(id)) {
+            Some(s) => {
+                s.receiveWindow -= length;
+                if (s.receiveWindow < 0) {
+                    overflow = true;
+                }
+                s.received += content.length as u64;
+                match (s.contentLength) {
+                    Some(n) => {
+                        if (s.received > n || (end && s.received != n)) {
+                            mismatch = true;
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        if (overflow) {
+            this.giveBack(0, payload.length)?;
+            return this.streamError(id, ErrorCodes.flowControlError()); // §6.9.1
+        }
+        if (mismatch) {
+            this.giveBack(0, payload.length)?;
+            return this.streamError(id, ErrorCodes.protocolError()); // content-length (§8.1.1)
+        }
+        // Padding counts against the windows but is never read: it is given back now.
+        this.giveBack(id, payload.length - content.length)?;
+        data.clear();
+        for (b in content) {
+            if (failed(data.push(b))) {
+                return Err(ErrorCodes.internalError());
+            }
+        }
+        if (end) {
+            this.remoteEnded(id);
+        }
+        return Ok(Some(H2Event.Data(id, end)));
+    }
+
+    fn headersFrame(
+        borrow mut this,
+        h: FrameHeader,
+        payload: Slice<u8>,
+        head: borrow mut HeaderBlock,
+    ) -> Result<H2Event?, u32> {
+        let id = h.stream;
+        if (id == 0) {
+            return Err(ErrorCodes.protocolError()); // §6.2
+        }
+        let unpadded = unpad(h.flags, payload)?;
+        let prioritized = h.flags & FrameFlags.priority() != 0;
+        if (prioritized && unpadded.length < 5) {
+            return Err(ErrorCodes.frameSizeError());
+        }
+        let selfDependent = prioritized && read32(unpadded, 0) & 0x7FFFFFFF == id;
+        let fragment = unpadded[if (prioritized) 5 else 0..];
+        let end = h.flags & FrameFlags.endStream() != 0;
+        let known = match (this.streams.get(id)) {
+            Some(s) => Some(s.state),
+            null => null,
+        };
+        var kind = BlockKind.Request;
+        match (known) {
+            Some(StreamState.ReservedLocal) => { return Err(ErrorCodes.protocolError()); }
+            Some(StreamState.HalfClosedRemote) => { kind = BlockKind.Discard; }
+            Some(_) => { kind = BlockKind.Trailers; }
+            null => {
+                if (id % 2 == 0) {
+                    return Err(ErrorCodes.protocolError()); // a client's streams are odd (§5.1.1)
+                }
+                if (id <= this.lastStream) {
+                    if (this.recentlyClosed(id)) {
+                        return Err(ErrorCodes.streamClosed()); // §5.1, closed
+                    }
+                    return Err(ErrorCodes.protocolError()); // not above every stream before it (§5.1.1)
+                }
+                this.lastStream = id;
+                if (this.goingAway) {
+                    kind = BlockKind.Discard;
+                }
+            }
+        }
+        this.blockStream = id;
+        this.blockKind = kind;
+        this.blockEndStream = end;
+        this.block.clear();
+        let r = this.blockFragment(fragment, h.flags & FrameFlags.endHeaders() != 0, head);
+        if (selfDependent) {
+            match (r) {
+                Ok(_) => { return this.streamError(id, ErrorCodes.protocolError()); } // §5.3.1
+                Err(e) => { return Err(e); }
+            }
+        }
+        return r;
+    }
+
+    /// Adds a fragment to the block being collected, and handles the block once it is complete.
+    fn blockFragment(
+        borrow mut this,
+        fragment: Slice<u8>,
+        last: bool,
+        head: borrow mut HeaderBlock,
+    ) -> Result<H2Event?, u32> {
+        if (this.block.length + fragment.length > this.guards.maxBlockBytes as usize) {
+            return Err(ErrorCodes.enhanceYourCalm()); // the CONTINUATION flood guard (Web ADR 0011 §3.4)
+        }
+        for (b in fragment) {
+            if (failed(this.block.push(b))) {
+                return Err(ErrorCodes.internalError());
+            }
+        }
+        if (!last) {
+            return Ok(null);
+        }
+        let id = this.blockStream;
+        let kind = this.blockKind;
+        let end = this.blockEndStream;
+        this.blockStream = 0;
+        this.blockKind = BlockKind.None;
+        var tooLarge = false;
+        match (this.decoder.decode(this.block.view(), head)) {
+            Ok() => {}
+            Err(HpackError.TooLarge) => { tooLarge = true; }
+            Err(_) => { return Err(ErrorCodes.compressionError()); } // §4.3
+        }
+        match (kind) {
+            BlockKind.Discard => {
+                if (this.streams.contains(id)) {
+                    return this.streamError(id, ErrorCodes.streamClosed()); // HEADERS after END_STREAM (§5.1)
+                }
+                return Ok(null);
+            }
+            BlockKind.Trailers => {
+                if (tooLarge || !end || !Requests.checkTrailers(head)) {
+                    return this.streamError(id, ErrorCodes.protocolError()); // §8.1
+                }
+                var mismatch = false;
+                match (this.streams.get(id)) {
+                    Some(s) => {
+                        match (s.contentLength) {
+                            Some(n) => { mismatch = s.received != n; }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+                if (mismatch) {
+                    return this.streamError(id, ErrorCodes.protocolError());
+                }
+                this.remoteEnded(id);
+                return Ok(Some(H2Event.Trailers(id)));
+            }
+            _ => {}
+        }
+        // A new request.
+        if (this.active >= this.local.maxConcurrentStreams) {
+            return this.refuse(id, ErrorCodes.refusedStream()); // §5.1.2
+        }
+        if (tooLarge) {
+            this.openStream(id, end, null)?;
+            return Ok(Some(H2Event.TooLarge(id)));
+        }
+        let shape = match (Requests.checkRequest(head)) {
+            Some(s) => s,
+            null => { return this.refuse(id, ErrorCodes.protocolError()); }, // malformed (§8.1.1)
+        };
+        match (shape.contentLength) {
+            Some(n) => {
+                if (end && n != 0) {
+                    return this.refuse(id, ErrorCodes.protocolError());
+                }
+            }
+            null => {}
+        }
+        this.openStream(id, end, shape.contentLength)?;
+        return Ok(Some(H2Event.Request(id, end)));
+    }
+
+    fn openStream(borrow mut this, id: u32, end: bool, contentLength: u64?) -> Result<void, u32> {
+        let stream = Stream {
+            state: if (end) StreamState.HalfClosedRemote else StreamState.Open,
+            sendWindow: this.peer.initialWindowSize as i64,
+            receiveWindow: this.local.initialWindowSize as i64,
+            unacked: 0,
+            contentLength: contentLength,
+            received: 0,
+            counted: true,
+        };
+        match (this.streams.put(id, stream)) {
+            Ok(_) => {}
+            Err(_) => { return Err(ErrorCodes.internalError()); }
+        }
+        this.active += 1;
+        return Ok();
+    }
+
+    /// A stream we will not serve: RST_STREAM, counted against the reset budget.
+    fn refuse(borrow mut this, id: u32, code: u32) -> Result<H2Event?, u32> {
+        this.resets += 1;
+        if (this.resets > this.guards.resetsPerInterval) {
+            return Err(ErrorCodes.enhanceYourCalm());
+        }
+        this.writeRst(id, code)?;
+        this.remember(id);
+        return Ok(null);
+    }
+
+    fn priorityFrame(borrow mut this, h: FrameHeader, payload: Slice<u8>) -> Result<H2Event?, u32> {
+        if (h.stream == 0) {
+            return Err(ErrorCodes.protocolError()); // §6.3
+        }
+        if (payload.length != 5) {
+            return this.streamError(h.stream, ErrorCodes.frameSizeError());
+        }
+        if (read32(payload, 0) & 0x7FFFFFFF == h.stream) {
+            return this.streamError(h.stream, ErrorCodes.protocolError()); // §5.3.1
+        }
+        return Ok(null); // priority is not used (Web ADR 0011 §3.2)
+    }
+
+    fn rstStreamFrame(borrow mut this, h: FrameHeader, payload: Slice<u8>) -> Result<H2Event?, u32> {
+        if (h.stream == 0) {
+            return Err(ErrorCodes.protocolError()); // §6.4
+        }
+        if (payload.length != 4) {
+            return Err(ErrorCodes.frameSizeError());
+        }
+        let id = h.stream;
+        if (!this.streams.contains(id)) {
+            if (this.idle(id)) {
+                return Err(ErrorCodes.protocolError()); // RST_STREAM on an idle stream (§6.4)
+            }
+            return Ok(null);
+        }
+        this.resets += 1;
+        if (this.resets > this.guards.resetsPerInterval) {
+            return Err(ErrorCodes.enhanceYourCalm()); // rapid reset (CVE-2023-44487)
+        }
+        this.close(id);
+        return Ok(Some(H2Event.Reset(id, read32(payload, 0))));
+    }
+
+    fn settingsFrame(borrow mut this, h: FrameHeader, payload: Slice<u8>) -> Result<H2Event?, u32> {
+        if (h.stream != 0) {
+            return Err(ErrorCodes.protocolError()); // §6.5
+        }
+        if (h.flags & FrameFlags.ack() != 0) {
+            if (payload.length != 0) {
+                return Err(ErrorCodes.frameSizeError());
+            }
+            return Ok(null);
+        }
+        if (payload.length % 6 != 0) {
+            return Err(ErrorCodes.frameSizeError());
+        }
+        this.settingsSeen = true;
+        var windowDelta: i64 = 0;
+        var at: usize = 0;
+        while (at < payload.length) {
+            let id = (payload[at] as u16 << 8) | payload[at + 1] as u16;
+            let value = read32(payload, at + 2);
+            at += 6;
+            if (id == SettingIds.headerTableSize()) {
+                this.peer.headerTableSize = value; // our encoder never indexes, so any size will do
+            } else if (id == SettingIds.enablePush()) {
+                if (value > 1) {
+                    return Err(ErrorCodes.protocolError());
+                }
+                this.peer.enablePush = value == 1;
+            } else if (id == SettingIds.maxConcurrentStreams()) {
+                this.peer.maxConcurrentStreams = value;
+            } else if (id == SettingIds.initialWindowSize()) {
+                if (value > 0x7FFFFFFF) {
+                    return Err(ErrorCodes.flowControlError()); // §6.5.2
+                }
+                windowDelta += value as i64 - this.peer.initialWindowSize as i64;
+                this.peer.initialWindowSize = value;
+            } else if (id == SettingIds.maxFrameSize()) {
+                if (value < 16384 || value > 16777215) {
+                    return Err(ErrorCodes.protocolError());
+                }
+                this.peer.maxFrameSize = value;
+            } else if (id == SettingIds.maxHeaderListSize()) {
+                this.peer.maxHeaderListSize = value;
+            }
+        }
+        if (windowDelta != 0) {
+            // Every open stream's window moves by the change (§6.9.2); one may go negative, none past 2^31 - 1.
+            for (i in 0..this.streams.length()) {
+                let id: u32 = this.streams.keyAt(i);
+                match (this.streams.getMut(id)) {
+                    Some(s) => {
+                        s.sendWindow += windowDelta;
+                        if (s.sendWindow > 0x7FFFFFFF) {
+                            return Err(ErrorCodes.flowControlError());
+                        }
+                    }
+                    null => {}
+                }
+            }
+        }
+        this.owedAcks += 1;
+        if (this.owedAcks > this.guards.maxOwedAcks) {
+            return Err(ErrorCodes.enhanceYourCalm()); // a SETTINGS flood
+        }
+        if (failed(Frames.writeSettingsAck(mut this.out))) {
+            return Err(ErrorCodes.internalError());
+        }
+        if (windowDelta > 0) {
+            return Ok(Some(H2Event.WindowOpened(0)));
+        }
+        return Ok(null);
+    }
+
+    fn pingFrame(borrow mut this, h: FrameHeader, payload: Slice<u8>) -> Result<H2Event?, u32> {
+        if (h.stream != 0) {
+            return Err(ErrorCodes.protocolError()); // §6.7
+        }
+        if (payload.length != 8) {
+            return Err(ErrorCodes.frameSizeError());
+        }
+        if (h.flags & FrameFlags.ack() != 0) {
+            return Ok(null);
+        }
+        this.owedAcks += 1;
+        if (this.owedAcks > this.guards.maxOwedAcks) {
+            return Err(ErrorCodes.enhanceYourCalm()); // a PING flood
+        }
+        var bytes = [0u8; 8];
+        for (i in 0..8usize) {
+            bytes[i] = payload[i];
+        }
+        if (failed(Frames.writePing(mut this.out, bytes, true))) {
+            return Err(ErrorCodes.internalError());
+        }
+        return Ok(null);
+    }
+
+    fn windowUpdateFrame(borrow mut this, h: FrameHeader, payload: Slice<u8>) -> Result<H2Event?, u32> {
+        if (payload.length != 4) {
+            return Err(ErrorCodes.frameSizeError()); // §6.9
+        }
+        let increment = read32(payload, 0) & 0x7FFFFFFF;
+        let id = h.stream;
+        if (increment == 0) {
+            this.emptyFrames += 1;
+            if (this.emptyFrames > this.guards.emptyFramesPerInterval) {
+                return Err(ErrorCodes.enhanceYourCalm());
+            }
+            if (id == 0) {
+                return Err(ErrorCodes.protocolError());
+            }
+            return this.streamError(id, ErrorCodes.protocolError());
+        }
+        if (id == 0) {
+            this.connectionSend += increment as i64;
+            if (this.connectionSend > 0x7FFFFFFF) {
+                return Err(ErrorCodes.flowControlError()); // §6.9.1
+            }
+            return Ok(Some(H2Event.WindowOpened(0)));
+        }
+        var overflow = false;
+        match (this.streams.getMut(id)) {
+            Some(s) => {
+                s.sendWindow += increment as i64;
+                overflow = s.sendWindow > 0x7FFFFFFF;
+            }
+            null => {
+                if (this.idle(id)) {
+                    return Err(ErrorCodes.protocolError()); // WINDOW_UPDATE on an idle stream (§5.1)
+                }
+                return Ok(null);
+            }
+        }
+        if (overflow) {
+            return this.streamError(id, ErrorCodes.flowControlError());
+        }
+        return Ok(Some(H2Event.WindowOpened(id)));
+    }
+
+    /// Whether `id` was never opened: a client's stream above the last one, or a push stream not yet promised.
+    fn idle(borrow this, id: u32) -> bool => if (id % 2 == 1) id > this.lastStream else id >= this.nextPush;
+
+    /// A stream error (§5.4.2): RST_STREAM, the stream closed, and an event so its handler is cancelled.
+    fn streamError(borrow mut this, id: u32, code: u32) -> Result<H2Event?, u32> {
+        this.writeRst(id, code)?;
+        if (this.streams.contains(id)) {
+            this.close(id);
+        } else {
+            this.remember(id);
+        }
+        return Ok(Some(H2Event.StreamError(id, code)));
+    }
+
+    fn writeRst(borrow mut this, id: u32, code: u32) -> Result<void, u32> {
+        match (Frames.writeRstStream(mut this.out, id, code)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(ErrorCodes.internalError()); }
+        }
+    }
+
+    /// The peer ended its side of `id`.
+    fn remoteEnded(borrow mut this, id: u32) {
+        var closeIt = false;
+        match (this.streams.getMut(id)) {
+            Some(s) => {
+                match (s.state) {
+                    StreamState.Open => { s.state = StreamState.HalfClosedRemote; }
+                    StreamState.HalfClosedLocal => { closeIt = true; }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        if (closeIt) {
+            this.close(id);
+        }
+    }
+
+    fn close(borrow mut this, id: u32) {
+        match (this.streams.remove(id)) {
+            Some(s) => {
+                if (s.counted) {
+                    this.active -= 1;
+                }
+                // What the stream had not given back of the connection's window, it gives back now.
+                this.connectionUnacked += s.unacked;
+            }
+            null => {}
+        }
+        this.remember(id);
+    }
+
+    fn remember(borrow mut this, id: u32) {
+        this.closed[this.closedAt] = id;
+        this.closedAt = (this.closedAt + 1) % 64;
+    }
+
+    fn recentlyClosed(borrow this, id: u32) -> bool {
+        for (c in this.closed) {
+            if (c == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Bytes read (or never to be read) on `id` (0: the connection only): a WINDOW_UPDATE once half a window is due.
+    fn giveBack(borrow mut this, id: u32, n: usize) -> Result<void, u32> {
+        let amount = truncate<u32>(n);
+        this.connectionUnacked += amount;
+        if (this.connectionUnacked as i64 >= this.connectionWindowTarget() / 2) {
+            if (failed(Frames.writeWindowUpdate(mut this.out, 0, this.connectionUnacked))) {
+                return Err(ErrorCodes.internalError());
+            }
+            this.connectionReceive += this.connectionUnacked as i64;
+            this.connectionUnacked = 0;
+        }
+        if (id == 0) {
+            return Ok();
+        }
+        let half = this.local.initialWindowSize / 2;
+        var update: u32 = 0;
+        match (this.streams.getMut(id)) {
+            Some(s) => {
+                s.unacked += amount;
+                let remoteOpen = match (s.state) {
+                    StreamState.HalfClosedRemote => false,
+                    _ => true,
+                };
+                if (s.unacked >= half && remoteOpen) {
+                    update = s.unacked;
+                    s.receiveWindow += s.unacked as i64;
+                    s.unacked = 0;
+                }
+            }
+            null => {}
+        }
+        if (update > 0 && failed(Frames.writeWindowUpdate(mut this.out, id, update))) {
+            return Err(ErrorCodes.internalError());
+        }
+        return Ok();
+    }
+
+    fn connectionWindowTarget(borrow this) -> i64 => this.connectionReceive + this.connectionUnacked as i64;
+
+    // ---- Sending, for the driver ----
+
+    /// The handler read `n` body bytes of `id`: their window is given back (WINDOW_UPDATE once half is due).
+    public fn consumed(borrow mut this, id: u32, n: usize) -> Result<void, u32> => this.giveBack(id, n);
+
+    /// How many DATA bytes may go out on `id` now: the smaller window, at most one frame.
+    public fn sendAllowance(borrow this, id: u32) -> usize {
+        let streamWindow = match (this.streams.get(id)) {
+            Some(s) => s.sendWindow,
+            null => 0i64,
+        };
+        var n = if (streamWindow < this.connectionSend) streamWindow else this.connectionSend;
+        if (n > this.peer.maxFrameSize as i64) {
+            n = this.peer.maxFrameSize as i64;
+        }
+        return if (n > 0) truncate<usize>(n) else 0;
+    }
+
+    /// Queues a HEADERS block for `id`: the response's head, or its trailers with `endStream`.
+    public fn sendHeaders(borrow mut this, id: u32, fields: borrow HeaderBlock, endStream: bool) -> Result<void, u32> {
+        if (!this.streams.contains(id)) {
+            return Err(ErrorCodes.streamClosed());
+        }
+        this.scratch.clear();
+        for (i in 0..fields.count()) {
+            if (failed(
+                HpackEncoder.field(fields.name(i), fields.value(i), fields.span(i).sensitive, mut this.scratch),
+            )) {
+                return Err(ErrorCodes.internalError());
+            }
+        }
+        if (failed(Frames.writeHeaders(mut this.out, id, this.scratch.view(), endStream, this.peer.maxFrameSize))) {
+            return Err(ErrorCodes.internalError());
+        }
+        var opened = false;
+        match (this.streams.getMut(id)) {
+            Some(s) => {
+                match (s.state) {
+                    StreamState.ReservedLocal => {
+                        s.state = StreamState.HalfClosedRemote; // a pushed response starts (§8.4)
+                        opened = true;
+                    }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        if (endStream) {
+            this.localEnded(id);
+        }
+        return Ok();
+    }
+
+    /// Queues DATA on `id`: at most `sendAllowance(id)` bytes (any number, even none, with `endStream`).
+    public fn sendData(borrow mut this, id: u32, bytes: Slice<u8>, endStream: bool) -> Result<void, u32> {
+        if (bytes.length > this.sendAllowance(id)) {
+            return Err(ErrorCodes.internalError()); // the driver waits for the window
+        }
+        match (this.streams.getMut(id)) {
+            Some(s) => { s.sendWindow -= truncate<i64>(bytes.length); }
+            null => { return Err(ErrorCodes.streamClosed()); }
+        }
+        this.connectionSend -= truncate<i64>(bytes.length);
+        if (failed(Frames.writeDataHeader(mut this.out, id, truncate<u32>(bytes.length), endStream))) {
+            return Err(ErrorCodes.internalError());
+        }
+        for (b in bytes) {
+            if (failed(this.out.push(b))) {
+                return Err(ErrorCodes.internalError());
+            }
+        }
+        if (endStream) {
+            this.localEnded(id);
+        }
+        return Ok();
+    }
+
+    /// We ended our side of `id`.
+    fn localEnded(borrow mut this, id: u32) {
+        var closeIt = false;
+        match (this.streams.getMut(id)) {
+            Some(s) => {
+                match (s.state) {
+                    StreamState.Open => { s.state = StreamState.HalfClosedLocal; }
+                    StreamState.HalfClosedRemote => { closeIt = true; }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        if (closeIt) {
+            this.close(id);
+        }
+    }
+
+    /// Resets `id` (a handler failed or was cancelled): RST_STREAM, and the stream closed.
+    public fn resetStream(borrow mut this, id: u32, code: u32) -> Result<void, u32> {
+        if (!this.streams.contains(id)) {
+            return Ok();
+        }
+        this.writeRst(id, code)?;
+        this.close(id);
+        return Ok();
+    }
+
+    /// Promises a pushed response on `parent` (§8.4): PUSH_PROMISE with the promised request's head, and a stream
+    /// reserved for its response. Null if the client disabled push, the connection is going away, the parent is not
+    /// open to us, or the client's SETTINGS_MAX_CONCURRENT_STREAMS is reached.
+    public fn promise(borrow mut this, parent: u32, request: borrow HeaderBlock) -> Result<u32?, u32> {
+        if (!this.peer.enablePush || this.goingAway || this.nextPush > 0x7FFFFFFF) {
+            return Ok(null);
+        }
+        var pushed: u32 = 0;
+        for (i in 0..this.streams.length()) {
+            match (this.streams.valueAt(i).state) {
+                StreamState.ReservedLocal => { pushed += 1; }
+                _ => {}
+            }
+        }
+        if (pushed >= this.peer.maxConcurrentStreams) {
+            return Ok(null);
+        }
+        let open = match (this.streams.get(parent)) {
+            Some(s) => match (s.state) {
+                StreamState.Open => true,
+                StreamState.HalfClosedRemote => true,
+                _ => false,
+            },
+            null => false,
+        };
+        if (!open) {
+            return Ok(null);
+        }
+        let id = this.nextPush;
+        this.nextPush += 2;
+        this.scratch.clear();
+        for (i in 0..request.count()) {
+            if (failed(HpackEncoder.field(request.name(i), request.value(i), false, mut this.scratch))) {
+                return Err(ErrorCodes.internalError());
+            }
+        }
+        if (failed(Frames.writePushPromise(mut this.out, parent, id, this.scratch.view(), this.peer.maxFrameSize))) {
+            return Err(ErrorCodes.internalError());
+        }
+        let stream = Stream {
+            state: StreamState.ReservedLocal,
+            sendWindow: this.peer.initialWindowSize as i64,
+            receiveWindow: 0,
+            unacked: 0,
+            contentLength: null,
+            received: 0,
+            counted: false,
+        };
+        match (this.streams.put(id, stream)) {
+            Ok(_) => { return Ok(Some(id)); }
+            Err(_) => { return Err(ErrorCodes.internalError()); }
+        }
+    }
+
+    /// Queues GOAWAY with `code` and the last stream the client opened; new streams are ignored from now on.
+    public fn goAway(borrow mut this, code: u32) -> Result<void, u32> {
+        this.goingAway = true;
+        match (Frames.writeGoAway(mut this.out, this.lastStream, code, "".bytes())) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(ErrorCodes.internalError()); }
+        }
+    }
+}
+
+/// DATA's or HEADERS' payload without its padding (§6.1, §6.2).
+fn unpad(flags: u8, payload: Slice<u8>) -> Result<Slice<u8>, u32> {
+    if (flags & FrameFlags.padded() == 0) {
+        return Ok(payload);
+    }
+    if (payload.length == 0) {
+        return Err(ErrorCodes.frameSizeError());
+    }
+    let pad = payload[0] as usize;
+    if (pad >= payload.length) {
+        return Err(ErrorCodes.protocolError()); // padding as long as the payload (§6.1)
+    }
+    return Ok(payload[1..payload.length - pad]);
+}
+
+fn read32(b: Slice<u8>, at: usize) -> u32 =>
+    (b[at] as u32 << 24) | (b[at + 1] as u32 << 16) | (b[at + 2] as u32 << 8) | b[at + 3] as u32;
+
+fn consume(input: borrow mut OwnedBuffer, n: usize) -> Result<void, u32> {
+    match (input.consume(n)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(ErrorCodes.internalError()); }
+    }
+}
+
+fn failed(r: Result<void, AllocError>) -> bool => match (r) {
+    Ok() => false,
+    Err(_) => true,
+};

@@ -1,0 +1,169 @@
+// Whether a decoded header list is a well-formed HTTP/2 request or trailer section (RFC 9113 §8.1-8.3). A malformed one
+// is a stream error of type PROTOCOL_ERROR (§8.1.1). Sans-I/O.
+
+/// What a request's head says about its body.
+public struct RequestShape {
+    /// The `content-length`, if given: the DATA must add up to it (§8.1.1).
+    public contentLength: u64?;
+}
+
+/// Request and trailer checks.
+public struct Requests {
+    /// Checks a request's head (§8.2, §8.3.1): field names in lower case with no forbidden byte; values without NUL,
+    /// CR, LF or surrounding whitespace; the pseudo-headers first, each at most once, only request ones; `:method`,
+    /// `:scheme` and a non-empty `:path` (only `:authority` with CONNECT); no connection-specific field; `te` only
+    /// "trailers"; one well-formed `content-length` at most. Null if malformed.
+    public fn checkRequest(head: borrow HeaderBlock) -> RequestShape? {
+        var method = false;
+        var scheme = false;
+        var path = false;
+        var authority = false;
+        var connect = false;
+        var regular = false;
+        var length: u64? = null;
+        for (i in 0..head.count()) {
+            let name = head.name(i);
+            let value = head.value(i);
+            if (!goodValue(value)) {
+                return null;
+            }
+            if (name.length > 0 && name[0] == 58) {
+                if (regular) {
+                    return null; // a pseudo-header after a regular field (§8.3)
+                }
+                if (isText(name, ":method")) {
+                    if (method || value.length == 0) {
+                        return null;
+                    }
+                    method = true;
+                    connect = isText(value, "CONNECT");
+                } else if (isText(name, ":scheme")) {
+                    if (scheme) {
+                        return null;
+                    }
+                    scheme = true;
+                } else if (isText(name, ":path")) {
+                    if (path || value.length == 0) {
+                        return null;
+                    }
+                    path = true;
+                } else if (isText(name, ":authority")) {
+                    if (authority) {
+                        return null;
+                    }
+                    authority = true;
+                } else {
+                    return null; // :status, or an unknown pseudo-header (§8.3)
+                }
+                continue;
+            }
+            regular = true;
+            if (!goodName(name) || connectionSpecific(name)) {
+                return null;
+            }
+            if (isText(name, "te") && !isText(value, "trailers")) {
+                return null;
+            }
+            if (isText(name, "content-length")) {
+                let n = decimal(value)?;
+                match (length) {
+                    Some(m) => {
+                        if (m != n) {
+                            return null;
+                        }
+                    }
+                    null => {}
+                }
+                length = Some(n);
+            }
+        }
+        if (!method) {
+            return null;
+        }
+        if (connect) {
+            if (scheme || path || !authority) {
+                return null; // §8.5
+            }
+        } else if (!scheme || !path) {
+            return null;
+        }
+        return Some(RequestShape { contentLength: length });
+    }
+
+    /// Checks a trailer section (§8.1): no pseudo-header, and the same rules for names and values as a request's.
+    public fn checkTrailers(head: borrow HeaderBlock) -> bool {
+        for (i in 0..head.count()) {
+            let name = head.name(i);
+            if (name.length > 0 && name[0] == 58) {
+                return false;
+            }
+            if (!goodName(name) || !goodValue(head.value(i)) || connectionSpecific(name)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+/// A field name: not empty, no upper case, and none of NUL, CR, LF, space or ':' (§8.2.1).
+fn goodName(name: Slice<u8>) -> bool {
+    if (name.length == 0) {
+        return false;
+    }
+    for (c in name) {
+        if ((c >= 65 && c <= 90) || c == 0 || c == 10 || c == 13 || c == 32 || c == 58 || c >= 127) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A field value: no NUL, CR or LF, and no leading or trailing space or tab (§8.2.1).
+fn goodValue(value: Slice<u8>) -> bool {
+    for (c in value) {
+        if (c == 0 || c == 10 || c == 13) {
+            return false;
+        }
+    }
+    if (value.length > 0) {
+        let first = value[0];
+        let last = value[value.length - 1];
+        if (first == 32 || first == 9 || last == 32 || last == 9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Fields that only HTTP/1.1 connections have (§8.2.2).
+fn connectionSpecific(name: Slice<u8>) -> bool =>
+    isText(name, "connection") || isText(name, "proxy-connection") || isText(name, "keep-alive") ||
+        isText(name, "transfer-encoding") || isText(name, "upgrade");
+
+fn isText(a: Slice<u8>, text: StringView) -> bool {
+    let b = text.bytes();
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A decimal number of at most 19 digits, else null.
+fn decimal(v: Slice<u8>) -> u64? {
+    if (v.length == 0 || v.length > 19) {
+        return null;
+    }
+    var n: u64 = 0;
+    for (c in v) {
+        if (c < 48 || c > 57) {
+            return null;
+        }
+        n = n * 10 + (c - 48) as u64;
+    }
+    return Some(n);
+}

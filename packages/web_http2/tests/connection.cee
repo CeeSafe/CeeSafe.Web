@@ -1,0 +1,581 @@
+// The connection state machine against RFC 9113's rules (each check cites its section): frames are written by hand as a
+// client would send them, and the expected events, frames back and error codes follow from the RFC's text.
+import web_core;
+
+/// A client's frame.
+fn frame(out: borrow mut Vector<u8>, kind: u8, flags: u8, stream: u32, payload: Slice<u8>) -> Result<void, TestFailure> {
+    grew(Frames.writeHeader(out, truncate<u32>(payload.length), kind, flags, stream))?;
+    for (b in payload) {
+        grew(out.push(b))?;
+    }
+    return Ok();
+}
+
+/// A client's frame whose payload is given in hex.
+fn frameHex(out: borrow mut Vector<u8>, kind: u8, flags: u8, stream: u32, payload: StringView) -> Result<void, TestFailure> {
+    let bytes = hexBytes(payload)?;
+    return frame(out, kind, flags, stream, bytes.view());
+}
+
+fn frameName(kind: u8) -> StringView => match (kind) {
+    0 => "data",
+    1 => "headers",
+    2 => "priority",
+    3 => "rst",
+    4 => "settings",
+    5 => "push",
+    6 => "ping",
+    7 => "goaway",
+    8 => "window",
+    9 => "cont",
+    _ => "unknown",
+};
+
+/// The client preface and an empty SETTINGS frame.
+fn preface(out: borrow mut Vector<u8>) -> Result<void, TestFailure> {
+    let p = clientPreface();
+    for (b in p.bytes()) {
+        grew(out.push(b))?;
+    }
+    return frame(out, FrameTypes.settings(), 0, 0, "".bytes());
+}
+
+/// A GET request's header block (HPACK, our encoder).
+fn getBlock(path: StringView) -> Result<Vector<u8>, TestFailure> {
+    var b = Vector<u8>.create();
+    grew(HpackEncoder.field(":method".bytes(), "GET".bytes(), false, mut b))?;
+    grew(HpackEncoder.field(":scheme".bytes(), "https".bytes(), false, mut b))?;
+    grew(HpackEncoder.field(":path".bytes(), path.bytes(), false, mut b))?;
+    grew(HpackEncoder.field(":authority".bytes(), "example.test".bytes(), false, mut b))?;
+    return Ok(b);
+}
+
+/// A header block from `name: value` lines (one per `\n`), names as written.
+fn blockOf(lines: StringView) -> Result<Vector<u8>, TestFailure> {
+    var b = Vector<u8>.create();
+    let t = lines.bytes();
+    var start: usize = 0;
+    for (i in 0..t.length) {
+        if (t[i] != 10) {
+            continue;
+        }
+        var cut = start + 1;
+        while (!(t[cut] == 58 && t[cut + 1] == 32)) {
+            cut += 1;
+        }
+        grew(HpackEncoder.field(t[start..cut], t[cut + 2..i], false, mut b))?;
+        start = i + 1;
+    }
+    return Ok(b);
+}
+
+fn server() -> Result<H2Connection, TestFailure> {
+    let settings = H2Settings.server(16384);
+    var c = match (H2Connection.create(settings, H2Guards.defaults(16384))) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("a connection")); },
+    };
+    grew(c.start(1048576))?;
+    c.outputWritten();
+    return Ok(c);
+}
+
+fn append(log: borrow mut Vector<u8>, text: StringView) -> Result<void, TestFailure> {
+    for (b in text.bytes()) {
+        grew(log.push(b))?;
+    }
+    return Ok();
+}
+
+fn number(log: borrow mut Vector<u8>, n: u64) -> Result<void, TestFailure> {
+    var digits = [0u8; 20];
+    var i: usize = 20;
+    var v = n;
+    loop {
+        i -= 1;
+        digits[i] = 48 + truncate<u8>(v % 10);
+        v /= 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    for (k in i..20usize) {
+        grew(log.push(digits[k]))?;
+    }
+    return Ok();
+}
+
+/// Feeds `bytes` to `c` at time `nowMs`, and describes what came out, one item per event:
+/// `req ID [end]`, `data ID LENGTH [end]`, `trailers ID`, `toolarge ID`, `reset ID CODE`, `error ID CODE`,
+/// `window ID`, `goaway LAST CODE`, or `conn CODE` for a connection error (which ends the feed).
+fn feedAt(c: borrow mut H2Connection, bytes: Slice<u8>, nowMs: u64) -> Result<Vector<u8>, TestFailure> {
+    var input = match (OwnedBuffer.create(bytes.length + 64)) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("a buffer")); },
+    };
+    match (input.append(bytes)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("append")); }
+    }
+    var head = HeaderBlock.create();
+    var data = Vector<u8>.create();
+    var log = Vector<u8>.create();
+    loop {
+        match (c.next(mut input, mut head, mut data, nowMs)) {
+            Ok(H2Event.NeedMore) => { return Ok(log); }
+            Ok(H2Event.Request(id, end)) => {
+                append(mut log, "req ")?;
+                number(mut log, id as u64)?;
+                append(mut log, if (end) " end; " else "; ")?;
+            }
+            Ok(H2Event.Data(id, end)) => {
+                append(mut log, "data ")?;
+                number(mut log, id as u64)?;
+                append(mut log, " ")?;
+                number(mut log, data.length as u64)?;
+                append(mut log, if (end) " end; " else "; ")?;
+            }
+            Ok(H2Event.Trailers(id)) => {
+                append(mut log, "trailers ")?;
+                number(mut log, id as u64)?;
+                append(mut log, "; ")?;
+            }
+            Ok(H2Event.TooLarge(id)) => {
+                append(mut log, "toolarge ")?;
+                number(mut log, id as u64)?;
+                append(mut log, "; ")?;
+            }
+            Ok(H2Event.Reset(id, code)) => {
+                append(mut log, "reset ")?;
+                number(mut log, id as u64)?;
+                append(mut log, " ")?;
+                number(mut log, code as u64)?;
+                append(mut log, "; ")?;
+            }
+            Ok(H2Event.StreamError(id, code)) => {
+                append(mut log, "error ")?;
+                number(mut log, id as u64)?;
+                append(mut log, " ")?;
+                number(mut log, code as u64)?;
+                append(mut log, "; ")?;
+            }
+            Ok(H2Event.WindowOpened(id)) => {
+                append(mut log, "window ")?;
+                number(mut log, id as u64)?;
+                append(mut log, "; ")?;
+            }
+            Ok(H2Event.GoAway(last, code)) => {
+                append(mut log, "goaway ")?;
+                number(mut log, last as u64)?;
+                append(mut log, " ")?;
+                number(mut log, code as u64)?;
+                append(mut log, "; ")?;
+            }
+            Err(code) => {
+                append(mut log, "conn ")?;
+                number(mut log, code as u64)?;
+                return Ok(log);
+            }
+        }
+    }
+}
+
+fn feed(c: borrow mut H2Connection, bytes: Slice<u8>) -> Result<Vector<u8>, TestFailure> => feedAt(c, bytes, 0);
+
+/// The frames in `c`'s output, one item per frame: `TYPE STREAM [FLAGS]`, with the error code for RST_STREAM and
+/// GOAWAY (`rst 1 code 5`) and the increment for WINDOW_UPDATE. The output is then marked written.
+fn sent(c: borrow mut H2Connection) -> Result<Vector<u8>, TestFailure> {
+    var log = Vector<u8>.create();
+    let out = c.output();
+    var at: usize = 0;
+    while (at + 9 <= out.length) {
+        let h = match (Frames.parseHeader(out[at..])) {
+            Some(h) => h,
+            null => { return Err(TestFailure.create("a frame")); },
+        };
+        let p = out[at + 9..at + 9 + h.length as usize];
+        append(mut log, frameName(h.kind))?;
+        append(mut log, " ")?;
+        number(mut log, h.stream as u64)?;
+        if (h.flags != 0) {
+            append(mut log, " f")?;
+            number(mut log, h.flags as u64)?;
+        }
+        if (h.kind == FrameTypes.rstStream()) {
+            append(mut log, " code ")?;
+            number(mut log, read32(p, 0) as u64)?;
+        } else if (h.kind == FrameTypes.goAway()) {
+            append(mut log, " last ")?;
+            number(mut log, read32(p, 0) as u64)?;
+            append(mut log, " code ")?;
+            number(mut log, read32(p, 4) as u64)?;
+        } else if (h.kind == FrameTypes.windowUpdate()) {
+            append(mut log, " +")?;
+            number(mut log, read32(p, 0) as u64)?;
+        }
+        append(mut log, "; ")?;
+        at += 9 + h.length as usize;
+    }
+    c.outputWritten();
+    return Ok(log);
+}
+
+fn is(expected: StringView, got: borrow Vector<u8>) -> Result<void, TestFailure> => Check.equalBytes(expected.bytes(), got.view());
+
+@test
+fn preface_and_settings_rfc9113_3_4() -> Result<void, TestFailure> {
+    var c = match (H2Connection.create(H2Settings.server(16384), H2Guards.defaults(16384))) {
+        Ok(c) => c,
+        Err(_) => { return Check.fail("a connection"); },
+    };
+    grew(c.start(1048576))?;
+    is("settings 0; window 0 +983041; ", sent(mut c)?)?; // our SETTINGS, then the connection window to 1 MiB
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    is("", feed(mut c, bytes.view())?)?;
+    is("settings 0 f1; ", sent(mut c)?)?; // SETTINGS ACK (§6.5.3)
+    // A wrong preface, and a first frame that is not SETTINGS, are PROTOCOL_ERROR (§3.4).
+    var bad = server()?;
+    is("conn 1", feed(mut bad, "GET / HTTP/1.1\r\n\r\nxxxxxx".bytes())?)?;
+    var noSettings = server()?;
+    var ping = Vector<u8>.create();
+    let p = clientPreface();
+    for (b in p.bytes()) {
+        grew(ping.push(b))?;
+    }
+    frame(mut ping, FrameTypes.ping(), 0, 0, "12345678".bytes())?;
+    return is("conn 1", feed(mut noSettings, ping.view())?);
+}
+
+@test
+fn a_request_and_its_body() -> Result<void, TestFailure> {
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let get = getBlock("/upload")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, get.view())?;
+    frame(mut bytes, FrameTypes.data(), 0, 1, "hello".bytes())?;
+    frame(mut bytes, FrameTypes.data(), FrameFlags.endStream(), 1, " world".bytes())?;
+    is("req 1; data 1 5; data 1 6 end; ", feed(mut c, bytes.view())?)?;
+    Check.equalU64(1, c.activeStreams() as u64)?;
+    // The response: HEADERS, then DATA with END_STREAM closes the stream (half-closed remote, then closed: §5.1).
+    var response = HeaderBlock.create();
+    grew(response.push(":status".bytes(), "200".bytes(), false))?;
+    match (c.sendHeaders(1, response, false)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("headers"); }
+    }
+    Check.equalU64(16384, c.sendAllowance(1) as u64)?;
+    match (c.sendData(1, "ok".bytes(), true)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("data"); }
+    }
+    is("settings 0 f1; headers 1 f4; data 1 f1; ", sent(mut c)?)?;
+    return Check.equalU64(0, c.activeStreams() as u64);
+}
+
+@test
+fn stream_identifiers_rfc9113_5_1_1() -> Result<void, TestFailure> {
+    let get = getBlock("/")?;
+    // An even stream from a client, a stream below one already opened, DATA on an idle stream and on stream 0 are
+    // PROTOCOL_ERROR (§5.1.1, §5.1, §6.1).
+    for (k in 0..4u32) {
+        var c = server()?;
+        var bytes = Vector<u8>.create();
+        preface(mut bytes)?;
+        if (k == 0) {
+            frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 2, get.view())?;
+        } else if (k == 1) {
+            frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 5, get.view())?;
+            frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 3, get.view())?;
+        } else if (k == 2) {
+            frame(mut bytes, FrameTypes.data(), 0, 7, "x".bytes())?;
+        } else {
+            frame(mut bytes, FrameTypes.data(), 0, 0, "x".bytes())?;
+        }
+        let log = feed(mut c, bytes.view())?;
+        is(if (k == 1) "req 5 end; conn 1" else "conn 1", log)?;
+    }
+    return Ok();
+}
+
+@test
+fn closed_and_half_closed_streams_rfc9113_5_1() -> Result<void, TestFailure> {
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let get = getBlock("/")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    frame(mut bytes, FrameTypes.data(), 0, 1, "late".bytes())?; // half-closed (remote): STREAM_CLOSED (§5.1)
+    is("req 1 end; error 1 5; ", feed(mut c, bytes.view())?)?;
+    is("settings 0 f1; rst 1 code 5; ", sent(mut c)?)?;
+    // After our reset, frames in flight on the stream are ignored (§5.1, closed).
+    var more = Vector<u8>.create();
+    frame(mut more, FrameTypes.data(), 0, 1, "still".bytes())?;
+    frameHex(mut more, FrameTypes.rstStream(), 0, 1, "00000008")?;
+    return is("", feed(mut c, more.view())?);
+}
+
+@test
+fn header_blocks_rfc9113_6_10() -> Result<void, TestFailure> {
+    let get = getBlock("/")?;
+    let all = get.view();
+    // HEADERS without END_HEADERS, then CONTINUATION: one request.
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endStream(), 1, all[0..3])?;
+    frame(mut bytes, FrameTypes.continuation(), FrameFlags.endHeaders(), 1, all[3..])?;
+    is("req 1 end; ", feed(mut c, bytes.view())?)?;
+    // Any other frame inside a header block is PROTOCOL_ERROR (§4.3).
+    var d = server()?;
+    var interrupted = Vector<u8>.create();
+    preface(mut interrupted)?;
+    frame(mut interrupted, FrameTypes.headers(), 0, 1, all[0..3])?;
+    frame(mut interrupted, FrameTypes.ping(), 0, 0, "12345678".bytes())?;
+    is("conn 1", feed(mut d, interrupted.view())?)?;
+    // The CONTINUATION flood guard: a block past twice the header list limit ends the connection (ENHANCE_YOUR_CALM).
+    var e = server()?;
+    var flood = Vector<u8>.create();
+    preface(mut flood)?;
+    frame(mut flood, FrameTypes.headers(), 0, 1, all[0..3])?;
+    var filler = Vector<u8>.create();
+    for (i in 0..16000u32) {
+        grew(filler.push(0x40))?;
+    }
+    for (i in 0..3u32) {
+        frame(mut flood, FrameTypes.continuation(), 0, 1, filler.view())?;
+    }
+    is("conn 11", feed(mut e, flood.view())?)?;
+    // A block HPACK cannot decode is COMPRESSION_ERROR (§4.3).
+    var f = server()?;
+    var broken = Vector<u8>.create();
+    preface(mut broken)?;
+    frameHex(mut broken, FrameTypes.headers(), FrameFlags.endHeaders(), 1, "80")?;
+    return is("conn 9", feed(mut f, broken.view())?);
+}
+
+@test
+fn flow_control_rfc9113_6_9() -> Result<void, TestFailure> {
+    let get = getBlock("/")?;
+    // The stream's window is 65535: 65536 bytes overflow it (§6.9.1), a stream error.
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, get.view())?;
+    var chunk = Vector<u8>.create();
+    for (i in 0..16384u32) {
+        grew(chunk.push(120))?;
+    }
+    for (i in 0..4u32) {
+        frame(mut bytes, FrameTypes.data(), 0, 1, chunk.view())?;
+    }
+    frame(mut bytes, FrameTypes.data(), 0, 1, "!".bytes())?;
+    is("req 1; data 1 16384; data 1 16384; data 1 16384; error 1 3; ", feed(mut c, bytes.view())?)?;
+    // A zero increment is PROTOCOL_ERROR; one past 2^31 - 1 is FLOW_CONTROL_ERROR (§6.9, §6.9.1).
+    var d = server()?;
+    var zero = Vector<u8>.create();
+    preface(mut zero)?;
+    frameHex(mut zero, FrameTypes.windowUpdate(), 0, 0, "00000000")?;
+    is("conn 1", feed(mut d, zero.view())?)?;
+    var e = server()?;
+    var over = Vector<u8>.create();
+    preface(mut over)?;
+    frameHex(mut over, FrameTypes.windowUpdate(), 0, 0, "7fffffff")?;
+    is("conn 3", feed(mut e, over.view())?)?;
+    // The client's window update lets more DATA out (window opened for the stream).
+    var f = server()?;
+    var opened = Vector<u8>.create();
+    preface(mut opened)?;
+    frame(mut opened, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    frameHex(mut opened, FrameTypes.windowUpdate(), 0, 1, "00001000")?;
+    is("req 1 end; window 1; ", feed(mut f, opened.view())?)?;
+    return Check.equalU64(16384, f.sendAllowance(1) as u64); // capped by the frame size
+}
+
+@test
+fn settings_rfc9113_6_5() -> Result<void, TestFailure> {
+    // ENABLE_PUSH 2: PROTOCOL_ERROR; INITIAL_WINDOW_SIZE 2^31: FLOW_CONTROL_ERROR; MAX_FRAME_SIZE 16383:
+    // PROTOCOL_ERROR; a length not a multiple of 6: FRAME_SIZE_ERROR; an ACK with a payload: FRAME_SIZE_ERROR;
+    // SETTINGS on a stream: PROTOCOL_ERROR.
+    let cases = [1u32, 3, 1, 6, 6, 1];
+    for (k in 0..6usize) {
+        var c = server()?;
+        var bytes = Vector<u8>.create();
+        let p = clientPreface();
+        for (b in p.bytes()) {
+            grew(bytes.push(b))?;
+        }
+        if (k == 0) {
+            frameHex(mut bytes, FrameTypes.settings(), 0, 0, "000200000002")?;
+        } else if (k == 1) {
+            frameHex(mut bytes, FrameTypes.settings(), 0, 0, "000480000000")?;
+        } else if (k == 2) {
+            frameHex(mut bytes, FrameTypes.settings(), 0, 0, "000500003fff")?;
+        } else if (k == 3) {
+            frameHex(mut bytes, FrameTypes.settings(), 0, 0, "0005000040")?;
+        } else if (k == 4) {
+            frame(mut bytes, FrameTypes.settings(), 0, 0, "".bytes())?;
+            frameHex(mut bytes, FrameTypes.settings(), FrameFlags.ack(), 0, "000000000000")?;
+        } else {
+            frame(mut bytes, FrameTypes.settings(), 0, 1, "".bytes())?;
+        }
+        let log = feed(mut c, bytes.view())?;
+        var want = Vector<u8>.create();
+        append(mut want, "conn ")?;
+        number(mut want, cases[k] as u64)?;
+        Check.equalBytes(want.view(), log.view())?;
+    }
+    return Ok();
+}
+
+@test
+fn ping_rfc9113_6_7() -> Result<void, TestFailure> {
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    frame(mut bytes, FrameTypes.ping(), 0, 0, "abcdefgh".bytes())?;
+    is("", feed(mut c, bytes.view())?)?;
+    let out = c.output();
+    let ack = hexBytes("000008 06 01 00000000 6162636465666768")?; // the same 8 bytes back, with ACK
+    Check.equalBytes(ack.view(), out[out.length - 17..])?;
+    var d = server()?;
+    var short = Vector<u8>.create();
+    preface(mut short)?;
+    frame(mut short, FrameTypes.ping(), 0, 0, "abcdefg".bytes())?;
+    return is("conn 6", feed(mut d, short.view())?); // FRAME_SIZE_ERROR
+}
+
+/// CVE-2023-44487: a client that opens and resets streams faster than the budget (200 a second) is sent away with
+/// ENHANCE_YOUR_CALM; the same number spread over two intervals is fine.
+@test
+fn rapid_reset_guard() -> Result<void, TestFailure> {
+    let get = getBlock("/")?;
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    is("", feed(mut c, bytes.view())?)?;
+    var log = Vector<u8>.create();
+    for (i in 0..201u32) {
+        var pair = Vector<u8>.create();
+        let id = 2 * i + 1;
+        frame(mut pair, FrameTypes.headers(), FrameFlags.endHeaders(), id, get.view())?;
+        frameHex(mut pair, FrameTypes.rstStream(), 0, id, "00000008")?;
+        log = feedAt(mut c, pair.view(), if (i < 100) 0 else 500)?;
+        c.outputWritten();
+    }
+    is("req 401; conn 11", log)?;
+    var d = server()?;
+    is("", feed(mut d, bytes.view())?)?;
+    for (i in 0..201u32) {
+        var pair = Vector<u8>.create();
+        let id = 2 * i + 1;
+        frame(mut pair, FrameTypes.headers(), FrameFlags.endHeaders(), id, get.view())?;
+        frameHex(mut pair, FrameTypes.rstStream(), 0, id, "00000008")?;
+        log = feedAt(mut d, pair.view(), if (i < 150) 0 else 1500)?;
+        d.outputWritten();
+    }
+    return is("req 401; reset 401 8; ", log);
+}
+
+@test
+fn malformed_requests_rfc9113_8() -> Result<void, TestFailure> {
+    // Each is refused with RST_STREAM PROTOCOL_ERROR and never reaches a handler (§8.1.1, §8.2, §8.3).
+    for (k in 0..6u32) {
+        let lines = match (k) {
+            0 => ":method: GET\n:scheme: https\n:path: /\nAccept: */*\n",
+            1 => ":method: GET\n:scheme: https\n",
+            2 => ":method: GET\n:scheme: https\n:path: /\nconnection: close\n",
+            3 => ":method: GET\n:scheme: https\n:path: /\nte: gzip\n",
+            4 => ":method: GET\nx: y\n:scheme: https\n:path: /\n",
+            _ => ":method: GET\n:scheme: https\n:path: /\n:status: 200\n",
+        };
+        var c = server()?;
+        var bytes = Vector<u8>.create();
+        preface(mut bytes)?;
+        let block = blockOf(lines)?;
+        frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, block.view())?;
+        is("", feed(mut c, bytes.view())?)?;
+        is("settings 0 f1; rst 1 code 1; ", sent(mut c)?)?;
+    }
+    // A content-length the DATA does not add up to (§8.1.1).
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let post = blockOf(":method: POST\n:scheme: https\n:path: /\ncontent-length: 10\n")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, post.view())?;
+    frame(mut bytes, FrameTypes.data(), FrameFlags.endStream(), 1, "short".bytes())?;
+    return is("req 1; error 1 1; ", feed(mut c, bytes.view())?);
+}
+
+@test
+fn concurrent_stream_limit_rfc9113_5_1_2() -> Result<void, TestFailure> {
+    let get = getBlock("/")?;
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    for (i in 0..101u32) {
+        frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 2 * i + 1, get.view())?;
+    }
+    let log = feed(mut c, bytes.view())?;
+    Check.equalU64(100, c.activeStreams() as u64)?;
+    let out = sent(mut c)?;
+    return Check.isTrue(endsWith(out.view(), "rst 201 code 7; "), "the 101st is REFUSED_STREAM");
+}
+
+/// Push (Web ADR 0011 §3.2): PUSH_PROMISE on the request's stream, an even promised stream whose response starts with
+/// HEADERS; none when the client disabled push.
+@test
+fn server_push_rfc9113_8_4() -> Result<void, TestFailure> {
+    let get = getBlock("/")?;
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    is("req 1 end; ", feed(mut c, bytes.view())?)?;
+    c.outputWritten();
+    var promised = HeaderBlock.create();
+    grew(promised.push(":method".bytes(), "GET".bytes(), false))?;
+    grew(promised.push(":scheme".bytes(), "https".bytes(), false))?;
+    grew(promised.push(":path".bytes(), "/style.css".bytes(), false))?;
+    grew(promised.push(":authority".bytes(), "example.test".bytes(), false))?;
+    let id = match (c.promise(1, promised)) {
+        Ok(Some(id)) => id,
+        _ => { return Check.fail("a promise"); },
+    };
+    Check.equalU64(2, id as u64)?;
+    var response = HeaderBlock.create();
+    grew(response.push(":status".bytes(), "200".bytes(), false))?;
+    match (c.sendHeaders(2, response, true)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the pushed response"); }
+    }
+    is("push 1 f4; headers 2 f5; ", sent(mut c)?)?;
+    // A client with SETTINGS_ENABLE_PUSH 0 gets no promise.
+    var d = server()?;
+    var off = Vector<u8>.create();
+    let p = clientPreface();
+    for (b in p.bytes()) {
+        grew(off.push(b))?;
+    }
+    frameHex(mut off, FrameTypes.settings(), 0, 0, "000200000000")?;
+    frame(mut off, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    is("req 1 end; ", feed(mut d, off.view())?)?;
+    match (d.promise(1, promised)) {
+        Ok(null) => { return Ok(); }
+        _ => { return Check.fail("push disabled"); }
+    }
+}
+
+fn endsWith(hay: Slice<u8>, tail: StringView) -> bool {
+    let t = tail.bytes();
+    if (t.length > hay.length) {
+        return false;
+    }
+    for (i in 0..t.length) {
+        if (hay[hay.length - t.length + i] != t[i]) {
+            return false;
+        }
+    }
+    return true;
+}
