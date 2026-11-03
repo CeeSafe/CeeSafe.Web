@@ -778,7 +778,28 @@ prints the area.
 app.get();` and then `let application: borrow dyn Application = sendable;`. That is two lines, not a workaround: no
 wrapper, no `unsafe`.
 
-## B16 — Bug: a task parked in `recvAsync` inside a race misses a send, under ~30 connections   *(found 2026-11-03, M7, ceesafec 0.10.1, macOS 27 arm64 (kqueue); open)*
+## B16 — Bug: a wake lost when a full kqueue change queue drains the wake pipe   *(found 2026-11-03, M7, ceesafec 0.10.1, macOS (kqueue); fixed on CeeSafe branch `b16-kqueue-drained-wake` (454ac74), not yet released)*
+
+**Cause (found 2026-11-03, in the CeeSafe repo):**
+- A channel's send wakes its parked receiver: it sets the receiver's `woken` flag and writes one byte to the
+  executor's wake pipe (`cee_poke`). The executor finds woken tasks by scanning its wake list in `cee_wait`, but only
+  after its reactor wait.
+- When more than 64 descriptor changes are queued before the executor next waits, `cee_kqueue_change` sends them
+  early with a non-blocking `cee_kqueue_call`. That call also reports the wake pipe, and drains its byte.
+- `cee_wait` then blocked in `kevent` until the next deadline, with the woken task still on its wake list.
+- About 30 HTTP/2 connections, each re-arming its socket per loop, queue more than 64 changes between waits. epoll
+  has no change queue, so only kqueue platforms were affected.
+- The trace that showed it: a task parked on a channel, on both lists and with `woken` set, unparked 1 003 ms later.
+  The executor had gone idle in between.
+
+**Fix:** `cee_kqueue_call` records a drained wake (`pipe_drained`), and `cee_wait` does not block while one is
+recorded. The scan finds the task. Regression test: CeeSafe's corpus `run-pass/async-drained-wake.cee`. 80 readers
+wake together, the first sends to a parked receiver, then all park on sockets. On 0.10.1 it takes 2 s (its guard)
+and prints 0; with the fix it takes 0.06 s and prints 1.
+
+**After the fix (2026-11-03, `examples/server` built with the fixed `out/ceesafec`):**
+- `h2load -c 30 -m 1`: 10 023 req/s, longest 5.2 ms.
+- `-c 100 -m 1`: 10 698 req/s, longest 19 ms.
 
 **Symptom:** with HTTP/2, `examples/server` under `h2load -c N -m 1 http://127.0.0.1:PORT/hello/x`:
 
@@ -820,6 +841,37 @@ HTTP/1.1 on the same server at 100 connections is 42 076 req/s, with the longest
 - HTTP/2 is correct: h2load 100 000 requests with 0 failed, and h2spec 145/145 over TLS.
 - Past ~20 connections, requests stall up to 1 s.
 - Not worked around: the 1 s timer stays as the backstop it was meant to be.
+
+## B17 — Performance: every finished race walks every parked task   *(found 2026-11-03, M7, ceesafec 0.10.1 with B16's fix; open)*
+
+**Symptom:** after B16's fix, HTTP/2 throughput falls with the number of concurrent streams. `h2load -n 20000`
+against `examples/server`:
+
+| connections × streams | req/s | mean request |
+|---|---|---|
+| 10 × 100 | 21 944 | 45 ms |
+| 50 × 10 | 22 308 | 22 ms |
+| 50 × 30 | 15 860 | 93 ms |
+| 20 × 100 | 13 871 | 144 ms |
+| 50 × 50 | 11 782 | 212 ms |
+| 50 × 100 (`-n 100000`) | 3 562 | 1.40 s |
+
+**Where:**
+- `sample` of the server under 50 × 100: `cee_exec_loop` 1 393 samples and `cee_cancel_scope` 895 samples, of
+  about 2 400.
+- A race's end cancels its losers through `cee_cancel_scope` → `cee_wake_waiters`
+  (`runtime/hosted/ceesafe_rt_async.c`). That walks the executor's whole parked list and, for each task, climbs its
+  scopes in `cee_cancelled`.
+- B5 made the walk wake only the tasks it reaches, not every task. The walk itself is still O(parked tasks) per
+  cancellation.
+- With a task per HTTP/2 stream, and a race per connection wake and per stream (handler against reset), the cost is
+  quadratic.
+
+**Wanted:** a cancellation that visits only the cancelled scope's own tasks. Each scope would keep its children, so
+the cost is proportional to what is cancelled. That is a runtime design change: an ADR first.
+
+**Effect on CeeSafe.Web until then:** correct at any load (h2load 100 000/100 000), but past about 2 000 concurrent
+streams on one executor, latency grows.
 
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
