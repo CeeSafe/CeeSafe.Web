@@ -778,6 +778,27 @@ prints the area.
 app.get();` and then `let application: borrow dyn Application = sendable;`. That is two lines, not a workaround: no
 wrapper, no `unsafe`.
 
+## U20 — A type that holds loans cannot be a `borrow mut dyn I`   *(found 2026-11-04, M8, ceesafec 0.10.3; **blocks the reverse proxy's request bodies**)*
+
+**Gap:** `web_client`'s `Client.send(request, body: borrow mut dyn BodySource)` takes the request body as a `dyn`.
+
+- The proxy's body source must read from the request's `Exchange`, so it is a struct with a region parameter:
+  `ExchangeBody<region r> { exchange: borrow mut(r) Exchange<r>, … }`, implementing `BodySource`.
+- Passing it is N0268: "'ExchangeBody' holds loans, so it cannot be a 'dyn BodySource': use it through a bound
+  instead" (`web_proxy/src/proxy.cee` on branch `m8-stage3`).
+- A bound is no way out in 0.10.3. `send` is a method, and methods cannot declare type parameters, so every step from
+  `send` to the write would have to become a top-level generic function.
+
+**Wanted:** CeeSafe ADR 0064 §3.2 (OD-10a): a scoped `T` behind a reference coerces to `borrow dyn I` and
+`borrow mut dyn I`, the `dyn` carrying the reference's loan.
+- Accepted 2026-11-03.
+- Implemented on CeeSafe's working tree 2026-11-04 (ADR 0064 §5.4), not yet released.
+- ADR 0064 §1's generic methods would also give `send<B: BodySource>` as a second route.
+
+**Effect on CeeSafe.Web until then:** the proxy's relay (M8 stage 3) cannot stream a request body to the upstream.
+- It is not worked around: no copy into memory, no extra task feeding a channel.
+- It waits for the CeeSafe release that carries ADR 0064, and M8's toolchain minimum becomes that release.
+
 ## B16 — Bug: a wake lost when a full kqueue change queue drains the wake pipe   *(found 2026-11-03, M7, ceesafec 0.10.1, macOS (kqueue); fixed in 0.10.2)*
 
 **Cause (found 2026-11-03, in the CeeSafe repo):**
