@@ -407,3 +407,24 @@ tasks" (CeeSafe ADR 0053 §1; spec §40.5).
     promises it was not processed (RFC 9113 §6.8).
 - **The `ClientResponse`** gets a stream variant, as `Exchange` did (Web ADR 0011 §3.2), so a caller reads both
   protocols the same way.
+
+## 8. Amendment 2 (2026-11-04, stage 3; the owner's choice): the connection worker reads the PROXY header
+
+§3.6 made the PROXY protocol `ProxyProtocolAcceptor`, an `Acceptor` that wrapped another and called it through
+`dyn Acceptor`. That is a cycle through `dyn`, so the call was a stacked await (CeeSafe ADR 0056). A frame-stack chunk
+that cannot be allocated is ADR 0056 §3.3's panic. The allocation sweep failed on it, and so would a server that ran
+out of memory in that path: it would abort rather than drop the connection.
+
+- **The connection worker** (`web_transport`, `ConnectionServer`) reads the header before it calls the acceptor,
+  when `ConnectionLimits.proxyProtocolFrom` lists any source.
+  - A source not in the list is closed unread.
+  - From a listed source the header is read exactly (`readProxyHeader`, as `ProxyProtocol.more` asks), within
+    `handshakeMs`.
+  - Its addresses go straight into the connection's context. No transport wraps another, and nothing more is boxed.
+  - A missing, malformed or late header counts as a failed handshake.
+- **The parser** (`ProxyProtocol`, `ProxyHeader`), and the address blocks it uses (`Cidr`, `TrustedProxies`), move to
+  `web_transport`. `web_proxy`'s forwarding fields use the same `TrustedProxies`.
+- **Tests:**
+  - `web_transport/tests/proxyheader.cee`: the parser against HAProxy's specification;
+  - the worker at every read size from 1 to 19, with an untrusted source and a source with no header;
+  - each with no allocation-sweep failure.

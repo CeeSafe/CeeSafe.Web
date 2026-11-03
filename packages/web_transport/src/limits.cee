@@ -26,9 +26,13 @@ public struct ConnectionLimits {
     public graceMs: u64;
     /// After a failed accept (out of descriptors, say): the pause before the worker tries again.
     public acceptBackoffMs: u64;
+    /// The balancers this listener takes PROXY headers from (Web ADR 0012 §3.6). From these the header comes first,
+    /// read within `handshakeMs`, and its addresses become the connection's. Every other source is closed. Empty (the
+    /// default): the listener speaks no PROXY protocol.
+    public proxyProtocolFrom: TrustedProxies;
 
     /// The defaults: 256 workers, 10 s handshake and head, 60 s idle, 30 s write, 240 B/s after 5 s, 16 KiB buffer,
-    /// 1 s linger, 30 s grace, 50 ms accept backoff.
+    /// 1 s linger, 30 s grace, 50 ms accept backoff, no PROXY protocol.
     public fn defaults() -> ConnectionLimits => ConnectionLimits {
         workers: 256,
         handshakeMs: 10000,
@@ -41,5 +45,6 @@ public struct ConnectionLimits {
         closeLingerMs: 1000,
         graceMs: 30000,
         acceptBackoffMs: 50,
+        proxyProtocolFrom: TrustedProxies.none(),
     };
 }

@@ -1,7 +1,7 @@
-// The PROXY protocol (Web ADR 0012 §3.6). Expected values come from HAProxy's proxy-protocol.txt: its v1 examples and
-// worst-case line (§2.1), and v2's layout (§2.2) built byte by byte here.
+// The PROXY protocol (Web ADR 0012 §3.6, amendment 2). Expected values come from HAProxy's proxy-protocol.txt: its v1
+// examples and worst-case line (§2.1), and v2's layout (§2.2) built byte by byte here. Then the connection worker over
+// mocks: the header's addresses become the connection's, and the bytes after it are untouched.
 import web_core;
-import web_transport;
 
 fn v2(command: u8, family: u8, body: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
     var h = Vector<u8>.create();
@@ -182,71 +182,117 @@ fn address(text: StringView, port: u16) -> Result<SocketAddress, TestFailure> {
     }
 }
 
-fn acceptor(trusted: StringView) -> Result<ProxyProtocolAcceptor, TestFailure> {
-    var t = TrustedProxies.none();
-    match (t.add(trusted)) {
-        Ok(true) => {}
-        _ => { return Err(TestFailure.create("a block")); }
-    }
-    let inner: Box<dyn Acceptor> = match (Box.create(PlainAcceptor {})) {
-        Ok(b) => b,
-        Err(_) => { return Err(TestFailure.create("a box")); },
-    };
-    return Ok(ProxyProtocolAcceptor.create(inner, t, 1000));
+/// Reads its connection to the end; counts connections whose bytes were exactly `GET / HTTP/1.1\r\n` and whose
+/// context names 203.0.113.7:51000 as the peer and port 443 as its own.
+struct HeaderHandler {
+    exact: AtomicU64;
+    named: AtomicU64;
 }
 
-fn stream(text: StringView, peer: StringView, chunk: usize) -> Result<PlainStream, TestFailure> {
+impl ConnectionHandler for HeaderHandler {
+    async fn serve(borrow this, conn: borrow mut dyn Transport, ctx: borrow ConnectionContext) -> Result<void, NetError> {
+        var all = [0u8; 64];
+        var got: usize = 0;
+        loop {
+            let n = await conn.read(mut all[got..])?;
+            if (n == 0) {
+                break;
+            }
+            got += n;
+        }
+        let want = "GET / HTTP/1.1\r\n".bytes();
+        var same = got == want.length;
+        for (i in 0..got) {
+            if (i < want.length && all[i] != want[i]) {
+                same = false;
+            }
+        }
+        if (same) {
+            let n = this.exact.fetchAdd(1);
+        }
+        var peerOk = false;
+        match (ctx.peerAddress()) {
+            Some(p) => {
+                var text = Vector<u8>.create();
+                match (ipText(p, mut text)) {
+                    Ok() => {}
+                    Err(_) => { return Err(NetError.OutOfMemory); }
+                }
+                let t = text.view();
+                let expected = "203.0.113.7".bytes();
+                peerOk = t.length == expected.length && p.port() == 51000;
+                for (i in 0..t.length) {
+                    if (peerOk && t[i] != expected[i]) {
+                        peerOk = false;
+                    }
+                }
+            }
+            null => {}
+        }
+        let localOk = match (ctx.localAddress()) {
+            Some(l) => l.port() == 443,
+            null => false,
+        };
+        if (peerOk && localOk) {
+            let n = this.named.fetchAdd(1);
+        }
+        return Ok();
+    }
+}
+
+fn source(text: StringView, from: StringView, chunk: usize) -> Result<MockTransport, TestFailure> {
     let m = match (MockTransport.create(text.bytes())) {
         Ok(m) => m,
         Err(_) => { return Err(TestFailure.create("a mock")); },
     };
-    let from = address(peer, 40000)?;
-    let local = address("10.0.0.1", 443)?;
-    return Ok(PlainStream.mock(m.withChunk(chunk).withAddresses(Some(from), Some(local))));
+    return Ok(m.withChunk(chunk).withAddresses(Some(address(from, 40000)?), Some(address("10.0.0.1", 8443)?)));
 }
 
-/// From a trusted balancer, the header's addresses become the connection's, and the bytes after it are untouched, at
-/// every read size; an untrusted source, and a trusted one without a header, are closed.
+/// A listener behind a trusted balancer: the worker reads the header exactly, at every read size, and the context
+/// gets its addresses; a source not in the list, and a listed one that sends no header, are closed unserved.
 @test
-async fn the_acceptor() -> Result<void, TestFailure> {
-    let a = acceptor("10.0.0.0/8")?;
+async fn the_worker_reads_proxy_headers() -> Result<void, TestFailure> {
+    let incoming = match (MockIncoming.create(32)) {
+        Ok(i) => i,
+        Err(_) => { return Check.fail("a source"); },
+    };
     let request = "PROXY TCP4 203.0.113.7 10.0.0.1 51000 443\r\nGET / HTTP/1.1\r\n";
     for (chunk in 1..20usize) {
-        var conn = match (await a.accept(stream(request, "10.0.0.5", chunk)?, Deadline.after(1000))) {
-            Ok(c) => c,
-            Err(e) => { return Check.fail(NetErrors.describe(e)); },
-        };
-        match (conn.peerAddress()) {
-            Some(p) => {
-                var text = Vector<u8>.create();
-                grow(ipText(p, mut text))?;
-                Check.equalBytes("203.0.113.7".bytes(), text.view())?;
-                Check.equalU64(51000, p.port() as u64)?;
-            }
-            null => { return Check.fail("no peer address"); }
+        match (incoming.push(source(request, "10.0.0.5", chunk)?)) {
+            Ok() => {}
+            Err(_) => { return Check.fail("a push"); }
         }
-        var rest = Vector<u8>.create();
-        var buf = [0u8; 64];
-        loop {
-            let n = match (await conn.read(mut buf[..])) {
-                Ok(n) => n,
-                Err(_) => { return Check.fail("a read"); },
-            };
-            if (n == 0) {
-                break;
-            }
-            for (b in buf[0..n]) {
-                grow(rest.push(b))?;
-            }
-        }
-        Check.equalBytes("GET / HTTP/1.1\r\n".bytes(), rest.view())?;
     }
-    match (await a.accept(stream(request, "198.51.100.9", 64)?, Deadline.after(1000))) {
-        Err(_) => {}
-        Ok(_) => { return Check.fail("an untrusted source was served"); }
+    match (incoming.push(source(request, "198.51.100.9", 64)?)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a push"); }
     }
-    match (await a.accept(stream("GET / HTTP/1.1\r\n\r\n", "10.0.0.5", 64)?, Deadline.after(1000))) {
-        Err(_) => { return Ok(); }
-        Ok(_) => { return Check.fail("a trusted source without a header was served"); }
+    match (incoming.push(source("GET / HTTP/1.1\r\n", "10.0.0.5", 64)?)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a push"); }
     }
+    incoming.close();
+    var limits = ConnectionLimits.defaults();
+    limits.workers = 4;
+    limits.handshakeMs = 500;
+    limits.closeLingerMs = 50;
+    match (limits.proxyProtocolFrom.add("10.0.0.0/8")) {
+        Ok(true) => {}
+        _ => { return Check.fail("a block"); }
+    }
+    let handler = HeaderHandler { exact: AtomicU64.create(0), named: AtomicU64.create(0) };
+    let acceptor = PlainAcceptor {};
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a drain"); },
+    };
+    let report = match (await ConnectionServer.run(incoming, acceptor, handler, limits, drain)) {
+        Ok(r) => r,
+        Err(e) => { return Check.fail(NetErrors.describe(e)); },
+    };
+    Check.equalU64(21, report.accepted)?;
+    Check.equalU64(19, report.served)?;
+    Check.equalU64(2, report.handshakesFailed)?;
+    Check.equalU64(19, handler.exact.load())?;
+    return Check.equalU64(19, handler.named.load());
 }

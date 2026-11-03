@@ -2,6 +2,7 @@
 // `Forwarded`, RFC 4632's prefix arithmetic for the blocks, and §3.4's rules (the right-most untrusted address is the
 // client; a field from an untrusted peer is replaced, never extended) for the rest.
 import web_core;
+import web_transport;
 import web_http;
 
 /// `lines` (`name: value`, one per line) as a header list over `text`, which must outlive it.

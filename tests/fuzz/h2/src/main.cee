@@ -397,6 +397,9 @@ fn run(input: Slice<u8>, rng: borrow mut Rng, whole: bool, log: borrow mut Vecto
                     number(log, id as u64);
                     append(log, "; ");
                 }
+                Ok(H2Event.Response(id, _)) => {
+                    fail("a response event from a server's connection", input);
+                }
                 Ok(H2Event.TooLarge(id)) => {
                     append(log, "toolarge ");
                     number(log, id as u64);

@@ -1,9 +1,142 @@
-// The PROXY protocol, versions 1 and 2 (HAProxy's proxy-protocol.txt; Web ADR 0012 §3.6): a load balancer in front
-// of the listener sends the client's addresses before anything else on the connection. `ProxyProtocol` parses a header
-// (sans-I/O); `ProxyProtocolAcceptor` reads one from a trusted source, exactly and no further, before the inner
-// acceptor's TLS handshake, and makes the connection report the header's addresses.
+// The PROXY protocol, versions 1 and 2 (HAProxy's proxy-protocol.txt; Web ADR 0012 §3.6, amendment 2): a load
+// balancer in front of a listener sends the client's addresses before anything else on the connection. The connection
+// worker reads the header from the sources in `ConnectionLimits.proxyProtocolFrom`, exactly and no further, before the
+// acceptor's TLS handshake, and gives the connection's context the header's addresses. Also the blocks of trusted
+// addresses that list, and `web_proxy`'s forwarding fields, are made of.
 import web_core;
-import web_transport;
+
+/// A block of addresses: `10.0.0.0/8`, `2001:db8::/32`, or one address (`192.0.2.1`, a /32 or /128).
+public struct Cidr {
+    private bytes: [u8; 16];
+    private v4: bool;
+    private prefix: u8;
+
+    /// The block `text` names; null if it is not an address with an optional `/prefix` within its family's length.
+    public fn parse(text: Slice<u8>) -> Cidr? {
+        var slash = text.length;
+        for (i in 0..text.length) {
+            if (text[i] == 47) {
+                slash = i;
+                break;
+            }
+        }
+        let addressText = match (StringView.fromUtf8(text[0..slash])) {
+            Some(t) => t,
+            null => { return null; },
+        };
+        let address = SocketAddresses.parseIp(addressText, 0)?;
+        var bytes = [0u8; 16];
+        var v4 = false;
+        var bits: u64 = 0;
+        match (address) {
+            SocketAddress.V4(a, _) => {
+                v4 = true;
+                for (k in 0..4usize) {
+                    bytes[k] = a[k];
+                }
+                bits = 32;
+            }
+            SocketAddress.V6(a, _, scope) => {
+                if (scope != 0) {
+                    return null; // a zone names a link, not a block
+                }
+                bytes = a;
+                bits = 128;
+            }
+        }
+        var prefix = bits;
+        if (slash < text.length) {
+            prefix = decimal(text[slash + 1..])?;
+            if (prefix > bits) {
+                return null;
+            }
+        }
+        return Some(Cidr { bytes: bytes, v4: v4, prefix: truncate<u8>(prefix) });
+    }
+
+    /// Whether `address` is in the block. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is matched as IPv4.
+    public fn contains(borrow this, address: SocketAddress) -> bool {
+        var bytes = [0u8; 16];
+        var v4 = false;
+        match (address) {
+            SocketAddress.V4(a, _) => {
+                v4 = true;
+                for (k in 0..4usize) {
+                    bytes[k] = a[k];
+                }
+            }
+            SocketAddress.V6(a, _, _) => {
+                if (mapped(a)) {
+                    v4 = true;
+                    for (k in 0..4usize) {
+                        bytes[k] = a[12 + k];
+                    }
+                } else {
+                    bytes = a;
+                }
+            }
+        }
+        if (v4 != this.v4) {
+            return false;
+        }
+        var left = this.prefix as usize;
+        var k: usize = 0;
+        while (left >= 8) {
+            if (bytes[k] != this.bytes[k]) {
+                return false;
+            }
+            left -= 8;
+            k += 1;
+        }
+        if (left == 0) {
+            return true;
+        }
+        let mask = truncate<u8>(0xFF00u32 >> truncate<u32>(left));
+        return bytes[k] & mask == this.bytes[k] & mask;
+    }
+}
+
+/// Whether `a` is an IPv4-mapped IPv6 address (RFC 4291 §2.5.5.2).
+fn mapped(a: [u8; 16]) -> bool {
+    for (k in 0..10usize) {
+        if (a[k] != 0) {
+            return false;
+        }
+    }
+    return a[10] == 255 && a[11] == 255;
+}
+
+/// Trusted addresses as CIDR blocks: the balancers a listener takes PROXY headers from, or the proxies whose forwarding
+/// fields `web_proxy` believes. None by default.
+public struct TrustedProxies {
+    private blocks: Vector<Cidr>;
+
+    /// No proxy is trusted: every peer is the client.
+    public fn none() -> TrustedProxies => TrustedProxies { blocks: Vector<Cidr>.create() };
+
+    /// Trusts the block `text` (`Cidr.parse`); false if it is not one.
+    public fn add(borrow mut this, text: StringView) -> Result<bool, AllocError> {
+        let block = match (Cidr.parse(text.bytes())) {
+            Some(b) => b,
+            null => { return Ok(false); },
+        };
+        this.blocks.push(block)?;
+        return Ok(true);
+    }
+
+    /// Whether there are no blocks.
+    public fn isEmpty(borrow this) -> bool => this.blocks.length == 0;
+
+    /// Whether `address` is in one of the blocks.
+    public fn trusts(borrow this, address: SocketAddress) -> bool {
+        for (i in 0..this.blocks.length) {
+            if (this.blocks[i].contains(address)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
 
 /// What a header says.
 public enum ProxyHeader {
@@ -228,104 +361,76 @@ fn equalsText(a: Slice<u8>, text: StringView) -> bool {
     return true;
 }
 
-/// An acceptor for a listener behind a balancer that speaks the PROXY protocol (Web ADR 0012 §3.6).
-///
-/// - A source not in `trusted` is closed before anything is read (the owner's choice, §6.4).
-/// - From a trusted source the header is read within `headerMs`, exactly: never a byte of what follows.
-/// - Then `inner` accepts the stream (a TLS handshake, or none), and the connection reports the header's addresses
-///   as its peer's and its own, so the context, logs and `clientOf` see the real client.
-/// - A header that is missing, malformed or late closes the connection.
-public struct ProxyProtocolAcceptor {
-    private inner: Box<dyn Acceptor>;
-    private trusted: TrustedProxies;
-    private headerMs: u64;
-
-    /// An acceptor that reads a PROXY header from `trusted` sources within `headerMs`, then accepts with `inner`.
-    public fn create(inner: Box<dyn Acceptor>, trusted: TrustedProxies, headerMs: u64) -> ProxyProtocolAcceptor =>
-        ProxyProtocolAcceptor { inner: inner, trusted: trusted, headerMs: headerMs };
-}
-
-impl Acceptor for ProxyProtocolAcceptor {
-    async fn accept(borrow this, stream: PlainStream, deadline: Deadline) -> Result<Box<dyn Transport>, NetError> {
-        var s = stream;
-        let source = match (s.peerAddress()) {
-            Some(a) => a,
-            null => { return Err(NetError.Closed); },
-        };
-        if (!this.trusted.trusts(source)) {
-            return Err(NetError.Closed);
-        }
-        let headerDeadline = Deadline.after(this.headerMs).earlier(deadline);
-        var header = [0u8; 4096];
-        var got: usize = 0;
-        loop {
-            let want = match (ProxyProtocol.more(header[0..got])) {
-                Ok(n) => n,
-                Err(_) => { return Err(NetError.Closed); },
-            };
-            if (want == 0) {
-                break;
-            }
-            let n = await Transports.readWithin(mut s, mut header[got..got + want], headerDeadline)?;
-            if (n == 0) {
-                return Err(NetError.Closed);
-            }
-            got += n;
-        }
-        let said = match (ProxyProtocol.parse(header[0..got])) {
-            Ok(h) => h,
+/// Reads a PROXY header from `conn` by `deadline`, exactly: each read asks for no more than `ProxyProtocol.more`
+/// says, so the bytes after the header stay unread. `Err(Closed)` if what arrives is not a valid header.
+public async fn readProxyHeader(conn: borrow mut dyn Transport, deadline: Deadline) -> Result<ProxyHeader, NetError> {
+    var header = [0u8; 4096];
+    var got: usize = 0;
+    loop {
+        let want = match (ProxyProtocol.more(header[0..got])) {
+            Ok(n) => n,
             Err(_) => { return Err(NetError.Closed); },
         };
-        let local = s.localAddress();
-        let conn = await this.inner.accept(s, deadline)?;
-        return match (said) {
-            ProxyHeader.Local => Ok(conn),
-            ProxyHeader.Proxied(from, to) => relabelled(conn, Some(from), Some(to)),
-        };
-    }
-}
-
-/// `conn`, reporting `peer` and `local` as its addresses.
-fn relabelled(
-    conn: Box<dyn Transport>,
-    peer: SocketAddress?,
-    local: SocketAddress?,
-) -> Result<Box<dyn Transport>, NetError> {
-    match (Box.create(Relabelled { inner: conn, peer: peer, local: local })) {
-        Ok(b) => {
-            let d: Box<dyn Transport> = b;
-            return Ok(d);
+        if (want == 0) {
+            break;
         }
-        Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        let n = await Transports.readWithin(conn, mut header[got..got + want], deadline)?;
+        if (n == 0) {
+            return Err(NetError.Closed);
+        }
+        got += n;
     }
+    return match (ProxyProtocol.parse(header[0..got])) {
+        Ok(h) => Ok(h),
+        Err(_) => Err(NetError.Closed),
+    };
 }
 
-/// A transport that reports other addresses than its own: the PROXY header's.
-struct Relabelled {
-    inner: Box<dyn Transport>;
-    peer: SocketAddress?;
-    local: SocketAddress?;
+/// `address`'s IP as text, without its port or brackets: `192.0.2.1`, `2001:db8::1` (RFC 5952's form).
+public fn ipText(address: SocketAddress, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var buffer = [0u8; 64];
+    var w = TextWriter.create(mut buffer[..]);
+    let zeroPort = address.withPort(0);
+    zeroPort.write(mut w);
+    let n = w.length();
+    let all = buffer[0..n];
+    // "a.b.c.d:0" or "[v6%zone]:0": drop the port, then the brackets and any zone.
+    var end = n;
+    while (end > 0 && all[end - 1] != 58) {
+        end -= 1;
+    }
+    end -= 1;
+    var start: usize = 0;
+    if (all[0] == 91) {
+        start = 1;
+        end -= 1;
+        var k = start;
+        while (k < end && all[k] != 37) {
+            k += 1;
+        }
+        end = k;
+    }
+    return appendText(out, all[start..end]);
 }
 
-impl Transport for Relabelled {
-    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> => await this.inner.read(buffer);
+fn appendText(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        out.push(b)?;
+    }
+    return Ok();
+}
 
-    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> => await this.inner.write(bytes);
-
-    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> =>
-        await this.inner.writeVectored(parts);
-
-    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => await this.inner.shutdownWrite();
-
-    @effects()
-    fn peerAddress(borrow this) -> SocketAddress? => this.peer;
-
-    @effects()
-    fn localAddress(borrow this) -> SocketAddress? => this.local;
-
-    @effects()
-    fn alpn(borrow this) -> Alpn => this.inner.alpn();
-
-    @effects(alloc)
-    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => this.inner.peerIdentity(into);
+/// A decimal number of at most 3 digits (a prefix length); null if it is not one.
+fn decimal(text: Slice<u8>) -> u64? {
+    if (text.length == 0 || text.length > 3) {
+        return null;
+    }
+    var n: u64 = 0;
+    for (b in text) {
+        if (b < 48 || b > 57) {
+            return null;
+        }
+        n = n * 10 + (b - 48) as u64;
+    }
+    return Some(n);
 }
