@@ -62,6 +62,7 @@ public struct Exchange<region r> {
     private written: u64;
     private keep: bool;
     private done: bool;
+    private upgraded: bool;
 
     /// An exchange for `request`, whose body is framed by `framing`. `carry` holds the bytes received after the head;
     /// `out` the responses not yet sent; `pending` and `response` are reset here. `keepAlive` is the request's own
@@ -122,6 +123,7 @@ public struct Exchange<region r> {
             written: 0,
             keep: keepAlive,
             done: false,
+            upgraded: false,
         };
     }
 
@@ -515,6 +517,74 @@ public struct Exchange<region r> {
             }
         }
     }
+
+    // ---- Another protocol (Web ADR 0010 §3.2) ----
+
+    /// Answers 101 Switching Protocols to `protocol` (a token, such as `websocket`) with the fields the handler added,
+    /// and sends it now. Afterwards the connection belongs to the handler, through `readRaw` and `writeRaw`, and the
+    /// server closes it when the handler returns. `Internal` if anything was sent already, if the request has a body,
+    /// or if it is not HTTP/1.1.
+    public async fn switchProtocols(borrow mut this, protocol: StringView) -> Result<void, HandlerError> {
+        let is11 = match (this.request.version()) {
+            Version.Http11 => true,
+            _ => false,
+        };
+        let noBody = match (this.body) {
+            BodyState.Done => true,
+            _ => false,
+        };
+        if (this.sent || this.done || !is11 || !noBody || this.pending.length() > 0) {
+            return Err(HandlerError.Internal);
+        }
+        this.response.setStatus(Status.switchingProtocols());
+        match (this.response.upgradeTo(protocol)) {
+            Ok() => {}
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+        this.keep = true; // so the head says `connection: upgrade`, not `close`
+        await this.sendHead(null)?;
+        this.keep = false; // never another request on this connection
+        this.done = true;
+        this.upgraded = true;
+        await this.flushOut()?;
+        return Ok();
+    }
+
+    /// After `switchProtocols`: bytes from the client, those received after the request's head first. 0 at the end
+    /// of the stream. Cancelling it loses nothing (Web ADR 0001 §3.4).
+    public async fn readRaw(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, HandlerError> {
+        if (!this.upgraded) {
+            return Err(HandlerError.Internal);
+        }
+        if (!this.carry.isEmpty()) {
+            let held = this.carry.readable();
+            let n = if (held.length < buffer.length) held.length else buffer.length;
+            for (i in 0..n) {
+                buffer[i] = held[i];
+            }
+            match (this.carry.consume(n)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+            return Ok(n);
+        }
+        match (await this.conn.read(buffer)) {
+            Ok(n) => { return Ok(n); }
+            Err(e) => { return Err(HandlerError.Io(e)); }
+        }
+    }
+
+    /// After `switchProtocols`: writes `bytes` to the client, within `Limits.writeTimeoutMs`. A failed or cancelled
+    /// write leaves the connection unusable (Web ADR 0001 §3.4).
+    public async fn writeRaw(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError> {
+        if (!this.upgraded) {
+            return Err(HandlerError.Internal);
+        }
+        return await this.writeBytes(bytes);
+    }
+
+    /// Whether the connection was switched to another protocol.
+    public fn switched(borrow this) -> bool => this.upgraded;
 
     // ---- For the driver ----
 

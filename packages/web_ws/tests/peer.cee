@@ -1,0 +1,308 @@
+// A scripted client for the session's tests: it sends `input` (in pieces of `chunk` bytes), then stays open until
+// `closeAtMs` (on `Timer.now()`'s clock) or forever, and records every byte the server writes. Plus an exchange
+// built by hand, as web_http1's driver would, and the client's side of frames.
+import web_core;
+import web_http;
+
+struct Peer {
+    input: Vector<u8>;
+    at: usize;
+    chunk: usize;
+    closeAtMs: u64?;
+    output: Vector<u8>;
+}
+
+impl Transport for Peer {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        if (this.at < this.input.length) {
+            var n = this.input.length - this.at;
+            if (n > this.chunk) {
+                n = this.chunk;
+            }
+            if (n > buffer.length) {
+                n = buffer.length;
+            }
+            for (i in 0..n) {
+                buffer[i] = this.input[this.at + i];
+            }
+            this.at += n;
+            return Ok(n);
+        }
+        loop {
+            var wait: u64 = 3600000;
+            match (this.closeAtMs) {
+                Some(at) => {
+                    let now = Timer.now();
+                    if (now >= at) {
+                        return Ok(0);
+                    }
+                    wait = at - now;
+                }
+                null => {}
+            }
+            match (await Timer.sleep(wait)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Cancelled); }
+            }
+        }
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        for (b in bytes) {
+            match (this.output.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+        return Ok();
+    }
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        var total: usize = 0;
+        for (i in 0..parts.count()) {
+            let p = parts.part(i);
+            await this.write(p)?;
+            total += p.length;
+        }
+        return Ok(total);
+    }
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => Ok();
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => Alpn.None;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => null;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => null;
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
+}
+
+fn peer(input: Vector<u8>, chunk: usize, closeAtMs: u64?) -> Peer =>
+    Peer { input: input, at: 0, chunk: chunk, closeAtMs: closeAtMs, output: Vector<u8>.create() };
+
+struct NoHooks {}
+
+impl Application for NoHooks {
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> =>
+        Ok();
+
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// RFC 6455 §1.2's upgrade, without an Origin.
+fn upgradeText() -> StringView =>
+    "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: chat, superchat\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+/// Appends a client's frame (masked with 01 02 03 04) to `out`.
+fn clientFrame(out: borrow mut Vector<u8>, opcode: Opcode, fin: bool, payload: Slice<u8>) -> Result<void, TestFailure> {
+    let mask = [1u8, 2, 3, 4];
+    pushed(Frames.writeHead(out, fin, false, opcode, payload.length as u64, Some(mask)))?;
+    return pushed(Frames.appendMasked(out, payload, mask, 0));
+}
+
+/// A close frame's payload for `code`.
+fn closePayload(code: u16) -> [u8; 2] => [truncate<u8>(code >> 8), truncate<u8>(code)];
+
+/// What the server wrote: its response head (up to the blank line), and the frames after it described as
+/// `readAll` does.
+struct Written {
+    head: Vector<u8>;
+    frames: Vector<u8>;
+}
+
+fn written(output: borrow Vector<u8>) -> Result<Written, TestFailure> {
+    var end: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < output.length) {
+        if (output[i] == 13 && output[i + 1] == 10 && output[i + 2] == 13 && output[i + 3] == 10) {
+            end = i + 4;
+            break;
+        }
+        i += 1;
+    }
+    var head = Vector<u8>.create();
+    for (k in 0..end) {
+        pushed(head.push(output[k]))?;
+    }
+    let all = output.view();
+    let frames = readAll(all[end..], output.length, Role.Client, 1048576, 1048576)?;
+    return Ok(Written { head: head, frames: frames });
+}
+
+fn contains(hay: Slice<u8>, needle: StringView) -> bool => containsBytes(hay, needle.bytes());
+
+fn containsHex(hay: Slice<u8>, needle: StringView) -> Result<bool, TestFailure> {
+    let n = hex(needle)?;
+    return Ok(containsBytes(hay, n.view()));
+}
+
+fn containsBytes(hay: Slice<u8>, n: Slice<u8>) -> bool {
+    if (n.length > hay.length) {
+        return false;
+    }
+    for (i in 0..hay.length - n.length + 1) {
+        var same = true;
+        for (k in 0..n.length) {
+            if (hay[i + k] != n[k]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn buffer(n: usize) -> Result<OwnedBuffer, TestFailure> {
+    match (OwnedBuffer.create(n)) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(TestFailure.create("a buffer")); }
+    }
+}
+
+/// What a session's handler should do.
+enum Script {
+    /// Echo every message until the end.
+    Echo,
+    /// Send `count` queued text messages from another task, then let the peer end it.
+    FromAnotherTask,
+    /// Send a message in fragments, then close with 1000 and wait for the end.
+    SendThenClose,
+}
+
+/// Runs a session for `head` over `conn` with `options`, following `script`, as a handler would; the close code it
+/// ends with (0 if the upgrade was refused).
+async fn session(
+    conn: borrow mut Peer,
+    head: StringView,
+    options: borrow WebSocketOptions,
+    script: Script,
+) -> Result<u16, TestFailure> {
+    let bytes = head.bytes();
+    let fields = fieldsOf(bytes)?;
+    let request = Request.create(Method.Get, bytes[0..3], "/chat", Version.Http11, fields);
+    var carry = buffer(1024)?;
+    var out = buffer(16384)?;
+    var pending = buffer(16384)?;
+    var response = match (ResponseHead.create(4096)) {
+        Ok(r) => r,
+        Err(_) => { return Err(TestFailure.create("a head")); },
+    };
+    var date = DateCache.create(false);
+    let limits = Limits.defaults();
+    let app = NoHooks {};
+    var exchange = Exchange.create(
+        conn,
+        mut carry,
+        mut out,
+        mut pending,
+        mut response,
+        app,
+        request,
+        limits,
+        mut date,
+        BodyFraming.None,
+        false,
+        true,
+    );
+    let code = await run(mut exchange, request, options, script)?;
+    match (await exchange.finish()) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("finish failed")); }
+    }
+    // What the driver does next: send what `finish` left in the connection's buffer.
+    match (await exchange.flush()) {
+        Ok() => { return Ok(code); }
+        Err(_) => { return Err(TestFailure.create("the last write")); }
+    }
+}
+
+async fn run(
+    exchange: borrow mut Exchange,
+    request: borrow Request,
+    options: borrow WebSocketOptions,
+    script: Script,
+) -> Result<u16, TestFailure> {
+    var ws = match (await accept(exchange, request, options, false)) {
+        Ok(Some(w)) => w,
+        Ok(null) => { return Ok(0); },
+        Err(_) => { return Err(TestFailure.create("accept failed")); },
+    };
+    var message = Vector<u8>.create();
+    match (script) {
+        Script.Echo => {}
+        Script.FromAnotherTask => {
+            let sender = ws.sender();
+            var ended: u16 = 0;
+            let r: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (s) => {
+                s.spawn(async () => {
+                    loop {
+                        match (await ws.receive(mut message)) {
+                            Ok(Received.Closed(code)) => {
+                                ended = code;
+                                return Ok();
+                            }
+                            Ok(_) => {}
+                            Err(_) => { return Err(NetError.Closed); }
+                        }
+                    }
+                });
+                s.spawn(async () => {
+                    for (i in 0..3u8) {
+                        var text = Vector<u8>.create();
+                        let a = text.push(97 + i);
+                        await sender.send(Outbound.Text(text))?;
+                        match (await Timer.sleep(10)) {
+                            Ok() => {}
+                            Err(_) => { return Err(NetError.Cancelled); }
+                        }
+                    }
+                    return Ok();
+                });
+            });
+            match (r) {
+                Ok() => { return Ok(ended); }
+                Err(_) => { return Err(TestFailure.create("the scope failed")); }
+            }
+        }
+        Script.SendThenClose => {
+            match (await ws.send(MessageKind.Text, "fragmented".bytes())) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("send failed")); }
+            }
+            match (await ws.close(1000)) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("close failed")); }
+            }
+        }
+    }
+    loop {
+        match (await ws.receive(mut message)) {
+            Ok(Received.Message(kind)) => {
+                match (await ws.send(kind, message.view())) {
+                    Ok() => {}
+                    Err(_) => { return Err(TestFailure.create("echo failed")); }
+                }
+            }
+            Ok(Received.Closed(code)) => { return Ok(code); }
+            Err(_) => { return Err(TestFailure.create("receive failed")); }
+        }
+    }
+}

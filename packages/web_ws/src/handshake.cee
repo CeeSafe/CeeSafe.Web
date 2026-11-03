@@ -177,3 +177,146 @@ fn sameIgnoringCase(a: Slice<u8>, b: Slice<u8>) -> bool {
     }
     return true;
 }
+
+/// permessage-deflate as agreed (RFC 7692 §7.1).
+public struct DeflateAgreement {
+    /// We compress each message on its own (we keep no context in any case; this is said when the client asked).
+    public serverNoContextTakeover: bool;
+    /// The client compresses each message on its own, so our inflater keeps no window.
+    public clientNoContextTakeover: bool;
+    /// The window our compressor may use (the client's limit, else 15).
+    public serverMaxWindowBits: u32;
+    /// Whether the client's offer named `server_max_window_bits`, which the response must then repeat.
+    public serverWindowNamed: bool;
+}
+
+public struct Extensions {
+    /// The first permessage-deflate offer in `Sec-WebSocket-Extensions` (any number of fields) whose parameters are
+    /// all known, unrepeated and in range (§7.1: an offer that is not is declined, and the next one considered).
+    public fn negotiateDeflate(request: borrow Request) -> DeflateAgreement? {
+        let headers = request.headers();
+        for (i in 0..headers.count()) {
+            if (!Ascii.equalsIgnoringCase(headers.nameBytes(i), "sec-websocket-extensions")) {
+                continue;
+            }
+            let v = headers.value(i);
+            var start: usize = 0;
+            for (k in 0..v.length + 1) {
+                if (k == v.length || v[k] == 44) {
+                    match (Extensions.deflateOffer(v[start..k])) {
+                        Some(a) => { return Some(a); }
+                        null => {}
+                    }
+                    start = k + 1;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// One offer (`permessage-deflate; param; param=value`) if it is permessage-deflate and acceptable.
+    public fn deflateOffer(offer: Slice<u8>) -> DeflateAgreement? {
+        var agreed = DeflateAgreement {
+            serverNoContextTakeover: false,
+            clientNoContextTakeover: false,
+            serverMaxWindowBits: 15,
+            serverWindowNamed: false,
+        };
+        var clientWindowSeen = false;
+        var part: usize = 0;
+        var start: usize = 0;
+        for (k in 0..offer.length + 1) {
+            if (k < offer.length && offer[k] != 59) {
+                continue;
+            }
+            let item = trim(offer[start..k]);
+            start = k + 1;
+            if (part == 0) {
+                if (!sameIgnoringCase(item, "permessage-deflate".bytes())) {
+                    return null;
+                }
+                part = 1;
+                continue;
+            }
+            var eq: usize = 0;
+            while (eq < item.length && item[eq] != 61) {
+                eq += 1;
+            }
+            let name = trim(item[0..eq]);
+            let hasValue = eq < item.length;
+            let raw = if (hasValue) trim(item[eq + 1..]) else item[0..0];
+            let quoted = raw.length >= 2 && raw[0] == 34 && raw[raw.length - 1] == 34;
+            let value = if (quoted) raw[1..raw.length - 1] else raw; // a quoted-string, or a token
+            if (sameIgnoringCase(name, "server_no_context_takeover".bytes())) {
+                if (hasValue || agreed.serverNoContextTakeover) {
+                    return null;
+                }
+                agreed.serverNoContextTakeover = true;
+            } else if (sameIgnoringCase(name, "client_no_context_takeover".bytes())) {
+                if (hasValue || agreed.clientNoContextTakeover) {
+                    return null;
+                }
+                agreed.clientNoContextTakeover = true;
+            } else if (sameIgnoringCase(name, "server_max_window_bits".bytes())) {
+                let bits = windowBits(value);
+                if (!hasValue || agreed.serverWindowNamed || bits == 0) {
+                    return null;
+                }
+                agreed.serverWindowNamed = true;
+                agreed.serverMaxWindowBits = bits;
+            } else if (sameIgnoringCase(name, "client_max_window_bits".bytes())) {
+                if (clientWindowSeen || (hasValue && windowBits(value) == 0)) {
+                    return null;
+                }
+                clientWindowSeen = true; // our inflater keeps 15 bits, so any client window is fine
+            } else {
+                return null; // an unknown parameter
+            }
+        }
+        if (part == 0) {
+            return null;
+        }
+        return Some(agreed);
+    }
+
+    /// The response's `Sec-WebSocket-Extensions` value for `agreed`.
+    public fn deflateResponse(agreed: borrow DeflateAgreement, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        appendText(out, "permessage-deflate")?;
+        if (agreed.serverNoContextTakeover) {
+            appendText(out, "; server_no_context_takeover")?;
+        }
+        if (agreed.clientNoContextTakeover) {
+            appendText(out, "; client_no_context_takeover")?;
+        }
+        if (agreed.serverWindowNamed) {
+            appendText(out, "; server_max_window_bits=")?;
+            if (agreed.serverMaxWindowBits >= 10) {
+                out.push(49)?;
+            }
+            out.push(48 + truncate<u8>(agreed.serverMaxWindowBits % 10))?;
+        }
+        return Ok();
+    }
+}
+
+/// 8-15 from a decimal value, else 0.
+fn windowBits(v: Slice<u8>) -> u32 {
+    if (v.length == 0 || v.length > 2 || (v.length == 2 && v[0] == 48)) {
+        return 0;
+    }
+    var n: u32 = 0;
+    for (c in v) {
+        if (c < 48 || c > 57) {
+            return 0;
+        }
+        n = n * 10 + (c - 48) as u32;
+    }
+    return if (n >= 8 && n <= 15) n else 0;
+}
+
+fn appendText(out: borrow mut Vector<u8>, text: StringView) -> Result<void, AllocError> {
+    for (b in text.bytes()) {
+        out.push(b)?;
+    }
+    return Ok();
+}

@@ -1,0 +1,555 @@
+// The WebSocket session over an upgraded exchange (Web ADR 0010 §3.3): `accept` checks the handshake and switches;
+// `receive` gives the next message, answering pings and the close handshake itself, and while it waits it writes
+// what other tasks queued and keeps the connection alive. Only the session's task writes; reads alone are raced.
+import web_core;
+import web_http;
+
+public struct WebSocketOptions {
+    /// The largest frame accepted (1009 past it).
+    public maxFrameBytes: u64;
+    /// The largest message accepted, after reassembly (1009 past it).
+    public maxMessageBytes: u64;
+    /// Messages longer than this are sent as fragments of this size.
+    public fragmentBytes: usize;
+    /// Quiet time before a ping; 0 for none.
+    public pingIntervalMs: u64;
+    /// How long a ping may go unanswered before the connection is closed (1011).
+    public pongTimeoutMs: u64;
+    /// How long to wait for the peer's Close after sending ours.
+    public closeTimeoutMs: u64;
+    /// Room in the queue other tasks send through.
+    public queueLength: usize;
+    /// The subprotocols the server speaks, most preferred first.
+    public subprotocols: Vector<Vector<u8>>;
+    /// Origins accepted besides the server's own (Web ADR 0010 §3.4), such as `https://app.example.com`.
+    public allowedOrigins: Vector<Vector<u8>>;
+    /// Accept permessage-deflate when the client offers it (RFC 7692, Web ADR 0010 §3.5).
+    public deflate: bool;
+
+    public fn defaults() -> WebSocketOptions => WebSocketOptions {
+        maxFrameBytes: 1048576,
+        maxMessageBytes: 16777216,
+        fragmentBytes: 65536,
+        pingIntervalMs: 30000,
+        pongTimeoutMs: 30000,
+        closeTimeoutMs: 5000,
+        queueLength: 64,
+        subprotocols: Vector<Vector<u8>>.create(),
+        allowedOrigins: Vector<Vector<u8>>.create(),
+        deflate: true,
+    };
+}
+
+/// A message another task queued for the session to send.
+public enum Outbound {
+    Text(Vector<u8>),
+    Binary(Vector<u8>),
+    /// Starts the close handshake with this code.
+    Close(u16),
+}
+
+/// What `receive` gives.
+public enum Received {
+    /// A whole message, in the caller's buffer.
+    Message(MessageKind),
+    /// The connection is over, with the close code: the peer's, ours after a violation (1002, 1007, 1009), 1006 if
+    /// the connection ended without a Close, 1011 if a ping went unanswered.
+    Closed(u16),
+}
+
+/// A handle for other tasks to send through the session (`Send`): messages wait in a bounded queue, and the
+/// session's task writes them.
+public struct WebSocketSender {
+    private queue: Channel<Outbound>;
+
+    /// Queues `message`, waiting for room. `Err(Closed)` once the session has ended.
+    public async fn send(borrow this, message: Outbound) -> Result<void, NetError> {
+        match (await this.queue.sendAsync(message)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(NetError.Closed); }
+        }
+    }
+
+    /// Queues `message` if there is room: false when the queue is full or the session has ended.
+    public fn trySend(borrow this, message: Outbound) -> bool {
+        match (this.queue.trySend(message)) {
+            Ok() => { return true; }
+            Err(_) => { return false; }
+        }
+    }
+
+    /// Another handle to the same queue.
+    public fn share(borrow this) -> WebSocketSender => WebSocketSender { queue: this.queue.clone() };
+}
+
+enum State {
+    Open,
+    /// We sent a Close (with this code) and wait for the peer's.
+    Closing(u16),
+    Closed(u16),
+}
+
+enum Wake {
+    Read(usize),
+    Queued(Outbound),
+    QueueEnded,
+    Timer,
+}
+
+public struct WebSocket<region r> {
+    private exchange: borrow mut(r) Exchange<r>;
+    private reader: MessageReader;
+    private input: OwnedBuffer;
+    private out: Vector<u8>;
+    private queue: Channel<Outbound>;
+    private state: State;
+    private protocolIndex: usize?;
+    private fragmentBytes: usize;
+    private pingIntervalMs: u64;
+    private pongTimeoutMs: u64;
+    private closeTimeoutMs: u64;
+    /// When the peer was last heard from, or a ping went out.
+    private lastActivity: u64;
+    private pingOutstanding: bool;
+    private closeDeadline: u64;
+    /// permessage-deflate, if agreed: messages are compressed into `packed` before they are framed.
+    private compress: bool;
+    private deflater: Deflater;
+    private packed: Vector<u8>;
+
+    /// Whether permessage-deflate was agreed.
+    public fn compressing(borrow this) -> bool => this.compress;
+
+    /// The index in `options.subprotocols` of the subprotocol agreed, if any.
+    public fn subprotocol(borrow this) -> usize? => this.protocolIndex;
+
+    /// A handle for other tasks to queue messages.
+    public fn sender(borrow this) -> WebSocketSender => WebSocketSender { queue: this.queue.clone() };
+
+    /// The next message from the peer, into `into` (cleared first). Pings are answered, a Close is answered and
+    /// ends the session, and a violation sends the matching Close and ends it. While no frame is complete, queued
+    /// messages are sent and the keep-alive runs. After `Closed`, every call returns `Closed` again.
+    public async fn receive(borrow mut this, into: borrow mut Vector<u8>) -> Result<Received, HandlerError> {
+        loop {
+            match (this.state) {
+                State.Closed(code) => { return Ok(Received.Closed(code)); }
+                _ => {}
+            }
+            match (this.reader.next(mut this.input, into)) {
+                Ok(Incoming.NeedMore) => {}
+                Ok(Incoming.Message(kind)) => {
+                    this.lastActivity = Timer.now();
+                    match (this.state) {
+                        State.Open => { return Ok(Received.Message(kind)); }
+                        _ => {} // after our Close, data is dropped (§5.5.1)
+                    }
+                    continue;
+                }
+                Ok(Incoming.Ping) => {
+                    this.lastActivity = Timer.now();
+                    match (this.state) {
+                        State.Open => { await this.pong()?; }
+                        _ => {}
+                    }
+                    continue;
+                }
+                Ok(Incoming.Pong) => {
+                    this.lastActivity = Timer.now();
+                    this.pingOutstanding = false;
+                    continue;
+                }
+                Ok(Incoming.Close(code)) => {
+                    match (this.state) {
+                        State.Open => {
+                            // Echo the code (§5.5.1); a Close without one is answered without one.
+                            let echoed = if (code == CloseCodes.noStatus()) null else Some(code);
+                            await this.writeClose(echoed)?;
+                        }
+                        _ => {}
+                    }
+                    return Ok(this.end(code));
+                }
+                Err(code) => {
+                    match (this.state) {
+                        State.Open => {
+                            let sent = await this.writeClose(Some(code)); // the connection is failed either way
+                        }
+                        _ => {}
+                    }
+                    return Ok(this.end(code));
+                }
+            }
+            // Nothing complete: wait for bytes, a queued message, or a timer.
+            this.input.compact();
+            if (this.input.spareLength() == 0) {
+                return Ok(this.end(CloseCodes.internalError())); // a frame head larger than the buffer cannot happen
+            }
+            let waitMs = this.untilTimer();
+            match (await wake(mut this.exchange, mut this.input, this.queue, waitMs)) {
+                Ok(Wake.Read(0)) => { return Ok(this.end(CloseCodes.abnormal())); }
+                Ok(Wake.Read(n)) => {
+                    match (this.input.commit(n)) {
+                        Ok() => {}
+                        Err(_) => { return Err(HandlerError.Internal); }
+                    }
+                }
+                Ok(Wake.Queued(message)) => { await this.sendQueued(message)?; }
+                Ok(Wake.QueueEnded) => {}
+                Ok(Wake.Timer) => {
+                    match (await this.timerFired()?) {
+                        Some(code) => { return Ok(this.end(code)); }
+                        null => {}
+                    }
+                }
+                Err(HandlerError.Io(NetError.Cancelled)) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                Err(_) => { return Ok(this.end(CloseCodes.abnormal())); }
+            }
+        }
+    }
+
+    /// Sends a whole message: one frame, or fragments past `fragmentBytes`. `Err(Io(Closed))` once a Close was sent.
+    public async fn send(borrow mut this, kind: MessageKind, bytes: Slice<u8>) -> Result<void, HandlerError> {
+        match (this.state) {
+            State.Open => {}
+            _ => { return Err(HandlerError.Io(NetError.Closed)); }
+        }
+        let first = match (kind) {
+            MessageKind.Text => Opcode.Text,
+            MessageKind.Binary => Opcode.Binary,
+        };
+        if (this.compress) {
+            this.packed.clear();
+            match (this.deflater.compress(bytes, mut this.packed)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+            return await sendFrames(
+                mut this.exchange,
+                mut this.out,
+                first,
+                true,
+                this.packed.view(),
+                this.fragmentBytes,
+            );
+        }
+        return await sendFrames(mut this.exchange, mut this.out, first, false, bytes, this.fragmentBytes);
+    }
+
+    /// Starts the close handshake with `code` (§7.4; 1000 for a normal end). Keep calling `receive` until it
+    /// returns `Closed`: the peer's Close, or `closeTimeoutMs`.
+    public async fn close(borrow mut this, code: u16) -> Result<void, HandlerError> {
+        match (this.state) {
+            State.Open => {}
+            _ => { return Ok(); }
+        }
+        await this.writeClose(Some(code))?;
+        this.state = State.Closing(code);
+        this.closeDeadline = Timer.now() + this.closeTimeoutMs;
+        return Ok();
+    }
+
+    fn end(borrow mut this, code: u16) -> Received {
+        this.state = State.Closed(code);
+        this.queue.close(); // senders wake with Err(Closed)
+        return Received.Closed(code);
+    }
+
+    /// Milliseconds until the next timer: the close deadline, the pong deadline, or the next ping.
+    fn untilTimer(borrow this) -> u64 {
+        let now = Timer.now();
+        var due = now + 3600000;
+        match (this.state) {
+            State.Closing(_) => { due = this.closeDeadline; }
+            _ => {
+                if (this.pingOutstanding) {
+                    due = this.lastActivity + this.pongTimeoutMs;
+                } else if (this.pingIntervalMs > 0) {
+                    due = this.lastActivity + this.pingIntervalMs;
+                }
+            }
+        }
+        return if (due > now) due - now else 0;
+    }
+
+    /// A timer fired: the close code that ends the session, or null after sending a ping.
+    async fn timerFired(borrow mut this) -> Result<u16?, HandlerError> {
+        let now = Timer.now();
+        match (this.state) {
+            State.Closing(_) => {
+                if (now >= this.closeDeadline) {
+                    return Ok(Some(CloseCodes.abnormal())); // no Close from the peer in time
+                }
+                return Ok(null);
+            }
+            _ => {}
+        }
+        if (this.pingOutstanding) {
+            if (now >= this.lastActivity + this.pongTimeoutMs) {
+                let sent = await this.writeClose(Some(CloseCodes.internalError()));
+                return Ok(Some(CloseCodes.internalError()));
+            }
+            return Ok(null);
+        }
+        if (this.pingIntervalMs > 0 && now >= this.lastActivity + this.pingIntervalMs) {
+            await this.writeFrame(Opcode.Ping, true, "".bytes())?;
+            this.pingOutstanding = true;
+            this.lastActivity = now;
+        }
+        return Ok(null);
+    }
+
+    async fn sendQueued(borrow mut this, message: Outbound) -> Result<void, HandlerError> {
+        match (this.state) {
+            State.Open => {}
+            _ => { return Ok(); } // closing: dropped
+        }
+        match (message) {
+            Outbound.Text(bytes) => { await this.send(MessageKind.Text, bytes.view())?; }
+            Outbound.Binary(bytes) => { await this.send(MessageKind.Binary, bytes.view())?; }
+            Outbound.Close(code) => { await this.close(code)?; }
+        }
+        return Ok();
+    }
+
+    async fn pong(borrow mut this) -> Result<void, HandlerError> {
+        var payload = [0u8; 125];
+        let control = this.reader.control();
+        let n = control.length;
+        for (i in 0..n) {
+            payload[i] = control[i];
+        }
+        return await this.writeFrame(Opcode.Pong, true, payload[0..n]);
+    }
+
+    async fn writeClose(borrow mut this, code: u16?) -> Result<void, HandlerError> {
+        var payload = [0u8; 2];
+        var n: usize = 0;
+        match (code) {
+            Some(c) => {
+                payload[0] = truncate<u8>(c >> 8);
+                payload[1] = truncate<u8>(c);
+                n = 2;
+            }
+            null => {}
+        }
+        let result = await this.writeFrame(Opcode.Close, true, payload[0..n]);
+        match (this.state) {
+            State.Open => {
+                this.state = State.Closing(match (code) {
+                    Some(c) => c,
+                    null => CloseCodes.noStatus(),
+                });
+            }
+            _ => {}
+        }
+        return result;
+    }
+
+    /// Writes one control frame, unmasked (a server's).
+    async fn writeFrame(borrow mut this, opcode: Opcode, fin: bool, payload: Slice<u8>) -> Result<void, HandlerError> =>
+        await writeFrameTo(mut this.exchange, mut this.out, opcode, fin, false, payload);
+}
+
+/// Sends `payload` as one message: one frame, or fragments of `fragmentBytes`; RSV1 on the first if `compressed`.
+async fn sendFrames(
+    exchange: borrow mut Exchange,
+    out: borrow mut Vector<u8>,
+    first: Opcode,
+    compressed: bool,
+    payload: Slice<u8>,
+    fragmentBytes: usize,
+) -> Result<void, HandlerError> {
+    let size = if (fragmentBytes == 0) payload.length else fragmentBytes;
+    var at: usize = 0;
+    loop {
+        let n = if (payload.length - at < size) payload.length - at else size;
+        let fin = at + n == payload.length;
+        let opcode = if (at == 0) first else Opcode.Continuation;
+        await writeFrameTo(exchange, out, opcode, fin, compressed && at == 0, payload[at..at + n])?;
+        at += n;
+        if (fin) {
+            return Ok();
+        }
+    }
+}
+
+/// Writes one unmasked frame: its head and a short payload in one write, a long payload in a second.
+async fn writeFrameTo(
+    exchange: borrow mut Exchange,
+    out: borrow mut Vector<u8>,
+    opcode: Opcode,
+    fin: bool,
+    rsv1: bool,
+    payload: Slice<u8>,
+) -> Result<void, HandlerError> {
+    out.clear();
+    match (Frames.writeHead(out, fin, rsv1, opcode, payload.length as u64, null)) {
+        Ok() => {}
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+    if (payload.length <= 4096) {
+        for (b in payload) {
+            match (out.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+        }
+        return await exchange.writeRaw(out.view());
+    }
+    await exchange.writeRaw(out.view())?;
+    return await exchange.writeRaw(payload);
+}
+
+/// One wait: bytes from the peer (into `input`'s spare room), a queued message, or `waitMs` passing.
+async fn wake(
+    exchange: borrow mut Exchange,
+    input: borrow mut OwnedBuffer,
+    queue: borrow Channel<Outbound>,
+    waitMs: u64,
+) -> Result<Wake, HandlerError> {
+    let raced: Result<Raced<Wake>, HandlerError> = await Async.race(
+        async () => {
+            let n = await exchange.readRaw(input.spare())?;
+            return Ok(Wake.Read(n));
+        },
+        async () => {
+            let inner: Result<Raced<Wake>, HandlerError> = await Async.race(
+                async () => {
+                    match (await queue.recvAsync()) {
+                        Ok(Some(m)) => { return Ok(Wake.Queued(m)); }
+                        Ok(null) => {
+                            // The queue only closes when the session ends; wait for the other arms.
+                            match (await Timer.sleep(3600000)) {
+                                Ok() => { return Ok(Wake.QueueEnded); }
+                                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                            }
+                        }
+                        Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                    }
+                },
+                async () => {
+                    match (await Timer.sleep(waitMs)) {
+                        Ok() => { return Ok(Wake.Timer); }
+                        Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                    }
+                },
+            );
+            let won = inner?;
+            return Ok(won.value);
+        },
+    );
+    let won = raced?;
+    return Ok(won.value);
+}
+
+/// Answers an upgrade request: checks it (Web ADR 0010 §3.1, §3.4), agrees the subprotocol, switches the exchange,
+/// and returns the session. A request that is refused gets its response here (400, 403, or 426 with
+/// `Sec-WebSocket-Version: 13`), and the result is null. `secure` says whether the connection is TLS (for the
+/// origin's scheme).
+public async fn accept<region r>(
+    exchange: borrow mut(r) Exchange<r>,
+    request: borrow Request,
+    options: borrow WebSocketOptions,
+    secure: bool,
+) -> Result<WebSocket<r>?, HandlerError> {
+    match (Handshake.check(request, secure, options.allowedOrigins)) {
+        Ok() => {}
+        Err(UpgradeRefusal.Version) => {
+            exchange.header("sec-websocket-version", "13".bytes())?;
+            await exchange.send(statusOf(426), "unsupported WebSocket version".bytes())?;
+            return Ok(null);
+        }
+        Err(UpgradeRefusal.Origin) => {
+            await exchange.send(statusOf(403), "origin not allowed".bytes())?;
+            return Ok(null);
+        }
+        Err(UpgradeRefusal.BadRequest) => {
+            await exchange.send(statusOf(400), "bad WebSocket upgrade".bytes())?;
+            return Ok(null);
+        }
+    }
+    let key = match (request.headers().getNamed("sec-websocket-key")) {
+        Some(k) => k,
+        null => { return Err(HandlerError.Internal); },
+    };
+    let acceptValue = match (Handshake.acceptKey(trimmed(key))) {
+        Ok(v) => v,
+        Err(_) => { return Err(HandlerError.Internal); },
+    };
+    exchange.header("sec-websocket-accept", acceptValue.view())?;
+    let deflate = if (options.deflate) Extensions.negotiateDeflate(request) else null;
+    match (deflate) {
+        Some(agreed) => {
+            var value = Vector<u8>.create();
+            match (Extensions.deflateResponse(agreed, mut value)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+            exchange.header("sec-websocket-extensions", value.view())?;
+        }
+        null => {}
+    }
+    let chosen = Handshake.chooseSubprotocol(request, options.subprotocols);
+    match (chosen) {
+        Some(i) => { exchange.header("sec-websocket-protocol", options.subprotocols[i].view())?; }
+        null => {}
+    }
+    await exchange.switchProtocols("websocket")?;
+    let input = match (OwnedBuffer.create(16384)) {
+        Ok(b) => b,
+        Err(_) => { return Err(HandlerError.Internal); },
+    };
+    let queue = match (Channel<Outbound>.create(if (options.queueLength == 0) 1 else options.queueLength)) {
+        Ok(q) => q,
+        Err(_) => { return Err(HandlerError.Internal); },
+    };
+    var reader = MessageReader.create(Role.Server, options.maxFrameBytes, options.maxMessageBytes);
+    var windowBits: u32 = 15;
+    match (deflate) {
+        Some(agreed) => {
+            reader.enableDeflate(!agreed.clientNoContextTakeover);
+            windowBits = agreed.serverMaxWindowBits;
+        }
+        null => {}
+    }
+    let compress = match (deflate) {
+        Some(_) => true,
+        null => false,
+    };
+    return Ok(Some(WebSocket {
+        exchange: exchange,
+        reader: reader,
+        input: input,
+        out: Vector<u8>.create(),
+        queue: queue,
+        state: State.Open,
+        protocolIndex: chosen,
+        fragmentBytes: options.fragmentBytes,
+        pingIntervalMs: options.pingIntervalMs,
+        pongTimeoutMs: options.pongTimeoutMs,
+        closeTimeoutMs: options.closeTimeoutMs,
+        lastActivity: Timer.now(),
+        pingOutstanding: false,
+        closeDeadline: 0,
+        compress: compress,
+        deflater: Deflater.create(windowBits),
+        packed: Vector<u8>.create(),
+    }));
+}
+
+fn statusOf(code: u16) -> StatusCode => match (StatusCode.of(code)) {
+    Some(s) => s,
+    null => Status.badRequest(),
+};
+
+fn trimmed<region r>(v: Slice<r, u8>) -> Slice<r, u8> {
+    var a: usize = 0;
+    var b = v.length;
+    while (a < b && (v[a] == 32 || v[a] == 9)) {
+        a += 1;
+    }
+    while (b > a && (v[b - 1] == 32 || v[b - 1] == 9)) {
+        b -= 1;
+    }
+    return v[a..b];
+}

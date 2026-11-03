@@ -1,0 +1,293 @@
+// permessage-deflate's inflate and deflate (Web ADR 0010 §3.5). Oracles: RFC 7692 §7.2.3's worked examples, and
+// zlib (Python's `zlib`, raw deflate with Z_SYNC_FLUSH and the 00 00 FF FF removed, as RFC 7692 §7.2.1 sends it) for
+// dynamic Huffman blocks, a 9-bit window, and context takeover. The compressor is checked by round trips here and
+// against zlib in tests/interop/ws.py and Autobahn's cases 12 and 13.
+import web_http;
+
+fn paragraph() -> StringView =>
+    "It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife. However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered the rightful property of some one or other of their daughters. ";
+
+fn text() -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    for (k in 0..3usize) {
+        for (b in paragraph().bytes()) {
+            pushed(out.push(b))?;
+        }
+    }
+    return Ok(out);
+}
+
+/// zlib -9, 15-bit window: one dynamic Huffman block.
+fn zlib15() -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    appendHex(mut out, "ec90d191c33008445ba1804ceab894a158c8664e020fa0f8dcfd41922e923f69d8ddb77073208302aed337984c0f542bbd9f")?;
+    appendHex(mut out, "50965f96a3635db15ec0b7e22133e2b5238cc2400cbb98a1190983b498ae22159aa84fc60b8c690e774ce151d85f92831a5e")?;
+    appendHex(mut out, "e1470e0c1074728fb8047120101a620f8481283c080f4b97cd650b6b4247393332805bd46ea4814076d430858491d6ed2e53")?;
+    appendHex(mut out, "b76892a543f4da2c1e267060efe1fac39aad123888eb13921f9baa32b966582b833aa1bd578f69442cc2461535fca9d7a079")?;
+    appendHex(mut out, "9b1d76951dd5cf675b19591073050995bed349a196198638f0156edfbb7feffe4177ff07")?;
+    return Ok(out);
+}
+
+/// zlib -9, 9-bit window.
+fn zlib9() -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    appendHex(mut out, "2c8fdb71c3300c045b410119d79194418ba08409056800d28abacf41f69f1e77b78b9f41125468f81c1b4d95177b94de2f2a")?;
+    appendHex(mut out, "cbafdad9b9ae5cbf686c652016a26b67da8b92281d16c111624ad6f07735abd4ccc754fea27dc6a02767f02c3ade91531a3f")?;
+    appendHex(mut out, "e8db4e0688ba8c81b90429104c8db90311644e2fe133b21573d9504de85eae9c0470837613078275b0a38488b2acdbd3a66f")?;
+    appendHex(mut out, "30496984de97e1218c4eee1dad3fae6995c05db4de907c89e96e536b8eb5b24b178e5c2983f017138b694865473ff30eda68")?;
+    appendHex(mut out, "b3d3e176b08febb6b53d05394f30a4fcb32e4eb54c14d8e3413f23f7cac76eaabcf0b9f47e51597ed5cece75e5fa81170a28")?;
+    appendHex(mut out, "75d8164df1c32238424c73bbd08a6ba9998fa9fc45fb8c414fcee05974bc23a7347ed0b79d0c107519037309d2fb92c6dc81")?;
+    appendHex(mut out, "88947e099f715f32970dd584eee5ca4900376837712058710a4a8828cbba3d6dfa06939446e87d191ec2e8e4ded1fae39a56")?;
+    appendHex(mut out, "09dc45eb0dc99798ee36b5e6582bbb74e1c89532087f31b198865476f433efa08d363b1d6e07fbb86e5bdb5390f30443ca3f")?;
+    appendHex(mut out, "ebe254cb44813d1ef43372af7ceca6ca0b9f4bef1795e557edec5c57ae1f78a18052876dd1143f2c8223c434b70badb8969a")?;
+    appendHex(mut out, "f998ca5fb4cf18f4e40c9e45c73b724ae3077ddbc900519731309720bd2f69cc1d8848e997f019f72573d9504de85eae9c04")?;
+    appendHex(mut out, "70837613078215a7a08488b2acdbd3a66f30496984de97e1218c4eee1dad3fae6995c05db4de907c89e96e536b8eb5b24b17")?;
+    appendHex(mut out, "8e5c2983f017138b694865473ff30eda68b3d3e176b08febb6b53d05394f30a4fcb32e4eb54c14d8e341ff00")?;
+    return Ok(out);
+}
+
+fn appendHex(out: borrow mut Vector<u8>, text: StringView) -> Result<void, TestFailure> {
+    let bytes = hex(text)?;
+    for (b in bytes.view()) {
+        pushed(out.push(b))?;
+    }
+    return Ok();
+}
+
+/// Inflates `data` (00 00 FF FF appended) with `inflater` into a fresh vector.
+fn inflated(inflater: borrow mut Inflater, data: Slice<u8>, limit: u64) -> Result<Vector<u8>, InflateError> {
+    var input = Vector<u8>.create();
+    for (b in data) {
+        orOom(input.push(b))?;
+    }
+    for (b in [0u8, 0, 0xFF, 0xFF]) {
+        orOom(input.push(b))?;
+    }
+    var out = Vector<u8>.create();
+    inflater.inflate(input.view(), mut out, limit)?;
+    return Ok(out);
+}
+
+fn orOom(r: Result<void, AllocError>) -> Result<void, InflateError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(InflateError.OutOfMemory); }
+    }
+}
+
+fn inflatesTo(inflater: borrow mut Inflater, hexData: StringView, want: Slice<u8>) -> Result<void, TestFailure> {
+    let data = hex(hexData)?;
+    match (inflated(inflater, data.view(), 1048576)) {
+        Ok(out) => { return Check.equalBytes(want, out.view()); }
+        Err(_) => { return Check.fail(hexData); }
+    }
+}
+
+fn isCorrupt(r: Result<Vector<u8>, InflateError>) -> bool => match (r) {
+    Err(InflateError.Corrupt) => true,
+    _ => false,
+};
+
+@test
+fn rfc7692_examples() -> Result<void, TestFailure> {
+    var a = Inflater.create(15, true);
+    inflatesTo(mut a, "f248cdc9c90700", "Hello".bytes())?; // §7.2.3.1
+    inflatesTo(mut a, "f200110000", "Hello".bytes())?; // §7.2.3.2: the window shared with the first
+    var b = Inflater.create(15, true);
+    inflatesTo(mut b, "000500faff48656c6c6f00", "Hello".bytes())?; // §7.2.3.3: a stored block
+    var c = Inflater.create(15, true);
+    inflatesTo(mut c, "f348cdc9c9070000", "Hello".bytes())?; // §7.2.3.4: BFINAL set
+    var d = Inflater.create(15, true);
+    inflatesTo(mut d, "f24805000000ffffcac9c90700", "Hello".bytes())?; // §7.2.3.5: two blocks
+    // Without context takeover, §7.2.3.2's second message refers to nothing.
+    var e = Inflater.create(15, false);
+    inflatesTo(mut e, "f248cdc9c90700", "Hello".bytes())?;
+    let second = hex("f200110000")?;
+    return Check.isTrue(isCorrupt(inflated(mut e, second.view(), 1048576)), "no window without takeover");
+}
+
+@test
+fn zlib_vectors() -> Result<void, TestFailure> {
+    let want = text()?;
+    var a = Inflater.create(15, false);
+    let d15 = zlib15()?;
+    match (inflated(mut a, d15.view(), 1048576)) {
+        Ok(out) => { Check.equalBytes(want.view(), out.view())?; }
+        Err(_) => { return Check.fail("zlib, 15 bits"); }
+    }
+    var b = Inflater.create(9, false);
+    let d9 = zlib9()?;
+    match (inflated(mut b, d9.view(), 1048576)) {
+        Ok(out) => { Check.equalBytes(want.view(), out.view())?; }
+        Err(_) => { return Check.fail("zlib, 9 bits"); }
+    }
+    // Context takeover: zlib's second message refers back into the first.
+    var c = Inflater.create(15, true);
+    inflatesTo(mut c, "f248cdc9c9d75128cf2fca49d153f040e60100", "Hello, world. Hello, world.".bytes())?;
+    inflatesTo(mut c, "f2c09452484c4fccccd30300", "Hello, world. Hello again.".bytes())?;
+    // The limit: a message inflating past it stops there.
+    var d = Inflater.create(15, false);
+    let tooBig = match (inflated(mut d, d15.view(), 100)) {
+        Err(InflateError.TooBig) => true,
+        _ => false,
+    };
+    return Check.isTrue(tooBig, "the limit");
+}
+
+@test
+fn damaged_input_never_panics_or_passes_the_limit() -> Result<void, TestFailure> {
+    let d15 = zlib15()?;
+    let data = d15.view();
+    // Every truncation, and a bit flipped every 7 bits: an error or bounded output, never a panic.
+    for (cut in 0..data.length) {
+        var i = Inflater.create(15, false);
+        match (inflated(mut i, data[0..cut], 2000)) {
+            Ok(out) => { Check.isTrue(out.length <= 2000, "bounded")?; }
+            Err(_) => {}
+        }
+    }
+    var bit: usize = 0;
+    while (bit < data.length * 8) {
+        var copy = Vector<u8>.create();
+        for (b in data) {
+            pushed(copy.push(b))?;
+        }
+        copy[bit / 8] = copy[bit / 8] ^ (1u8 << truncate<u32>(bit % 8));
+        var i = Inflater.create(15, false);
+        match (inflated(mut i, copy.view(), 2000)) {
+            Ok(out) => { Check.isTrue(out.length <= 2000, "bounded")?; }
+            Err(_) => {}
+        }
+        bit += 7;
+    }
+    var j = Inflater.create(15, false);
+    let garbage = hex("ff ff ff ff ff ff")?;
+    return Check.isTrue(isCorrupt(inflated(mut j, garbage.view(), 2000)), "BTYPE 3");
+}
+
+fn roundTrip(input: Slice<u8>, windowBits: u32) -> Result<u64, TestFailure> {
+    let deflater = Deflater.create(windowBits);
+    var compressed = Vector<u8>.create();
+    pushed(deflater.compress(input, mut compressed))?;
+    var inflater = Inflater.create(windowBits, false);
+    match (inflated(mut inflater, compressed.view(), 1 << 24)) {
+        Ok(out) => {
+            Check.equalBytes(input, out.view())?;
+            return Ok(compressed.length as u64);
+        }
+        Err(_) => { return Err(TestFailure.create("our own output did not inflate")); }
+    }
+}
+
+@test
+fn deflate_round_trips() -> Result<void, TestFailure> {
+    Check.equalU64(2, roundTrip("".bytes(), 15)?)?; // an empty message: 02 00, as zlib gives
+    roundTrip("Hello".bytes(), 15)?;
+    let t = text()?;
+    let small = roundTrip(t.view(), 15)?;
+    Check.isTrue(small < t.length as u64 / 2, "repetitive text halves at least")?;
+    roundTrip(t.view(), 9)?; // references stay within 512 bytes: the inflater refuses any further
+    var runs = Vector<u8>.create();
+    for (i in 0..100000usize) {
+        pushed(runs.push(97))?;
+    }
+    let r = roundTrip(runs.view(), 15)?;
+    Check.isTrue(r < 1000, "100000 equal bytes")?;
+    var noise = Vector<u8>.create();
+    var x: u32 = 2463534242;
+    for (i in 0..70000usize) {
+        x = x ^ (x << 13);
+        x = x ^ (x >> 17);
+        x = x ^ (x << 5);
+        pushed(noise.push(truncate<u8>(x)))?;
+    }
+    roundTrip(noise.view(), 15)?;
+    return Ok();
+}
+
+fn offerGives(offer: StringView, want: StringView) -> Result<void, TestFailure> {
+    match (Extensions.deflateOffer(offer.bytes())) {
+        Some(agreed) => {
+            var out = Vector<u8>.create();
+            pushed(Extensions.deflateResponse(agreed, mut out))?;
+            return Check.equalBytes(want.bytes(), out.view());
+        }
+        null => { return Check.isTrue(want.length == 0, offer); }
+    }
+}
+
+@test
+fn negotiation_rfc7692() -> Result<void, TestFailure> {
+    offerGives("permessage-deflate", "permessage-deflate")?;
+    offerGives("permessage-deflate; client_max_window_bits", "permessage-deflate")?;
+    offerGives("permessage-deflate; client_max_window_bits=10", "permessage-deflate")?;
+    offerGives("permessage-deflate; server_max_window_bits=10", "permessage-deflate; server_max_window_bits=10")?;
+    offerGives("permessage-deflate; server_max_window_bits=\"9\"", "permessage-deflate; server_max_window_bits=9")?;
+    offerGives(
+        "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+        "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+    )?;
+    // Declined (§7.1): unknown, repeated, valueless or out-of-range parameters, and other extensions.
+    offerGives("permessage-deflate; foo", "")?;
+    offerGives("permessage-deflate; server_no_context_takeover; server_no_context_takeover", "")?;
+    offerGives("permessage-deflate; server_max_window_bits", "")?;
+    offerGives("permessage-deflate; server_max_window_bits=16", "")?;
+    offerGives("permessage-deflate; server_max_window_bits=7", "")?;
+    offerGives("permessage-deflate; server_max_window_bits=09", "")?;
+    offerGives("permessage-deflate; client_max_window_bits=20", "")?;
+    offerGives("permessage-deflate; server_no_context_takeover=1", "")?;
+    offerGives("x-webkit-deflate-frame", "")?;
+
+    // In a request: the first acceptable offer wins; a declined one is skipped.
+    let head = "GET / HTTP/1.1\r\nHost: a\r\nSec-WebSocket-Extensions: foo, permessage-deflate; server_max_window_bits=7\r\nSec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=12\r\n\r\n";
+    let bytes = head.bytes();
+    let request = Request.create(Method.Get, bytes[0..3], "/", Version.Http11, fieldsOf(bytes)?);
+    match (Extensions.negotiateDeflate(request)) {
+        Some(a) => { return Check.equalU64(12, a.serverMaxWindowBits as u64); }
+        null => { return Check.fail("no offer accepted"); }
+    }
+}
+
+@test
+fn compressed_frames() -> Result<void, TestFailure> {
+    // RFC 7692 §7.2.3.1's "Hello" as a client sends it (RSV1, masked), twice: the second message refers back.
+    var input = Vector<u8>.create();
+    let mask = [1u8, 2, 3, 4];
+    let first = hex("f248cdc9c90700")?;
+    pushed(Frames.writeHead(mut input, true, true, Opcode.Text, first.length as u64, Some(mask)))?;
+    pushed(Frames.appendMasked(mut input, first.view(), mask, 0))?;
+    let second = hex("f200110000")?;
+    pushed(Frames.writeHead(mut input, true, true, Opcode.Text, second.length as u64, Some(mask)))?;
+    pushed(Frames.appendMasked(mut input, second.view(), mask, 0))?;
+    for (split in 0..input.length + 1) {
+        let got = readAllWith(input.view(), split, Role.Server, 1048576, 1048576, true)?;
+        Check.equalBytes("T[Hello]T[Hello]".bytes(), got.view())?;
+    }
+    // Without the extension, RSV1 is a protocol error.
+    let plain = readAll(input.view(), input.length, Role.Server, 1048576, 1048576)?;
+    Check.equalBytes("E1002".bytes(), plain.view())?;
+    // RSV1 on a continuation, compressed data that does not inflate, and a bomb past the limit.
+    var cont = Vector<u8>.create();
+    pushed(Frames.writeHead(mut cont, false, true, Opcode.Text, first.length as u64, Some(mask)))?;
+    pushed(Frames.appendMasked(mut cont, first.view(), mask, 0))?;
+    pushed(Frames.writeHead(mut cont, true, true, Opcode.Continuation, 0, Some(mask)))?;
+    let c = readAllWith(cont.view(), cont.length, Role.Server, 1048576, 1048576, true)?;
+    Check.equalBytes("E1002".bytes(), c.view())?;
+    var bad = Vector<u8>.create();
+    let junk = hex("ffffffff")?;
+    pushed(Frames.writeHead(mut bad, true, true, Opcode.Binary, junk.length as u64, Some(mask)))?;
+    pushed(Frames.appendMasked(mut bad, junk.view(), mask, 0))?;
+    let b = readAllWith(bad.view(), bad.length, Role.Server, 1048576, 1048576, true)?;
+    Check.equalBytes("E1007".bytes(), b.view())?;
+    var zeros = Vector<u8>.create();
+    for (i in 0..100000usize) {
+        pushed(zeros.push(0))?;
+    }
+    var bomb = Vector<u8>.create();
+    pushed(Deflater.create(15).compress(zeros.view(), mut bomb))?;
+    var framed = Vector<u8>.create();
+    pushed(Frames.writeHead(mut framed, true, true, Opcode.Binary, bomb.length as u64, Some(mask)))?;
+    pushed(Frames.appendMasked(mut framed, bomb.view(), mask, 0))?;
+    let big = readAllWith(framed.view(), framed.length, Role.Server, 1048576, 50000, true)?;
+    return Check.equalBytes("E1009".bytes(), big.view());
+}

@@ -41,6 +41,13 @@ public struct MessageReader {
     private controlBytes: [u8; 125];
     private controlLength: usize;
 
+    /// permessage-deflate (RFC 7692): RSV1 marks a compressed message, whose payload collects in `compressed` and is
+    /// inflated when it ends.
+    private deflate: bool;
+    private compressedMessage: bool;
+    private compressed: Vector<u8>;
+    private inflater: Inflater;
+
     public fn create(role: Role, maxFrameBytes: u64, maxMessageBytes: u64) -> MessageReader => MessageReader {
         role: role,
         maxFrameBytes: maxFrameBytes,
@@ -57,7 +64,18 @@ public struct MessageReader {
         utf8: Utf8Validator.create(),
         controlBytes: [0u8; 125],
         controlLength: 0,
+        deflate: false,
+        compressedMessage: false,
+        compressed: Vector<u8>.create(),
+        inflater: Inflater.create(15, false),
     };
+
+    /// Accepts compressed messages from now on (permessage-deflate agreed); `takeover` keeps the window across
+    /// messages (the client did not agree to `client_no_context_takeover`).
+    public fn enableDeflate(borrow mut this, takeover: bool) {
+        this.deflate = true;
+        this.inflater = Inflater.create(15, takeover);
+    }
 
     /// The last control frame's payload.
     public fn control(borrow this) -> Slice<u8> => this.controlBytes[0..this.controlLength];
@@ -79,7 +97,7 @@ public struct MessageReader {
     ) -> Result<Incoming, u16> {
         loop {
             if (!this.inFrame) {
-                let parsed = Frames.parseHead(input.readable(), this.role, this.maxFrameBytes, false)?;
+                let parsed = Frames.parseHead(input.readable(), this.role, this.maxFrameBytes, this.deflate)?;
                 let p = match (parsed) {
                     Some(p) => p,
                     null => { return Ok(Incoming.NeedMore); },
@@ -97,7 +115,7 @@ public struct MessageReader {
                 }
             }
             this.inFrame = false;
-            match (this.ended()?) {
+            match (this.ended(message)?) {
                 Some(event) => { return Ok(event); }
                 null => {}
             }
@@ -108,15 +126,22 @@ public struct MessageReader {
     fn begin(borrow mut this, head: FrameHead, message: borrow mut Vector<u8>) -> Result<void, u16> {
         match (head.opcode) {
             Opcode.Continuation => {
-                if (!this.messageOpen) {
-                    return Err(CloseCodes.protocolError());
+                if (!this.messageOpen || head.rsv1) {
+                    return Err(CloseCodes.protocolError()); // RSV1 only on a message's first frame (RFC 7692 §6.1)
                 }
             }
-            Opcode.Text => { this.open(true, message)?; }
-            Opcode.Binary => { this.open(false, message)?; }
+            Opcode.Text => {
+                this.open(true, message)?;
+                this.compressedMessage = head.rsv1;
+            }
+            Opcode.Binary => {
+                this.open(false, message)?;
+                this.compressedMessage = head.rsv1;
+            }
             _ => { this.controlLength = 0; }
         }
-        if (!Opcodes.isControl(head.opcode) && message.length as u64 + head.length > this.maxMessageBytes) {
+        let collected = if (this.compressedMessage) this.compressed.length else message.length;
+        if (!Opcodes.isControl(head.opcode) && collected as u64 + head.length > this.maxMessageBytes) {
             return Err(CloseCodes.tooBig());
         }
         this.inFrame = true;
@@ -137,6 +162,7 @@ public struct MessageReader {
         this.text = text;
         this.utf8.reset();
         message.clear();
+        this.compressed.clear();
         return Ok();
     }
 
@@ -153,6 +179,11 @@ public struct MessageReader {
             if (control) {
                 this.controlBytes[this.controlLength] = b;
                 this.controlLength += 1;
+            } else if (this.compressedMessage) {
+                match (this.compressed.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(CloseCodes.internalError()); }
+                }
             } else {
                 if (this.text && !this.utf8.step(b)) {
                     return Err(CloseCodes.invalidData());
@@ -173,7 +204,7 @@ public struct MessageReader {
     }
 
     /// What the frame that just ended gives the caller, if anything.
-    fn ended(borrow mut this) -> Result<Incoming?, u16> {
+    fn ended(borrow mut this, message: borrow mut Vector<u8>) -> Result<Incoming?, u16> {
         match (this.opcode) {
             Opcode.Ping => { return Ok(Some(Incoming.Ping)); }
             Opcode.Pong => { return Ok(Some(Incoming.Pong)); }
@@ -183,11 +214,36 @@ public struct MessageReader {
         if (!this.fin) {
             return Ok(null);
         }
+        if (this.compressedMessage) {
+            this.inflateMessage(message)?;
+        }
         if (this.text && !this.utf8.complete()) {
             return Err(CloseCodes.invalidData());
         }
         this.messageOpen = false;
         return Ok(Some(Incoming.Message(if (this.text) MessageKind.Text else MessageKind.Binary)));
+    }
+
+    /// Inflates the compressed message into `message` (RFC 7692 §7.2.2: with 00 00 FF FF appended), and checks its text.
+    fn inflateMessage(borrow mut this, message: borrow mut Vector<u8>) -> Result<void, u16> {
+        for (b in [0u8, 0, 0xFF, 0xFF]) {
+            match (this.compressed.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(CloseCodes.internalError()); }
+            }
+        }
+        message.clear();
+        match (this.inflater.inflate(this.compressed.view(), message, this.maxMessageBytes)) {
+            Ok() => {}
+            Err(InflateError.TooBig) => { return Err(CloseCodes.tooBig()); }
+            Err(InflateError.Corrupt) => { return Err(CloseCodes.invalidData()); }
+            Err(InflateError.OutOfMemory) => { return Err(CloseCodes.internalError()); }
+        }
+        this.compressed.clear();
+        if (this.text && !this.utf8.feed(message.view())) {
+            return Err(CloseCodes.invalidData());
+        }
+        return Ok();
     }
 
     /// The received Close's code, checked with its reason (§5.5.1, §7.4).

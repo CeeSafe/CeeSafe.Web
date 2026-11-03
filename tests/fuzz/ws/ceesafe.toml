@@ -1,0 +1,8 @@
+[package]
+name = "fuzz_ws"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+web_core = { path = "../../../packages/web_core" }
+web_ws = { path = "../../../packages/web_ws" }

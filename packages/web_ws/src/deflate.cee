@@ -1,0 +1,139 @@
+// Deflate (RFC 1951) for permessage-deflate (RFC 7692, Web ADR 0010 §3.5): one fixed-Huffman block per message, with
+// LZ77 matches found through hash chains over the negotiated window, then the sync flush whose 00 00 FF FF tail
+// RFC 7692 §7.2.1 removes. Each message is compressed on its own: context takeover permits references to earlier
+// messages but never requires them (§7.2.2), so the compressor keeps no state between messages.
+
+struct BitWriter {
+    buffer: u64;
+    count: u32;
+}
+
+fn put(w: borrow mut BitWriter, out: borrow mut Vector<u8>, value: u32, n: u32) -> Result<void, AllocError> {
+    w.buffer = w.buffer | (value as u64 << w.count);
+    w.count += n;
+    while (w.count >= 8) {
+        out.push(truncate<u8>(w.buffer))?;
+        w.buffer = w.buffer >> 8;
+        w.count -= 8;
+    }
+    return Ok();
+}
+
+/// `code`'s low `n` bits in reverse order: Huffman codes are sent most significant bit first (RFC 1951 §3.1.1).
+fn reversed(code: u32, n: u32) -> u32 {
+    var v: u32 = 0;
+    var c = code;
+    for (i in 0..n) {
+        v = (v << 1) | (c & 1);
+        c = c >> 1;
+    }
+    return v;
+}
+
+/// A fixed-Huffman literal/length symbol (RFC 1951 §3.2.6).
+fn symbol(w: borrow mut BitWriter, out: borrow mut Vector<u8>, s: u32) -> Result<void, AllocError> {
+    if (s < 144) {
+        return put(w, out, reversed(0x30 + s, 8), 8);
+    }
+    if (s < 256) {
+        return put(w, out, reversed(0x190 + s - 144, 9), 9);
+    }
+    if (s < 280) {
+        return put(w, out, reversed(s - 256, 7), 7);
+    }
+    return put(w, out, reversed(0xC0 + s - 280, 8), 8);
+}
+
+fn backReference(
+    w: borrow mut BitWriter,
+    out: borrow mut Vector<u8>,
+    length: u32,
+    distance: u32,
+) -> Result<void, AllocError> {
+    var li: usize = 28;
+    while (lengthBase(li) > length) {
+        li -= 1;
+    }
+    symbol(w, out, 257 + truncate<u32>(li))?;
+    put(w, out, length - lengthBase(li), lengthExtra(li))?;
+    var di: usize = 29;
+    while (distanceBase(di) > distance) {
+        di -= 1;
+    }
+    put(w, out, reversed(truncate<u32>(di), 5), 5)?;
+    return put(w, out, distance - distanceBase(di), distanceExtra(di));
+}
+
+fn hash3(input: Slice<u8>, i: usize) -> usize =>
+    (((input[i] as u32 << 10) ^ (input[i + 1] as u32 << 5) ^ input[i + 2] as u32) & 4095) as usize;
+
+public struct Deflater {
+    private windowBytes: usize;
+
+    /// A compressor whose back-references stay within 2^`windowBits` bytes (8-15).
+    public fn create(windowBits: u32) -> Deflater =>
+        Deflater { windowBytes: 1usize << (if (windowBits < 8) 8u32 else if (windowBits > 15) 15u32 else windowBits) };
+
+    /// Appends `input`'s compressed form to `out`, without the final 00 00 FF FF (RFC 7692 §7.2.1).
+    public fn compress(borrow this, input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        var w = BitWriter { buffer: 0, count: 0 };
+        put(mut w, out, 0, 1)?;                             // BFINAL = 0
+        put(mut w, out, 1, 2)?;                             // BTYPE = 01, fixed Huffman
+        var head = [0u32; 4096];                            // position + 1 of the last 3 bytes with each hash
+        var prev = Vector<u32>.withCapacity(input.length)?; // the chain: the previous position + 1 with the same hash
+        var i: usize = 0;
+        while (i < input.length) {
+            var bestLength: usize = 0;
+            var bestDistance: usize = 0;
+            if (i + 3 <= input.length) {
+                let h = hash3(input, i);
+                var candidate = head[h] as usize;
+                var steps = 0;
+                while (candidate > 0 && steps < 32) {
+                    let at = candidate - 1;
+                    let distance = i - at;
+                    if (distance > this.windowBytes) {
+                        break;
+                    }
+                    var n: usize = 0;
+                    while (n < 258 && i + n < input.length && input[at + n] == input[i + n]) {
+                        n += 1;
+                    }
+                    if (n > bestLength) {
+                        bestLength = n;
+                        bestDistance = distance;
+                        if (n == 258) {
+                            break;
+                        }
+                    }
+                    candidate = prev[at] as usize;
+                    steps += 1;
+                }
+            }
+            let advance = if (bestLength >= 3) bestLength else 1;
+            if (bestLength >= 3) {
+                backReference(mut w, out, truncate<u32>(bestLength), truncate<u32>(bestDistance))?;
+            } else {
+                symbol(mut w, out, input[i] as u32)?;
+            }
+            for (k in 0..advance) {
+                let p = i + k;
+                if (p + 3 <= input.length) {
+                    let h = hash3(input, p);
+                    prev.push(head[h])?;
+                    head[h] = truncate<u32>(p + 1);
+                } else {
+                    prev.push(0)?;
+                }
+            }
+            i += advance;
+        }
+        symbol(mut w, out, 256)?; // end of block
+        // The sync flush: an empty stored block (BFINAL = 0, BTYPE = 00), padded to a byte; its LEN/NLEN are the
+        // 00 00 FF FF that RFC 7692 removes.
+        put(mut w, out, 0, 3)?;
+        let pad = (8 - w.count % 8) % 8;
+        put(mut w, out, 0, pad)?;
+        return Ok();
+    }
+}

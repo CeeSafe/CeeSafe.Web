@@ -71,8 +71,22 @@ fn fieldsOf<region r>(head: Slice<r, u8>) -> Result<HeaderList<r>, TestFailure> 
 
 /// Feeds `input` to a reader in two pieces split at `split`, and describes what it yields, one letter per event:
 /// T or B (a message, then its bytes in brackets), P (ping), O (pong), C<code>, E<code> (a violation; stops).
-fn readAll(input: Slice<u8>, split: usize, role: Role, maxFrame: u64, maxMessage: u64) -> Result<Vector<u8>, TestFailure> {
+fn readAll(input: Slice<u8>, split: usize, role: Role, maxFrame: u64, maxMessage: u64) -> Result<Vector<u8>, TestFailure> =>
+    readAllWith(input, split, role, maxFrame, maxMessage, false);
+
+/// `readAll`, with permessage-deflate on if `deflate` (context takeover kept).
+fn readAllWith(
+    input: Slice<u8>,
+    split: usize,
+    role: Role,
+    maxFrame: u64,
+    maxMessage: u64,
+    deflate: bool,
+) -> Result<Vector<u8>, TestFailure> {
     var reader = MessageReader.create(role, maxFrame, maxMessage);
+    if (deflate) {
+        reader.enableDeflate(true);
+    }
     var buffer = match (OwnedBuffer.create(input.length + 1)) {
         Ok(b) => b,
         Err(_) => { return Err(TestFailure.create("a buffer")); },

@@ -77,6 +77,8 @@ public struct Status {
     /// 100 Continue.
     public fn continue100() -> StatusCode => StatusCode { value: 100 };
     /// 200 OK.
+    public fn switchingProtocols() -> StatusCode => StatusCode { value: 101 };
+
     public fn ok() -> StatusCode => StatusCode { value: 200 };
     /// 201 Created.
     public fn created() -> StatusCode => StatusCode { value: 201 };

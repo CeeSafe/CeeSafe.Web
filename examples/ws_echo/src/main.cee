@@ -1,0 +1,150 @@
+// A WebSocket echo server on web_server and web_ws (Web ADR 0010), for Autobahn's fuzzingclient and
+// tests/interop/ws.py. Listens on CW_ADDRESS (default 127.0.0.1; 0.0.0.0 to reach it from a container) port CW_PORT
+// (default 9001).
+//
+//   GET  /        a WebSocket that sends every message back as it came (text as text, binary as binary)
+//   POST /stop    starts the drain
+//
+// CW_MAX_MESSAGE (default 16777216) bounds frames and messages alike; CW_PING_MS (default 30000) is the keep-alive and
+// CW_PONG_MS (default 30000) how long a ping may go unanswered;
+// CW_ORIGIN, if set, is one more origin to accept; CW_WRITE_TIMEOUT_MS (default 30000) bounds each write to a client that
+// stops reading.
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_ws;
+
+struct App {
+    options: WebSocketOptions;
+    sessions: AtomicU64;
+}
+
+struct Echo {}
+
+impl Handler<App> for Echo {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let app = ctx.state();
+        var ws = match (await accept(exchange, request, app.options, false)?) {
+            Some(w) => w,
+            null => { return Ok(); }, // refused: the response is sent
+        };
+        app.sessions.fetchAdd(1);
+        var message = Vector<u8>.create();
+        loop {
+            match (await ws.receive(mut message)?) {
+                Received.Message(kind) => { await ws.send(kind, message.view())?; }
+                Received.Closed(_) => { return Ok(); }
+            }
+        }
+    }
+}
+
+struct Stop {}
+
+impl Handler<App> for Stop {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        ctx.connection().drain().start();
+        return await exchange.send(Status.ok(), "stopping".bytes());
+    }
+}
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    return match (Ascii.parseDecimal(text.bytes())) {
+        Some(v) => v,
+        null => otherwise,
+    };
+}
+
+fn handler<H: Handler<App>>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App>>, RouteError> {
+    match (b) {
+        Ok(h) => {
+            let d: Box<dyn Handler<App>> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+fn application() -> Result<Server<App>, RouteError> {
+    var options = WebSocketOptions.defaults();
+    let max = setting("CW_MAX_MESSAGE", 16777216);
+    options.maxFrameBytes = max;
+    options.maxMessageBytes = max;
+    options.pingIntervalMs = setting("CW_PING_MS", 30000);
+    options.pongTimeoutMs = setting("CW_PONG_MS", 30000);
+    match (Environment.variable("CW_ORIGIN")) {
+        Some(o) => {
+            var origin = Vector<u8>.create();
+            for (b in o.bytes()) {
+                match (origin.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(RouteError.OutOfMemory); }
+                }
+            }
+            match (options.allowedOrigins.push(origin)) {
+                Ok() => {}
+                Err(_) => { return Err(RouteError.OutOfMemory); }
+            }
+        }
+        null => {}
+    }
+    let app = App { options: options, sessions: AtomicU64.create(0) };
+    var limits = Limits.defaults();
+    limits.writeTimeoutMs = setting("CW_WRITE_TIMEOUT_MS", 30000);
+    var server = Server<App>.create(app, limits)?;
+    server.router().get("/", handler(Box.create(Echo {}))?)?;
+    server.router().post("/stop", handler(Box.create(Stop {}))?)?;
+    return Ok(server);
+}
+
+async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
+    let port = truncate<u16>(setting("CW_PORT", 9001));
+    let any = match (Environment.variable("CW_ADDRESS")) {
+        Some(a) => a == "0.0.0.0",
+        null => false,
+    };
+    let address = if (any) SocketAddresses.v4Any(port) else SocketAddresses.v4Loopback(port);
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = Listener.bindWith(address, options)?;
+    let drain = Drain.create()?;
+    var limits = ConnectionLimits.defaults();
+    limits.graceMs = 1000;
+    match (await AsyncConsole.writeLine("ws_echo: listening")) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    let report = await server.run(listener, PlainAcceptor {}, limits, drain)?;
+    match (await AsyncConsole.writeLine("ws_echo: drained")) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+fn main() {
+    let server = match (application()) {
+        Ok(s) => s,
+        Err(_) => {
+            Console.writeLine("ws_echo: could not build the routes");
+            return;
+        },
+    };
+    match (Async.run(serve(server))) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

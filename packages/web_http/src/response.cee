@@ -125,4 +125,18 @@ public struct ResponseHead {
 
     /// Whether the connection closes after this response.
     public fn closes(borrow this) -> bool => this.closing;
+
+    /// Adds `upgrade: <protocol>` and `connection: upgrade`, the fields of a 101 (RFC 9110 §7.8), which `add` keeps
+    /// from handlers; for `Exchange.switchProtocols` only. `protocol` must be a token.
+    public fn upgradeTo(borrow mut this, protocol: StringView) -> Result<void, FieldError> {
+        this.add("upgrade", protocol.bytes())?;
+        let field = "connection: upgrade\r\n";
+        if (this.fields.spareLength() < field.length) {
+            return Err(FieldError.TooLarge);
+        }
+        match (this.fields.append(field.bytes())) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(FieldError.TooLarge); }
+        }
+    }
 }

@@ -1,0 +1,362 @@
+// Inflate (RFC 1951) for permessage-deflate (RFC 7692, Web ADR 0010 §3.5): stored, fixed and dynamic Huffman
+// blocks, with canonical Huffman decoding as in RFC 1951 §3.2.2. A message is inflated whole: its data ends at a block
+// boundary (the sync flush of RFC 7692 §7.2.1, whose 00 00 FF FF the receiver appends), so the decoder never resumes
+// mid-block. With context takeover, back-references may reach into earlier messages through `history`.
+
+public enum InflateError {
+    /// Not valid deflate data, or data that ends inside a block.
+    Corrupt,
+    /// The output would pass the limit.
+    TooBig,
+    /// Memory could not be allocated.
+    OutOfMemory,
+}
+
+/// A canonical Huffman code: how many codes of each length, and the symbols in code order.
+struct Huffman {
+    counts: [u16; 16];
+    symbols: [u16; 288];
+}
+
+/// Base lengths and extra bits for length codes 257-285, base distances and extra bits for distance codes 0-29
+/// (RFC 1951 §3.2.5).
+fn lengthBase(i: usize) -> u32 {
+    let t = [
+        3u32, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195,
+        227, 258,
+    ];
+    return t[i];
+}
+
+fn lengthExtra(i: usize) -> u32 {
+    let t = [0u32, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    return t[i];
+}
+
+fn distanceBase(i: usize) -> u32 {
+    let t = [
+        1u32, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073,
+        4097, 6145, 8193, 12289, 16385, 24577,
+    ];
+    return t[i];
+}
+
+fn distanceExtra(i: usize) -> u32 {
+    let t = [0u32, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+    return t[i];
+}
+
+/// Builds the code for `lengths[0..n]`. False if the lengths over-subscribe the code; an incomplete code is allowed
+/// only as RFC 1951 permits it in practice (a single distance code), and decoding a missing code fails then.
+fn construct(h: borrow mut Huffman, lengths: Slice<u16>) -> bool {
+    for (len in 0..16usize) {
+        h.counts[len] = 0;
+    }
+    for (l in lengths) {
+        h.counts[l as usize] += 1;
+    }
+    if (h.counts[0] as usize == lengths.length) {
+        return true; // no codes: a decode will fail
+    }
+    var left: i32 = 1;
+    for (len in 1..16usize) {
+        left = left * 2 - h.counts[len] as i32;
+        if (left < 0) {
+            return false;
+        }
+    }
+    var offsets = [0u16; 16];
+    for (len in 1..15usize) {
+        offsets[len + 1] = offsets[len] + h.counts[len];
+    }
+    for (symbol in 0..lengths.length) {
+        let l = lengths[symbol] as usize;
+        if (l != 0) {
+            h.symbols[offsets[l] as usize] = truncate<u16>(symbol);
+            offsets[l] += 1;
+        }
+    }
+    return true;
+}
+
+/// Bits from the input, least significant first (RFC 1951 §3.1.1).
+struct BitReader {
+    at: usize;
+    buffer: u32;
+    count: u32;
+}
+
+/// The inflater of one direction of a connection.
+public struct Inflater {
+    /// The last `windowBytes` of output, for back-references into earlier messages (context takeover).
+    private history: Vector<u8>;
+    private windowBytes: usize;
+    private takeover: bool;
+    private lit: Huffman;
+    private dist: Huffman;
+
+    /// An inflater with a window of 2^`windowBits` bytes (8-15); `takeover` keeps it across messages.
+    public fn create(windowBits: u32, takeover: bool) -> Inflater => Inflater {
+        history: Vector<u8>.create(),
+        windowBytes: 1usize << (if (windowBits < 8) 8u32 else if (windowBits > 15) 15u32 else windowBits),
+        takeover: takeover,
+        lit: Huffman { counts: [0u16; 16], symbols: [0u16; 288] },
+        dist: Huffman { counts: [0u16; 16], symbols: [0u16; 288] },
+    };
+
+    /// Inflates one message's data (`input`, with the 00 00 FF FF tail already appended) onto `out`, at most `limit`
+    /// bytes in all.
+    public fn inflate(
+        borrow mut this,
+        input: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        limit: u64,
+    ) -> Result<void, InflateError> {
+        let start = out.length;
+        var r = BitReader { at: 0, buffer: 0, count: 0 };
+        loop {
+            if (r.at >= input.length && r.count < 3) {
+                break; // a whole number of blocks ended here
+            }
+            let last = need(mut r, input, 1)?;
+            let kind = need(mut r, input, 2)?;
+            match (kind) {
+                0 => { this.stored(mut r, input, out, start, limit)?; }
+                1 => {
+                    this.fixedTables();
+                    this.codes(mut r, input, out, start, limit)?;
+                }
+                2 => {
+                    this.dynamicTables(mut r, input)?;
+                    this.codes(mut r, input, out, start, limit)?;
+                }
+                _ => { return Err(InflateError.Corrupt); }
+            }
+            if (last == 1) {
+                break;
+            }
+            if (r.at >= input.length && r.count == 0) {
+                break;
+            }
+        }
+        this.remember(out, start)?;
+        return Ok();
+    }
+
+    /// Keeps the window's worth of output for the next message, or nothing without context takeover.
+    fn remember(borrow mut this, out: borrow Vector<u8>, start: usize) -> Result<void, InflateError> {
+        if (!this.takeover) {
+            this.history.clear();
+            return Ok();
+        }
+        let produced = out.length - start;
+        if (produced >= this.windowBytes) {
+            this.history.clear();
+            for (i in out.length - this.windowBytes..out.length) {
+                pushOut(mut this.history, out[i])?;
+            }
+            return Ok();
+        }
+        // Keep the tail of the old history that still fits, then this message's output.
+        let keep =
+            if (this.history.length + produced > this.windowBytes) this.windowBytes - produced else this.history.length;
+        var next = Vector<u8>.create();
+        for (i in this.history.length - keep..this.history.length) {
+            pushOut(mut next, this.history[i])?;
+        }
+        for (i in start..out.length) {
+            pushOut(mut next, out[i])?;
+        }
+        this.history = next;
+        return Ok();
+    }
+
+    fn stored(
+        borrow mut this,
+        r: borrow mut BitReader,
+        input: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        start: usize,
+        limit: u64,
+    ) -> Result<void, InflateError> {
+        r.buffer = 0; // to a byte boundary
+        r.count = 0;
+        if (r.at + 4 > input.length) {
+            return Err(InflateError.Corrupt);
+        }
+        let len = input[r.at] as u32 | (input[r.at + 1] as u32 << 8);
+        let nlen = input[r.at + 2] as u32 | (input[r.at + 3] as u32 << 8);
+        if (len != (nlen ^ 0xFFFF)) {
+            return Err(InflateError.Corrupt);
+        }
+        r.at += 4;
+        if (r.at + len as usize > input.length) {
+            return Err(InflateError.Corrupt);
+        }
+        if ((out.length - start) as u64 + len as u64 > limit) {
+            return Err(InflateError.TooBig);
+        }
+        for (i in 0..len as usize) {
+            pushOut(out, input[r.at + i])?;
+        }
+        r.at += len as usize;
+        return Ok();
+    }
+
+    fn fixedTables(borrow mut this) {
+        var lengths = [0u16; 288];
+        for (i in 0..288usize) {
+            lengths[i] = if (i < 144) 8 else if (i < 256) 9 else if (i < 280) 7 else 8;
+        }
+        let a = construct(mut this.lit, lengths[..]);
+        var d = [5u16; 30];
+        let b = construct(mut this.dist, d[..]);
+    }
+
+    fn dynamicTables(borrow mut this, r: borrow mut BitReader, input: Slice<u8>) -> Result<void, InflateError> {
+        let nlen = need(r, input, 5)? as usize + 257;
+        let ndist = need(r, input, 5)? as usize + 1;
+        let ncode = need(r, input, 4)? as usize + 4;
+        if (nlen > 286 || ndist > 30) {
+            return Err(InflateError.Corrupt);
+        }
+        let order = [16usize, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+        var lengths = [0u16; 320];
+        for (i in 0..ncode) {
+            lengths[order[i]] = truncate<u16>(need(r, input, 3)?);
+        }
+        var lencode = Huffman { counts: [0u16; 16], symbols: [0u16; 288] };
+        if (!construct(mut lencode, lengths[0..19])) {
+            return Err(InflateError.Corrupt);
+        }
+        var index: usize = 0;
+        while (index < nlen + ndist) {
+            let symbol = decode(r, input, lencode)?;
+            if (symbol < 16) {
+                lengths[index] = truncate<u16>(symbol);
+                index += 1;
+                continue;
+            }
+            var value: u16 = 0;
+            var repeat: usize = 0;
+            if (symbol == 16) {
+                if (index == 0) {
+                    return Err(InflateError.Corrupt); // nothing to repeat
+                }
+                value = lengths[index - 1];
+                repeat = 3 + need(r, input, 2)? as usize;
+            } else if (symbol == 17) {
+                repeat = 3 + need(r, input, 3)? as usize;
+            } else {
+                repeat = 11 + need(r, input, 7)? as usize;
+            }
+            if (index + repeat > nlen + ndist) {
+                return Err(InflateError.Corrupt);
+            }
+            for (k in 0..repeat) {
+                lengths[index] = value;
+                index += 1;
+            }
+        }
+        if (lengths[256] == 0) {
+            return Err(InflateError.Corrupt); // no end-of-block code
+        }
+        if (!construct(mut this.lit, lengths[0..nlen])) {
+            return Err(InflateError.Corrupt);
+        }
+        if (!construct(mut this.dist, lengths[nlen..nlen + ndist])) {
+            return Err(InflateError.Corrupt);
+        }
+        return Ok();
+    }
+
+    /// The literal/length and distance codes of one block, to its end-of-block code.
+    fn codes(
+        borrow mut this,
+        r: borrow mut BitReader,
+        input: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        start: usize,
+        limit: u64,
+    ) -> Result<void, InflateError> {
+        loop {
+            let symbol = decode(r, input, this.lit)?;
+            if (symbol < 256) {
+                if ((out.length - start) as u64 >= limit) {
+                    return Err(InflateError.TooBig);
+                }
+                pushOut(out, truncate<u8>(symbol))?;
+                continue;
+            }
+            if (symbol == 256) {
+                return Ok();
+            }
+            let li = (symbol - 257) as usize;
+            if (li >= 29) {
+                return Err(InflateError.Corrupt);
+            }
+            let length = (lengthBase(li) + need(r, input, lengthExtra(li))?) as usize;
+            let ds = decode(r, input, this.dist)? as usize;
+            if (ds >= 30) {
+                return Err(InflateError.Corrupt);
+            }
+            let distance = (distanceBase(ds) + need(r, input, distanceExtra(ds))?) as usize;
+            let produced = out.length - start;
+            if (distance > produced + this.history.length || distance > this.windowBytes) {
+                return Err(InflateError.Corrupt); // before the window
+            }
+            if (produced as u64 + length as u64 > limit) {
+                return Err(InflateError.TooBig);
+            }
+            for (k in 0..length) {
+                let made = out.length - start;
+                let b =
+                    if (distance <= made) out[out.length - distance] else this.history[this.history.length -
+                        (distance - made)];
+                pushOut(out, b)?;
+            }
+        }
+    }
+}
+
+fn pushOut(out: borrow mut Vector<u8>, b: u8) -> Result<void, InflateError> {
+    match (out.push(b)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(InflateError.OutOfMemory); }
+    }
+}
+
+/// The next `n` bits (0-16), least significant first.
+fn need(r: borrow mut BitReader, input: Slice<u8>, n: u32) -> Result<u32, InflateError> {
+    while (r.count < n) {
+        if (r.at >= input.length) {
+            return Err(InflateError.Corrupt); // the data ends inside a block
+        }
+        r.buffer = r.buffer | (input[r.at] as u32 << r.count);
+        r.at += 1;
+        r.count += 8;
+    }
+    let v = r.buffer & ((1u32 << n) - 1);
+    r.buffer = if (n == 32) 0 else r.buffer >> n;
+    r.count -= n;
+    return Ok(v);
+}
+
+/// One symbol of `h`, reading a bit at a time (RFC 1951 §3.2.2's canonical codes, as in zlib's puff.c).
+fn decode(r: borrow mut BitReader, input: Slice<u8>, h: borrow Huffman) -> Result<u32, InflateError> {
+    var code: i64 = 0;
+    var first: i64 = 0;
+    var index: i64 = 0;
+    for (len in 1..16usize) {
+        code += need(r, input, 1)? as i64; // the low bit is free: `code` was doubled
+        let count = h.counts[len] as i64;
+        if (code - count < first) {
+            return Ok(h.symbols[truncate<usize>(index + (code - first))] as u32);
+        }
+        index += count;
+        first += count;
+        first = first * 2;
+        code = code * 2;
+    }
+    return Err(InflateError.Corrupt);
+}

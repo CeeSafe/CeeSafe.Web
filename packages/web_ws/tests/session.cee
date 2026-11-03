@@ -1,0 +1,179 @@
+// The session over an exchange (Web ADR 0010 §3.2-3.3), against a scripted client. Expected bytes follow RFC 6455:
+// the 101 response of §1.3 (its key and accept value), echoes, pongs with the ping's payload (§5.5.3), the Close
+// echoed with its code (§5.5.1), the codes of §7.4.1 for violations, and the ADR's keep-alive rules.
+import web_core;
+import web_http;
+
+fn options() -> WebSocketOptions => WebSocketOptions.defaults();
+
+@test
+async fn handshake_echo_ping_close() -> Result<void, TestFailure> {
+    var input = Vector<u8>.create();
+    clientFrame(mut input, Opcode.Text, true, "Hello".bytes())?;
+    clientFrame(mut input, Opcode.Binary, false, "ab".bytes())?;
+    clientFrame(mut input, Opcode.Ping, true, "pp".bytes())?; // between fragments
+    clientFrame(mut input, Opcode.Continuation, true, "c".bytes())?;
+    let close = closePayload(1000);
+    clientFrame(mut input, Opcode.Close, true, close[..])?;
+    for (chunk in [1usize, 3, 1000]) {
+        var copy = Vector<u8>.create();
+        for (b in input.view()) {
+            pushed(copy.push(b))?;
+        }
+        var conn = peer(copy, chunk, null);
+        var prefs = options();
+        pushed(prefs.subprotocols.push(bytesOf("superchat")?))?;
+        let code = await session(mut conn, upgradeText(), prefs, Script.Echo)?;
+        Check.equalU64(1000, code as u64)?;
+        let w = written(conn.output)?;
+        Check.isTrue(contains(w.head.view(), "HTTP/1.1 101 Switching Protocols\r\n"), "101")?;
+        Check.isTrue(contains(w.head.view(), "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"), "accept")?;
+        Check.isTrue(contains(w.head.view(), "upgrade: websocket\r\n"), "upgrade")?;
+        Check.isTrue(contains(w.head.view(), "connection: upgrade\r\n"), "connection")?;
+        Check.isTrue(contains(w.head.view(), "sec-websocket-protocol: superchat\r\n"), "subprotocol")?;
+        Check.equalBytes("T[Hello]OB[abc]C1000".bytes(), w.frames.view())?;
+    }
+    return Ok();
+}
+
+@test
+async fn refused_upgrades() -> Result<void, TestFailure> {
+    let v8 = "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 8\r\n\r\n";
+    var a = peer(Vector<u8>.create(), 1000, Some(0));
+    Check.equalU64(0, await session(mut a, v8, options(), Script.Echo)? as u64)?;
+    Check.isTrue(contains(a.output.view(), "HTTP/1.1 426 "), "426")?;
+    Check.isTrue(contains(a.output.view(), "sec-websocket-version: 13\r\n"), "the version we speak")?;
+    let foreign = "GET / HTTP/1.1\r\nHost: a.example\r\nOrigin: https://evil.example\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    var b = peer(Vector<u8>.create(), 1000, Some(0));
+    Check.equalU64(0, await session(mut b, foreign, options(), Script.Echo)? as u64)?;
+    Check.isTrue(contains(b.output.view(), "HTTP/1.1 403 "), "403")?;
+    let bad = "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    var c = peer(Vector<u8>.create(), 1000, Some(0));
+    Check.equalU64(0, await session(mut c, bad, options(), Script.Echo)? as u64)?;
+    Check.isTrue(contains(c.output.view(), "HTTP/1.1 400 "), "400")?;
+    return Ok();
+}
+
+/// A session whose client sends `input` and then stays open; the code it ends with and the frames the server sent.
+async fn violationIs(input: Vector<u8>, opts: WebSocketOptions, want: StringView) -> Result<void, TestFailure> {
+    var conn = peer(input, 1000, null);
+    let code = await session(mut conn, upgradeText(), opts, Script.Echo)?;
+    let w = written(conn.output)?;
+    var frames = Vector<u8>.create();
+    for (b in w.frames.view()) {
+        pushed(frames.push(b))?;
+    }
+    pushed(frames.push(47))?; // "/" then the code the session ended with
+    number(mut frames, code)?;
+    return Check.equalBytes(want.bytes(), frames.view());
+}
+
+@test
+async fn violations_close_with_their_codes() -> Result<void, TestFailure> {
+    // An unmasked frame from a client: 1002.
+    var unmasked = Vector<u8>.create();
+    pushed(Frames.writeHead(mut unmasked, true, false, Opcode.Text, 1, null))?;
+    pushed(unmasked.push(97))?;
+    await violationIs(unmasked, options(), "C1002/1002")?;
+    // Text that is not UTF-8: 1007.
+    var bad = Vector<u8>.create();
+    let overlong = [0xC0u8, 0x80];
+    clientFrame(mut bad, Opcode.Text, true, overlong[..])?;
+    await violationIs(bad, options(), "C1007/1007")?;
+    // A message over the limit: 1009.
+    var big = Vector<u8>.create();
+    clientFrame(mut big, Opcode.Binary, true, "0123456789".bytes())?;
+    var small = options();
+    small.maxMessageBytes = 8;
+    await violationIs(big, small, "C1009/1009")?;
+    // A Close with a code that must not be sent: 1002.
+    var reserved = Vector<u8>.create();
+    let p = closePayload(1005);
+    clientFrame(mut reserved, Opcode.Close, true, p[..])?;
+    return await violationIs(reserved, options(), "C1002/1002");
+}
+
+@test
+async fn keep_alive_and_the_peer_leaving() -> Result<void, TestFailure> {
+    // A quiet peer gets a ping after pingIntervalMs; one that never answers is closed with 1011 after pongTimeoutMs.
+    var opts = options();
+    opts.pingIntervalMs = 100;
+    opts.pongTimeoutMs = 100;
+    var quiet = peer(Vector<u8>.create(), 1000, null);
+    let before = Timer.now();
+    let code = await session(mut quiet, upgradeText(), opts, Script.Echo)?;
+    let took = Timer.now() - before;
+    Check.equalU64(1011, code as u64)?;
+    let w = written(quiet.output)?;
+    Check.equalBytes("PC1011".bytes(), w.frames.view())?;
+    Check.isTrue(took >= 200 && took < 2000, "a ping at 100 ms, the close at 200 ms")?;
+
+    // A peer heard from at 0 ms (an unsolicited pong) gets its ping at 100 ms; it leaves at 150 ms, before the pong
+    // deadline, so the session ends with 1006 and no Close.
+    var answering = Vector<u8>.create();
+    clientFrame(mut answering, Opcode.Pong, true, "".bytes())?;
+    var b = peer(answering, 1000, Some(Timer.now() + 150));
+    Check.equalU64(1006, await session(mut b, upgradeText(), opts, Script.Echo)? as u64)?;
+    let wb = written(b.output)?;
+    return Check.equalBytes("P".bytes(), wb.frames.view());
+}
+
+@test
+async fn messages_from_another_task() -> Result<void, TestFailure> {
+    var conn = peer(Vector<u8>.create(), 1000, Some(Timer.now() + 200));
+    let code = await session(mut conn, upgradeText(), options(), Script.FromAnotherTask)?;
+    Check.equalU64(1006, code as u64)?;
+    let w = written(conn.output)?;
+    return Check.equalBytes("T[a]T[b]T[c]".bytes(), w.frames.view());
+}
+
+@test
+async fn fragments_and_the_servers_close() -> Result<void, TestFailure> {
+    // The server sends "fragmented" in 4-byte fragments, then closes; the client's Close ends it.
+    var reply = Vector<u8>.create();
+    let p = closePayload(1000);
+    clientFrame(mut reply, Opcode.Close, true, p[..])?;
+    var opts = options();
+    opts.fragmentBytes = 4;
+    var conn = peer(reply, 1000, null);
+    Check.equalU64(1000, await session(mut conn, upgradeText(), opts, Script.SendThenClose)? as u64)?;
+    let all = conn.output.view();
+    let w = written(conn.output)?;
+    Check.equalBytes("T[fragmented]C1000".bytes(), w.frames.view())?;
+    Check.isTrue(containsHex(all, "01 04 66 72 61 67")?, "the first fragment: Text, no FIN")?;
+    Check.isTrue(containsHex(all, "00 04 6d 65 6e 74")?, "a continuation")?;
+    Check.isTrue(containsHex(all, "80 02 65 64")?, "the last: FIN")?;
+
+    // A client that never answers the Close: closeTimeoutMs, then 1006.
+    var silent = peer(Vector<u8>.create(), 1000, null);
+    var quick = options();
+    quick.closeTimeoutMs = 100;
+    return Check.equalU64(1006, await session(mut silent, upgradeText(), quick, Script.SendThenClose)? as u64);
+}
+
+@test
+async fn compressed_echo() -> Result<void, TestFailure> {
+    // The client offers permessage-deflate and sends a compressed "Hello"; the echo comes back compressed.
+    let head = "GET /chat HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    var input = Vector<u8>.create();
+    let mask = [1u8, 2, 3, 4];
+    let hello = hex("f248cdc9c90700")?;
+    pushed(Frames.writeHead(mut input, true, true, Opcode.Text, hello.length as u64, Some(mask)))?;
+    pushed(Frames.appendMasked(mut input, hello.view(), mask, 0))?;
+    let close = closePayload(1000);
+    clientFrame(mut input, Opcode.Close, true, close[..])?;
+    var conn = peer(input, 1000, null);
+    Check.equalU64(1000, await session(mut conn, head, options(), Script.Echo)? as u64)?;
+    var end: usize = 0;
+    while (end + 3 < conn.output.length) {
+        if (conn.output[end] == 13 && conn.output[end + 1] == 10 && conn.output[end + 2] == 13 && conn.output[end + 3] == 10) {
+            break;
+        }
+        end += 1;
+    }
+    let all = conn.output.view();
+    Check.isTrue(contains(all[0..end], "sec-websocket-extensions: permessage-deflate\r\n"), "agreed")?;
+    Check.equalU64(0xC1, all[end + 4] as u64)?; // FIN, RSV1, Text
+    let frames = readAllWith(all[end + 4..], conn.output.length, Role.Client, 1048576, 1048576, true)?;
+    return Check.equalBytes("T[Hello]C1000".bytes(), frames.view());
+}

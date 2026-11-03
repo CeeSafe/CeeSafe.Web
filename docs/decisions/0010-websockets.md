@@ -199,3 +199,26 @@ cross-site WebSocket hijacking by default.
 2. **permessage-deflate:** in pure CeeSafe, in M6.
 3. **A client:** yes, in `web_client`, with Autobahn's fuzzingserver.
 4. **Origins:** same-origin by default, with an allow-list.
+
+## 7. Amendment 1 (2026-11-03, M6 stages 2 and 3, as built)
+
+1. **The switch (§3.2)** is `Exchange.switchProtocols(protocol)`.
+   - It sets 101 and adds `upgrade: <protocol>` and `connection: upgrade` through `ResponseHead.upgradeTo`, since
+     handlers may not set `Connection`.
+   - It sends the head with the handler's other fields, and marks the exchange done and the connection not
+     reusable.
+   - Then `readRaw(buffer)` gives the bytes received after the head first, and `writeRaw(bytes)` writes within
+     `Limits.writeTimeoutMs`. `switched()` tells a driver which path was taken.
+2. **`accept(exchange, request, options, secure)`.**
+   - It takes the request separately: handlers receive it beside the exchange.
+   - It takes `secure` from the application, because neither the exchange nor the connection context records TLS.
+3. **permessage-deflate (§3.5).**
+   - The compressor writes one fixed-Huffman block per message and keeps no context, which RFC 7692 §7.2.2 allows
+     whatever the agreement. It respects `server_max_window_bits` (8-15).
+   - The inflater always keeps a 15-bit window, so any client window works, and the response never names
+     `client_max_window_bits`.
+   - The response repeats `server_no_context_takeover`, `client_no_context_takeover` and `server_max_window_bits`
+     when they were offered.
+   - With `client_no_context_takeover`, the inflater drops its window after each message.
+   - A compressed message is collected whole and inflated at its end, bounded by `maxMessageBytes` (1009 past it,
+     1007 if it does not inflate). Its text is checked after inflating.

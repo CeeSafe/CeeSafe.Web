@@ -1,0 +1,287 @@
+// A mutational fuzzer for web_ws's engine (Web ADR 0010 §5: the frame reader and permessage-deflate under the
+// sanitizers). Built natively with ASan and UBSan; CEESAFE_ALLOC_REPORT=1 checks that nothing leaks.
+//
+//   CW_FUZZ_SECONDS (default 60), CW_FUZZ_SEED (default 1)
+//
+// Invariants, none needing the code under test as its own oracle:
+//  1. the message reader yields the same events (and the same violation) fed whole or in random pieces, in both
+//     roles, with and without permessage-deflate;
+//  2. deflate then inflate gives back the input, for random data with repeats and a random window (8-15 bits);
+//  3. damaged compressed data never panics, never inflates past the limit, and inflates the same way twice;
+//  4. the UTF-8 validator, fed in random pieces, agrees with lib/std's StringView.fromUtf8.
+// A broken invariant prints the input in hex and exits 1; a panic or a sanitizer report ends the run by itself.
+import web_core;
+import web_ws;
+
+/// xorshift64*.
+struct Rng {
+    s: u64;
+    fn next(borrow mut this) -> u64 {
+        this.s = this.s ^ (this.s >> 12);
+        this.s = this.s ^ (this.s << 25);
+        this.s = this.s ^ (this.s >> 27);
+        return this.s.wrappingMul(2685821657736338717);
+    }
+    fn below(borrow mut this, n: u64) -> u64 => if (n == 0) 0 else this.next() % n;
+}
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    var v: u64 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57) {
+            return otherwise;
+        }
+        v = v * 10 + (b - 48) as u64;
+    }
+    return v;
+}
+
+fn fail(what: StringView, input: Slice<u8>) {
+    Console.writeLine("fuzz_ws: invariant broken:");
+    Console.writeLine(what);
+    var line = Vector<u8>.create();
+    let digits = "0123456789abcdef".bytes();
+    for (b in input) {
+        let a = line.push(digits[(b >> 4) as usize]);
+        let c = line.push(digits[(b & 15) as usize]);
+    }
+    match (StringView.fromUtf8(line.view())) {
+        Some(t) => { Console.writeLine(t); }
+        null => {}
+    }
+    Process.exit(1);
+}
+
+/// A frame stream to start from: a few frames of each kind, masked or not for `role`, compressed or not.
+fn seedFrames(rng: borrow mut Rng, role: Role, deflate: bool, out: borrow mut Vector<u8>) {
+    let n = 1 + rng.below(5);
+    let deflater = Deflater.create(15);
+    for (k in 0..n) {
+        let kind = rng.below(6);
+        var payload = Vector<u8>.create();
+        let length = rng.below(if (kind >= 3) 40 else 300);
+        for (i in 0..length) {
+            let p = payload.push(if (rng.below(3) == 0) truncate<u8>(rng.next()) else 97 + truncate<u8>(rng.below(4)));
+        }
+        let opcode = match (kind) {
+            0 => Opcode.Text,
+            1 => Opcode.Binary,
+            2 => Opcode.Continuation,
+            3 => Opcode.Ping,
+            4 => Opcode.Pong,
+            _ => Opcode.Close,
+        };
+        var body = Vector<u8>.create();
+        let compress = deflate && kind < 2 && rng.below(2) == 0;
+        if (compress) {
+            let c = deflater.compress(payload.view(), mut body);
+        } else {
+            for (b in payload.view()) {
+                let p = body.push(b);
+            }
+        }
+        let fin = rng.below(4) != 0;
+        let mask: [u8; 4]? = match (role) {
+            Role.Server => Some([truncate<u8>(rng.next()), 7, 9, 200]),
+            Role.Client => null,
+        };
+        let h = Frames.writeHead(out, fin, compress, opcode, body.length as u64, mask);
+        match (mask) {
+            Some(m) => { let a = Frames.appendMasked(out, body.view(), m, 0); }
+            null => {
+                for (b in body.view()) {
+                    let p = out.push(b);
+                }
+            }
+        }
+    }
+}
+
+fn mutate(rng: borrow mut Rng, data: borrow mut Vector<u8>) {
+    let n = rng.below(4);
+    for (k in 0..n) {
+        if (data.length == 0) {
+            return;
+        }
+        let at = rng.below(data.length as u64) as usize;
+        match (rng.below(4)) {
+            0 => { data[at] = data[at] ^ (1u8 << truncate<u32>(rng.below(8))); }
+            1 => { data[at] = truncate<u8>(rng.next()); }
+            2 => { data.truncate(at); }
+            _ => { data[at] = 0xFF; }
+        }
+    }
+}
+
+/// The reader's events over `input`, fed in pieces whose sizes come from `rng` (one piece if null).
+fn events(input: Slice<u8>, role: Role, deflate: bool, rng: borrow mut Rng, whole: bool, log: borrow mut Vector<u8>) {
+    var reader = MessageReader.create(role, 4096, 8192);
+    if (deflate) {
+        reader.enableDeflate(true);
+    }
+    var buffer = match (OwnedBuffer.create(input.length + 16)) {
+        Ok(b) => b,
+        Err(_) => { return; },
+    };
+    var message = Vector<u8>.create();
+    var at: usize = 0;
+    while (at < input.length) {
+        let n = if (whole) input.length - at else 1 + rng.below((input.length - at) as u64) as usize;
+        let a = buffer.append(input[at..at + n]);
+        at += n;
+        loop {
+            match (reader.next(mut buffer, mut message)) {
+                Ok(Incoming.NeedMore) => { break; }
+                Ok(Incoming.Message(kind)) => {
+                    let p = log.push(match (kind) {
+                        MessageKind.Text => 84u8,
+                        MessageKind.Binary => 66u8,
+                    });
+                    for (b in message.view()) {
+                        let q = log.push(b);
+                    }
+                }
+                Ok(Incoming.Ping) => { let p = log.push(80); }
+                Ok(Incoming.Pong) => { let p = log.push(79); }
+                Ok(Incoming.Close(code)) => {
+                    let p = log.push(67);
+                    let q = log.push(truncate<u8>(code >> 8));
+                    let r = log.push(truncate<u8>(code));
+                }
+                Err(code) => {
+                    let p = log.push(69);
+                    let q = log.push(truncate<u8>(code >> 8));
+                    let r = log.push(truncate<u8>(code));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn readerCase(rng: borrow mut Rng) {
+    let role = if (rng.below(2) == 0) Role.Server else Role.Client;
+    let deflate = rng.below(2) == 0;
+    var input = Vector<u8>.create();
+    seedFrames(rng, role, deflate, mut input);
+    mutate(rng, mut input);
+    var a = Vector<u8>.create();
+    var b = Vector<u8>.create();
+    events(input.view(), role, deflate, rng, true, mut a);
+    events(input.view(), role, deflate, rng, false, mut b);
+    if (!same(a.view(), b.view())) {
+        fail("1: the reader differs fed whole and in pieces", input.view());
+    }
+}
+
+fn deflateCase(rng: borrow mut Rng) {
+    var input = Vector<u8>.create();
+    let length = rng.below(20000);
+    while (input.length < length as usize) {
+        if (input.length > 3 && rng.below(3) == 0) {
+            let back = 1 + rng.below(input.length as u64) as usize;
+            let run = 3 + rng.below(300) as usize;
+            for (k in 0..run) {
+                let b = input[input.length - back];
+                let p = input.push(b);
+            }
+        } else {
+            let p = input.push(truncate<u8>(rng.below(if (rng.below(2) == 0) 4 else 256)));
+        }
+    }
+    let bits = 8 + truncate<u32>(rng.below(8));
+    var packed = Vector<u8>.create();
+    let c = Deflater.create(bits).compress(input.view(), mut packed);
+    for (b in [0u8, 0, 0xFF, 0xFF]) {
+        let p = packed.push(b);
+    }
+    var inflater = Inflater.create(bits, false);
+    var out = Vector<u8>.create();
+    match (inflater.inflate(packed.view(), mut out, 1 << 24)) {
+        Ok() => {
+            if (!same(input.view(), out.view())) {
+                fail("2: deflate then inflate changed the data", input.view());
+            }
+        }
+        Err(_) => { fail("2: our deflate output did not inflate", input.view()); }
+    }
+    // 3: damaged.
+    mutate(rng, mut packed);
+    var x = Vector<u8>.create();
+    var y = Vector<u8>.create();
+    var i1 = Inflater.create(15, false);
+    var i2 = Inflater.create(15, false);
+    let r1 = match (i1.inflate(packed.view(), mut x, 30000)) {
+        Ok() => 0,
+        Err(InflateError.Corrupt) => 1,
+        Err(InflateError.TooBig) => 2,
+        Err(InflateError.OutOfMemory) => 3,
+    };
+    let r2 = match (i2.inflate(packed.view(), mut y, 30000)) {
+        Ok() => 0,
+        Err(InflateError.Corrupt) => 1,
+        Err(InflateError.TooBig) => 2,
+        Err(InflateError.OutOfMemory) => 3,
+    };
+    if (x.length > 30000 || r1 != r2 || !same(x.view(), y.view())) {
+        fail("3: damaged data inflated past the limit or differently twice", packed.view());
+    }
+}
+
+fn utf8Case(rng: borrow mut Rng) {
+    var input = Vector<u8>.create();
+    let length = rng.below(24);
+    for (i in 0..length) {
+        let kind = rng.below(4);
+        let p = input.push(if (kind == 0) truncate<u8>(rng.below(128)) else if (kind == 1) 0x80 + truncate<u8>(
+            rng.below(64),
+        ) else if (kind == 2) 0xC0 + truncate<u8>(rng.below(64)) else truncate<u8>(rng.next()));
+    }
+    var v = Utf8Validator.create();
+    var ok = true;
+    var at: usize = 0;
+    while (at < input.length && ok) {
+        let n = 1 + rng.below((input.length - at) as u64) as usize;
+        ok = v.feed(input[at..at + n]);
+        at += n;
+    }
+    ok = ok && v.complete();
+    let oracle = match (StringView.fromUtf8(input.view())) {
+        Some(_) => true,
+        null => false,
+    };
+    if (ok != oracle) {
+        fail("4: the UTF-8 validator disagrees with StringView.fromUtf8", input.view());
+    }
+}
+
+fn main() {
+    let seconds = setting("CW_FUZZ_SECONDS", 60);
+    var rng = Rng { s: setting("CW_FUZZ_SEED", 1).wrappingMul(2654435761).wrappingAdd(1) };
+    let started = Timer.now();
+    var cases: u64 = 0;
+    while (Timer.now() - started < seconds * 1000) {
+        readerCase(mut rng);
+        deflateCase(mut rng);
+        utf8Case(mut rng);
+        cases += 1;
+    }
+    Console.writeLine("fuzz_ws: clean");
+    Console.writeLine(cases);
+}

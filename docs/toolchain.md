@@ -15,6 +15,7 @@ that needs an unreleased compiler is not merged to main.
 | M3 streaming and SSE | **0.9.2** | everything M2 needs; nothing new (U13 is wanted for `DropOldest`) | gate passed (`docs/milestones/M3.md`) |
 | M4 TLS | 0.9.2 | U8 manifest `links` (OpenSSL, ADR 0047), released in 0.8.0; built and tested on 0.9.2 | done (`docs/milestones/M4.md`) |
 | M5 client | 0.9.4 | U5 DNS (ADR 0048), released in 0.8.0; B15 (`dyn I + Send` async frames), fixed in 0.9.4 | done (`docs/milestones/M5.md`) |
+| M6 WebSockets | 0.9.4 | nothing new for the server; the client needs U16 (random bytes) | server done; client waits for U16 (`docs/milestones/M6.md`) |
 | M9 sendfile | 0.9.0 | U7 (ADR 0051) | released |
 | M10 HTTP/3 | 0.9.0 | U6 UDP (ADR 0050) | released |
 
