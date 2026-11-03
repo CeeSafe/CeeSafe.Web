@@ -1,0 +1,216 @@
+// Trusted proxies and forwarding fields (Web ADR 0012 §3.4). Expected values: RFC 7239 §4 and §6's examples for
+// `Forwarded`, RFC 4632's prefix arithmetic for the blocks, and §3.4's rules (the right-most untrusted address is the
+// client; a field from an untrusted peer is replaced, never extended) for the rest.
+import web_core;
+import web_http;
+
+/// `lines` (`name: value`, one per line) as a header list over `text`, which must outlive it.
+fn listOf<region r>(text: Slice<r, u8>) -> Result<HeaderList<r>, TestFailure> {
+    var list = HeaderList.create(text);
+    var start: usize = 0;
+    for (i in 0..text.length) {
+        if (text[i] != 10) {
+            continue;
+        }
+        var colon = start;
+        while (text[colon] != 58) {
+            colon += 1;
+        }
+        match (list.push(start, colon, colon + 2, i, 64)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("a field")); }
+        }
+        start = i + 1;
+    }
+    return Ok(list);
+}
+
+fn ip(text: StringView) -> Result<SocketAddress, TestFailure> {
+    match (SocketAddresses.parseIp(text, 0)) {
+        Some(a) => { return Ok(a); }
+        null => { return Err(TestFailure.create("an address")); }
+    }
+}
+
+fn block(text: StringView) -> Result<Cidr, TestFailure> {
+    match (Cidr.parse(text.bytes())) {
+        Some(c) => { return Ok(c); }
+        null => { return Err(TestFailure.create("a block")); }
+    }
+}
+
+fn trusting(text: StringView) -> Result<TrustedProxies, TestFailure> {
+    var t = TrustedProxies.none();
+    match (t.add(text)) {
+        Ok(true) => { return Ok(t); }
+        _ => { return Err(TestFailure.create("a trusted block")); }
+    }
+}
+
+fn sameAddress(a: SocketAddress, b: SocketAddress) -> bool {
+    var x = Vector<u8>.create();
+    var y = Vector<u8>.create();
+    match (ipText(a, mut x)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (ipText(b, mut y)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    return Ascii.sameIgnoringCase(x.view(), y.view()) && a.port() == b.port();
+}
+
+@test
+fn blocks_rfc4632() -> Result<void, TestFailure> {
+    let ten = block("10.0.0.0/8")?;
+    Check.isTrue(ten.contains(ip("10.255.0.1")?), "10.255.0.1 in 10/8")?;
+    Check.isTrue(!ten.contains(ip("11.0.0.0")?), "11.0.0.0 not in 10/8")?;
+    Check.isTrue(ten.contains(ip("::ffff:10.1.2.3")?), "an IPv4-mapped address as IPv4")?;
+    let half = block("192.168.1.0/25")?;
+    Check.isTrue(half.contains(ip("192.168.1.127")?), ".127 in /25")?;
+    Check.isTrue(!half.contains(ip("192.168.1.128")?), ".128 not in /25")?;
+    let doc = block("2001:db8::/32")?;
+    Check.isTrue(doc.contains(ip("2001:db8:ffff::1")?), "in 2001:db8::/32")?;
+    Check.isTrue(!doc.contains(ip("2001:db9::")?), "2001:db9:: not in it")?;
+    Check.isTrue(!doc.contains(ip("10.0.0.1")?), "no IPv4 in an IPv6 block")?;
+    let one = block("192.0.2.1")?;
+    Check.isTrue(one.contains(ip("192.0.2.1")?) && !one.contains(ip("192.0.2.2")?), "an address is a /32")?;
+    let all = block("0.0.0.0/0")?;
+    Check.isTrue(all.contains(ip("203.0.113.9")?), "/0 holds every IPv4 address")?;
+    for (k in 0..5u32) {
+        let bad = match (k) {
+            0 => "10.0.0.0/33",
+            1 => "::/129",
+            2 => "example.com",
+            3 => "fe80::1%2/64",
+            _ => "10.0.0.0/",
+        };
+        match (Cidr.parse(bad.bytes())) {
+            Some(_) => { return Check.fail("a bad block was accepted"); }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// RFC 7239 §4's examples, and §6's rule that an IPv6 node is quoted.
+@test
+fn forwarded_rfc7239_4() -> Result<void, TestFailure> {
+    let text = "Forwarded: for=\"_gazonk\"\nForwarded: For=\"[2001:db8:cafe::17]:4711\"\nForwarded: for=192.0.2.60;proto=http;by=203.0.113.43\nForwarded: for=192.0.2.43, for=198.51.100.17\nForwarded: for=[2001:db8::1]\nForwarded: proto=https\n";
+    let bytes = text.bytes();
+    let list = listOf(bytes)?;
+    let hops = match (Hops.fromForwarded(list)) {
+        Ok(h) => h,
+        Err(_) => { return Check.fail("out of memory"); },
+    };
+    Check.equalU64(7, hops.count() as u64)?;
+    match (hops.hop(0)) {
+        Hop.Hidden => {}
+        _ => { return Check.fail("_gazonk is hidden"); }
+    }
+    match (hops.hop(1)) {
+        Hop.Address(a) => {
+            Check.isTrue(sameAddress(a, ip("2001:db8:cafe::17")?.withPort(4711)), "[2001:db8:cafe::17]:4711")?;
+        }
+        _ => { return Check.fail("an IPv6 node with a port"); }
+    }
+    match (hops.hop(2)) {
+        Hop.Address(a) => { Check.isTrue(sameAddress(a, ip("192.0.2.60")?), "192.0.2.60")?; }
+        _ => { return Check.fail("for= among other parameters"); }
+    }
+    match (hops.hop(4)) {
+        Hop.Address(a) => { Check.isTrue(sameAddress(a, ip("198.51.100.17")?), "the second of a list")?; }
+        _ => { return Check.fail("a list"); }
+    }
+    match (hops.hop(5)) {
+        Hop.Malformed => {}
+        _ => { return Check.fail("an unquoted IPv6 node"); }
+    }
+    match (hops.hop(6)) {
+        Hop.Malformed => { return Ok(); }
+        _ => { return Check.fail("an element without for="); }
+    }
+}
+
+fn clientIs(
+    peer: StringView,
+    fields: StringView,
+    trusted: borrow TrustedProxies,
+    source: ForwardedSource,
+) -> Result<ClientIs, TestFailure> {
+    let bytes = fields.bytes();
+    let list = listOf(bytes)?;
+    match (clientOf(Some(ip(peer)?), list, trusted, source)) {
+        Ok(c) => { return Ok(c); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn isAddress(c: ClientIs, expected: StringView) -> Result<void, TestFailure> {
+    match (c) {
+        ClientIs.Address(a) => { return Check.isTrue(sameAddress(a, ip(expected)?), "the client's address"); }
+        _ => { return Check.fail("not an address"); }
+    }
+}
+
+/// The plan's exit criterion: a spoofed `X-Forwarded-For` from an untrusted peer is ignored; past trusted proxies the
+/// right-most untrusted address is the client.
+@test
+fn the_client_is_the_rightmost_untrusted_address() -> Result<void, TestFailure> {
+    let trusted = trusting("10.0.0.0/8")?;
+    let first = ForwardedSource.ForwardedFirst;
+    // An untrusted peer: its fields are not believed.
+    isAddress(clientIs("198.51.100.9", "X-Forwarded-For: 1.2.3.4\nForwarded: for=5.6.7.8\n", trusted, first)?,
+        "198.51.100.9")?;
+    // A trusted peer: right to left past trusted hops; a spoof at the left is not reached.
+    isAddress(clientIs("10.0.0.1", "X-Forwarded-For: 1.1.1.1, 203.0.113.7, 10.0.0.2\n", trusted, first)?,
+        "203.0.113.7")?;
+    // Several fields are one list.
+    isAddress(clientIs("10.0.0.1", "X-Forwarded-For: 203.0.113.7\nX-Forwarded-For: 10.0.0.2\n", trusted, first)?,
+        "203.0.113.7")?;
+    // Every hop trusted: the left-most.
+    isAddress(clientIs("10.0.0.1", "X-Forwarded-For: 10.0.0.3, 10.0.0.2\n", trusted, first)?, "10.0.0.3")?;
+    // A malformed hop ends the walk: the last trusted address.
+    isAddress(clientIs("10.0.0.1", "X-Forwarded-For: 203.0.113.7, garbage, 10.0.0.2\n", trusted, first)?, "10.0.0.2")?;
+    // A hidden hop is the client, unnamed.
+    match (clientIs("10.0.0.1", "Forwarded: for=unknown, for=10.0.0.2\n", trusted, first)?) {
+        ClientIs.Hidden => {}
+        _ => { return Check.fail("a hidden client"); }
+    }
+    // Both fields: the configured one wins.
+    let both = "Forwarded: for=203.0.113.7\nX-Forwarded-For: 192.0.2.99\n";
+    isAddress(clientIs("10.0.0.1", both, trusted, first)?, "203.0.113.7")?;
+    return isAddress(clientIs("10.0.0.1", both, trusted, ForwardedSource.XForwardedForFirst)?, "192.0.2.99");
+}
+
+fn fieldsFor(peer: StringView, fields: StringView, trusted: borrow TrustedProxies, host: StringView) -> Result<ForwardingFields, TestFailure> {
+    let bytes = fields.bytes();
+    let list = listOf(bytes)?;
+    match (forwardingFields(Some(ip(peer)?), list, trusted, "https", host.bytes(), true, true)) {
+        Ok(f) => { return Ok(f); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+/// What goes upstream: from an untrusted peer, fresh fields naming it; from a trusted one, its chain extended.
+@test
+fn forwarding_fields_sent_upstream() -> Result<void, TestFailure> {
+    let trusted = trusting("10.0.0.0/8")?;
+    let spoof = "X-Forwarded-For: 1.2.3.4\nForwarded: for=1.2.3.4\nX-Forwarded-Proto: http\nX-Forwarded-Host: evil.test\n";
+    let fresh = fieldsFor("198.51.100.9", spoof, trusted, "example.com")?;
+    Check.equalBytes("for=198.51.100.9;proto=https;host=example.com".bytes(), fresh.forwarded.view())?;
+    Check.equalBytes("198.51.100.9".bytes(), fresh.forwardedFor.view())?;
+    Check.equalBytes("https".bytes(), fresh.forwardedProto.view())?;
+    Check.equalBytes("example.com".bytes(), fresh.forwardedHost.view())?;
+    let chain = "Forwarded: for=203.0.113.7;proto=https\nX-Forwarded-For: 203.0.113.7\nX-Forwarded-Proto: https\n";
+    let extended = fieldsFor("10.0.0.1", chain, trusted, "example.com:8080")?;
+    Check.equalBytes("for=203.0.113.7;proto=https, for=10.0.0.1;proto=https;host=\"example.com:8080\"".bytes(),
+        extended.forwarded.view())?;
+    Check.equalBytes("203.0.113.7, 10.0.0.1".bytes(), extended.forwardedFor.view())?;
+    Check.equalBytes("https".bytes(), extended.forwardedProto.view())?;
+    // An IPv6 peer is quoted and bracketed in Forwarded (RFC 7239 §6), bare in X-Forwarded-For.
+    let six = fieldsFor("2001:db8::1", "", TrustedProxies.none(), "example.com")?;
+    Check.equalBytes("for=\"[2001:db8::1]\";proto=https;host=example.com".bytes(), six.forwarded.view())?;
+    return Check.equalBytes("2001:db8::1".bytes(), six.forwardedFor.view());
+}

@@ -1,2 +1,2 @@
-// web_proxy: Reverse proxy: upstream pools, forwarding headers, PROXY protocol, relay.
-// Milestone M8 (docs/implementation-plan.md). Empty until then.
+// web_proxy: the reverse proxy (Web ADR 0012): forwarding fields and trusted proxies, the PROXY protocol, upstreams
+// with balancing and health, and the relay. Milestone M8 (docs/implementation-plan.md).
