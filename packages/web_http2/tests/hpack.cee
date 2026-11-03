@@ -1,6 +1,8 @@
 // HPACK (RFC 7541) against the RFC's own examples: Appendix C.1's integers, C.2-C.6's blocks (rfc7541.cee, generated
 // from the RFC's text), and Huffman strings from C.4's and C.6's decoding walkthroughs. The encoder is checked by
 // decoding what it writes back to the RFC's header lists.
+import web_http;
+
 
 fn grew(r: Result<void, AllocError>) -> Result<void, TestFailure> {
     match (r) {

@@ -1,5 +1,6 @@
 // HPACK (RFC 7541): the decoder, with the dynamic table and size updates, and an encoder that uses the static table
 // only (Web ADR 0011). Sans-I/O: blocks in, fields out.
+import web_http;
 
 /// Why a header block could not be decoded. Every one is a connection error, COMPRESSION_ERROR (RFC 9113 §4.3), except
 /// `TooLarge`, after which the block was still decoded, so the dynamic table stays in step with the peer's.
@@ -17,78 +18,6 @@ public enum HpackError {
     /// The decoded list is larger than the limit (RFC 9113 §6.5.2: each field counts its name, value and 32).
     TooLarge,
     OutOfMemory,
-}
-
-/// Where one field's name and value are in a `HeaderBlock`'s bytes.
-public struct FieldSpan {
-    public nameAt: u32;
-    public nameLength: u32;
-    public valueAt: u32;
-    public valueLength: u32;
-    /// Sent as "never indexed" (§6.2.3): an intermediary must forward it the same way.
-    public sensitive: bool;
-}
-
-/// A decoded header list: the fields in order, their bytes in one buffer.
-@noncopy
-public struct HeaderBlock {
-    private bytes: Vector<u8>;
-    private spans: Vector<FieldSpan>;
-    private listSize: u64;
-
-    /// An empty list.
-    public fn create() -> HeaderBlock =>
-        HeaderBlock { bytes: Vector<u8>.create(), spans: Vector<FieldSpan>.create(), listSize: 0 };
-
-    /// Empties the list, keeping its memory.
-    public fn clear(borrow mut this) {
-        this.bytes.clear();
-        this.spans.clear();
-        this.listSize = 0;
-    }
-
-    /// How many fields.
-    public fn count(borrow this) -> usize => this.spans.length;
-
-    /// The `i`th field's name.
-    public fn name(borrow this, i: usize) -> Slice<u8> {
-        let s = this.spans[i];
-        let all = this.bytes.view();
-        return all[s.nameAt as usize..(s.nameAt + s.nameLength) as usize];
-    }
-
-    /// The `i`th field's value.
-    public fn value(borrow this, i: usize) -> Slice<u8> {
-        let s = this.spans[i];
-        let all = this.bytes.view();
-        return all[s.valueAt as usize..(s.valueAt + s.valueLength) as usize];
-    }
-
-    /// The `i`th field's span.
-    public fn span(borrow this, i: usize) -> FieldSpan => this.spans[i];
-
-    /// The list's size as RFC 9113 §6.5.2 counts it: each field's name and value, plus 32.
-    public fn size(borrow this) -> u64 => this.listSize;
-
-    /// All the names and values, which the spans index.
-    public fn allBytes(borrow this) -> Slice<u8> => this.bytes.view();
-
-    /// Appends a field.
-    public fn push(borrow mut this, name: Slice<u8>, value: Slice<u8>, sensitive: bool) -> Result<void, AllocError> {
-        let nameAt = this.bytes.length;
-        appendAll(mut this.bytes, name)?;
-        let valueAt = this.bytes.length;
-        appendAll(mut this.bytes, value)?;
-        this.spans.push(FieldSpan {
-            nameAt: truncate<u32>(nameAt),
-            nameLength: truncate<u32>(name.length),
-            valueAt: truncate<u32>(valueAt),
-            valueLength: truncate<u32>(value.length),
-            sensitive: sensitive,
-        })?;
-        this.listSize += name.length as u64 + value.length as u64 + 32;
-        return Ok();
-    }
 }
 
 /// One dynamic table entry.

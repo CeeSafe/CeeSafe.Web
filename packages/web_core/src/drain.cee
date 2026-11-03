@@ -4,28 +4,36 @@
 /// A server's drain: once started, every task waiting on it wakes, and every later check sees it. One drain serves any
 /// number of waiters (unlike CeeSafe's `AsyncSignal`, which wakes one task): it is a channel that is never sent to
 /// and is closed to start the drain, so each waiter's `recvAsync` sees the end (`tests/probes/drain-broadcast.cee`).
-/// It is shared by borrow; starting it is idempotent and has no effects, so a signal handler's task may call it.
+/// It is shared by borrow, or, for a task that may hold no loan (an HTTP/2 stream's), by `share`; starting it is
+/// idempotent and has no effects, so a signal handler's task may call it.
 @noncopy
 public struct Drain {
     private channel: Channel<u8>;
-    private started: AtomicBool;
+    private started: Arc<AtomicBool>;
 
-    /// A drain not started. Allocates the channel once.
+    /// A drain not started. Allocates the channel and the flag once.
     public fn create() -> Result<Drain, NetError> {
-        match (Channel<u8>.create(1)) {
-            Ok(c) => { return Ok(Drain { channel: c, started: AtomicBool.create(false) }); }
+        let channel = match (Channel<u8>.create(1)) {
+            Ok(c) => c,
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+        };
+        match (Arc<AtomicBool>.create(AtomicBool.create(false))) {
+            Ok(flag) => { return Ok(Drain { channel: channel, started: flag }); }
             Err(e) => { return Err(NetErrors.fromAlloc(e)); }
         }
     }
 
+    /// Another handle to the same drain: started when it is, waking with it.
+    public fn share(borrow this) -> Drain => Drain { channel: this.channel.clone(), started: this.started.clone() };
+
     /// Starts the drain: wakes every waiter. Calling it again does nothing more.
     public fn start(borrow this) {
-        this.started.store(true);
+        this.started.get().store(true);
         this.channel.close();
     }
 
     /// Whether the drain has started.
-    public fn isDraining(borrow this) -> bool => this.started.load();
+    public fn isDraining(borrow this) -> bool => this.started.get().load();
 
     /// Waits until the drain starts (at once if it has). `Err(Cancelled)` if the task is cancelled first.
     public async fn wait(borrow this) -> Result<void, NetError> {

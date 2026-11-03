@@ -1,6 +1,7 @@
 // The connection state machine against RFC 9113's rules (each check cites its section): frames are written by hand as a
 // client would send them, and the expected events, frames back and error codes follow from the RFC's text.
 import web_core;
+import web_http;
 
 /// A client's frame.
 fn frame(out: borrow mut Vector<u8>, kind: u8, flags: u8, stream: u32, payload: Slice<u8>) -> Result<void, TestFailure> {

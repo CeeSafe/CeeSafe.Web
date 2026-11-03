@@ -17,6 +17,21 @@ public struct PeerIdentity {
         namesText: Vector<u8>.create(),
     };
 
+    /// A copy, for a task that cannot borrow the connection's (an HTTP/2 stream's).
+    public fn copy(borrow this) -> Result<PeerIdentity, AllocError> {
+        var c = PeerIdentity.empty();
+        for (b in this.der.view()) {
+            c.der.push(b)?;
+        }
+        for (b in this.subjectText.view()) {
+            c.subjectText.push(b)?;
+        }
+        for (b in this.namesText.view()) {
+            c.namesText.push(b)?;
+        }
+        return Ok(c);
+    }
+
     /// Whether there is none.
     public fn isEmpty(borrow this) -> bool => this.der.length == 0;
 

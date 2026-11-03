@@ -35,11 +35,17 @@ enum BodyState {
     Done,
     Length,
     Chunked,
+    /// A multiplexed stream's: read through its `StreamSink` until it ends.
+    Stream,
 }
 
 /// One request's body and response, over its connection.
 public struct Exchange<region r> {
     private conn: borrow mut(r) dyn Transport;
+    /// A multiplexed stream's body and response go through `stream` (Web ADR 0011 §3.2); an HTTP/1.1 exchange's
+    /// through `conn`, with a `NoStream` here.
+    private stream: borrow mut(r) dyn StreamSink;
+    private multiplexed: bool;
     private carry: borrow mut(r) OwnedBuffer;
     private out: borrow mut(r) OwnedBuffer;
     private pending: borrow mut(r) OwnedBuffer;
@@ -69,6 +75,7 @@ public struct Exchange<region r> {
     /// verdict (version and Connection).
     public fn create(
         conn: borrow mut(r) dyn Transport,
+        stream: borrow mut(r) dyn StreamSink,
         carry: borrow mut(r) OwnedBuffer,
         out: borrow mut(r) OwnedBuffer,
         pending: borrow mut(r) OwnedBuffer,
@@ -103,6 +110,8 @@ public struct Exchange<region r> {
         };
         return Exchange {
             conn: conn,
+            stream: stream,
+            multiplexed: false,
             carry: carry,
             out: out,
             pending: pending,
@@ -127,6 +136,54 @@ public struct Exchange<region r> {
         };
     }
 
+    /// An exchange for a request that came on a multiplexed stream (Web ADR 0011 §3.2): its body is read and its
+    /// response written through `stream`. `conn` is a `NoTransport`, and `carry` and `out` are unused; `pending`
+    /// collects the body before the head is sent, as over HTTP/1.1. `hasBody` is false when the request ended with
+    /// its head (END_STREAM).
+    public fn forStream(
+        stream: borrow mut(r) dyn StreamSink,
+        conn: borrow mut(r) dyn Transport,
+        carry: borrow mut(r) OwnedBuffer,
+        out: borrow mut(r) OwnedBuffer,
+        pending: borrow mut(r) OwnedBuffer,
+        response: borrow mut(r) ResponseHead,
+        app: borrow(r) dyn Application,
+        request: borrow(r) Request<r>,
+        limits: borrow(r) Limits,
+        date: borrow mut(r) DateCache,
+        hasBody: bool,
+    ) -> Exchange<r> {
+        pending.clear();
+        response.reset();
+        let decoder = ChunkDecoder.create(limits);
+        return Exchange {
+            conn: conn,
+            stream: stream,
+            multiplexed: true,
+            carry: carry,
+            out: out,
+            pending: pending,
+            response: response,
+            app: app,
+            request: request,
+            limits: limits,
+            date: date,
+            body: if (hasBody) BodyState.Stream else BodyState.Done,
+            left: 0,
+            decoder: decoder,
+            rate: MinRate.off(),
+            continuePending: false,
+            bodyBroken: false,
+            sent: false,
+            framing: ResponseFraming.NoContent,
+            streaming: false,
+            written: 0,
+            keep: false,
+            done: false,
+            upgraded: false,
+        };
+    }
+
     // ---- The request body ----
 
     /// Reads body bytes into `buffer`: at least one, or 0 at the end of the body. The first read sends `100
@@ -142,6 +199,13 @@ public struct Exchange<region r> {
         match (this.body) {
             BodyState.Done => { return Ok(0); }
             _ => {}
+        }
+        if (this.multiplexed) {
+            let n = await this.stream.readBody(buffer)?;
+            if (n == 0) {
+                this.body = BodyState.Done;
+            }
+            return Ok(n);
         }
         if (this.continuePending) {
             this.continuePending = false;
@@ -196,6 +260,7 @@ public struct Exchange<region r> {
                     }
                 }
                 BodyState.Done => { return Ok(0); }
+                BodyState.Stream => { return Ok(0); } // a stream's is read above
             }
         }
     }
@@ -228,6 +293,15 @@ public struct Exchange<region r> {
     /// sends meanwhile are kept for the driver; once that buffer is full this waits until it is cancelled, and a
     /// failed write finds the close instead. Cancelling it loses nothing.
     public async fn peerClosed(borrow mut this) -> Result<void, HandlerError> {
+        if (this.multiplexed) {
+            // A stream's reset cancels its whole task (Web ADR 0011 §3.2), so this only waits to be cancelled.
+            loop {
+                match (await Timer.sleep(3600000)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                }
+            }
+        }
         match (this.body) {
             BodyState.Done => {}
             _ => { return Err(HandlerError.Internal); }
@@ -262,6 +336,7 @@ public struct Exchange<region r> {
         BodyState.Done => Some(0u64),
         BodyState.Length => Some(this.left),
         BodyState.Chunked => null,
+        BodyState.Stream => null,
     };
 
     /// Reads more of the connection into `carry`, bounded by the minimum-rate deadline.
@@ -365,7 +440,9 @@ public struct Exchange<region r> {
     public async fn flush(borrow mut this) -> Result<void, HandlerError> {
         this.streaming = true;
         await this.sendPending()?;
-        await this.flushOut()?;
+        if (!this.multiplexed) {
+            await this.flushOut()?;
+        }
         return Ok();
     }
 
@@ -379,6 +456,9 @@ public struct Exchange<region r> {
     /// Sends the head if it was not sent, then moves `pending` to the wire: into `out` if it fits, else written with
     /// `out` in one vectored step.
     async fn sendPending(borrow mut this) -> Result<void, HandlerError> {
+        if (this.multiplexed) {
+            return await this.streamPending(false);
+        }
         if (!this.sent) {
             await this.sendHead(this.response.contentLength())?;
         }
@@ -455,6 +535,87 @@ public struct Exchange<region r> {
         return Ok();
     }
 
+    /// A stream's response head (RFC 9113 §8.3.2): `:status`, the handler's fields with their names in lower case
+    /// (§8.2.1), `content-length` when `length` is known and the status allows content, and `date`. The application's
+    /// hook runs first when `hooks`.
+    async fn streamHead(borrow mut this, length: u64?, end: bool, hooks: bool) -> Result<void, HandlerError> {
+        if (hooks) {
+            await this.app.beforeHead(this.request, this.response)?;
+        }
+        var fields = HeaderBlock.create();
+        let status = this.response.status();
+        let code = status.code();
+        var digits = [48 + truncate<u8>(code / 100), 48 + truncate<u8>(code / 10 % 10), 48 + truncate<u8>(code % 10)];
+        grown(fields.push(":status".bytes(), digits[..], false))?;
+        let all = this.response.fieldBytes();
+        var lower = Vector<u8>.create();
+        var start: usize = 0;
+        for (i in 0..all.length) {
+            if (all[i] != 10) {
+                continue;
+            }
+            let line = all[start..i - 1]; // without CR LF
+            start = i + 1;
+            var colon: usize = 0;
+            while (colon < line.length && line[colon] != 58) {
+                colon += 1;
+            }
+            lower.clear();
+            for (c in line[0..colon]) {
+                grown(lower.push(if (c >= 65 && c <= 90) c + 32 else c))?;
+            }
+            grown(fields.push(lower.view(), line[colon + 2..], false))?;
+        }
+        match (length) {
+            Some(n) => {
+                if (status.allowsContent()) {
+                    var text = [0u8; 20];
+                    var at: usize = 20;
+                    var v = n;
+                    loop {
+                        at -= 1;
+                        text[at] = 48 + truncate<u8>(v % 10);
+                        v /= 10;
+                        if (v == 0) {
+                            break;
+                        }
+                    }
+                    grown(fields.push("content-length".bytes(), text[at..], false))?;
+                }
+            }
+            null => {}
+        }
+        this.date.refresh();
+        match (this.date.bytes()) {
+            Some(d) => { grown(fields.push("date".bytes(), d, false))?; }
+            null => {}
+        }
+        this.sent = true;
+        return await this.stream.sendHead(fields, end);
+    }
+
+    /// A stream's buffered body as DATA (the head first, if not sent), ending the response if `end`.
+    async fn streamPending(borrow mut this, end: bool) -> Result<void, HandlerError> {
+        if (!this.sent) {
+            await this.streamHead(this.response.contentLength(), false, true)?;
+        }
+        let n = this.pending.length();
+        if (n == 0 && !end) {
+            return Ok();
+        }
+        this.written += n as u64;
+        if (Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent()) {
+            this.pending.clear(); // counted, not sent
+            if (end) {
+                await this.stream.sendData("".bytes(), true)?;
+            }
+            return Ok();
+        }
+        await this.stream.sendData(this.pending.readable(), end)?;
+        this.pending.clear();
+        return Ok();
+    }
+
     /// Runs the application's hook, chooses the framing, and queues the head in `out`.
     async fn sendHead(borrow mut this, length: u64?) -> Result<void, HandlerError> {
         await this.app.beforeHead(this.request, this.response)?;
@@ -525,6 +686,9 @@ public struct Exchange<region r> {
     /// server closes it when the handler returns. `Internal` if anything was sent already, if the request has a body,
     /// or if it is not HTTP/1.1.
     public async fn switchProtocols(borrow mut this, protocol: StringView) -> Result<void, HandlerError> {
+        if (this.multiplexed) {
+            return Err(HandlerError.Internal); // no upgrade on a stream (RFC 9113 §8.6)
+        }
         let is11 = match (this.request.version()) {
             Version.Http11 => true,
             _ => false,
@@ -583,6 +747,16 @@ public struct Exchange<region r> {
         return await this.writeBytes(bytes);
     }
 
+    /// Pushes a response to a GET for `path` (RFC 9113 §8.4; Web ADR 0011 §3.2): the client is promised it, and the
+    /// application handles that request on its own stream as if the client had asked. False over HTTP/1.1, when the
+    /// client refuses pushes, or when the connection cannot make one now.
+    public async fn push(borrow mut this, path: StringView) -> Result<bool, HandlerError> {
+        if (!this.multiplexed) {
+            return Ok(false);
+        }
+        return await this.stream.push(path.bytes());
+    }
+
     /// Whether the connection was switched to another protocol.
     public fn switched(borrow this) -> bool => this.upgraded;
 
@@ -596,6 +770,22 @@ public struct Exchange<region r> {
             return Ok();
         }
         this.done = true;
+        if (this.multiplexed) {
+            if (this.sent) {
+                return await this.streamPending(true);
+            }
+            let length = match (this.response.contentLength()) {
+                Some(n) => n,
+                null => this.pending.length() as u64,
+            };
+            let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
+            if (bodyless || this.pending.length() == 0) {
+                this.pending.clear();
+                return await this.streamHead(Some(length), true, true);
+            }
+            await this.streamHead(Some(length), false, true)?;
+            return await this.streamPending(true);
+        }
         if (!this.sent) {
             let length = match (this.response.contentLength()) {
                 Some(n) => Some(n),
@@ -631,6 +821,20 @@ public struct Exchange<region r> {
     /// Replaces an unsent response with an error response of `status` and no content, closing the connection if
     /// `close`. False if a head was already sent: the connection must close instead.
     public async fn respondError(borrow mut this, status: StatusCode, close: bool) -> bool {
+        if (this.multiplexed) {
+            if (this.sent) {
+                return false; // the driver resets the stream instead
+            }
+            this.response.reset();
+            this.response.setStatus(status);
+            this.pending.clear();
+            this.done = true;
+            let length: u64? = if (status.allowsContent()) Some(0u64) else null;
+            match (await this.streamHead(length, true, false)) {
+                Ok() => { return true; }
+                Err(_) => { return false; }
+            }
+        }
         if (this.sent) {
             this.keep = false;
             return false;
@@ -669,6 +873,9 @@ public struct Exchange<region r> {
     /// After the response: reads and discards what the handler left of the body, up to `Limits.drainBytes`, so the
     /// next request can be read; past that, or on an error, the connection closes instead (Web ADR 0003 §3.3).
     public async fn finishBody(borrow mut this) {
+        if (this.multiplexed) {
+            return; // the stream's driver discards what was not read
+        }
         if (this.bodyBroken) {
             this.keep = false;
             return;
@@ -706,4 +913,11 @@ public struct Exchange<region r> {
 
     /// Whether this response was streamed (flushed by the handler): the driver sends it before reading on.
     public fn streamed(borrow this) -> bool => this.streaming;
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, HandlerError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
 }

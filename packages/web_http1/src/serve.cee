@@ -146,8 +146,10 @@ async fn exchangeOne(
     };
     b.clear();
     b.append(input[end..])?;
+    var noStream = NoStream {};
     var ex = Exchange.create(
         conn,
+        mut noStream,
         b,
         out,
         pending,

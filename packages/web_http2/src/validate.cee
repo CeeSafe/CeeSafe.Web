@@ -1,5 +1,6 @@
 // Whether a decoded header list is a well-formed HTTP/2 request or trailer section (RFC 9113 §8.1-8.3). A malformed one
 // is a stream error of type PROTOCOL_ERROR (§8.1.1). Sans-I/O.
+import web_http;
 
 /// What a request's head says about its body.
 public struct RequestShape {

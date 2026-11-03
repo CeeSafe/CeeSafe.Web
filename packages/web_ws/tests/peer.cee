@@ -208,8 +208,10 @@ async fn session(
     var date = DateCache.create(false);
     let limits = Limits.defaults();
     let app = NoHooks {};
+    var noStream = NoStream {};
     var exchange = Exchange.create(
         conn,
+        mut noStream,
         mut carry,
         mut out,
         mut pending,

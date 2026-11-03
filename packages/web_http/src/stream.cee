@@ -1,0 +1,60 @@
+// An exchange over a multiplexed stream (Web ADR 0011 §3.2; Web ADR 0003 §3): what `Exchange` reads and writes when
+// its request came on an HTTP/2 stream instead of an HTTP/1.1 connection. The stream's task implements it over
+// channels to its connection's task (web_http2's `StreamPort`).
+import web_core;
+
+/// A request stream's body in, and its response out.
+public interface StreamSink {
+    /// Request body bytes into `into`: at least one, or 0 at the end of the body.
+    async fn readBody(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError>;
+
+    /// Sends the response's head (`:status` first); with `endStream`, the response has no body.
+    async fn sendHead(borrow mut this, fields: HeaderBlock, endStream: bool) -> Result<void, HandlerError>;
+
+    /// Sends body bytes, waiting while the flow-control window is closed; `endStream` ends the response.
+    async fn sendData(borrow mut this, bytes: Slice<u8>, endStream: bool) -> Result<void, HandlerError>;
+
+    /// Promises a pushed response to a GET for `path` on this request's authority: false if the client does not
+    /// accept pushes or the connection cannot make one now.
+    async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError>;
+}
+
+/// The sink of an HTTP/1.1 exchange, which has no stream: every call is `Internal`, and nothing is pushed.
+public struct NoStream {}
+
+impl StreamSink for NoStream {
+    async fn readBody(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError> => Err(HandlerError.Internal);
+
+    async fn sendHead(borrow mut this, fields: HeaderBlock, endStream: bool) -> Result<void, HandlerError> =>
+        Err(HandlerError.Internal);
+
+    async fn sendData(borrow mut this, bytes: Slice<u8>, endStream: bool) -> Result<void, HandlerError> =>
+        Err(HandlerError.Internal);
+
+    async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError> => Ok(false);
+}
+
+/// The transport of a stream's exchange, which has none of its own: reads end, writes fail.
+public struct NoTransport {}
+
+impl Transport for NoTransport {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> => Ok(0);
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> => Err(NetError.Closed);
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> => Err(NetError.Closed);
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => Ok();
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => Alpn.None;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => null;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => null;
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
+}

@@ -1,4 +1,5 @@
 import web_core;
+import web_http;
 
 // The HTTP/2 connection, server side (RFC 9113 §3-6; Web ADR 0011 §3.1): frames in, events out; the frames the
 // protocol owes (acknowledgements, WINDOW_UPDATE, RST_STREAM) and the ones the driver asks for go to an output buffer.
