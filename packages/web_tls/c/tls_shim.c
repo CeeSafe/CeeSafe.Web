@@ -5,7 +5,10 @@
  *   - no OpenSSL-owned pointer is returned; data is copied out;
  *   - every length is a size_t and is checked;
  *   - SSL_get_error is mapped to wt_status in one place (status_of);
- *   - no I/O, and no allocation beyond OpenSSL's.
+ *   - no I/O, and no allocation beyond OpenSSL's;
+ *   - OpenSSL allocates through CeeSafe's allocator for C code (CEE_ALLOC_FOREIGN, CeeSafe ADR 0060; Web ADR 0002
+ *     amendment 5), so the allocation-failure sweep reaches OpenSSL's out-of-memory paths. Built without the CeeSafe
+ *     runtime (the fuzz harness), WT_STANDALONE leaves OpenSSL its own allocator.
  * Every exported function is in the ADR's table.
  */
 #include <openssl/core_names.h>
@@ -16,6 +19,9 @@
 #include <openssl/x509v3.h>
 #include <stdint.h>
 #include <string.h>
+#ifndef WT_STANDALONE
+#include "ceesafe/foreign.h"
+#endif
 
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
 #error "web_tls needs OpenSSL 3.0 or later (Web ADR 0002 §3.1)"
@@ -305,7 +311,54 @@ uint64_t wt_error(wt_ctx *c, uint8_t *out, size_t cap, size_t *len);
 size_t wt_openssl_version(uint8_t *out, size_t cap);
 
 /* A server (server != 0) or client configuration with the settings of Web ADR 0002 §3.3; NULL on failure. */
+#ifndef WT_STANDALONE
+/* Set only on the thread running OpenSSL's one-time initialisation, and only while it runs: those allocations go under
+   CEE_ALLOC_FOREIGN_INIT (CeeSafe ADR 0061), never failed, since OpenSSL cannot survive a failure there (a failed
+   allocation raises an error, which re-enters the pthread_once running the initialisation). */
+static _Thread_local int initialising;
+
+static uint32_t foreign_number(void) {
+    return initialising ? CEE_ALLOC_FOREIGN_INIT : CEE_ALLOC_FOREIGN;
+}
+
+static void *foreign_malloc(size_t n, const char *file, int line) {
+    (void)file;
+    (void)line;
+    return ceesafe_alloc(n, foreign_number());
+}
+
+static void *foreign_realloc(void *p, size_t n, const char *file, int line) {
+    (void)file;
+    (void)line;
+    return ceesafe_realloc(p, n, foreign_number());
+}
+
+static void foreign_free(void *p, const char *file, int line) {
+    (void)file;
+    (void)line;
+    ceesafe_free(p, CEE_ALLOC_FOREIGN);
+}
+
+static CRYPTO_ONCE route_once = CRYPTO_ONCE_STATIC_INIT;
+
+/* OpenSSL accepts allocation functions only before its first allocation; a configuration is the first thing the shim
+   makes, so its creation sets them. If something else in the process used OpenSSL first, OpenSSL refuses and keeps
+   its own allocator, which is safe: every block is then freed by the allocator that made it. CRYPTO_THREAD_run_once
+   allocates nothing. */
+static void route_allocations(void) {
+    if (!CRYPTO_set_mem_functions(foreign_malloc, foreign_realloc, foreign_free)) {
+        return; /* OpenSSL already allocated: it keeps its own allocator */
+    }
+    initialising = 1;
+    (void)OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+    initialising = 0;
+}
+#endif
+
 SSL_CTX *wt_cfg_new(int32_t server) {
+#ifndef WT_STANDALONE
+    (void)CRYPTO_THREAD_run_once(&route_once, route_allocations);
+#endif
     SSL_CTX *ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
     if (ctx == NULL) {
         return NULL;
