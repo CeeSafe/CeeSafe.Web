@@ -920,6 +920,9 @@ public struct H2Connection {
 
     /// Queues DATA on `id`: at most `sendAllowance(id)` bytes (any number, even none, with `endStream`).
     public fn sendData(borrow mut this, id: u32, bytes: Slice<u8>, endStream: bool) -> Result<void, u32> {
+        if (!this.streams.contains(id)) {
+            return Err(ErrorCodes.streamClosed()); // reset while the data was on its way: dropped (§5.4.2)
+        }
         if (bytes.length > this.sendAllowance(id)) {
             return Err(ErrorCodes.internalError()); // the driver waits for the window
         }
