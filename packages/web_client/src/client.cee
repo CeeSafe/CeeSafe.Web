@@ -250,6 +250,20 @@ public struct Client {
         }
     }
 
+    /// Opens a WebSocket to `url` (`ws://` or `wss://`): DNS, Happy Eyeballs and TLS as for a request, then the
+    /// upgrade (Web ADR 0010 §3.6), all within `options.handshakeMs`. Run the session with `clientSession`. No
+    /// redirect is followed: a server that does not switch is `WebSocket(NotSwitched(status))`.
+    public async fn connectWebSocket(
+        borrow this,
+        url: StringView,
+        options: borrow WebSocketClientOptions,
+    ) -> Result<WebSocketConnection, ClientError> {
+        let address = webSocketUrl(url.bytes())?;
+        let total = if (options.handshakeMs == 0) Deadline.never() else Deadline.after(options.handshakeMs);
+        let conn = await this.connect(address, total)?;
+        return await handshake(conn, address, options, total, this.options.limits);
+    }
+
     /// Closes the idle connections; requests that start afterwards fail with `Shutdown`.
     public async fn shutdown(borrow this) {
         await this.pool.shutdown();

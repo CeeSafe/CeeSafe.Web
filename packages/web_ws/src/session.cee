@@ -1,6 +1,7 @@
-// The WebSocket session over an upgraded exchange (Web ADR 0010 §3.3): `accept` checks the handshake and switches;
-// `receive` gives the next message, answering pings and the close handshake itself, and while it waits it writes
-// what other tasks queued and keeps the connection alive. Only the session's task writes; reads alone are raced.
+// The WebSocket session (Web ADR 0010 §3.3, amendment 2): `accept` checks a client's handshake and switches the
+// exchange; `open` starts a session over any `RawLink` (the client's connection, in web_client). `receive` gives the
+// next message, answering pings and the close handshake itself, and while it waits it writes what other tasks queued
+// and keeps the connection alive. Only the session's task writes; reads alone are raced.
 import web_core;
 import web_http;
 
@@ -82,6 +83,22 @@ public struct WebSocketSender {
     public fn share(borrow this) -> WebSocketSender => WebSocketSender { queue: this.queue.clone() };
 }
 
+/// The bytes under a session: an upgraded exchange (the server's), or the client's own connection. The session is
+/// generic over it, since an exchange is a scoped type, which implements an interface through a bound but not as
+/// `dyn` (CeeSafe ADR 0054 §3.2).
+public interface RawLink {
+    /// Bytes from the peer into `into`: at least one, or 0 at the end of the stream. Cancel-safe.
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError>;
+    /// Writes all of `bytes` within the link's write deadline.
+    async fn writeAll(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError>;
+}
+
+impl<region r> RawLink for Exchange<r> {
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError> => await this.readRaw(into);
+
+    async fn writeAll(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError> => await this.writeRaw(bytes);
+}
+
 enum State {
     Open,
     /// We sent a Close (with this code) and wait for the peer's.
@@ -96,8 +113,10 @@ enum Wake {
     Timer,
 }
 
-public struct WebSocket<region r> {
-    private exchange: borrow mut(r) Exchange<r>;
+public struct WebSocket<region r, L: RawLink> {
+    private link: borrow mut(r) L;
+    /// A client masks every frame it sends, with a key from the system's random source (RFC 6455 §5.3).
+    private role: Role;
     private reader: MessageReader;
     private input: OwnedBuffer;
     private out: Vector<u8>;
@@ -185,7 +204,7 @@ public struct WebSocket<region r> {
                 return Ok(this.end(CloseCodes.internalError())); // a frame head larger than the buffer cannot happen
             }
             let waitMs = this.untilTimer();
-            match (await wake(mut this.exchange, mut this.input, this.queue, waitMs)) {
+            match (await wake(mut this.link, mut this.input, this.queue, waitMs)) {
                 Ok(Wake.Read(0)) => { return Ok(this.end(CloseCodes.abnormal())); }
                 Ok(Wake.Read(n)) => {
                     match (this.input.commit(n)) {
@@ -224,15 +243,16 @@ public struct WebSocket<region r> {
                 Err(_) => { return Err(HandlerError.Internal); }
             }
             return await sendFrames(
-                mut this.exchange,
+                mut this.link,
                 mut this.out,
+                this.role,
                 first,
                 true,
                 this.packed.view(),
                 this.fragmentBytes,
             );
         }
-        return await sendFrames(mut this.exchange, mut this.out, first, false, bytes, this.fragmentBytes);
+        return await sendFrames(mut this.link, mut this.out, this.role, first, false, bytes, this.fragmentBytes);
     }
 
     /// Starts the close handshake with `code` (§7.4; 1000 for a normal end). Keep calling `receive` until it
@@ -345,15 +365,16 @@ public struct WebSocket<region r> {
         return result;
     }
 
-    /// Writes one control frame, unmasked (a server's).
+    /// Writes one control frame.
     async fn writeFrame(borrow mut this, opcode: Opcode, fin: bool, payload: Slice<u8>) -> Result<void, HandlerError> =>
-        await writeFrameTo(mut this.exchange, mut this.out, opcode, fin, false, payload);
+        await writeFrameTo(mut this.link, mut this.out, this.role, opcode, fin, false, payload);
 }
 
 /// Sends `payload` as one message: one frame, or fragments of `fragmentBytes`; RSV1 on the first if `compressed`.
-async fn sendFrames(
-    exchange: borrow mut Exchange,
+async fn sendFrames<L: RawLink>(
+    link: borrow mut L,
     out: borrow mut Vector<u8>,
+    role: Role,
     first: Opcode,
     compressed: bool,
     payload: Slice<u8>,
@@ -365,7 +386,7 @@ async fn sendFrames(
         let n = if (payload.length - at < size) payload.length - at else size;
         let fin = at + n == payload.length;
         let opcode = if (at == 0) first else Opcode.Continuation;
-        await writeFrameTo(exchange, out, opcode, fin, compressed && at == 0, payload[at..at + n])?;
+        await writeFrameTo(link, out, role, opcode, fin, compressed && at == 0, payload[at..at + n])?;
         at += n;
         if (fin) {
             return Ok();
@@ -373,19 +394,44 @@ async fn sendFrames(
     }
 }
 
-/// Writes one unmasked frame: its head and a short payload in one write, a long payload in a second.
-async fn writeFrameTo(
-    exchange: borrow mut Exchange,
+/// Writes one frame. A server's is unmasked: its head and a short payload in one write, a long payload in a second.
+/// A client's is masked with a fresh key (RFC 6455 §5.3) and written in pieces of at most `maskedPiece` bytes.
+async fn writeFrameTo<L: RawLink>(
+    link: borrow mut L,
     out: borrow mut Vector<u8>,
+    role: Role,
     opcode: Opcode,
     fin: bool,
     rsv1: bool,
     payload: Slice<u8>,
 ) -> Result<void, HandlerError> {
     out.clear();
-    match (Frames.writeHead(out, fin, rsv1, opcode, payload.length as u64, null)) {
+    let mask: [u8; 4]? = match (role) {
+        Role.Server => null,
+        Role.Client => Some(await maskKey()?),
+    };
+    match (Frames.writeHead(out, fin, rsv1, opcode, payload.length as u64, mask)) {
         Ok() => {}
         Err(_) => { return Err(HandlerError.Internal); }
+    }
+    match (mask) {
+        Some(key) => {
+            var at: usize = 0;
+            loop {
+                let n = if (payload.length - at < maskedPiece()) payload.length - at else maskedPiece();
+                match (Frames.appendMasked(out, payload[at..at + n], key, at as u64)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+                await link.writeAll(out.view())?;
+                out.clear();
+                at += n;
+                if (at == payload.length) {
+                    return Ok();
+                }
+            }
+        }
+        null => {}
     }
     if (payload.length <= 4096) {
         for (b in payload) {
@@ -394,22 +440,35 @@ async fn writeFrameTo(
                 Err(_) => { return Err(HandlerError.Internal); }
             }
         }
-        return await exchange.writeRaw(out.view());
+        return await link.writeAll(out.view());
     }
-    await exchange.writeRaw(out.view())?;
-    return await exchange.writeRaw(payload);
+    await link.writeAll(out.view())?;
+    return await link.writeAll(payload);
+}
+
+/// How much masked payload is copied before a write.
+fn maskedPiece() -> usize => 16384;
+
+/// A masking key from the system's cryptographic random source (CeeSafe ADR 0060): the key "MUST be derived from a
+/// strong source of entropy" (RFC 6455 §5.3). A failed source fails the write; no key is ever made up.
+async fn maskKey() -> Result<[u8; 4], HandlerError> {
+    var key = [0u8; 4];
+    match (Random.fill(mut key[..])) {
+        Ok() => { return Ok(key); }
+        Err(e) => { return Err(HandlerError.Io(NetError.Io(e))); }
+    }
 }
 
 /// One wait: bytes from the peer (into `input`'s spare room), a queued message, or `waitMs` passing.
-async fn wake(
-    exchange: borrow mut Exchange,
+async fn wake<L: RawLink>(
+    link: borrow mut L,
     input: borrow mut OwnedBuffer,
     queue: borrow Channel<Outbound>,
     waitMs: u64,
 ) -> Result<Wake, HandlerError> {
     let raced: Result<Raced<Wake>, HandlerError> = await Async.race(
         async () => {
-            let n = await exchange.readRaw(input.spare())?;
+            let n = await link.readSome(input.spare())?;
             return Ok(Wake.Read(n));
         },
         async () => {
@@ -451,7 +510,7 @@ public async fn accept<region r>(
     request: borrow Request,
     options: borrow WebSocketOptions,
     secure: bool,
-) -> Result<WebSocket<r>?, HandlerError> {
+) -> Result<WebSocket<r, Exchange<r>>?, HandlerError> {
     match (Handshake.check(request, secure, options.allowedOrigins)) {
         Ok() => {}
         Err(UpgradeRefusal.Version) => {
@@ -495,6 +554,19 @@ public async fn accept<region r>(
         null => {}
     }
     await exchange.switchProtocols("websocket")?;
+    return Ok(Some(open(exchange, Role.Server, options, deflate, chosen)?));
+}
+
+/// A session over `link`, after a handshake that agreed `deflate` (if any) and the subprotocol at `protocol` (an index
+/// into the offer's or the preferences' list). `role` is this end's: a client masks what it sends and refuses masked
+/// frames; a server the reverse. web_client's `WebSocketClient` calls it after checking the server's 101.
+public fn open<region r, L: RawLink>(
+    link: borrow mut(r) L,
+    role: Role,
+    options: borrow WebSocketOptions,
+    deflate: DeflateAgreement?,
+    protocol: usize?,
+) -> Result<WebSocket<r, L>, HandlerError> {
     let input = match (OwnedBuffer.create(16384)) {
         Ok(b) => b,
         Err(_) => { return Err(HandlerError.Internal); },
@@ -503,12 +575,21 @@ public async fn accept<region r>(
         Ok(q) => q,
         Err(_) => { return Err(HandlerError.Internal); },
     };
-    var reader = MessageReader.create(Role.Server, options.maxFrameBytes, options.maxMessageBytes);
+    var reader = MessageReader.create(role, options.maxFrameBytes, options.maxMessageBytes);
     var windowBits: u32 = 15;
     match (deflate) {
         Some(agreed) => {
-            reader.enableDeflate(!agreed.clientNoContextTakeover);
-            windowBits = agreed.serverMaxWindowBits;
+            // The peer's compressor keeps its window unless it agreed not to; ours writes within the peer's limit.
+            match (role) {
+                Role.Server => {
+                    reader.enableDeflate(!agreed.clientNoContextTakeover);
+                    windowBits = agreed.serverMaxWindowBits;
+                }
+                Role.Client => {
+                    reader.enableDeflate(!agreed.serverNoContextTakeover);
+                    windowBits = agreed.clientMaxWindowBits;
+                }
+            }
         }
         null => {}
     }
@@ -516,14 +597,15 @@ public async fn accept<region r>(
         Some(_) => true,
         null => false,
     };
-    return Ok(Some(WebSocket {
-        exchange: exchange,
+    return Ok(WebSocket {
+        link: link,
+        role: role,
         reader: reader,
         input: input,
         out: Vector<u8>.create(),
         queue: queue,
         state: State.Open,
-        protocolIndex: chosen,
+        protocolIndex: protocol,
         fragmentBytes: options.fragmentBytes,
         pingIntervalMs: options.pingIntervalMs,
         pongTimeoutMs: options.pongTimeoutMs,
@@ -534,7 +616,7 @@ public async fn accept<region r>(
         compress: compress,
         deflater: Deflater.create(windowBits),
         packed: Vector<u8>.create(),
-    }));
+    });
 }
 
 fn statusOf(code: u16) -> StatusCode => match (StatusCode.of(code)) {

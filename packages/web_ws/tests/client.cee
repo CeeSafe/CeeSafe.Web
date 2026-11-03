@@ -1,0 +1,288 @@
+// The client's side of web_ws (Web ADR 0010 amendment 2). Expected values follow RFC 6455: §1.3's key and its accept
+// value, §4.1's checks of the answer, §5.2's frame layout and §5.3's masking (decoded here by hand: the mask bit, the
+// key, then each payload byte XOR key[i % 4]), §5.1 (a masked frame from the server is refused with 1002), and RFC
+// 7692 §7.1's parameters.
+import web_core;
+import web_http;
+
+fn appendAll(to: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, TestFailure> {
+    for (b in bytes) {
+        pushed(to.push(b))?;
+    }
+    return Ok();
+}
+
+/// RFC 6455 §1.3's key and the accept value the RFC gives for it.
+fn exampleKey() -> StringView => "dGhlIHNhbXBsZSBub25jZQ==";
+
+fn offeredChatProtocols() -> Result<Vector<Vector<u8>>, TestFailure> {
+    var v = Vector<Vector<u8>>.create();
+    pushed(v.push(bytesOf("chat")?))?;
+    pushed(v.push(bytesOf("superchat")?))?;
+    return Ok(v);
+}
+
+/// `checkAnswer` for the answer `head` (a status line, then fields), with permessage-deflate offered if `deflate`.
+fn answer(status: u16, head: StringView, deflate: bool) -> Result<Result<HandshakeAnswer, HandshakeFailure>, TestFailure> {
+    let bytes = head.bytes();
+    let fields = fieldsOf(bytes)?;
+    let offered = offeredChatProtocols()?;
+    let key = exampleKey();
+    return Ok(Handshake.checkAnswer(status, fields, key.bytes(), deflate, offered));
+}
+
+fn failure(r: Result<HandshakeAnswer, HandshakeFailure>) -> u32 => match (r) {
+    Ok(_) => 0,
+    Err(HandshakeFailure.NotSwitched(_)) => 1,
+    Err(HandshakeFailure.Upgrade) => 2,
+    Err(HandshakeFailure.Accept) => 3,
+    Err(HandshakeFailure.Extension) => 4,
+    Err(HandshakeFailure.Subprotocol) => 5,
+};
+
+@test
+fn answers_rfc6455_4_1() -> Result<void, TestFailure> {
+    let good = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: superchat\r\n\r\n";
+    match (answer(101, good, false)?) {
+        Ok(a) => {
+            match (a.protocol) {
+                Some(i) => { Check.equalU64(1, i as u64)?; }
+                null => { return Check.fail("the subprotocol"); }
+            }
+            Check.isTrue(a.deflate == null, "no extension")?;
+        }
+        Err(_) => { return Check.fail("RFC 6455 §1.3's answer"); }
+    }
+    let plain = "HTTP/1.1 101 Switching Protocols\r\nupgrade: WebSocket\r\nconnection: keep-alive, Upgrade\r\nsec-websocket-accept:  s3pPLMBiTxaQ9kYGzzhZRbK+xOo= \r\n\r\n";
+    Check.equalU64(0, failure(answer(101, plain, false)?) as u64)?; // case, a list, spaces: still a match
+    let refused = "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n";
+    match (answer(403, refused, false)?) {
+        Err(HandshakeFailure.NotSwitched(s)) => { Check.equalU64(403, s as u64)?; }
+        _ => { return Check.fail("403 is not switched"); }
+    }
+    Check.equalU64(
+        2,
+        failure(answer(
+            101,
+            "HTTP/1.1 101 x\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            false,
+        )?) as u64,
+    )?;
+    Check.equalU64(
+        2,
+        failure(answer(
+            101,
+            "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            false,
+        )?) as u64,
+    )?;
+    // The accept of another key (RFC 6455 §4.2.2's computation for "x3JJHMbDL1EzLkh9GBhXDw==", from Python's hashlib).
+    Check.equalU64(
+        3,
+        failure(answer(
+            101,
+            "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: HSmrc0sMlYUkAGmm5OPpG2HaGWk=\r\n\r\n",
+            false,
+        )?) as u64,
+    )?;
+    Check.equalU64(
+        3,
+        failure(answer(101, "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", false)?) as u64,
+    )?;
+    Check.equalU64(
+        3,
+        failure(answer(
+            101,
+            "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            false,
+        )?) as u64,
+    )?;
+    Check.equalU64(
+        5,
+        failure(answer(
+            101,
+            "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: other\r\n\r\n",
+            false,
+        )?) as u64,
+    )?;
+    Check.equalU64(
+        5,
+        failure(answer(
+            101,
+            "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: superchat\r\n\r\n",
+            false,
+        )?) as u64,
+    )?;
+    return Ok();
+}
+
+@test
+fn deflate_answers_rfc7692() -> Result<void, TestFailure> {
+    let head = "HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
+    // Accepted, with each parameter reaching the agreement.
+    var text = bytesOf(head)?;
+    appendAll(
+        mut text,
+        "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_max_window_bits=10\r\n\r\n".bytes(),
+    )?;
+    match (StringView.fromUtf8(text.view())) {
+        Some(t) => {
+            match (answer(101, t, true)?) {
+                Ok(a) => {
+                    match (a.deflate) {
+                        Some(d) => {
+                            Check.isTrue(d.serverNoContextTakeover && !d.clientNoContextTakeover, "takeover")?;
+                            Check.equalU64(10, d.clientMaxWindowBits as u64)?;
+                            Check.equalU64(15, d.serverMaxWindowBits as u64)?;
+                        }
+                        null => { return Check.fail("deflate agreed"); }
+                    }
+                }
+                Err(_) => { return Check.fail("a good deflate answer"); }
+            }
+        }
+        null => { return Check.fail("text"); }
+    }
+    // Each refused: not offered, an unknown extension, a parameter the client cannot accept, deflate twice.
+    for (k in 0..6u32) {
+        var bad = bytesOf(head)?;
+        let field = match (k) {
+            0 => "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+            1 => "Sec-WebSocket-Extensions: x-webkit-deflate-frame\r\n\r\n",
+            2 => "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n",
+            3 => "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=7\r\n\r\n",
+            4 => "Sec-WebSocket-Extensions: permessage-deflate, permessage-deflate\r\n\r\n",
+            _ => "Sec-WebSocket-Extensions: permessage-deflate; mystery\r\n\r\n",
+        };
+        appendAll(mut bad, field.bytes())?;
+        let deflateOffered = k != 0;
+        match (StringView.fromUtf8(bad.view())) {
+            Some(t) => { Check.equalU64(4, failure(answer(101, t, deflateOffered)?) as u64)?; }
+            null => { return Check.fail("text"); }
+        }
+    }
+    let offer = Extensions.clientOffer();
+    Check.equalBytes("permessage-deflate; client_max_window_bits".bytes(), offer.bytes())?;
+    return Ok();
+}
+
+/// The client's link over a scripted server (`Peer` from peer.cee: sends `input`, records what is written).
+struct PeerLink {
+    peer: Peer;
+}
+
+impl RawLink for PeerLink {
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError> {
+        match (await this.peer.read(into)) {
+            Ok(n) => { return Ok(n); }
+            Err(e) => { return Err(HandlerError.Io(e)); }
+        }
+    }
+
+    async fn writeAll(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError> {
+        match (await this.peer.write(bytes)) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(HandlerError.Io(e)); }
+        }
+    }
+}
+
+/// One frame the client wrote, decoded by hand from RFC 6455 §5.2: (the first byte, the mask key, the payload
+/// unmasked), and where the next frame starts. Payloads under 126 bytes only.
+struct ClientFrame {
+    first: u8;
+    masked: bool;
+    key: [u8; 4];
+    payload: Vector<u8>;
+    next: usize;
+}
+
+fn clientFrameAt(out: Slice<u8>, at: usize) -> Result<ClientFrame, TestFailure> {
+    if (at + 6 > out.length) {
+        return Err(TestFailure.create("a frame"));
+    }
+    let n = (out[at + 1] & 0x7F) as usize;
+    if (n >= 126 || at + 6 + n > out.length) {
+        return Err(TestFailure.create("a short frame"));
+    }
+    let key = [out[at + 2], out[at + 3], out[at + 4], out[at + 5]];
+    var payload = Vector<u8>.create();
+    for (i in 0..n) {
+        pushed(payload.push(out[at + 6 + i] ^ key[i % 4]))?;
+    }
+    return Ok(ClientFrame {
+        first: out[at],
+        masked: (out[at + 1] & 0x80) != 0,
+        key: key,
+        payload: payload,
+        next: at + 6 + n,
+    });
+}
+
+/// RFC 6455 §5.7's unmasked "Hello" and an unmasked ping "pp" from the server; the client echoes the text and
+/// answers the ping, every frame masked with a key of its own; then the server's Close is echoed.
+@test
+async fn a_client_session_masks_every_frame() -> Result<void, TestFailure> {
+    var input = hex("81 05 48 65 6c 6c 6f  89 02 70 70")?;
+    let serverClose = hex("88 02 03 e8")?;
+    appendAll(mut input, serverClose.view())?;
+    var link = PeerLink { peer: peer(input, 1000, null) };
+    var options = WebSocketOptions.defaults();
+    options.deflate = false;
+    var ws = match (open(mut link, Role.Client, options, null, null)) {
+        Ok(w) => w,
+        Err(_) => { return Check.fail("open"); },
+    };
+    var message = Vector<u8>.create();
+    match (await ws.receive(mut message)) {
+        Ok(Received.Message(MessageKind.Text)) => { Check.equalBytes("Hello".bytes(), message.view())?; }
+        _ => { return Check.fail("Hello"); }
+    }
+    match (await ws.send(MessageKind.Text, message.view())) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the echo"); }
+    }
+    match (await ws.receive(mut message)) {
+        Ok(Received.Closed(code)) => { Check.equalU64(1000, code as u64)?; }
+        _ => { return Check.fail("the server's close"); }
+    }
+    let out = link.peer.output.view();
+    let echo = clientFrameAt(out, 0)?;
+    let pong = clientFrameAt(out, echo.next)?;
+    let close = clientFrameAt(out, pong.next)?;
+    Check.equalU64(out.length as u64, close.next as u64)?;
+    Check.isTrue(echo.masked && pong.masked && close.masked, "every frame masked (§5.1)")?;
+    Check.equalU64(0x81, echo.first as u64)?;
+    Check.equalBytes("Hello".bytes(), echo.payload.view())?;
+    Check.equalU64(0x8A, pong.first as u64)?;
+    Check.equalBytes("pp".bytes(), pong.payload.view())?;
+    Check.equalU64(0x88, close.first as u64)?;
+    var code = [0x03u8, 0xE8];
+    Check.equalBytes(code[..], close.payload.view())?;
+    let sameKey = echo.key[0] == pong.key[0] && echo.key[1] == pong.key[1] && echo.key[2] == pong.key[2] &&
+        echo.key[3] == pong.key[3];
+    Check.isTrue(!sameKey, "a fresh key per frame (§5.3)")?;
+    return Ok();
+}
+
+/// A masked frame from the server breaks §5.1: the client closes with 1002, masking its Close too.
+@test
+async fn a_masked_server_frame_is_refused() -> Result<void, TestFailure> {
+    let input = hex("81 85 37 fa 21 3d 7f 9f 4d 51 58")?; // §5.7's masked "Hello": a client's frame
+    var link = PeerLink { peer: peer(input, 1000, null) };
+    var options = WebSocketOptions.defaults();
+    var ws = match (open(mut link, Role.Client, options, null, null)) {
+        Ok(w) => w,
+        Err(_) => { return Check.fail("open"); },
+    };
+    var message = Vector<u8>.create();
+    match (await ws.receive(mut message)) {
+        Ok(Received.Closed(code)) => { Check.equalU64(1002, code as u64)?; }
+        _ => { return Check.fail("closed with 1002"); }
+    }
+    let close = clientFrameAt(link.peer.output.view(), 0)?;
+    Check.isTrue(close.masked && close.first == 0x88, "a masked Close")?;
+    var code = [0x03u8, 0xEA];
+    Check.equalBytes(code[..], close.payload.view())?;
+    return Ok();
+}

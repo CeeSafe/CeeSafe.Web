@@ -1,0 +1,112 @@
+// Design probe for the WebSocket client (Web ADR 0010 amendment 2): one session type over two links. The server's link
+// is a scoped type (an exchange borrowed from the driver, `Exchange<r>`), which CeeSafe ADR 0054 §3.2 lets implement
+// an interface "through bounds but not as dyn I"; the client's is an owned transport. So the session is generic over
+// the link, holding `borrow mut(r) L`, and its waits race the link's read in a generic top-level function.
+//
+//   ceesafec run --interp tests/probes/ws-link-generic.cee
+//   ceesafec build tests/probes/ws-link-generic.cee -o /tmp/wslink && /tmp/wslink
+// Both print 3070 (ceesafec 0.10.0, 2026-11-03): 3 bytes through the scoped link and 7 through the owned one, each
+// echoed (3 * 1000 + 7 * 10 + the 10 bytes written, less 10).
+
+interface Link {
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, u32>;
+    async fn writeAll(borrow mut this, bytes: Slice<u8>) -> Result<void, u32>;
+}
+
+/// The server's side: a link that borrows the driver's state (as `Exchange<r>` does).
+struct Borrowed<region r> {
+    source: Slice<r, u8>;
+    at: usize;
+    written: usize;
+}
+
+impl<region r> Link for Borrowed<r> {
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, u32> {
+        var n: usize = 0;
+        while (n < into.length && this.at < this.source.length) {
+            into[n] = this.source[this.at];
+            n += 1;
+            this.at += 1;
+        }
+        return Ok(n);
+    }
+
+    async fn writeAll(borrow mut this, bytes: Slice<u8>) -> Result<void, u32> {
+        this.written += bytes.length;
+        return Ok();
+    }
+}
+
+/// The client's side: an owned link.
+struct Owned {
+    left: usize;
+    written: usize;
+}
+
+impl Link for Owned {
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, u32> {
+        if (this.left == 0) {
+            return Ok(0);
+        }
+        into[0] = 1;
+        this.left -= 1;
+        return Ok(1);
+    }
+
+    async fn writeAll(borrow mut this, bytes: Slice<u8>) -> Result<void, u32> {
+        this.written += bytes.length;
+        return Ok();
+    }
+}
+
+struct Session<region r, L: Link> {
+    link: borrow mut(r) L;
+    total: usize;
+
+    /// Reads to the end, racing each read against a timer (as the WebSocket session's `wake` does), and echoes.
+    async fn drain(borrow mut this) -> Result<usize, u32> {
+        var buffer = [0u8; 4];
+        loop {
+            let n = await wake(mut this.link, mut buffer[..])?;
+            if (n == 0) {
+                return Ok(this.total);
+            }
+            this.total += n;
+            await this.link.writeAll(buffer[0..n])?;
+        }
+    }
+}
+
+async fn wake<L: Link>(link: borrow mut L, into: SliceMut<u8>) -> Result<usize, u32> {
+    let raced: Result<Raced<usize>, u32> = await Async.race(
+        async () => await link.readSome(into),
+        async () => {
+            match (await Timer.sleep(60000)) {
+                Ok() => { return Ok(0); }
+                Err(_) => { return Err(9); }
+            }
+        },
+    );
+    let won = raced?;
+    return Ok(won.value);
+}
+
+fn open<region r, L: Link>(link: borrow mut(r) L) -> Session<r, L> => Session { link: link, total: 0 };
+
+async fn run() -> Result<usize, u32> {
+    let text = "abc";
+    var server = Borrowed { source: text.bytes(), at: 0, written: 0 };
+    var s = open(mut server);
+    let a = await s.drain()?;
+    var client = Owned { left: 7, written: 0 };
+    var c = open(mut client);
+    let b = await c.drain()?;
+    return Ok(a * 1000 + b * 10 + server.written + client.written - 10);
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok(n) => { Console.writeLine(n); }
+        _ => { Console.writeLine("failed"); }
+    }
+}

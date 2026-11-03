@@ -222,3 +222,51 @@ cross-site WebSocket hijacking by default.
    - With `client_no_context_takeover`, the inflater drops its window after each message.
    - A compressed message is collected whole and inflated at its end, bounded by `maxMessageBytes` (1009 past it,
      1007 if it does not inflate). Its text is checked after inflating.
+
+## 8. Amendment 2 (2026-11-03, M6 stage 4: the client, on ceesafec 0.10.0)
+
+CeeSafe 0.10.0 gives random bytes (`Random.fill`, CeeSafe ADR 0060; upstream U16), so §3.6's client is built.
+
+1. **One session for both ends.** `WebSocket<region r, L: RawLink>` holds `borrow mut(r) L`.
+   - `RawLink` (`web_ws`) has two methods: `readSome` (cancel-safe) and `writeAll` (within the link's deadline).
+   - `Exchange<r>` implements it, for the server. web_client's `WebSocketConnection` implements it, for the client:
+     it owns the transport, and keeps the bytes that came after the 101's head.
+   - A scoped type such as `Exchange<r>` implements an interface through a bound, but not as `dyn` (CeeSafe ADR 0054
+     §3.2), so the session is generic rather than holding a `dyn RawLink`. `tests/probes/ws-link-generic.cee` checks
+     the shape: it prints `3070`, interpreted and natively.
+   - `accept` returns `WebSocket<r, Exchange<r>>`. `open(link, role, options, deflate, protocol)` starts a session
+     over any link.
+2. **The role decides masking.**
+   - A client masks every frame it sends, with a key from `Random.fill` per frame (RFC 6455 §5.3). If the source
+     fails, the write fails; no key is ever made up.
+   - Masked payloads are copied in pieces of 16 KiB, each written as it is masked.
+   - The reader refuses masked frames from a server with 1002 (§5.1).
+3. **The answer is checked in `web_ws`, without I/O.** `Handshake.checkAnswer(status, headers, key, deflateOffered,
+   offered)` applies §4.1's rules:
+   - the status is 101 (`NotSwitched(status)` otherwise);
+   - `Upgrade: websocket` and `Connection: upgrade` are present;
+   - there is exactly one `Sec-WebSocket-Accept`, and it is the key's;
+   - the only extension is permessage-deflate, once, and only if it was offered;
+   - there is at most one subprotocol, and it is one that was offered.
+
+   `Extensions.deflateAnswer` reads RFC 7692 §7.1's parameters with the same parser as the server's
+   `deflateOffer`. A response's `client_max_window_bits` must have a value (§7.1.2.2), and our compressor keeps to
+   it. Our inflater always keeps 15 bits, so any `server_max_window_bits` is fine.
+4. **The client (`web_client`).**
+   - `Client.connectWebSocket(url, options)` takes `ws://` and `wss://` URLs, refusing a `#` (RFC 6455 §3).
+   - It dials as a request does (DNS, Happy Eyeballs, and TLS through the connector), all within
+     `options.handshakeMs` (10 s).
+   - It sends `GET` with `Upgrade`, `Connection`, a fresh key, version 13, and the `Origin`, subprotocols and
+     `permessage-deflate; client_max_window_bits` offer if any.
+   - `clientSession(connection, options)` starts the session.
+   - No redirect is followed. The connection never enters the pool, and takes none of its per-origin slots.
+   - `ClientError.WebSocket(HandshakeFailure)` reports a failed check.
+   - `WebSocketClientOptions` holds the session's `WebSocketOptions`, `origin`, `handshakeMs` and `writeTimeoutMs`.
+5. **Layering:** `web_client` depends on `web_ws` (Web ADR 0004 amendment 2).
+6. **Tests:**
+   - `web_ws`: §1.3's key against §4.1's checks; RFC 7692 answers; a client session's frames decoded by hand (masked,
+     a fresh key each); a masked server frame refused with 1002.
+   - `web_client`: the URL mapping; refusals, a redirect and a wrong accept over scripted connections.
+   - `tests/interop/ws_client.py`: Python's `websockets` server (with zlib), and raw servers for each failed check.
+   - Autobahn's fuzzingserver against `examples/ws_client` (`tests/interop/autobahn.py --client`).
+

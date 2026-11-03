@@ -19,3 +19,7 @@ source = "path+../web_http2"
 [[package]]
 name = "web_transport"
 source = "path+../web_transport"
+
+[[package]]
+name = "web_ws"
+source = "path+../web_ws"

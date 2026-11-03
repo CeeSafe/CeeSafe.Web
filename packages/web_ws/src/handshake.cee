@@ -1,5 +1,6 @@
-// The opening handshake (RFC 6455 §4.2): checking an upgrade request, its origin (Web ADR 0010 §3.4), the
-// subprotocol, and Sec-WebSocket-Accept. Sans-I/O.
+// The opening handshake (RFC 6455 §4): the server's side checks an upgrade request, its origin (Web ADR 0010 §3.4)
+// and the subprotocol, and answers with Sec-WebSocket-Accept; the client's side checks the server's 101 (§4.1).
+// Sans-I/O.
 import web_http;
 
 /// Why an upgrade request is refused, and with which status.
@@ -12,6 +13,29 @@ public enum UpgradeRefusal {
     Origin,
 }
 
+/// Why a client fails the connection after the server's answer (RFC 6455 §4.1, "the client MUST _Fail the WebSocket
+/// Connection_").
+public enum HandshakeFailure {
+    /// The status was not 101: the server did not switch (it may have refused, redirected or asked for credentials).
+    NotSwitched(u16),
+    /// `Upgrade: websocket` or `Connection: upgrade` is missing (rules 2 and 3).
+    Upgrade,
+    /// `Sec-WebSocket-Accept` is missing, repeated, or not the key's (rule 4).
+    Accept,
+    /// An extension the client did not offer, or permessage-deflate with parameters it cannot accept (rule 5).
+    Extension,
+    /// A subprotocol the client did not offer, or more than one (rule 6).
+    Subprotocol,
+}
+
+/// What the server agreed to, once its answer has passed every check.
+public struct HandshakeAnswer {
+    /// permessage-deflate, if the server accepted the offer.
+    public deflate: DeflateAgreement?;
+    /// The index in the client's offered subprotocols of the one the server chose, if any.
+    public protocol: usize?;
+}
+
 public struct Handshake {
     /// `Sec-WebSocket-Accept` for `key`: base64(SHA-1(key + the GUID)) (§4.2.2 step 5.4), 28 bytes.
     public fn acceptKey(key: Slice<u8>) -> Result<Vector<u8>, AllocError> {
@@ -22,6 +46,85 @@ public struct Handshake {
         var out = Vector<u8>.withCapacity(28)?;
         Base64.encode(digest[..], mut out)?;
         return Ok(out);
+    }
+
+    /// The client's check of the server's answer (§4.1): status 101, `Upgrade: websocket`, `Connection: upgrade`,
+    /// `Sec-WebSocket-Accept` matching `key` (the base64 text the client sent), extensions only as offered
+    /// (`deflateOffered`: permessage-deflate, once), and a subprotocol only from `offered`.
+    public fn checkAnswer(
+        status: u16,
+        headers: borrow HeaderList,
+        key: Slice<u8>,
+        deflateOffered: bool,
+        offered: borrow Vector<Vector<u8>>,
+    ) -> Result<HandshakeAnswer, HandshakeFailure> {
+        if (status != 101) {
+            return Err(HandshakeFailure.NotSwitched(status));
+        }
+        if (!headers.hasToken(HeaderName.Upgrade, "websocket") || !headers.hasToken(HeaderName.Connection, "upgrade")) {
+            return Err(HandshakeFailure.Upgrade);
+        }
+        let expected = match (Handshake.acceptKey(key)) {
+            Ok(v) => v,
+            Err(_) => { return Err(HandshakeFailure.Accept); }, // cannot check it, so cannot accept it
+        };
+        var accepts: u32 = 0;
+        var matched = false;
+        var deflate: DeflateAgreement? = null;
+        var protocol: usize? = null;
+        var protocols: u32 = 0;
+        for (i in 0..headers.count()) {
+            let name = headers.nameBytes(i);
+            let v = headers.value(i);
+            if (Ascii.equalsIgnoringCase(name, "sec-websocket-accept")) {
+                accepts += 1;
+                matched = same(trim(v), expected.view());
+            } else if (Ascii.equalsIgnoringCase(name, "sec-websocket-extensions")) {
+                var start: usize = 0;
+                for (k in 0..v.length + 1) {
+                    if (k < v.length && v[k] != 44) {
+                        continue;
+                    }
+                    let element = trim(v[start..k]);
+                    start = k + 1;
+                    if (element.length == 0) {
+                        continue; // an empty list element (RFC 9110 §5.6.1)
+                    }
+                    let agreed = match (Extensions.deflateAnswer(element)) {
+                        Some(a) => a,
+                        null => { return Err(HandshakeFailure.Extension); },
+                    };
+                    let again = match (deflate) {
+                        Some(_) => true,
+                        null => false,
+                    };
+                    if (!deflateOffered || again) {
+                        return Err(HandshakeFailure.Extension);
+                    }
+                    deflate = Some(agreed);
+                }
+            } else if (Ascii.equalsIgnoringCase(name, "sec-websocket-protocol")) {
+                protocols += 1;
+                let chosen = trim(v);
+                var found: usize? = null;
+                for (k in 0..offered.length) {
+                    if (same(chosen, offered[k].view())) {
+                        found = Some(k);
+                    }
+                }
+                if (found == null) {
+                    return Err(HandshakeFailure.Subprotocol);
+                }
+                protocol = found;
+            }
+        }
+        if (accepts != 1 || !matched) {
+            return Err(HandshakeFailure.Accept);
+        }
+        if (protocols > 1) {
+            return Err(HandshakeFailure.Subprotocol);
+        }
+        return Ok(HandshakeAnswer { deflate: deflate, protocol: protocol });
     }
 
     /// Whether `request` is a WebSocket upgrade at all (`Upgrade: websocket`), before checking it fully.
@@ -188,6 +291,20 @@ public struct DeflateAgreement {
     public serverMaxWindowBits: u32;
     /// Whether the client's offer named `server_max_window_bits`, which the response must then repeat.
     public serverWindowNamed: bool;
+    /// The window the client's compressor may use: what the server's response named, else 15.
+    public clientMaxWindowBits: u32;
+}
+
+/// The parameters of one permessage-deflate offer or response, each checked as RFC 7692 §7.1 requires: known,
+/// unrepeated, `*_no_context_takeover` without a value, and window bits 8-15.
+struct DeflateParams {
+    serverNoContextTakeover: bool;
+    clientNoContextTakeover: bool;
+    /// 0 when absent.
+    serverMaxWindowBits: u32;
+    clientWindowNamed: bool;
+    /// 0 when absent or named without a value.
+    clientMaxWindowBits: u32;
 }
 
 public struct Extensions {
@@ -216,68 +333,43 @@ public struct Extensions {
 
     /// One offer (`permessage-deflate; param; param=value`) if it is permessage-deflate and acceptable.
     public fn deflateOffer(offer: Slice<u8>) -> DeflateAgreement? {
-        var agreed = DeflateAgreement {
-            serverNoContextTakeover: false,
-            clientNoContextTakeover: false,
-            serverMaxWindowBits: 15,
-            serverWindowNamed: false,
+        let p = match (deflateParams(offer)) {
+            Some(p) => p,
+            null => { return null; },
         };
-        var clientWindowSeen = false;
-        var part: usize = 0;
-        var start: usize = 0;
-        for (k in 0..offer.length + 1) {
-            if (k < offer.length && offer[k] != 59) {
-                continue;
-            }
-            let item = trim(offer[start..k]);
-            start = k + 1;
-            if (part == 0) {
-                if (!sameIgnoringCase(item, "permessage-deflate".bytes())) {
-                    return null;
-                }
-                part = 1;
-                continue;
-            }
-            var eq: usize = 0;
-            while (eq < item.length && item[eq] != 61) {
-                eq += 1;
-            }
-            let name = trim(item[0..eq]);
-            let hasValue = eq < item.length;
-            let raw = if (hasValue) trim(item[eq + 1..]) else item[0..0];
-            let quoted = raw.length >= 2 && raw[0] == 34 && raw[raw.length - 1] == 34;
-            let value = if (quoted) raw[1..raw.length - 1] else raw; // a quoted-string, or a token
-            if (sameIgnoringCase(name, "server_no_context_takeover".bytes())) {
-                if (hasValue || agreed.serverNoContextTakeover) {
-                    return null;
-                }
-                agreed.serverNoContextTakeover = true;
-            } else if (sameIgnoringCase(name, "client_no_context_takeover".bytes())) {
-                if (hasValue || agreed.clientNoContextTakeover) {
-                    return null;
-                }
-                agreed.clientNoContextTakeover = true;
-            } else if (sameIgnoringCase(name, "server_max_window_bits".bytes())) {
-                let bits = windowBits(value);
-                if (!hasValue || agreed.serverWindowNamed || bits == 0) {
-                    return null;
-                }
-                agreed.serverWindowNamed = true;
-                agreed.serverMaxWindowBits = bits;
-            } else if (sameIgnoringCase(name, "client_max_window_bits".bytes())) {
-                if (clientWindowSeen || (hasValue && windowBits(value) == 0)) {
-                    return null;
-                }
-                clientWindowSeen = true; // our inflater keeps 15 bits, so any client window is fine
-            } else {
-                return null; // an unknown parameter
-            }
-        }
-        if (part == 0) {
+        // Our inflater keeps 15 bits, so any client window is fine, named with a value or without.
+        return Some(DeflateAgreement {
+            serverNoContextTakeover: p.serverNoContextTakeover,
+            clientNoContextTakeover: p.clientNoContextTakeover,
+            serverMaxWindowBits: if (p.serverMaxWindowBits == 0) 15 else p.serverMaxWindowBits,
+            serverWindowNamed: p.serverMaxWindowBits != 0,
+            clientMaxWindowBits: 15,
+        });
+    }
+
+    /// The client's side: a server's `Sec-WebSocket-Extensions` response to `clientOffer()`, the agreement if it is
+    /// permessage-deflate with acceptable parameters, else null and the client fails the connection (RFC 6455 §4.1
+    /// rule 5; RFC 7692 §7.1). `client_max_window_bits` must have a value in a response (§7.1.2.2).
+    public fn deflateAnswer(response: Slice<u8>) -> DeflateAgreement? {
+        let p = match (deflateParams(response)) {
+            Some(p) => p,
+            null => { return null; },
+        };
+        if (p.clientWindowNamed && p.clientMaxWindowBits == 0) {
             return null;
         }
-        return Some(agreed);
+        return Some(DeflateAgreement {
+            serverNoContextTakeover: p.serverNoContextTakeover,
+            clientNoContextTakeover: p.clientNoContextTakeover,
+            serverMaxWindowBits: if (p.serverMaxWindowBits == 0) 15 else p.serverMaxWindowBits,
+            serverWindowNamed: p.serverMaxWindowBits != 0,
+            clientMaxWindowBits: if (p.clientMaxWindowBits == 0) 15 else p.clientMaxWindowBits,
+        });
     }
+
+    /// The client's offer: permessage-deflate, letting the server choose our window (our inflater keeps 15 bits, so
+    /// any server window is fine).
+    public fn clientOffer() -> StringView => "permessage-deflate; client_max_window_bits";
 
     /// The response's `Sec-WebSocket-Extensions` value for `agreed`.
     public fn deflateResponse(agreed: borrow DeflateAgreement, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
@@ -297,6 +389,73 @@ public struct Extensions {
         }
         return Ok();
     }
+}
+
+/// The parameters of `offer` (`permessage-deflate; param; param=value`), or null if it is not permessage-deflate or
+/// a parameter is unknown, repeated or out of range.
+fn deflateParams(offer: Slice<u8>) -> DeflateParams? {
+    var p = DeflateParams {
+        serverNoContextTakeover: false,
+        clientNoContextTakeover: false,
+        serverMaxWindowBits: 0,
+        clientWindowNamed: false,
+        clientMaxWindowBits: 0,
+    };
+    var part: usize = 0;
+    var start: usize = 0;
+    for (k in 0..offer.length + 1) {
+        if (k < offer.length && offer[k] != 59) {
+            continue;
+        }
+        let item = trim(offer[start..k]);
+        start = k + 1;
+        if (part == 0) {
+            if (!sameIgnoringCase(item, "permessage-deflate".bytes())) {
+                return null;
+            }
+            part = 1;
+            continue;
+        }
+        var eq: usize = 0;
+        while (eq < item.length && item[eq] != 61) {
+            eq += 1;
+        }
+        let name = trim(item[0..eq]);
+        let hasValue = eq < item.length;
+        let raw = if (hasValue) trim(item[eq + 1..]) else item[0..0];
+        let quoted = raw.length >= 2 && raw[0] == 34 && raw[raw.length - 1] == 34;
+        let value = if (quoted) raw[1..raw.length - 1] else raw; // a quoted-string, or a token
+        if (sameIgnoringCase(name, "server_no_context_takeover".bytes())) {
+            if (hasValue || p.serverNoContextTakeover) {
+                return null;
+            }
+            p.serverNoContextTakeover = true;
+        } else if (sameIgnoringCase(name, "client_no_context_takeover".bytes())) {
+            if (hasValue || p.clientNoContextTakeover) {
+                return null;
+            }
+            p.clientNoContextTakeover = true;
+        } else if (sameIgnoringCase(name, "server_max_window_bits".bytes())) {
+            let bits = windowBits(value);
+            if (!hasValue || p.serverMaxWindowBits != 0 || bits == 0) {
+                return null;
+            }
+            p.serverMaxWindowBits = bits;
+        } else if (sameIgnoringCase(name, "client_max_window_bits".bytes())) {
+            let bits = if (hasValue) windowBits(value) else 0;
+            if (p.clientWindowNamed || (hasValue && bits == 0)) {
+                return null;
+            }
+            p.clientWindowNamed = true;
+            p.clientMaxWindowBits = bits;
+        } else {
+            return null; // an unknown parameter
+        }
+    }
+    if (part == 0) {
+        return null;
+    }
+    return Some(p);
 }
 
 /// 8-15 from a decimal value, else 0.

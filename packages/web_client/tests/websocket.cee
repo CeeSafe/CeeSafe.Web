@@ -1,0 +1,93 @@
+// The WebSocket client's connect over mock connections (Web ADR 0010 §3.6, amendment 2). A scripted server cannot
+// answer a random key, so these cover the URL and every way the handshake fails before a session; the success path
+// runs against Python's `websockets` and Autobahn (tests/interop/ws_client.py, autobahn.py --client). Expected
+// outcomes follow RFC 6455 §3 (ws and wss URIs) and §4.1 (the client's checks).
+import web_core;
+import web_transport;
+import web_http;
+import web_ws;
+
+fn urlText(text: StringView) -> Result<Vector<u8>, TestFailure> {
+    let url = match (webSocketUrl(text.bytes())) {
+        Ok(u) => u,
+        Err(_) => { return Err(TestFailure.create("a WebSocket URL")); },
+    };
+    var out = Vector<u8>.create();
+    match (url.text(mut out)) {
+        Ok() => { return Ok(out); }
+        Err(_) => { return Err(TestFailure.create("its text")); }
+    }
+}
+
+fn refusedWith(text: StringView) -> UrlError? => match (webSocketUrl(text.bytes())) {
+    Err(ClientError.BadUrl(e)) => Some(e),
+    _ => null,
+};
+
+@test
+fn websocket_urls_rfc6455_3() -> Result<void, TestFailure> {
+    let plain = urlText("ws://example.test/chat?room=1")?;
+    Check.equalBytes("http://example.test/chat?room=1".bytes(), plain.view())?;
+    let secure = urlText("WSS://Example.test:8443")?;
+    Check.equalBytes("https://example.test:8443/".bytes(), secure.view())?;
+    let schemes = match (refusedWith("http://example.test/")) {
+        Some(UrlError.BadScheme) => true,
+        _ => false,
+    };
+    Check.isTrue(schemes, "http is not a WebSocket URI")?;
+    let fragment = match (refusedWith("ws://example.test/chat#top")) {
+        Some(UrlError.BadCharacter) => true,
+        _ => false,
+    };
+    Check.isTrue(fragment, "a fragment is refused")?;
+    return Ok();
+}
+
+/// What `connectWebSocket` gives over one scripted connection answering `text`, as a code: 0 for a connection, else
+/// the failure's (1 not switched with `status`, 2 upgrade, 3 accept, 6 another error).
+async fn connectOver(text: StringView, status: borrow mut u16) -> Result<u32, TestFailure> {
+    let scripts = scriptsOf(1)?;
+    queue(scripts, script(text)?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    var options = WebSocketClientOptions.defaults();
+    options.session.deflate = false;
+    match (await client.connectWebSocket("ws://example.test/chat", options)) {
+        Ok(_) => { return Ok(0); }
+        Err(ClientError.WebSocket(HandshakeFailure.NotSwitched(s))) => {
+            status = s;
+            return Ok(1);
+        }
+        Err(ClientError.WebSocket(HandshakeFailure.Upgrade)) => { return Ok(2); }
+        Err(ClientError.WebSocket(HandshakeFailure.Accept)) => { return Ok(3); }
+        Err(_) => { return Ok(6); }
+    }
+}
+
+@test
+async fn failed_handshakes() -> Result<void, TestFailure> {
+    var status: u16 = 0;
+    Check.equalU64(1, await connectOver("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n", mut status)? as u64)?;
+    Check.equalU64(403, status as u64)?;
+    // A redirect is not followed (§4.1: the client may, this one does not).
+    Check.equalU64(
+        1,
+        await connectOver("HTTP/1.1 302 Found\r\nlocation: ws://other.test/\r\ncontent-length: 0\r\n\r\n", mut status)? as
+            u64,
+    )?;
+    Check.equalU64(302, status as u64)?;
+    // RFC 6455 §1.3's accept value answers §1.3's key, never a fresh random one.
+    Check.equalU64(
+        3,
+        await connectOver(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            mut status,
+        )? as u64,
+    )?;
+    Check.equalU64(
+        2,
+        await connectOver("HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\n\r\n", mut status)? as u64,
+    )?;
+    // The connection ends before a whole head: closed, not a handshake failure.
+    Check.equalU64(6, await connectOver("HTTP/1.1 101 Swi", mut status)? as u64)?;
+    return Ok();
+}

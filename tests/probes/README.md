@@ -36,6 +36,7 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `dyn-send-async-frames-bug.cee` | builds and prints `3` since 0.9.4; before, the C defined the dyn-call frame twice | CeeSafe bug B15; blocks `web_client` natively | 0009 |
 | `scope-droppable-error-bug.cee` | builds and prints `3` since 0.9.4; before, the C called the error's drop function before declaring it | CeeSafe bug B13; scopes in `web_sse`'s tests | 0008 |
 | `ws-session-region.cee` | prints `2`, `3`, `1`, `closed` | a `Session<region r>` holding the exchange races a read against a queue and a timer through a top-level function (N0241 forbids arms over fields of one `this`) | 0010 |
+| `ws-link-generic.cee` | prints `3070`, natively too | one session type over two links: a scoped one (`impl<region r> Link for Borrowed<r>`, usable through a bound, not as `dyn`, CeeSafe ADR 0054 §3.2) and an owned one; the session holds `borrow mut(r) L` and races `L`'s read in a generic top-level function | 0010 amendment 2 |
 
 ## Runs
 

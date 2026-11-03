@@ -1,0 +1,282 @@
+// The WebSocket client (Web ADR 0010 §3.6, amendment 2): `Client.connectWebSocket` dials as the HTTP client does (DNS,
+// Happy Eyeballs, TLS through the connector), sends the upgrade request with a fresh key from the system's random
+// source, and checks the server's 101 with web_ws's `Handshake.checkAnswer`. `clientSession` then runs web_ws's
+// session over the connection, masking every frame. An upgraded connection never enters the pool, and takes none of
+// its per-origin slots.
+import web_core;
+import web_http;
+import web_http1;
+import web_ws;
+
+/// How a WebSocket client connects, and how its session behaves.
+public struct WebSocketClientOptions {
+    /// The session's limits, keep-alive, queue and fragment size (as on the server). `subprotocols` are offered in
+    /// this order; `deflate` offers permessage-deflate; `allowedOrigins` is the server's and is not used here.
+    public session: WebSocketOptions;
+    /// Sent as `Origin` when set, as a browser would (RFC 6455 §4.1, §10.2); servers that check origins need it.
+    public origin: Vector<u8>?;
+    /// The connection, TLS and the server's 101 must all be done within this, in milliseconds; 0 for no bound
+    /// beyond the client's own `connectMs` and `tlsMs`.
+    public handshakeMs: u64;
+    /// Each write of the session must finish within this, in milliseconds (a peer that stops reading).
+    public writeTimeoutMs: u64;
+
+    public fn defaults() -> WebSocketClientOptions => WebSocketClientOptions {
+        session: WebSocketOptions.defaults(),
+        origin: null,
+        handshakeMs: 10000,
+        writeTimeoutMs: 30000,
+    };
+}
+
+/// An open WebSocket connection after a successful handshake: the transport, the bytes that came after the 101's
+/// head, and what the server agreed to. `clientSession` runs a session over it; dropping it closes the connection.
+@noncopy
+public struct WebSocketConnection {
+    private conn: Box<dyn Transport + Send>;
+    private carry: OwnedBuffer;
+    private writeTimeoutMs: u64;
+    private agreedDeflate: DeflateAgreement?;
+    private agreedProtocol: usize?;
+
+    /// The index in the offered subprotocols of the one the server chose, if any.
+    public fn protocol(borrow this) -> usize? => this.agreedProtocol;
+
+    /// Whether permessage-deflate was agreed.
+    public fn compressing(borrow this) -> bool => match (this.agreedDeflate) {
+        Some(_) => true,
+        null => false,
+    };
+}
+
+impl RawLink for WebSocketConnection {
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError> {
+        if (!this.carry.isEmpty()) {
+            let ready = this.carry.readable();
+            let n = if (into.length < ready.length) into.length else ready.length;
+            for (i in 0..n) {
+                into[i] = ready[i];
+            }
+            match (this.carry.consume(n)) {
+                Ok() => { return Ok(n); }
+                Err(_) => { return Err(HandlerError.Internal); }
+            }
+        }
+        match (await this.conn.read(into)) {
+            Ok(n) => { return Ok(n); }
+            Err(e) => { return Err(HandlerError.Io(e)); }
+        }
+    }
+
+    async fn writeAll(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError> {
+        let deadline = if (this.writeTimeoutMs == 0) Deadline.never() else Deadline.after(this.writeTimeoutMs);
+        match (await writeBoxed(mut this.conn, bytes, deadline)) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(HandlerError.Io(e)); }
+        }
+    }
+}
+
+/// The session over `connection`, as the client: it masks what it sends and refuses masked frames. `options` must be
+/// the ones the connection was made with (`subprotocol()` indexes their `subprotocols`).
+public fn clientSession<region r>(
+    connection: borrow mut(r) WebSocketConnection,
+    options: borrow WebSocketClientOptions,
+) -> Result<WebSocket<r, WebSocketConnection>, ClientError> {
+    let deflate = connection.agreedDeflate;
+    let protocol = connection.agreedProtocol;
+    match (open(connection, Role.Client, options.session, deflate, protocol)) {
+        Ok(ws) => { return Ok(ws); }
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+    }
+}
+
+/// `text` as the http(s) URL the handshake is sent to: `ws://` is `http://` and `wss://` is `https://` (RFC 6455
+/// §3); anything else is `BadScheme`. A `#` is `BadCharacter`: a fragment "MUST NOT be used" and the character must
+/// be escaped (§3).
+public fn webSocketUrl(text: Slice<u8>) -> Result<Url, ClientError> {
+    for (b in text) {
+        if (b == 35) {
+            return Err(ClientError.BadUrl(UrlError.BadCharacter));
+        }
+    }
+    var mapped = Vector<u8>.create();
+    let plain = "ws://";
+    let secure = "wss://";
+    let isPlain = startsWith(text, plain.bytes());
+    if (!isPlain && !startsWith(text, secure.bytes())) {
+        return Err(ClientError.BadUrl(UrlError.BadScheme));
+    }
+    copyBytes(mut mapped, if (isPlain) "http://".bytes() else "https://".bytes())?;
+    copyBytes(mut mapped, text[if (isPlain) 5 else 6..])?;
+    match (Url.parse(mapped.view())) {
+        Ok(u) => { return Ok(u); }
+        Err(e) => { return Err(ClientError.BadUrl(e)); }
+    }
+}
+
+fn startsWith(text: Slice<u8>, prefix: Slice<u8>) -> bool {
+    if (text.length < prefix.length) {
+        return false;
+    }
+    for (i in 0..prefix.length) {
+        let c = text[i];
+        let lower = if (c >= 65 && c <= 90) c + 32 else c;
+        if (lower != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The opening handshake over `conn` (RFC 6455 §4.1): the request with a fresh 16-byte key, then the server's
+/// answer, checked, by `deadline`.
+async fn handshake(
+    connection: Box<dyn Transport + Send>,
+    url: borrow Url,
+    options: borrow WebSocketClientOptions,
+    deadline: Deadline,
+    limits: Limits,
+) -> Result<WebSocketConnection, ClientError> {
+    var conn = connection;
+    var nonce = [0u8; 16];
+    match (Random.fill(mut nonce[..])) {
+        Ok() => {}
+        Err(e) => { return Err(ClientError.Net(NetError.Io(e))); } // never a predictable key (§4.1, §10.3)
+    }
+    var key = Vector<u8>.create();
+    match (Base64.encode(nonce[..], mut key)) {
+        Ok() => {}
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+    }
+    var head = Vector<u8>.create();
+    writeRequest(mut head, url, options, key.view())?;
+    match (await writeBoxed(mut conn, head.view(), deadline)) {
+        Ok() => {}
+        Err(e) => { return Err(ClientError.Net(e)); }
+    }
+    // The answer's head; the bytes after it are the server's first frames.
+    var answer = Vector<u8>.create();
+    var scanner = HeadScanner.create();
+    var buf = [0u8; 4096];
+    loop {
+        match (scanner.scan(answer.view(), limits)) {
+            Ok(true) => { break; }
+            Ok(false) => {}
+            Err(e) => { return Err(ClientError.Protocol(e)); }
+        }
+        let n = net(await readBoxed(mut conn, mut buf[..], deadline))?;
+        if (n == 0) {
+            return Err(ClientError.Net(NetError.Closed));
+        }
+        copyBytes(mut answer, buf[0..n])?;
+    }
+    let end = scanner.end();
+    let all = answer.view();
+    let parsed = match (parseResponseHead(all, scanner.start(), end, Method.Get, limits)) {
+        Ok(p) => p,
+        Err(e) => { return Err(ClientError.Protocol(e)); },
+    };
+    let agreed = match (Handshake.checkAnswer(
+        parsed.status,
+        parsed.headers,
+        key.view(),
+        options.session.deflate,
+        options.session.subprotocols,
+    )) {
+        Ok(a) => a,
+        Err(f) => { return Err(ClientError.WebSocket(f)); },
+    };
+    var carry = match (OwnedBuffer.create(16384)) {
+        Ok(b) => b,
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+    };
+    match (carry.append(all[end..])) {
+        Ok() => {}
+        Err(e) => { return Err(ClientError.Net(e)); }
+    }
+    return Ok(WebSocketConnection {
+        conn: conn,
+        carry: carry,
+        writeTimeoutMs: options.writeTimeoutMs,
+        agreedDeflate: agreed.deflate,
+        agreedProtocol: agreed.protocol,
+    });
+}
+
+/// The upgrade request (§4.1): GET with `Upgrade`, `Connection`, the key, version 13, and the origin, subprotocols
+/// and permessage-deflate offer if any. A subprotocol that is not a token is `BadRequest`.
+fn writeRequest(
+    head: borrow mut Vector<u8>,
+    url: borrow Url,
+    options: borrow WebSocketClientOptions,
+    key: Slice<u8>,
+) -> Result<void, ClientError> {
+    var authority = Vector<u8>.create();
+    match (url.authority(mut authority)) {
+        Ok() => {}
+        Err(e) => { return Err(ClientError.BadUrl(e)); }
+    }
+    let method = "GET";
+    var w = RequestWriter.start(head, method.bytes(), url.target(), authority.view());
+    w.field(head, "upgrade".bytes(), "websocket".bytes());
+    w.field(head, "connection".bytes(), "upgrade".bytes());
+    w.field(head, "sec-websocket-key".bytes(), key);
+    w.field(head, "sec-websocket-version".bytes(), "13".bytes());
+    match (borrow options.origin) {
+        Some(o) => { w.field(head, "origin".bytes(), o.view()); }
+        null => {}
+    }
+    let offered = options.session.subprotocols.view();
+    if (offered.length > 0) {
+        var list = Vector<u8>.create();
+        for (i in 0..offered.length) {
+            let p = offered[i].view();
+            if (!Ascii.isToken(p)) {
+                return Err(ClientError.BadRequest);
+            }
+            if (i > 0) {
+                copyBytes(mut list, ", ".bytes())?;
+            }
+            copyBytes(mut list, p)?;
+        }
+        w.field(head, "sec-websocket-protocol".bytes(), list.view());
+    }
+    if (options.session.deflate) {
+        let offer = Extensions.clientOffer();
+        w.field(head, "sec-websocket-extensions".bytes(), offer.bytes());
+    }
+    if (!w.finish(head, Some(0), false)) {
+        return Err(ClientError.BadRequest);
+    }
+    return Ok();
+}
+
+/// Writes all of `bytes` to `conn` by `deadline`; a write stopped by the deadline poisons the connection (Web ADR
+/// 0001 §3.4), which the session then closes.
+async fn writeBoxed(
+    conn: borrow mut Box<dyn Transport + Send>,
+    bytes: Slice<u8>,
+    deadline: Deadline,
+) -> Result<void, NetError> {
+    if (deadline.isNever()) {
+        return await writeAllBoxed(conn, bytes);
+    }
+    if (deadline.isExpired()) {
+        return Err(NetError.TimedOut);
+    }
+    return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await writeAllBoxed(conn, bytes));
+}
+
+async fn writeAllBoxed(conn: borrow mut Box<dyn Transport + Send>, bytes: Slice<u8>) -> Result<void, NetError> {
+    var at: usize = 0;
+    while (at < bytes.length) {
+        let parts = IoParts.of(bytes[at..]);
+        let n = await conn.writeVectored(borrow parts)?;
+        if (n == 0) {
+            return Err(NetError.Closed);
+        }
+        at += n;
+    }
+    return Ok();
+}

@@ -84,7 +84,7 @@ a `web_http.ProtocolError` with one status (or a connection close) per reason. E
 | `web_http` | `web_core` |
 | `web_http1`, `web_sse`, `web_ws`, `web_http2` | `web_core`, `web_http` |
 | `web_http3` | `web_core`, `web_http`, `web_tls` |
-| `web_client` | `web_core`, `web_transport`, `web_http`, `web_http1`, `web_http2` |
+| `web_client` | `web_core`, `web_transport`, `web_http`, `web_http1`, `web_http2`, `web_ws` (amendment 2) |
 | `web_server` | `web_core`, `web_transport`, `web_http`, `web_http1`, `web_http2`, `web_sse`, `web_ws` |
 | `web_proxy` | `web_core`, `web_transport`, `web_http`, `web_client`, `web_server` |
 
@@ -131,3 +131,11 @@ the code it calls must be in `web_http` too:
    `beforeHead`. `web_server`'s generic `Server<S>` implements it, so drivers need no type parameter.
 4. HTTP/2 and HTTP/3 add their framing to `Exchange` as variants when they arrive (M6, M10), as §3.3's `RequestBody`
    intended for `Stream`.
+
+## 8. Amendment 2 (2026-11-03, M6 stage 4): `web_client` depends on `web_ws`
+
+The WebSocket client (Web ADR 0010 §3.6) dials and writes the upgrade request as the HTTP client does, then runs
+`web_ws`'s session over the connection. So `web_client` may depend on `web_ws`. Both stay below `web_tls`, and
+`web_ws` depends on neither `web_client` nor `web_transport`, so there is no cycle; `tools/check_layers.py` has the
+edge.
+

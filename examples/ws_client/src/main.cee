@@ -1,0 +1,408 @@
+// A WebSocket client on web_client and web_ws (Web ADR 0010 §3.6), for tests/interop/ws_client.py and Autobahn's
+// fuzzingserver (tests/interop/autobahn.py --client).
+//
+//   CW_URL        ws:// or wss:// (wss verified against the roots in CW_CA, a PEM file, or the system's)
+//   CW_MODE       echo (the default): sends each of CW_SEND's messages (separated by `|`) as text, then
+//                 CW_BINARY bytes (default 0) of a counting pattern as binary, reads one answer for each, closes
+//                 with 1000 and waits for the server's Close. It prints
+//                     ws_client: open protocol=<name or -> deflate=<0|1>
+//                     ws_client: text <the answer>                     (for each text message)
+//                     ws_client: binary <length> <same|different>      (for the binary one)
+//                     ws_client: closed <code>
+//                 autobahn: CW_URL is the fuzzingserver's base (ws://host:9001); runs every case as an echo client
+//                 under the agent name CW_AGENT (default ceesafe-web), then asks the server to write its reports.
+//   CW_PROTOCOLS  subprotocols to offer, comma-separated, in order
+//   CW_ORIGIN     the Origin to send
+//   CW_DEFLATE    1 (the default) offers permessage-deflate; 0 does not
+//   CW_MAX_MESSAGE  bounds frames and messages alike (default 16777216)
+// A failure prints `ws_client: failed: <reason>`.
+import web_core;
+import web_transport;
+import web_http;
+import web_tls;
+import web_ws;
+import web_client;
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    var v: u64 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57) {
+            return otherwise;
+        }
+        v = v * 10 + (b - 48) as u64;
+    }
+    return v;
+}
+
+async fn readFile(path: StringView, out: borrow mut Vector<u8>) -> Result<void, NetError> {
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(e) => { return Err(NetErrors.fromAsync(e)); },
+    };
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (await AsyncFiles.read(mut file, mut chunk[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(NetErrors.fromAsync(e)); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        append(out, chunk[0..n])?;
+    }
+}
+
+fn append(line: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, NetError> {
+    for (b in text) {
+        match (line.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+    return Ok();
+}
+
+fn appendNumber(line: borrow mut Vector<u8>, n: u64) -> Result<void, NetError> {
+    var digits = [0u8; 20];
+    var i: usize = 20;
+    var v = n;
+    loop {
+        i -= 1;
+        digits[i] = 48 + truncate<u8>(v % 10);
+        v /= 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    return append(line, digits[i..]);
+}
+
+async fn sayBytes(bytes: Slice<u8>) -> Result<void, NetError> {
+    let text = match (StringView.fromUtf8(bytes)) {
+        Some(t) => t,
+        null => "ws_client: (not UTF-8)",
+    };
+    match (await AsyncConsole.writeLine(text)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn say(text: StringView) -> Result<void, NetError> => await sayBytes(text.bytes());
+
+/// The wss connector: the roots in CW_CA, or the system's.
+async fn connector() -> Result<Box<dyn Connector>, NetError> {
+    var config = match (TlsConfig.client()) {
+        Ok(c) => c,
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
+    };
+    match (Environment.variable("CW_CA")) {
+        Some(path) => {
+            var ca = Vector<u8>.create();
+            await readFile(path, mut ca)?;
+            match (config.trustPem(ca.view())) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+            }
+        }
+        null => {
+            match (config.trustSystem()) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+            }
+        }
+    }
+    var protocols = [Alpn.Http11]; // the upgrade is HTTP/1.1's (RFC 6455 §4.1)
+    match (config.setAlpn(protocols[..])) {
+        Ok() => {}
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+    }
+    let tls = match (TlsConnector.create(config)) {
+        Ok(t) => t,
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
+    };
+    match (Box.create(tls)) {
+        Ok(b) => {
+            let d: Box<dyn Connector> = b;
+            return Ok(d);
+        }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}
+
+/// The options from the environment.
+fn options() -> Result<WebSocketClientOptions, NetError> {
+    var o = WebSocketClientOptions.defaults();
+    let max = setting("CW_MAX_MESSAGE", 16777216);
+    o.session.maxFrameBytes = max;
+    o.session.maxMessageBytes = max;
+    o.session.deflate = setting("CW_DEFLATE", 1) != 0;
+    match (Environment.variable("CW_ORIGIN")) {
+        Some(origin) => {
+            var v = Vector<u8>.create();
+            append(mut v, origin.bytes())?;
+            o.origin = Some(v);
+        }
+        null => {}
+    }
+    match (Environment.variable("CW_PROTOCOLS")) {
+        Some(list) => {
+            let bytes = list.bytes();
+            var start: usize = 0;
+            for (k in 0..bytes.length + 1) {
+                if (k == bytes.length || bytes[k] == 44) {
+                    var p = Vector<u8>.create();
+                    append(mut p, bytes[start..k])?;
+                    match (o.session.subprotocols.push(p)) {
+                        Ok() => {}
+                        Err(_) => { return Err(NetError.OutOfMemory); }
+                    }
+                    start = k + 1;
+                }
+            }
+        }
+        null => {}
+    }
+    return Ok(o);
+}
+
+async fn failed(e: ClientError) -> Result<void, NetError> {
+    var line = Vector<u8>.create();
+    append(mut line, "ws_client: failed: ".bytes())?;
+    append(mut line, ClientErrors.describe(e).bytes())?;
+    return await sayBytes(line.view());
+}
+
+async fn sessionFailed(e: HandlerError) -> Result<void, NetError> {
+    let text = match (borrow e) {
+        HandlerError.Io(n) => NetErrors.describe(n),
+        _ => "the session failed",
+    };
+    var line = Vector<u8>.create();
+    append(mut line, "ws_client: failed: ".bytes())?;
+    append(mut line, text.bytes())?;
+    return await sayBytes(line.view());
+}
+
+/// Echo mode: the messages, their answers, the close.
+async fn echo(client: borrow Client, url: StringView, o: borrow WebSocketClientOptions) -> Result<void, NetError> {
+    var connection = match (await client.connectWebSocket(url, o)) {
+        Ok(c) => c,
+        Err(e) => { return await failed(e); },
+    };
+    var line = Vector<u8>.create();
+    append(mut line, "ws_client: open protocol=".bytes())?;
+    match (connection.protocol()) {
+        Some(i) => { append(mut line, o.session.subprotocols[i].view())?; }
+        null => { append(mut line, "-".bytes())?; }
+    }
+    append(mut line, if (connection.compressing()) " deflate=1".bytes() else " deflate=0".bytes())?;
+    await sayBytes(line.view())?;
+    var ws = match (clientSession(mut connection, o)) {
+        Ok(w) => w,
+        Err(e) => { return await failed(e); },
+    };
+    var answer = Vector<u8>.create();
+    match (Environment.variable("CW_SEND")) {
+        Some(list) => {
+            let bytes = list.bytes();
+            var start: usize = 0;
+            for (k in 0..bytes.length + 1) {
+                if (k < bytes.length && bytes[k] != 124) {
+                    continue;
+                }
+                match (await ws.send(MessageKind.Text, bytes[start..k])) {
+                    Ok() => {}
+                    Err(e) => { return await sessionFailed(e); }
+                }
+                start = k + 1;
+                match (await ws.receive(mut answer)) {
+                    Ok(Received.Message(_)) => {
+                        line.clear();
+                        append(mut line, "ws_client: text ".bytes())?;
+                        append(mut line, answer.view())?;
+                        await sayBytes(line.view())?;
+                    }
+                    Ok(Received.Closed(code)) => { return await closed(code); }
+                    Err(e) => { return await sessionFailed(e); }
+                }
+            }
+        }
+        null => {}
+    }
+    let binary = setting("CW_BINARY", 0);
+    if (binary > 0) {
+        var payload = Vector<u8>.create();
+        for (i in 0..binary) {
+            match (payload.push(truncate<u8>(i % 251))) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+        match (await ws.send(MessageKind.Binary, payload.view())) {
+            Ok() => {}
+            Err(e) => { return await sessionFailed(e); }
+        }
+        match (await ws.receive(mut answer)) {
+            Ok(Received.Message(_)) => {
+                var same = answer.length == payload.length;
+                for (i in 0..answer.length) {
+                    if (same && answer[i] != payload[i]) {
+                        same = false;
+                    }
+                }
+                line.clear();
+                append(mut line, "ws_client: binary ".bytes())?;
+                appendNumber(mut line, answer.length as u64)?;
+                append(mut line, if (same) " same".bytes() else " different".bytes())?;
+                await sayBytes(line.view())?;
+            }
+            Ok(Received.Closed(code)) => { return await closed(code); }
+            Err(e) => { return await sessionFailed(e); }
+        }
+    }
+    match (await ws.close(CloseCodes.normal())) {
+        Ok() => {}
+        Err(e) => { return await sessionFailed(e); }
+    }
+    loop {
+        match (await ws.receive(mut answer)) {
+            Ok(Received.Message(_)) => {}
+            Ok(Received.Closed(code)) => { return await closed(code); }
+            Err(e) => { return await sessionFailed(e); }
+        }
+    }
+}
+
+async fn closed(code: u16) -> Result<void, NetError> {
+    var line = Vector<u8>.create();
+    append(mut line, "ws_client: closed ".bytes())?;
+    appendNumber(mut line, code as u64)?;
+    return await sayBytes(line.view());
+}
+
+/// One connection that echoes every message until it closes; the text of the first message, if `first`.
+async fn echoAll(
+    client: borrow Client,
+    url: Slice<u8>,
+    o: borrow WebSocketClientOptions,
+    first: borrow mut Vector<u8>,
+) -> Result<bool, NetError> {
+    let text = match (StringView.fromUtf8(url)) {
+        Some(t) => t,
+        null => { return Ok(false); },
+    };
+    var connection = match (await client.connectWebSocket(text, o)) {
+        Ok(c) => c,
+        Err(e) => {
+            await failed(e)?;
+            return Ok(false);
+        },
+    };
+    var ws = match (clientSession(mut connection, o)) {
+        Ok(w) => w,
+        Err(e) => {
+            await failed(e)?;
+            return Ok(false);
+        },
+    };
+    var message = Vector<u8>.create();
+    loop {
+        match (await ws.receive(mut message)) {
+            Ok(Received.Message(kind)) => {
+                if (first.length == 0) {
+                    append(first, message.view())?;
+                }
+                match (await ws.send(kind, message.view())) {
+                    Ok() => {}
+                    Err(_) => {} // the session ends itself; receive reports how
+                }
+            }
+            Ok(Received.Closed(_)) => { return Ok(true); }
+            Err(e) => {
+                await sessionFailed(e)?;
+                return Ok(false);
+            }
+        }
+    }
+}
+
+/// Autobahn's fuzzingserver protocol: getCaseCount, runCase for each, updateReports.
+async fn autobahn(client: borrow Client, base: StringView, o: borrow WebSocketClientOptions) -> Result<void, NetError> {
+    let agent = match (Environment.variable("CW_AGENT")) {
+        Some(a) => a,
+        null => "ceesafe-web",
+    };
+    var url = Vector<u8>.create();
+    append(mut url, base.bytes())?;
+    append(mut url, "/getCaseCount".bytes())?;
+    var count = Vector<u8>.create();
+    if (!await echoAll(client, url.view(), o, mut count)?) {
+        return Ok();
+    }
+    var cases: u64 = 0;
+    for (b in count.view()) {
+        if (b >= 48 && b <= 57) {
+            cases = cases * 10 + (b - 48) as u64;
+        }
+    }
+    var line = Vector<u8>.create();
+    append(mut line, "ws_client: cases ".bytes())?;
+    appendNumber(mut line, cases)?;
+    await sayBytes(line.view())?;
+    for (i in 1..cases + 1) {
+        url.clear();
+        append(mut url, base.bytes())?;
+        append(mut url, "/runCase?case=".bytes())?;
+        appendNumber(mut url, i)?;
+        append(mut url, "&agent=".bytes())?;
+        append(mut url, agent.bytes())?;
+        var ignored = Vector<u8>.create();
+        let ran = await echoAll(client, url.view(), o, mut ignored)?;
+    }
+    url.clear();
+    append(mut url, base.bytes())?;
+    append(mut url, "/updateReports?agent=".bytes())?;
+    append(mut url, agent.bytes())?;
+    var ignored = Vector<u8>.create();
+    let updated = await echoAll(client, url.view(), o, mut ignored)?;
+    return await say("ws_client: reports updated");
+}
+
+async fn run() -> Result<void, NetError> {
+    let url = match (Environment.variable("CW_URL")) {
+        Some(u) => u,
+        null => { return await say("ws_client: set CW_URL"); },
+    };
+    let o = options()?;
+    let tls = await connector()?;
+    let client = match (Client.create(ClientOptions.defaults(), Some(tls))) {
+        Ok(c) => c,
+        Err(e) => { return await failed(e); },
+    };
+    let mode = match (Environment.variable("CW_MODE")) {
+        Some(m) => m,
+        null => "echo",
+    };
+    if (mode == "autobahn") {
+        await autobahn(client, url, o)?;
+    } else {
+        await echo(client, url, o)?;
+    }
+    await client.shutdown();
+    return Ok();
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok() => {}
+        Err(e) => {
+            Console.writeLine("ws_client: failed:");
+            Console.writeLine(NetErrors.describe(e));
+        }
+    }
+}

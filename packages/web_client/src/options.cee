@@ -1,6 +1,7 @@
 // The client's options (Web ADR 0009 §3.4, §3.6-3.8).
 import web_core;
 import web_http;
+import web_ws;
 
 /// When a failed attempt may be sent again (Web ADR 0009 §3.8). Retrying needs all of: an idempotent method or an
 /// `Idempotency-Key`; no byte of the request written, or a reuse race; a body that can replay; and room in
@@ -78,6 +79,8 @@ public enum ClientError {
     Protocol(ProtocolError),
     /// The client was shut down.
     Shutdown,
+    /// A WebSocket server's answer failed RFC 6455 §4.1's checks (or it did not switch).
+    WebSocket(HandshakeFailure),
 }
 
 /// Descriptions.
@@ -89,5 +92,10 @@ public struct ClientErrors {
         ClientError.Net(n) => NetErrors.describe(n),
         ClientError.Protocol(p) => ProtocolErrors.describe(p),
         ClientError.Shutdown => "client shut down",
+        ClientError.WebSocket(HandshakeFailure.NotSwitched(_)) => "the server did not switch to WebSocket",
+        ClientError.WebSocket(HandshakeFailure.Upgrade) => "the server's answer is not a WebSocket upgrade",
+        ClientError.WebSocket(HandshakeFailure.Accept) => "the server's Sec-WebSocket-Accept is wrong",
+        ClientError.WebSocket(HandshakeFailure.Extension) => "the server agreed to an extension not offered",
+        ClientError.WebSocket(HandshakeFailure.Subprotocol) => "the server chose a subprotocol not offered",
     };
 }
