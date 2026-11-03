@@ -41,4 +41,5 @@ See [`AGENTS.md`](AGENTS.md) for the project's rules.
 
 ## License
 
-CeeSafe.Web is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)), as CeeSafe is.
+CeeSafe.Web is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)), as CeeSafe is,
+with an exception that permits linking it with OpenSSL ([COPYING.OPENSSL](COPYING.OPENSSL)), which `web_tls` does.
