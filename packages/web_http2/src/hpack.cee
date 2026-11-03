@@ -1,0 +1,464 @@
+// HPACK (RFC 7541): the decoder, with the dynamic table and size updates, and an encoder that uses the static table
+// only (Web ADR 0011). Sans-I/O: blocks in, fields out.
+
+/// Why a header block could not be decoded. Every one is a connection error, COMPRESSION_ERROR (RFC 9113 §4.3), except
+/// `TooLarge`, after which the block was still decoded, so the dynamic table stays in step with the peer's.
+public enum HpackError {
+    /// An integer longer than 4 bytes of continuation, or one that does not fit (§5.1).
+    BadInteger,
+    /// The block ends inside a representation.
+    Truncated,
+    /// A Huffman-coded string that is not a valid coding (§5.2).
+    BadHuffman,
+    /// Index 0, or one past the static and dynamic tables (§2.3.3).
+    BadIndex,
+    /// A dynamic table size update above the limit we announced, or after a field (§4.2, §6.3).
+    BadTableSizeUpdate,
+    /// The decoded list is larger than the limit (RFC 9113 §6.5.2: each field counts its name, value and 32).
+    TooLarge,
+    OutOfMemory,
+}
+
+/// Where one field's name and value are in a `HeaderBlock`'s bytes.
+public struct FieldSpan {
+    public nameAt: u32;
+    public nameLength: u32;
+    public valueAt: u32;
+    public valueLength: u32;
+    /// Sent as "never indexed" (§6.2.3): an intermediary must forward it the same way.
+    public sensitive: bool;
+}
+
+/// A decoded header list: the fields in order, their bytes in one buffer.
+@noncopy
+public struct HeaderBlock {
+    private bytes: Vector<u8>;
+    private spans: Vector<FieldSpan>;
+    private listSize: u64;
+
+    /// An empty list.
+    public fn create() -> HeaderBlock =>
+        HeaderBlock { bytes: Vector<u8>.create(), spans: Vector<FieldSpan>.create(), listSize: 0 };
+
+    /// Empties the list, keeping its memory.
+    public fn clear(borrow mut this) {
+        this.bytes.clear();
+        this.spans.clear();
+        this.listSize = 0;
+    }
+
+    /// How many fields.
+    public fn count(borrow this) -> usize => this.spans.length;
+
+    /// The `i`th field's name.
+    public fn name(borrow this, i: usize) -> Slice<u8> {
+        let s = this.spans[i];
+        let all = this.bytes.view();
+        return all[s.nameAt as usize..(s.nameAt + s.nameLength) as usize];
+    }
+
+    /// The `i`th field's value.
+    public fn value(borrow this, i: usize) -> Slice<u8> {
+        let s = this.spans[i];
+        let all = this.bytes.view();
+        return all[s.valueAt as usize..(s.valueAt + s.valueLength) as usize];
+    }
+
+    /// The `i`th field's span.
+    public fn span(borrow this, i: usize) -> FieldSpan => this.spans[i];
+
+    /// The list's size as RFC 9113 §6.5.2 counts it: each field's name and value, plus 32.
+    public fn size(borrow this) -> u64 => this.listSize;
+
+    /// All the names and values, which the spans index.
+    public fn allBytes(borrow this) -> Slice<u8> => this.bytes.view();
+
+    /// Appends a field.
+    public fn push(borrow mut this, name: Slice<u8>, value: Slice<u8>, sensitive: bool) -> Result<void, AllocError> {
+        let nameAt = this.bytes.length;
+        appendAll(mut this.bytes, name)?;
+        let valueAt = this.bytes.length;
+        appendAll(mut this.bytes, value)?;
+        this.spans.push(FieldSpan {
+            nameAt: truncate<u32>(nameAt),
+            nameLength: truncate<u32>(name.length),
+            valueAt: truncate<u32>(valueAt),
+            valueLength: truncate<u32>(value.length),
+            sensitive: sensitive,
+        })?;
+        this.listSize += name.length as u64 + value.length as u64 + 32;
+        return Ok();
+    }
+}
+
+/// One dynamic table entry.
+struct Entry {
+    name: Vector<u8>;
+    value: Vector<u8>;
+}
+
+/// The dynamic table (§2.3.2, §4): a ring of entries, newest last, sized by `maxSize` (§4.1: each entry costs its name,
+/// value and 32). The ring holds `limit / 32 + 1` entries, which no table within `limit` can exceed.
+struct DynamicTable {
+    slots: Vector<Entry>;
+    oldest: usize;
+    count: usize;
+    size: u32;
+    maxSize: u32;
+
+    fn create(limit: u32) -> Result<DynamicTable, AllocError> {
+        var slots = Vector<Entry>.create();
+        for (i in 0..(limit / 32 + 1)) {
+            slots.push(Entry { name: Vector<u8>.create(), value: Vector<u8>.create() })?;
+        }
+        return Ok(DynamicTable { slots: slots, oldest: 0, count: 0, size: 0, maxSize: limit });
+    }
+
+    /// The `i`th entry, 1 for the newest.
+    fn at(borrow this, i: usize) -> usize => (this.oldest + this.count - i) % this.slots.length;
+
+    fn evictTo(borrow mut this, room: u32) {
+        while (this.count > 0 && this.size > room) {
+            let s = this.oldest;
+            this.size -= entrySize(this.slots[s].name.length, this.slots[s].value.length);
+            this.slots[s].name.clear();
+            this.slots[s].value.clear();
+            this.oldest = (this.oldest + 1) % this.slots.length;
+            this.count -= 1;
+        }
+    }
+
+    /// A new maximum size (§4.3: entries are evicted to fit).
+    fn resize(borrow mut this, maxSize: u32) {
+        this.maxSize = maxSize;
+        this.evictTo(maxSize);
+    }
+
+    /// Adds an entry, evicting the oldest to make room; one larger than the table empties it (§4.4).
+    fn insert(borrow mut this, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+        let cost = entrySize(name.length, value.length);
+        if (cost > this.maxSize) {
+            this.evictTo(0);
+            return Ok();
+        }
+        this.evictTo(this.maxSize - cost);
+        let s = (this.oldest + this.count) % this.slots.length;
+        this.slots[s].name.clear();
+        this.slots[s].value.clear();
+        appendAll(mut this.slots[s].name, name)?;
+        appendAll(mut this.slots[s].value, value)?;
+        this.count += 1;
+        this.size += cost;
+        return Ok();
+    }
+}
+
+fn entrySize(name: usize, value: usize) -> u32 => truncate<u32>(name + value + 32);
+
+fn appendAll(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        out.push(b)?;
+    }
+    return Ok();
+}
+
+/// Decodes header blocks (§3), keeping the dynamic table between them.
+@noncopy
+public struct HpackDecoder {
+    private table: DynamicTable;
+    private limit: u32;
+    private maxListSize: u64;
+    private scratch: Vector<u8>;
+    private nameBuffer: Vector<u8>;
+
+    /// A decoder whose dynamic table may grow to `tableLimit` bytes (what we announce as SETTINGS_HEADER_TABLE_SIZE),
+    /// for header lists up to `maxListSize` (SETTINGS_MAX_HEADER_LIST_SIZE).
+    public fn create(tableLimit: u32, maxListSize: u64) -> Result<HpackDecoder, AllocError> =>
+        Ok(HpackDecoder {
+            table: DynamicTable.create(tableLimit)?,
+            limit: tableLimit,
+            maxListSize: maxListSize,
+            scratch: Vector<u8>.create(),
+            nameBuffer: Vector<u8>.create(),
+        });
+
+    /// The dynamic table's size, as §4.1 counts it.
+    public fn tableSize(borrow this) -> u32 => this.table.size;
+
+    /// How many entries the dynamic table holds.
+    public fn tableCount(borrow this) -> usize => this.table.count;
+
+    /// Decodes one complete header block (the HEADERS or PUSH_PROMISE fragment and its CONTINUATIONs) into `out`
+    /// (cleared first).
+    public fn decode(borrow mut this, block: Slice<u8>, out: borrow mut HeaderBlock) -> Result<void, HpackError> {
+        out.clear();
+        var at: usize = 0;
+        var sawField = false;
+        var tooLarge = false;
+        while (at < block.length) {
+            let b = block[at];
+            if (b & 0x80 != 0) {
+                // Indexed field (§6.1).
+                let index = readInteger(block, mut at, 7)?;
+                this.emitIndexed(index, out, mut tooLarge)?;
+                sawField = true;
+            } else if (b & 0xC0 == 0x40) {
+                // Literal with incremental indexing (§6.2.1).
+                this.readLiteral(block, mut at, 6, false, true, out, mut tooLarge)?;
+                sawField = true;
+            } else if (b & 0xE0 == 0x20) {
+                // Dynamic table size update (§6.3), only before the block's first field (§4.2).
+                let size = readInteger(block, mut at, 5)?;
+                if (sawField || size > this.limit as u64) {
+                    return Err(HpackError.BadTableSizeUpdate);
+                }
+                this.table.resize(truncate<u32>(size));
+            } else {
+                // Literal without indexing (0000) or never indexed (0001) (§6.2.2, §6.2.3).
+                this.readLiteral(block, mut at, 4, b & 0x10 != 0, false, out, mut tooLarge)?;
+                sawField = true;
+            }
+        }
+        if (tooLarge) {
+            out.clear();
+            return Err(HpackError.TooLarge);
+        }
+        return Ok();
+    }
+
+    fn emitIndexed(
+        borrow mut this,
+        index: u64,
+        out: borrow mut HeaderBlock,
+        tooLarge: borrow mut bool,
+    ) -> Result<void, HpackError> {
+        if (index == 0) {
+            return Err(HpackError.BadIndex);
+        }
+        if (index <= 61) {
+            let text = staticText();
+            let t = text.bytes();
+            let i = index as usize;
+            let nameAt = STATIC_NAME_AT;
+            let nameLen = STATIC_NAME_LEN;
+            let valueAt = STATIC_VALUE_AT;
+            let valueLen = STATIC_VALUE_LEN;
+            return this.emit(
+                t[nameAt[i] as usize..nameAt[i] as usize + nameLen[i] as usize],
+                t[valueAt[i] as usize..valueAt[i] as usize + valueLen[i] as usize],
+                false,
+                out,
+                tooLarge,
+            );
+        }
+        let d = index - 61;
+        if (d > this.table.count as u64) {
+            return Err(HpackError.BadIndex);
+        }
+        let s = this.table.at(truncate<usize>(d));
+        let name = this.table.slots[s].name.view();
+        let value = this.table.slots[s].value.view();
+        return emitTo(name, value, false, this.maxListSize, out, tooLarge);
+    }
+
+    fn emit(
+        borrow this,
+        name: Slice<u8>,
+        value: Slice<u8>,
+        sensitive: bool,
+        out: borrow mut HeaderBlock,
+        tooLarge: borrow mut bool,
+    ) -> Result<void, HpackError> =>
+        emitTo(name, value, sensitive, this.maxListSize, out, tooLarge);
+
+    /// A literal field: the name indexed (`prefix` bits) or literal, then the value; added to the table if `index`.
+    fn readLiteral(
+        borrow mut this,
+        block: Slice<u8>,
+        at: borrow mut usize,
+        prefix: u32,
+        sensitive: bool,
+        index: bool,
+        out: borrow mut HeaderBlock,
+        tooLarge: borrow mut bool,
+    ) -> Result<void, HpackError> {
+        let nameIndex = readInteger(block, at, prefix)?;
+        this.nameBuffer.clear();
+        if (nameIndex == 0) {
+            readString(block, at, mut this.nameBuffer)?;
+        } else if (nameIndex <= 61) {
+            let text = staticText();
+            let t = text.bytes();
+            let i = nameIndex as usize;
+            let nameAt = STATIC_NAME_AT;
+            let nameLen = STATIC_NAME_LEN;
+            pushed(appendAll(mut this.nameBuffer, t[nameAt[i] as usize..nameAt[i] as usize + nameLen[i] as usize]))?;
+        } else {
+            let d = nameIndex - 61;
+            if (d > this.table.count as u64) {
+                return Err(HpackError.BadIndex);
+            }
+            let s = this.table.at(truncate<usize>(d));
+            pushed(appendAll(mut this.nameBuffer, this.table.slots[s].name.view()))?;
+        }
+        this.scratch.clear();
+        readString(block, at, mut this.scratch)?;
+        emitTo(this.nameBuffer.view(), this.scratch.view(), sensitive, this.maxListSize, out, tooLarge)?;
+        if (index) {
+            pushed(this.table.insert(this.nameBuffer.view(), this.scratch.view()))?;
+        }
+        return Ok();
+    }
+}
+
+/// Appends a field to `out` unless the list has outgrown `maxListSize`, which `tooLarge` records.
+fn emitTo(
+    name: Slice<u8>,
+    value: Slice<u8>,
+    sensitive: bool,
+    maxListSize: u64,
+    out: borrow mut HeaderBlock,
+    tooLarge: borrow mut bool,
+) -> Result<void, HpackError> {
+    if (tooLarge || out.size() + name.length as u64 + value.length as u64 + 32 > maxListSize) {
+        tooLarge = true;
+        return Ok();
+    }
+    return pushed(out.push(name, value, sensitive));
+}
+
+fn pushed(r: Result<void, AllocError>) -> Result<void, HpackError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HpackError.OutOfMemory); }
+    }
+}
+
+/// An integer with an `n`-bit prefix (§5.1), from `block` at `at`, which it advances. At most 2^32 - 1.
+fn readInteger(block: Slice<u8>, at: borrow mut usize, n: u32) -> Result<u64, HpackError> {
+    if (at >= block.length) {
+        return Err(HpackError.Truncated);
+    }
+    let mask = (1u64 << n) - 1;
+    var value = block[at] as u64 & mask;
+    at += 1;
+    if (value < mask) {
+        return Ok(value);
+    }
+    var shift: u32 = 0;
+    loop {
+        if (at >= block.length) {
+            return Err(HpackError.Truncated);
+        }
+        let b = block[at];
+        at += 1;
+        value += (b as u64 & 127) << shift;
+        if (value > 0xFFFFFFFF) {
+            return Err(HpackError.BadInteger);
+        }
+        if (b & 128 == 0) {
+            return Ok(value);
+        }
+        shift += 7;
+        if (shift > 28) {
+            return Err(HpackError.BadInteger);
+        }
+    }
+}
+
+/// A string literal (§5.2) appended to `out`: Huffman-coded if its first bit is set.
+fn readString(block: Slice<u8>, at: borrow mut usize, out: borrow mut Vector<u8>) -> Result<void, HpackError> {
+    if (at >= block.length) {
+        return Err(HpackError.Truncated);
+    }
+    let huffman = block[at] & 0x80 != 0;
+    let length = readInteger(block, at, 7)?;
+    if (length > (block.length - at) as u64) {
+        return Err(HpackError.Truncated);
+    }
+    let bytes = block[at..at + truncate<usize>(length)];
+    at += truncate<usize>(length);
+    if (!huffman) {
+        return pushed(appendAll(out, bytes));
+    }
+    match (Huffman.decode(bytes, out)) {
+        Ok(true) => { return Ok(); }
+        Ok(false) => { return Err(HpackError.BadHuffman); }
+        Err(_) => { return Err(HpackError.OutOfMemory); }
+    }
+}
+
+/// Encodes header fields with the static table and string literals (Web ADR 0011): never touching the dynamic table,
+/// it never needs a size update, whatever the peer's SETTINGS_HEADER_TABLE_SIZE.
+public struct HpackEncoder {
+    /// Appends one field to `out`: an exact static match as an indexed field; otherwise the value literal (Huffman-coded
+    /// when shorter), with the name's static index if it has one, without indexing, or never indexed if `sensitive`.
+    public fn field(
+        name: Slice<u8>,
+        value: Slice<u8>,
+        sensitive: bool,
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, AllocError> {
+        let text = staticText();
+        let t = text.bytes();
+        let nameAt = STATIC_NAME_AT;
+        let nameLen = STATIC_NAME_LEN;
+        let valueAt = STATIC_VALUE_AT;
+        let valueLen = STATIC_VALUE_LEN;
+        var nameIndex: u64 = 0;
+        for (i in 1..62usize) {
+            if (!same(t[nameAt[i] as usize..nameAt[i] as usize + nameLen[i] as usize], name)) {
+                continue;
+            }
+            if (nameIndex == 0) {
+                nameIndex = i as u64;
+            }
+            if (!sensitive && same(t[valueAt[i] as usize..valueAt[i] as usize + valueLen[i] as usize], value)) {
+                return writeInteger(out, 0x80, 7, i as u64);
+            }
+        }
+        writeInteger(out, if (sensitive) 0x10 else 0x00, 4, nameIndex)?;
+        if (nameIndex == 0) {
+            writeString(out, name)?;
+        }
+        return writeString(out, value);
+    }
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Appends `value` with an `n`-bit prefix (§5.1) after the high bits `flags`.
+public fn writeInteger(out: borrow mut Vector<u8>, flags: u8, n: u32, value: u64) -> Result<void, AllocError> {
+    let mask = (1u64 << n) - 1;
+    if (value < mask) {
+        return out.push(flags | truncate<u8>(value));
+    }
+    out.push(flags | truncate<u8>(mask))?;
+    var rest = value - mask;
+    while (rest >= 128) {
+        out.push(truncate<u8>(rest % 128) | 0x80)?;
+        rest /= 128;
+    }
+    return out.push(truncate<u8>(rest));
+}
+
+/// Appends a string literal (§5.2), Huffman-coded when that is shorter.
+fn writeString(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    let coded = Huffman.encodedLength(bytes);
+    if (coded < bytes.length) {
+        writeInteger(out, 0x80, 7, coded as u64)?;
+        return Huffman.encode(bytes, out);
+    }
+    writeInteger(out, 0x00, 7, bytes.length as u64)?;
+    return appendAll(out, bytes);
+}

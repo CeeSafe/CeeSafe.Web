@@ -1,0 +1,257 @@
+// HTTP/2 frames (RFC 9113 §4, §6): the 9-byte header, frame types, flags, error codes and settings, and writers for
+// each frame. Sans-I/O.
+
+/// The connection preface a client sends first (§3.4).
+public fn clientPreface() -> StringView => "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Frame types (§6).
+public struct FrameTypes {
+    public fn data() -> u8 => 0x0;
+    public fn headers() -> u8 => 0x1;
+    public fn priority() -> u8 => 0x2;
+    public fn rstStream() -> u8 => 0x3;
+    public fn settings() -> u8 => 0x4;
+    public fn pushPromise() -> u8 => 0x5;
+    public fn ping() -> u8 => 0x6;
+    public fn goAway() -> u8 => 0x7;
+    public fn windowUpdate() -> u8 => 0x8;
+    public fn continuation() -> u8 => 0x9;
+}
+
+/// Frame flags (§6): which apply depends on the frame type.
+public struct FrameFlags {
+    /// DATA, HEADERS: the sender's last frame on the stream.
+    public fn endStream() -> u8 => 0x01;
+    /// SETTINGS, PING: an acknowledgement.
+    public fn ack() -> u8 => 0x01;
+    /// HEADERS, PUSH_PROMISE, CONTINUATION: the header block ends here.
+    public fn endHeaders() -> u8 => 0x04;
+    /// DATA, HEADERS, PUSH_PROMISE: a pad length and padding are present.
+    public fn padded() -> u8 => 0x08;
+    /// HEADERS: the (deprecated) priority fields are present.
+    public fn priority() -> u8 => 0x20;
+}
+
+/// Error codes (§7), carried by RST_STREAM and GOAWAY.
+public struct ErrorCodes {
+    public fn noError() -> u32 => 0x0;
+    public fn protocolError() -> u32 => 0x1;
+    public fn internalError() -> u32 => 0x2;
+    public fn flowControlError() -> u32 => 0x3;
+    public fn settingsTimeout() -> u32 => 0x4;
+    public fn streamClosed() -> u32 => 0x5;
+    public fn frameSizeError() -> u32 => 0x6;
+    public fn refusedStream() -> u32 => 0x7;
+    public fn cancel() -> u32 => 0x8;
+    public fn compressionError() -> u32 => 0x9;
+    public fn connectError() -> u32 => 0xa;
+    public fn enhanceYourCalm() -> u32 => 0xb;
+    public fn inadequateSecurity() -> u32 => 0xc;
+    public fn http11Required() -> u32 => 0xd;
+}
+
+/// Setting identifiers (§6.5.2).
+public struct SettingIds {
+    public fn headerTableSize() -> u16 => 0x1;
+    public fn enablePush() -> u16 => 0x2;
+    public fn maxConcurrentStreams() -> u16 => 0x3;
+    public fn initialWindowSize() -> u16 => 0x4;
+    public fn maxFrameSize() -> u16 => 0x5;
+    public fn maxHeaderListSize() -> u16 => 0x6;
+}
+
+/// A frame's header (§4.1).
+public struct FrameHeader {
+    /// The payload's length (24 bits).
+    public length: u32;
+    public kind: u8;
+    public flags: u8;
+    /// The stream (31 bits; the reserved bit is ignored on receipt).
+    public stream: u32;
+}
+
+/// Reading and writing frames.
+public struct Frames {
+    /// The header at the start of `bytes`, if all 9 bytes are there.
+    public fn parseHeader(bytes: Slice<u8>) -> FrameHeader? {
+        if (bytes.length < 9) {
+            return null;
+        }
+        return Some(FrameHeader {
+            length: (bytes[0] as u32 << 16) | (bytes[1] as u32 << 8) | bytes[2] as u32,
+            kind: bytes[3],
+            flags: bytes[4],
+            stream: ((bytes[5] as u32 & 0x7F) << 24) |
+                (bytes[6] as u32 << 16) | (bytes[7] as u32 << 8) | bytes[8] as u32,
+        });
+    }
+
+    /// Appends a frame header; the reserved bit is sent as 0.
+    public fn writeHeader(
+        out: borrow mut Vector<u8>,
+        length: u32,
+        kind: u8,
+        flags: u8,
+        stream: u32,
+    ) -> Result<void, AllocError> {
+        out.push(truncate<u8>(length >> 16))?;
+        out.push(truncate<u8>(length >> 8))?;
+        out.push(truncate<u8>(length))?;
+        out.push(kind)?;
+        out.push(flags)?;
+        return push32(out, stream & 0x7FFFFFFF);
+    }
+
+    /// A SETTINGS frame with these (id, value) pairs, in order (§6.5).
+    public fn writeSettings(
+        out: borrow mut Vector<u8>,
+        ids: Slice<u16>,
+        values: Slice<u32>,
+    ) -> Result<void, AllocError> {
+        Frames.writeHeader(out, truncate<u32>(ids.length * 6), FrameTypes.settings(), 0, 0)?;
+        for (i in 0..ids.length) {
+            out.push(truncate<u8>(ids[i] >> 8))?;
+            out.push(truncate<u8>(ids[i]))?;
+            push32(out, values[i])?;
+        }
+        return Ok();
+    }
+
+    /// An empty SETTINGS frame with ACK (§6.5.3).
+    public fn writeSettingsAck(out: borrow mut Vector<u8>) -> Result<void, AllocError> =>
+        Frames.writeHeader(out, 0, FrameTypes.settings(), FrameFlags.ack(), 0);
+
+    /// A PING with these 8 bytes, or its acknowledgement (§6.7).
+    public fn writePing(out: borrow mut Vector<u8>, data: [u8; 8], ack: bool) -> Result<void, AllocError> {
+        Frames.writeHeader(out, 8, FrameTypes.ping(), if (ack) FrameFlags.ack() else 0, 0)?;
+        for (b in data) {
+            out.push(b)?;
+        }
+        return Ok();
+    }
+
+    /// GOAWAY with the last stream processed, an error code and debug data (§6.8).
+    public fn writeGoAway(
+        out: borrow mut Vector<u8>,
+        lastStream: u32,
+        code: u32,
+        debug: Slice<u8>,
+    ) -> Result<void, AllocError> {
+        Frames.writeHeader(out, truncate<u32>(8 + debug.length), FrameTypes.goAway(), 0, 0)?;
+        push32(out, lastStream & 0x7FFFFFFF)?;
+        push32(out, code)?;
+        for (b in debug) {
+            out.push(b)?;
+        }
+        return Ok();
+    }
+
+    /// WINDOW_UPDATE for a stream, or the connection (stream 0) (§6.9).
+    public fn writeWindowUpdate(out: borrow mut Vector<u8>, stream: u32, increment: u32) -> Result<void, AllocError> {
+        Frames.writeHeader(out, 4, FrameTypes.windowUpdate(), 0, stream)?;
+        return push32(out, increment & 0x7FFFFFFF);
+    }
+
+    /// RST_STREAM with an error code (§6.4).
+    public fn writeRstStream(out: borrow mut Vector<u8>, stream: u32, code: u32) -> Result<void, AllocError> {
+        Frames.writeHeader(out, 4, FrameTypes.rstStream(), 0, stream)?;
+        return push32(out, code);
+    }
+
+    /// A DATA frame's header; the caller writes the payload (§6.1).
+    public fn writeDataHeader(
+        out: borrow mut Vector<u8>,
+        stream: u32,
+        length: u32,
+        endStream: bool,
+    ) -> Result<void, AllocError> =>
+        Frames.writeHeader(out, length, FrameTypes.data(), if (endStream) FrameFlags.endStream() else 0, stream);
+
+    /// A header block as HEADERS and as many CONTINUATIONs as `maxFrame` needs (§6.2, §6.10).
+    public fn writeHeaders(
+        out: borrow mut Vector<u8>,
+        stream: u32,
+        block: Slice<u8>,
+        endStream: bool,
+        maxFrame: u32,
+    ) -> Result<void, AllocError> =>
+        writeBlock(
+            out,
+            FrameTypes.headers(),
+            stream,
+            block,
+            if (endStream) FrameFlags.endStream() else 0,
+            null,
+            maxFrame,
+        );
+
+    /// A PUSH_PROMISE for `promised` on `stream`, with its block split as `writeHeaders` does (§6.6).
+    public fn writePushPromise(
+        out: borrow mut Vector<u8>,
+        stream: u32,
+        promised: u32,
+        block: Slice<u8>,
+        maxFrame: u32,
+    ) -> Result<void, AllocError> =>
+        writeBlock(out, FrameTypes.pushPromise(), stream, block, 0, Some(promised), maxFrame);
+}
+
+/// HEADERS or PUSH_PROMISE (with `promised`'s 4 bytes first), then CONTINUATIONs, each payload at most `maxFrame`.
+fn writeBlock(
+    out: borrow mut Vector<u8>,
+    kind: u8,
+    stream: u32,
+    block: Slice<u8>,
+    flags: u8,
+    promised: u32?,
+    maxFrame: u32,
+) -> Result<void, AllocError> {
+    let lead: usize = match (promised) {
+        Some(_) => 4,
+        null => 0,
+    };
+    let room = maxFrame as usize - lead;
+    let first = if (block.length < room) block.length else room;
+    let done = first == block.length;
+    Frames.writeHeader(
+        out,
+        truncate<u32>(lead + first),
+        kind,
+        flags | (if (done) FrameFlags.endHeaders() else 0),
+        stream,
+    )?;
+    match (promised) {
+        Some(p) => { push32(out, p & 0x7FFFFFFF)?; }
+        null => {}
+    }
+    appendBytes(out, block[0..first])?;
+    var at = first;
+    while (at < block.length) {
+        let n = if (block.length - at < maxFrame as usize) block.length - at else maxFrame as usize;
+        let last = at + n == block.length;
+        Frames.writeHeader(
+            out,
+            truncate<u32>(n),
+            FrameTypes.continuation(),
+            if (last) FrameFlags.endHeaders() else 0,
+            stream,
+        )?;
+        appendBytes(out, block[at..at + n])?;
+        at += n;
+    }
+    return Ok();
+}
+
+fn push32(out: borrow mut Vector<u8>, v: u32) -> Result<void, AllocError> {
+    out.push(truncate<u8>(v >> 24))?;
+    out.push(truncate<u8>(v >> 16))?;
+    out.push(truncate<u8>(v >> 8))?;
+    return out.push(truncate<u8>(v));
+}
+
+fn appendBytes(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        out.push(b)?;
+    }
+    return Ok();
+}

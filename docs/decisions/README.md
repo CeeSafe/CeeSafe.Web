@@ -15,6 +15,8 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0007](0007-handler-model.md) | Handler model: handlers, middleware, routing and application state | Accepted 2026-11-02 (§6.2 pending M2's spike) | M2 on |
 | [0008](0008-streaming-and-sse.md) | Streaming responses and Server-Sent Events | Accepted 2026-11-02 | M3 on |
 | [0009](0009-http-client.md) | The HTTP client: engine, pool, Happy Eyeballs, redirects, retries | Accepted 2026-11-02 | M5 on |
+| [0010](0010-websockets.md) | WebSockets: the engine, the upgrade, the session, permessage-deflate, the client | Accepted 2026-11-03 | M6 |
+| [0011](0011-http2.md) | HTTP/2: HPACK, frames, streams as tasks, flow control, push, the flood guards | Accepted 2026-11-03 | M7 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 
@@ -34,3 +36,17 @@ The language facts the ADRs rely on are checked by the programs in `tests/probes
 | 0006 §4.1 | List U10 (generic impls) with CeeSafe now? | as wanted, not scheduled |
 | 0007 §6.1 | Hook middleware by default, wrapping as an opt-in? | yes |
 | 0007 §6.2 | Application-declared request extensions, or a fixed set? | M2's spike decides; recorded as an amendment |
+
+## Answers (the owner, 2026-11-03)
+
+| ADR | Question | Answer |
+|---|---|---|
+| 0010 §6.1 | Where does Autobahn run? | Docker on this Mac |
+| 0010 §6.2 | permessage-deflate in pure CeeSafe, or deferred? | pure CeeSafe, in M6 |
+| 0010 §6.3 | A WebSocket client too? | yes, in `web_client` |
+| 0010 §6.4 | Which origins by default? | the same origin, with an allow-list |
+| 0011 §6.1 | Which ways in to HTTP/2? | TLS ALPN `h2` and `h2c` by prior knowledge; no Upgrade |
+| 0011 §6.2 | HTTP/2 in the client too? | not in M7 |
+| 0011 §6.3 | Stream priority? | ignored; streams served fairly |
+| 0011 §6.4 | Server push? | supported |
+

@@ -1,0 +1,72 @@
+// Frames against RFC 9113's layouts (§4.1's header; §6's payloads), written out by hand from its figures.
+
+fn bytesAre(expected: StringView, out: borrow Vector<u8>) -> Result<void, TestFailure> {
+    let want = hexBytes(expected)?;
+    return Check.equalBytes(want.view(), out.view());
+}
+
+@test
+fn frame_headers_rfc9113_4_1() -> Result<void, TestFailure> {
+    // Length 0x000102, type HEADERS, flags END_STREAM|END_HEADERS, stream 3 with the reserved bit set.
+    let raw = hexBytes("000102 01 05 80000003")?;
+    match (Frames.parseHeader(raw.view())) {
+        Some(h) => {
+            Check.equalU64(258, h.length as u64)?;
+            Check.equalU64(1, h.kind as u64)?;
+            Check.equalU64(5, h.flags as u64)?;
+            Check.equalU64(3, h.stream as u64)?; // the reserved bit is ignored on receipt
+        }
+        null => { return Check.fail("a header"); }
+    }
+    let short = hexBytes("0001020105800000")?;
+    Check.isTrue(Frames.parseHeader(short.view()) == null, "8 bytes are not a header")?;
+    var out = Vector<u8>.create();
+    grew(Frames.writeHeader(mut out, 258, 1, 5, 0x80000003))?;
+    return bytesAre("000102 01 05 00000003", out); // the reserved bit is sent as 0
+}
+
+@test
+fn control_frames_rfc9113_6() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    grew(Frames.writeSettingsAck(mut out))?;
+    bytesAre("000000 04 01 00000000", out)?; // §6.5: SETTINGS, ACK, stream 0
+    out.clear();
+    var ids = [SettingIds.maxConcurrentStreams(), SettingIds.initialWindowSize()];
+    var values = [100u32, 65535];
+    grew(Frames.writeSettings(mut out, ids[..], values[..]))?;
+    bytesAre("00000c 04 00 00000000 0003 00000064 0004 0000ffff", out)?;
+    out.clear();
+    grew(Frames.writePing(mut out, [1u8, 2, 3, 4, 5, 6, 7, 8], true))?;
+    bytesAre("000008 06 01 00000000 0102030405060708", out)?; // §6.7
+    out.clear();
+    grew(Frames.writeGoAway(mut out, 7, ErrorCodes.enhanceYourCalm(), "x".bytes()))?;
+    bytesAre("000009 07 00 00000000 00000007 0000000b 78", out)?; // §6.8
+    out.clear();
+    grew(Frames.writeWindowUpdate(mut out, 5, 1024))?;
+    bytesAre("000004 08 00 00000005 00000400", out)?; // §6.9
+    out.clear();
+    grew(Frames.writeRstStream(mut out, 5, ErrorCodes.cancel()))?;
+    bytesAre("000004 03 00 00000005 00000008", out)?; // §6.4
+    out.clear();
+    grew(Frames.writeDataHeader(mut out, 1, 5, true))?;
+    bytesAre("000005 00 01 00000001", out)?; // §6.1, END_STREAM
+    let preface = clientPreface();
+    let expected = hexBytes("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a")?; // §3.4
+    return Check.equalBytes(expected.view(), preface.bytes());
+}
+
+/// A block larger than the frame size: HEADERS without END_HEADERS, then CONTINUATIONs, the last with END_HEADERS
+/// (§6.2, §6.10); END_STREAM stays on the HEADERS frame. PUSH_PROMISE counts its promised stream in the first frame.
+@test
+fn header_blocks_split_rfc9113_6_10() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let block = hexBytes("01020304050607080900")?;
+    grew(Frames.writeHeaders(mut out, 1, block.view(), true, 4))?;
+    bytesAre("000004 01 01 00000001 01020304 000004 09 00 00000001 05060708 000002 09 04 00000001 0900", out)?;
+    out.clear();
+    grew(Frames.writeHeaders(mut out, 3, block.view(), false, 16384))?;
+    bytesAre("00000a 01 04 00000003 01020304050607080900", out)?;
+    out.clear();
+    grew(Frames.writePushPromise(mut out, 1, 2, block.view(), 8))?;
+    return bytesAre("000008 05 00 00000001 00000002 01020304 000006 09 04 00000001 050607080900", out);
+}

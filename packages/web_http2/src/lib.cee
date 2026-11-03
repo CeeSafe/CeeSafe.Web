@@ -1,2 +1,3 @@
 // web_http2: HTTP/2: frames, HPACK, stream state machines, flow control.
-// Milestone M7 (docs/implementation-plan.md). Empty until then.
+// Milestone M7 (docs/implementation-plan.md; Web ADR 0011): HPACK (hpack.cee, huffman.cee, the generated
+// tables.cee) and frames (frame.cee) so far; the connection state machine and the driver follow.

@@ -1,0 +1,285 @@
+// HPACK (RFC 7541) against the RFC's own examples: Appendix C.1's integers, C.2-C.6's blocks (rfc7541.cee, generated
+// from the RFC's text), and Huffman strings from C.4's and C.6's decoding walkthroughs. The encoder is checked by
+// decoding what it writes back to the RFC's header lists.
+
+fn grew(r: Result<void, AllocError>) -> Result<void, TestFailure> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn hexBytes(text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    var high: u8 = 0;
+    var half = false;
+    for (c in text.bytes()) {
+        let v: u8 = if (c >= 48 && c <= 57) c - 48 else if (c >= 97 && c <= 102) c - 87 else 255;
+        if (v == 255) {
+            continue;
+        }
+        if (half) {
+            grew(out.push(high * 16 + v))?;
+        } else {
+            high = v;
+        }
+        half = !half;
+    }
+    return Ok(out);
+}
+
+fn bytesOf(text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    for (b in text.bytes()) {
+        grew(out.push(b))?;
+    }
+    return Ok(out);
+}
+
+fn example(block: StringView, expected: StringView, tableSize: u32) -> Result<Example, TestFailure> =>
+    Ok(Example { block: hexBytes(block)?, expected: bytesOf(expected)?, tableSize: tableSize });
+
+/// `name: value` per line, as the RFC writes a header list.
+fn listing(fields: borrow HeaderBlock) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    for (i in 0..fields.count()) {
+        for (b in fields.name(i)) {
+            grew(out.push(b))?;
+        }
+        grew(out.push(58))?;
+        grew(out.push(32))?;
+        for (b in fields.value(i)) {
+            grew(out.push(b))?;
+        }
+        grew(out.push(10))?;
+    }
+    return Ok(out);
+}
+
+fn decoder(limit: u32) -> Result<HpackDecoder, TestFailure> {
+    match (HpackDecoder.create(limit, 65536)) {
+        Ok(d) => { return Ok(d); }
+        Err(_) => { return Err(TestFailure.create("a decoder")); }
+    }
+}
+
+/// Decodes `e` with `d` and checks the list and the table's size against the RFC.
+fn decodes(d: borrow mut HpackDecoder, e: borrow Example) -> Result<void, TestFailure> {
+    var fields = HeaderBlock.create();
+    match (d.decode(e.block.view(), mut fields)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the block did not decode"); }
+    }
+    let got = listing(fields)?;
+    Check.equalBytes(e.expected.view(), got.view())?;
+    return Check.equalU64(e.tableSize as u64, d.tableSize() as u64);
+}
+
+@test
+fn integers_rfc7541_c1() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    grew(writeInteger(mut out, 0, 5, 10))?;
+    let c11 = hexBytes("0a")?;
+    Check.equalBytes(c11.view(), out.view())?; // C.1.1
+    out.clear();
+    grew(writeInteger(mut out, 0, 5, 1337))?;
+    let c12 = hexBytes("1f9a0a")?;
+    Check.equalBytes(c12.view(), out.view())?; // C.1.2
+    out.clear();
+    grew(writeInteger(mut out, 0, 8, 42))?;
+    let c13 = hexBytes("2a")?;
+    return Check.equalBytes(c13.view(), out.view()); // C.1.3
+}
+
+@test
+fn fields_rfc7541_c2() -> Result<void, TestFailure> {
+    // Each example starts from an empty table.
+    var a = decoder(4096)?;
+    decodes(mut a, exampleC_2_1()?)?;
+    var b = decoder(4096)?;
+    decodes(mut b, exampleC_2_2()?)?;
+    var c = decoder(4096)?;
+    let never = exampleC_2_3()?;
+    decodes(mut c, never)?;
+    var fields = HeaderBlock.create();
+    var c2 = decoder(4096)?;
+    match (c2.decode(never.block.view(), mut fields)) {
+        Ok() => { Check.isTrue(fields.span(0).sensitive, "never indexed is kept sensitive")?; }
+        Err(_) => { return Check.fail("C.2.3"); }
+    }
+    var d = decoder(4096)?;
+    return decodes(mut d, exampleC_2_4()?);
+}
+
+@test
+fn requests_rfc7541_c3_c4() -> Result<void, TestFailure> {
+    var plain = decoder(4096)?;
+    decodes(mut plain, exampleC_3_1()?)?;
+    decodes(mut plain, exampleC_3_2()?)?;
+    decodes(mut plain, exampleC_3_3()?)?;
+    var huffman = decoder(4096)?;
+    decodes(mut huffman, exampleC_4_1()?)?;
+    decodes(mut huffman, exampleC_4_2()?)?;
+    return decodes(mut huffman, exampleC_4_3()?);
+}
+
+@test
+fn responses_rfc7541_c5_c6() -> Result<void, TestFailure> {
+    // "the HPACK decoder's dynamic table size limited to 256 octets", so entries are evicted.
+    var plain = decoder(256)?;
+    decodes(mut plain, exampleC_5_1()?)?;
+    decodes(mut plain, exampleC_5_2()?)?;
+    decodes(mut plain, exampleC_5_3()?)?;
+    var huffman = decoder(256)?;
+    decodes(mut huffman, exampleC_6_1()?)?;
+    decodes(mut huffman, exampleC_6_2()?)?;
+    return decodes(mut huffman, exampleC_6_3()?);
+}
+
+/// Huffman-coded strings from the RFC's walkthroughs (C.4.1, C.4.2, C.4.3), both ways.
+@test
+fn huffman_rfc7541() -> Result<void, TestFailure> {
+    for (k in 0..3u32) {
+        let text = match (k) {
+            0 => "www.example.com",
+            1 => "no-cache",
+            _ => "custom-key",
+        };
+        let coded = hexBytes(match (k) {
+            0 => "f1e3c2e5f23a6ba0ab90f4ff",
+            1 => "a8eb10649cbf",
+            _ => "25a849e95ba97d7f",
+        })?;
+        var out = Vector<u8>.create();
+        grew(Huffman.encode(text.bytes(), mut out))?;
+        Check.equalBytes(coded.view(), out.view())?;
+        Check.equalU64(coded.length as u64, Huffman.encodedLength(text.bytes()) as u64)?;
+        var back = Vector<u8>.create();
+        match (Huffman.decode(coded.view(), mut back)) {
+            Ok(true) => { Check.equalBytes(text.bytes(), back.view())?; }
+            _ => { return Check.fail("decoding the RFC's string"); }
+        }
+    }
+    // Invalid: padding of 8 bits; padding that is not all ones ('0' is 00000, then 000); EOS (30 ones) in a string.
+    for (k in 0..3u32) {
+        var out = Vector<u8>.create();
+        let bytes = hexBytes(match (k) {
+            0 => "ff",
+            1 => "00",
+            _ => "ffffffff",
+        })?;
+        match (Huffman.decode(bytes.view(), mut out)) {
+            Ok(false) => {}
+            _ => { return Check.fail("an invalid coding was accepted"); }
+        }
+    }
+    return Ok();
+}
+
+/// The encoder's output decodes to the RFC's header lists; an exact static match is one byte.
+@test
+fn encoder_round_trips() -> Result<void, TestFailure> {
+    let examples = [0u32, 1, 2, 3, 4, 5];
+    for (k in examples) {
+        let e = match (k) {
+            0 => exampleC_3_1()?,
+            1 => exampleC_3_2()?,
+            2 => exampleC_3_3()?,
+            3 => exampleC_5_1()?,
+            4 => exampleC_5_2()?,
+            _ => exampleC_5_3()?,
+        };
+        // Re-encode the RFC's list, field by field.
+        var block = Vector<u8>.create();
+        let text = e.expected.view();
+        var start: usize = 0;
+        for (i in 0..text.length) {
+            if (text[i] != 10) {
+                continue;
+            }
+            var cut = start + 1;
+            while (!(text[cut] == 58 && text[cut + 1] == 32)) {
+                cut += 1;
+            }
+            grew(HpackEncoder.field(text[start..cut], text[cut + 2..i], false, mut block))?;
+            start = i + 1;
+        }
+        var d = decoder(4096)?;
+        var fields = HeaderBlock.create();
+        match (d.decode(block.view(), mut fields)) {
+            Ok() => {}
+            Err(_) => { return Check.fail("our block did not decode"); }
+        }
+        let got = listing(fields)?;
+        Check.equalBytes(text, got.view())?;
+        Check.equalU64(0, d.tableSize() as u64)?; // the encoder never indexes
+    }
+    var one = Vector<u8>.create();
+    grew(HpackEncoder.field(":method".bytes(), "GET".bytes(), false, mut one))?;
+    let indexed = hexBytes("82")?;
+    return Check.equalBytes(indexed.view(), one.view());
+}
+
+fn failsWith(block: StringView, limit: u32, maxList: u64) -> Result<HpackError?, TestFailure> {
+    var d = match (HpackDecoder.create(limit, maxList)) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a decoder")); },
+    };
+    var fields = HeaderBlock.create();
+    let bytes = hexBytes(block)?;
+    match (d.decode(bytes.view(), mut fields)) {
+        Ok() => { return Ok(null); }
+        Err(e) => { return Ok(Some(e)); }
+    }
+}
+
+fn errorCode(e: HpackError?) -> u32 => match (e) {
+    null => 0,
+    Some(HpackError.BadInteger) => 1,
+    Some(HpackError.Truncated) => 2,
+    Some(HpackError.BadHuffman) => 3,
+    Some(HpackError.BadIndex) => 4,
+    Some(HpackError.BadTableSizeUpdate) => 5,
+    Some(HpackError.TooLarge) => 6,
+    Some(HpackError.OutOfMemory) => 7,
+};
+
+@test
+fn malformed_blocks() -> Result<void, TestFailure> {
+    Check.equalU64(4, errorCode(failsWith("80", 4096, 65536)?) as u64)?; // index 0
+    Check.equalU64(4, errorCode(failsWith("be", 4096, 65536)?) as u64)?; // index 62, the dynamic table empty
+    Check.equalU64(2, errorCode(failsWith("41", 4096, 65536)?) as u64)?; // a literal cut short
+    Check.equalU64(2, errorCode(failsWith("4103", 4096, 65536)?) as u64)?; // a value shorter than its length
+    Check.equalU64(1, errorCode(failsWith("7fffffffff0f", 4096, 65536)?) as u64)?; // an integer past 2^32
+    Check.equalU64(3, errorCode(failsWith("4081ff", 4096, 65536)?) as u64)?; // a name of one byte of bad Huffman
+    Check.equalU64(5, errorCode(failsWith("3fe21f", 4096, 65536)?) as u64)?; // a size update to 4097 > 4096
+    Check.equalU64(5, errorCode(failsWith("823f00", 4096, 65536)?) as u64)?; // a size update after a field
+    Check.equalU64(0, errorCode(failsWith("3fe11f82", 4096, 65536)?) as u64)?; // to 4096, first: fine
+    return Ok();
+}
+
+/// A list over SETTINGS_MAX_HEADER_LIST_SIZE is refused, but the block is still decoded, so the table stays in step:
+/// the RFC's next block then decodes as it should.
+@test
+fn too_large_keeps_the_table_in_step() -> Result<void, TestFailure> {
+    var d = match (HpackDecoder.create(4096, 100)) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a decoder"); },
+    };
+    var fields = HeaderBlock.create();
+    let first = exampleC_3_1()?; // its list's size is 180
+    match (d.decode(first.block.view(), mut fields)) {
+        Err(HpackError.TooLarge) => {}
+        _ => { return Check.fail("too large"); }
+    }
+    Check.equalU64(first.tableSize as u64, d.tableSize() as u64)?;
+    Check.equalU64(0, fields.count() as u64)?;
+    var big = decoder(4096)?;
+    decodes(mut big, first)?;
+    let second = exampleC_3_2()?;
+    match (d.decode(second.block.view(), mut fields)) {
+        Err(HpackError.TooLarge) => {}
+        _ => { return Check.fail("too large again"); }
+    }
+    return Check.equalU64(second.tableSize as u64, d.tableSize() as u64);
+}

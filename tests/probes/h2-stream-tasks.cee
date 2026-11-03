@@ -1,0 +1,101 @@
+// Design probe for M7 (Web ADR 0011): a connection's streams as children of a task set (CeeSafe ADR 0053), each
+// sharing the application through `Arc` (a set child may hold no loan), and each racing its handler against a reset
+// signal, so that one stream's RST_STREAM cancels only that stream's handler.
+//
+//   ceesafec run --interp tests/probes/h2-stream-tasks.cee
+//   ceesafec build tests/probes/h2-stream-tasks.cee -o /tmp/h2tasks && /tmp/h2tasks
+// Expected: 3 handlers finish (streams 1, 3, 7), stream 5's is cancelled by its reset: prints 11, then 1.
+
+interface App {
+    async fn handle(borrow this, stream: u32) -> Result<u32, AsyncError>;
+}
+
+struct Slow {}
+
+impl App for Slow {
+    /// Stream 5 takes 10 s; the others 10 ms.
+    async fn handle(borrow this, stream: u32) -> Result<u32, AsyncError> {
+        await Timer.sleep(if (stream == 5) 10000 else 10)?;
+        return Ok(stream);
+    }
+}
+
+/// One stream: the handler, unless its reset arrives first.
+async fn stream(
+    app: borrow Arc<Box<dyn App + Send>>,
+    id: u32,
+    reset: borrow Channel<u8>,
+    done: borrow Channel<u32>,
+) -> Result<void, AsyncError> {
+    let r: Result<Raced<u32>, AsyncError> = await Async.race(
+        async () => await app.get().handle(id),
+        async () => {
+            match (await reset.recvAsync()) {
+                Ok(_) => { return Ok(0u32); }
+                Err(e) => { return Err(e); }
+            }
+        },
+    );
+    let won = r?;
+    match (done.trySend(won.value)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Ok(); }
+    }
+}
+
+async fn run() -> Result<u32, AsyncError> {
+    let boxed: Box<dyn App + Send> = match (Box.create(Slow {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(AsyncError.Io(IoError.OutOfMemory)); },
+    };
+    let app = match (Arc<Box<dyn App + Send>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(AsyncError.Io(IoError.OutOfMemory)); },
+    };
+    let done = match (Channel<u32>.create(8)) {
+        Ok(c) => c,
+        Err(_) => { return Err(AsyncError.Io(IoError.OutOfMemory)); },
+    };
+    let reset5 = match (Channel<u8>.create(1)) {
+        Ok(c) => c,
+        Err(_) => { return Err(AsyncError.Io(IoError.OutOfMemory)); },
+    };
+    let started = Timer.now();
+    await Async.tasks(100, AsyncError.Io(IoError.OutOfMemory), async (set) => {
+        for (id in [1u32, 3, 5, 7]) {
+            let a = app.clone();
+            let d = done.clone();
+            let never = match (Channel<u8>.create(1)) {
+                Ok(c) => c,
+                Err(_) => { return Err(AsyncError.Io(IoError.OutOfMemory)); },
+            };
+            let r = if (id == 5) reset5.clone() else never;
+            await set.spawn(async move () => await stream(a, id, r, d))?;
+        }
+        await Timer.sleep(50)?;
+        match (reset5.trySend(1)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        return Ok();
+    })?;
+    var sum: u32 = 0;
+    loop {
+        match (done.tryRecv()) {
+            Some(v) => { sum += v; }
+            null => { break; }
+        }
+    }
+    let quick: u32 = if (Timer.now() - started < 5000) 1 else 0;
+    return Ok(sum * 100 + quick);
+}
+
+fn main() {
+    match (Async.run(run())) {
+        Ok(v) => {
+            Console.writeLine(v / 100);
+            Console.writeLine(v % 100);
+        }
+        Err(_) => { Console.writeLine("failed"); }
+    }
+}

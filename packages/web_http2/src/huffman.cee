@@ -1,0 +1,71 @@
+// HPACK's Huffman code (RFC 7541 §5.2, Appendix B), over the generated tables (tables.cee). Sans-I/O.
+
+/// The static Huffman code for string literals.
+public struct Huffman {
+    /// How many bytes `bytes` takes Huffman-coded.
+    public fn encodedLength(bytes: Slice<u8>) -> usize {
+        let lengths = HUFFMAN_LENGTH;
+        var bits: usize = 0;
+        for (b in bytes) {
+            bits += lengths[b as usize] as usize;
+        }
+        return (bits + 7) / 8;
+    }
+
+    /// Appends the Huffman coding of `bytes` to `out`, the last byte padded with the most significant bits of EOS
+    /// (all ones, §5.2).
+    public fn encode(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let codes = HUFFMAN_CODE;
+        let lengths = HUFFMAN_LENGTH;
+        var pending: u64 = 0; // the low `count` bits are not yet written
+        var count: u32 = 0;
+        for (b in bytes) {
+            let n = lengths[b as usize] as u32;
+            pending = (pending << n) | codes[b as usize] as u64;
+            count += n;
+            while (count >= 8) {
+                count -= 8;
+                out.push(truncate<u8>(pending >> count))?;
+            }
+        }
+        if (count > 0) {
+            out.push(truncate<u8>((pending << (8 - count)) | (0xFFu64 >> count)))?;
+        }
+        return Ok();
+    }
+
+    /// Appends the decoding of `bytes` to `out`: `Ok(false)` if they are not a valid coding (§5.2: EOS in the
+    /// string, or padding longer than 7 bits or not all ones).
+    public fn decode(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        let first = HUFFMAN_FIRST_CODE;
+        let firstIndex = HUFFMAN_FIRST_INDEX;
+        let counts = HUFFMAN_COUNT;
+        let symbols = HUFFMAN_SYMBOLS;
+        var code: u32 = 0; // the bits of the symbol being read
+        var length: u32 = 0;
+        for (b in bytes) {
+            var bit: u32 = 8;
+            while (bit > 0) {
+                bit -= 1;
+                code = (code << 1) | ((b as u32 >> bit) & 1);
+                length += 1;
+                if (length > 30) {
+                    return Ok(false);
+                }
+                let n = counts[length as usize] as u32;
+                if (n > 0 && code >= first[length as usize] && code - first[length as usize] < n) {
+                    let symbol =
+                        symbols[firstIndex[length as usize] as usize + (code - first[length as usize]) as usize];
+                    if (symbol == 256) {
+                        return Ok(false); // EOS inside a string
+                    }
+                    out.push(truncate<u8>(symbol))?;
+                    code = 0;
+                    length = 0;
+                }
+            }
+        }
+        // What is left must be padding: at most 7 bits, all ones.
+        return Ok(length <= 7 && code == (1u32 << length) - 1);
+    }
+}
