@@ -149,6 +149,16 @@ async fn request_trailers_reach_the_handler() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// A streamed response's trailers go in its last chunk (RFC 9112 §7.1.2).
+@test
+async fn response_trailers_in_the_last_chunk() -> Result<void, TestFailure> {
+    let s = await run("GET /stream-trailers HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    return same(
+        "HTTP/1.1 200 OK\r\nx-hook: 1\r\ntransfer-encoding: chunked\r\n\r\n5\r\npart1\r\n5\r\npart2\r\n0\r\nx-sum: 10\r\n\r\n",
+        s.output,
+    );
+}
+
 @test
 async fn expect_100_continue() -> Result<void, TestFailure> {
     let read = await run("POST /e HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", 4096,

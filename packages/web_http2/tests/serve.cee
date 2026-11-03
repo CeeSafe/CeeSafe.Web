@@ -93,7 +93,8 @@ impl Transport for Client {
 
 /// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css";
 /// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends;
-/// `/trailers`: reads the body, then answers each trailer as `name=value;`.
+/// `/trailers`: reads the body, then answers each trailer as `name=value;`; `/rtrailers`: "abc" and the trailer
+/// `x-sum: 3`.
 struct Site {}
 
 impl Application for Site {
@@ -120,6 +121,10 @@ impl Application for Site {
                 }
             }
             return await exchange.send(Status.ok(), body.view());
+        }
+        if (Ascii.equals(path.bytes(), "/rtrailers")) {
+            await exchange.write("abc".bytes())?;
+            return exchange.trailer("x-sum", "3".bytes());
         }
         if (Ascii.equals(path.bytes(), "/trailers")) {
             var buf = [0u8; 64];
@@ -343,6 +348,18 @@ async fn request_trailers_reach_the_handler() -> Result<void, TestFailure> {
     let out = await served(bytes, 300)?;
     let log = frames(out)?;
     return Check.isTrue(contains(log.view(), "data 1 f1 x-t=1;x-checksum=abc;; "), "the trailers listed");
+}
+
+/// A response's trailers end the stream as HEADERS after its DATA (RFC 9113 §8.1).
+@test
+async fn response_trailers_end_the_stream() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let get = getBlock("/rtrailers")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    return Check.isTrue(contains(log.view(), "headers 1 f4 200; data 1 abc; headers 1 f5 3; "), "head, DATA, trailers");
 }
 
 @test

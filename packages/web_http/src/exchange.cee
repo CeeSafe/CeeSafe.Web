@@ -72,6 +72,8 @@ public struct Exchange<region r> {
     /// The request's trailer section: its lines as they arrive (HTTP/1.1), then its fields once the body has ended.
     private trailerLines: Vector<u8>;
     private trailerFields: HeaderBlock;
+    /// The response's trailer fields, sent at its end (`trailer`).
+    private responseTrailers: HeaderBlock;
 
     /// An exchange for `request`, whose body is framed by `framing`. `carry` holds the bytes received after the head;
     /// `out` the responses not yet sent; `pending` and `response` are reset here. `keepAlive` is the request's own
@@ -138,6 +140,7 @@ public struct Exchange<region r> {
             upgraded: false,
             trailerLines: Vector<u8>.create(),
             trailerFields: HeaderBlock.create(),
+            responseTrailers: HeaderBlock.create(),
         };
     }
 
@@ -188,6 +191,7 @@ public struct Exchange<region r> {
             upgraded: false,
             trailerLines: Vector<u8>.create(),
             trailerFields: HeaderBlock.create(),
+            responseTrailers: HeaderBlock.create(),
         };
     }
 
@@ -282,6 +286,33 @@ public struct Exchange<region r> {
     /// none. Over HTTP/1.1 they come from a chunked body's trailer section; over HTTP/2 from the HEADERS that ended the
     /// stream (RFC 9113 §8.1). Names are lowercase.
     public fn trailers(borrow this) -> borrow HeaderBlock => borrow this.trailerFields;
+
+    /// Adds a trailer field to the response (RFC 9110 §6.5), sent after its content: over HTTP/2 as HEADERS ending the
+    /// stream, over HTTP/1.1 in the last chunk of a chunked response. A response with a declared length over HTTP/1.1
+    /// has nowhere to put trailers (RFC 9112 §7.1.2), so they are dropped, as for a response without content. A name
+    /// that is not a token, a value with a control byte, and the fields that frame or route a message
+    /// (`content-length`, `transfer-encoding`, `host`, `connection`, `te`, `trailer`) are `Internal`.
+    public fn trailer(borrow mut this, name: StringView, value: Slice<u8>) -> Result<void, HandlerError> {
+        let n = name.bytes();
+        if (!Ascii.isToken(n) || Ascii.equalsIgnoringCase(n, "content-length") ||
+            Ascii.equalsIgnoringCase(n, "transfer-encoding") || Ascii.equalsIgnoringCase(n, "host") ||
+            Ascii.equalsIgnoringCase(n, "connection") || Ascii.equalsIgnoringCase(n, "te") ||
+            Ascii.equalsIgnoringCase(n, "trailer")) {
+            return Err(HandlerError.Internal);
+        }
+        for (b in value) {
+            if (!Ascii.isFieldValueChar(b)) {
+                return Err(HandlerError.Internal);
+            }
+        }
+        var lower = Vector<u8>.create();
+        for (c in n) {
+            grown(lower.push(Ascii.lower(c)))?;
+        }
+        let l = lower.view();
+        grown(this.responseTrailers.push(l, value, HeaderBlock.sensitiveByDefault(l)))?;
+        return Ok();
+    }
 
     /// Reads the rest of the body into `into`. `Status(413)` if it would exceed `into`'s room.
     public async fn readToEnd(borrow mut this, into: borrow mut OwnedBuffer) -> Result<void, HandlerError> {
@@ -635,6 +666,16 @@ public struct Exchange<region r> {
         return Ok();
     }
 
+    /// Over a stream, the response's trailers as HEADERS ending it, if `trailing`.
+    async fn streamTrailers(borrow mut this, trailing: bool) -> Result<void, HandlerError> {
+        if (!trailing) {
+            return Ok();
+        }
+        var fields = HeaderBlock.create();
+        grown(fields.pushAll(this.responseTrailers))?;
+        return await this.stream.sendHead(fields, true);
+    }
+
     /// Runs the application's hook, chooses the framing, and queues the head in `out`.
     async fn sendHead(borrow mut this, length: u64?) -> Result<void, HandlerError> {
         await this.app.beforeHead(this.request, this.response)?;
@@ -790,20 +831,23 @@ public struct Exchange<region r> {
         }
         this.done = true;
         if (this.multiplexed) {
+            let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
+            let trailing = this.responseTrailers.count() > 0 && !bodyless;
             if (this.sent) {
-                return await this.streamPending(true);
+                await this.streamPending(!trailing)?;
+                return await this.streamTrailers(trailing);
             }
             let length = match (this.response.contentLength()) {
                 Some(n) => n,
                 null => this.pending.length() as u64,
             };
-            let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
-            if (bodyless || this.pending.length() == 0) {
+            if (bodyless || (this.pending.length() == 0 && !trailing)) {
                 this.pending.clear();
                 return await this.streamHead(Some(length), true, true);
             }
-            await this.streamHead(Some(length), false, true)?;
-            return await this.streamPending(true);
+            await this.streamHead(if (trailing) this.response.contentLength() else Some(length), false, true)?;
+            await this.streamPending(!trailing)?;
+            return await this.streamTrailers(trailing);
         }
         if (!this.sent) {
             let length = match (this.response.contentLength()) {
@@ -815,13 +859,25 @@ public struct Exchange<region r> {
         await this.sendPending()?;
         match (this.framing) {
             ResponseFraming.Chunked => {
-                if (this.out.spareLength() < 5) {
+                // The last chunk, its trailer section (RFC 9112 §7.1.2), and the empty line.
+                var size: usize = 5;
+                for (i in 0..this.responseTrailers.count()) {
+                    size += this.responseTrailers.name(i).length + this.responseTrailers.value(i).length + 4;
+                }
+                if (this.out.spareLength() < size) {
                     await this.flushOut()?;
                 }
-                match (Encoder.lastChunk(this.out)) {
-                    Ok() => {}
-                    Err(_) => { return Err(HandlerError.Internal); }
+                if (this.out.spareLength() < size) {
+                    return Err(HandlerError.Internal); // trailers larger than the write buffer
                 }
+                grown(netGrown(this.out.append("0\r\n".bytes())))?;
+                for (i in 0..this.responseTrailers.count()) {
+                    grown(netGrown(this.out.append(this.responseTrailers.name(i))))?;
+                    grown(netGrown(this.out.append(": ".bytes())))?;
+                    grown(netGrown(this.out.append(this.responseTrailers.value(i))))?;
+                    grown(netGrown(this.out.append("\r\n".bytes())))?;
+                }
+                grown(netGrown(this.out.append("\r\n".bytes())))?;
             }
             ResponseFraming.Length(total) => {
                 if (this.written != total && !Methods.same(this.request.method(), Method.Head)) {
@@ -938,5 +994,12 @@ fn grown(r: Result<void, AllocError>) -> Result<void, HandlerError> {
     match (r) {
         Ok() => { return Ok(); }
         Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+fn netGrown(r: Result<void, NetError>) -> Result<void, AllocError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(AllocError.OutOfMemory); }
     }
 }
