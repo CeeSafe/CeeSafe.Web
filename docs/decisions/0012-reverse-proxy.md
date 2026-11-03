@@ -1,6 +1,12 @@
 # Web ADR 0012 — The reverse proxy, and what M7 left open
 
-**Status:** proposed 2026-11-03 (M8). The questions for the owner are in §6.
+**Status:** accepted 2026-11-03 (M8). The owner accepted every recommendation in §6:
+- requests relay the body, then the response, and only tunnels are full duplex;
+- HTTP/2 to upstreams;
+- rendezvous hashing;
+- an untrusted source on a PROXY-protocol listener is closed;
+- both families of forwarding fields;
+- 504 for a connect timeout.
 **Scope:**
 - Implementation plan §7 M8: `web_proxy`, which covers upstream pools, health, balancing, forwarding fields, the PROXY
   protocol, the relay, retries, 502 and 504, and tunnels.
@@ -336,7 +342,7 @@ Tests, with oracles outside the code:
   - the HTTP/2 fuzzer with the client mode;
   - 24 CPU-hours each (Web ADR 0005 §2.2).
 
-## 6. Questions for the owner
+## 6. Questions for the owner (answered 2026-11-03: each as recommended)
 
 1. **Full duplex for requests in M8?** Recommended: **no, tunnels only.**
    - Requests relay the body first, then the response (§2).
