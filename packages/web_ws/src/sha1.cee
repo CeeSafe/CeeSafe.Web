@@ -8,6 +8,7 @@ public struct Sha1 {
     private filled: usize;
     private total: u64;
 
+    /// An empty hash.
     public fn create() -> Sha1 => Sha1 {
         h: [0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
         block: [0u8; 64],
@@ -15,6 +16,7 @@ public struct Sha1 {
         total: 0,
     };
 
+    /// Adds `bytes` to the hash.
     public fn update(borrow mut this, bytes: Slice<u8>) {
         for (b in bytes) {
             this.block[this.filled] = b;

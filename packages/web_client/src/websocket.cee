@@ -21,6 +21,7 @@ public struct WebSocketClientOptions {
     /// Each write of the session must finish within this, in milliseconds (a peer that stops reading).
     public writeTimeoutMs: u64;
 
+    /// 10 s for the handshake, 30 s for each write, no `Origin`, and the session's defaults.
     public fn defaults() -> WebSocketClientOptions => WebSocketClientOptions {
         session: WebSocketOptions.defaults(),
         origin: null,

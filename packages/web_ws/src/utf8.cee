@@ -1,6 +1,7 @@
 // Incremental UTF-8 validation (RFC 3629 §4): no overlong forms, no surrogates, nothing above U+10FFFF. Bytes may
 // arrive in any pieces; a byte is refused as soon as no valid completion exists ("fail fast", RFC 6455 §8.1).
 
+/// An incremental UTF-8 check (RFC 3629) that fails as soon as no valid completion exists.
 public struct Utf8Validator {
     /// Continuation bytes still needed by the current sequence.
     private need: u8;
@@ -8,8 +9,10 @@ public struct Utf8Validator {
     private lo: u8;
     private hi: u8;
 
+    /// A validator at the start of a sequence.
     public fn create() -> Utf8Validator => Utf8Validator { need: 0, lo: 0x80, hi: 0xBF };
 
+    /// Starts again, for the next message.
     public fn reset(borrow mut this) {
         this.need = 0;
         this.lo = 0x80;

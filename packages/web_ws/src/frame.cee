@@ -1,5 +1,6 @@
 // Frames (RFC 6455 §5): heads, opcodes, masking and close codes. Sans-I/O.
 
+/// A frame's opcode (RFC 6455 §5.2).
 public enum Opcode {
     Continuation,
     Text,
@@ -15,7 +16,9 @@ public enum Role {
     Client,
 }
 
+/// Opcodes on the wire.
 public struct Opcodes {
+    /// The opcode's 4-bit code.
     public fn code(op: Opcode) -> u8 => match (op) {
         Opcode.Continuation => 0,
         Opcode.Text => 1,
@@ -36,6 +39,7 @@ public struct Opcodes {
         _ => null,
     };
 
+    /// Whether `op` is a control frame (Close, Ping, Pong), which may not be fragmented (§5.5).
     public fn isControl(op: Opcode) -> bool => match (op) {
         Opcode.Close => true,
         Opcode.Ping => true,
@@ -46,18 +50,27 @@ public struct Opcodes {
 
 /// Close codes (§7.4.1) and which may appear on the wire (§7.4.2).
 public struct CloseCodes {
+    /// 1000: a normal close.
     public fn normal() -> u16 => 1000;
+    /// 1001: the endpoint is going away (a server shutting down, a page closed).
     public fn goingAway() -> u16 => 1001;
+    /// 1002: the peer broke the protocol.
     public fn protocolError() -> u16 => 1002;
+    /// 1003: a kind of data the endpoint cannot accept.
     public fn unsupported() -> u16 => 1003;
     /// Never sent: a Close without a code.
     public fn noStatus() -> u16 => 1005;
     /// Never sent: the connection ended without a Close.
     public fn abnormal() -> u16 => 1006;
+    /// 1007: data inconsistent with the message's type (text that is not UTF-8).
     public fn invalidData() -> u16 => 1007;
+    /// 1008: a message that violates the endpoint's policy.
     public fn policy() -> u16 => 1008;
+    /// 1009: a message too big to process.
     public fn tooBig() -> u16 => 1009;
+    /// 1010: the server did not agree to an extension the client needs.
     public fn extension() -> u16 => 1010;
+    /// 1011: an unexpected condition on the server (also an unanswered ping here).
     public fn internalError() -> u16 => 1011;
 
     /// Whether a Close frame may carry `code`: 1000-1003, 1007-1011 and 3000-4999.
@@ -65,6 +78,7 @@ public struct CloseCodes {
         (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1011) || (code >= 3000 && code <= 4999);
 }
 
+/// A frame's head (RFC 6455 §5.2): the flags, the opcode, the mask and the payload's length.
 public struct FrameHead {
     public fin: bool;
     /// Set on the first frame of a compressed message (RFC 7692 §6).
@@ -81,6 +95,7 @@ public struct ParsedHead {
     public size: usize;
 }
 
+/// Reading and writing frame heads, and masking payloads (§5.2-5.3).
 public struct Frames {
     /// The frame head at the start of `input`: `Ok(null)` if more bytes are needed, `Err(code)` with the close code
     /// for a frame that breaks §5: RSV bits not negotiated, a reserved opcode, the wrong masking for `role`, a

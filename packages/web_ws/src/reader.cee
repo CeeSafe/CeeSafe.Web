@@ -3,11 +3,13 @@
 // gets a message, a control frame, or a request for more bytes. Any violation ends with the close code to send.
 import web_core;
 
+/// A data message's type.
 public enum MessageKind {
     Text,
     Binary,
 }
 
+/// What `MessageReader.next` found in the input.
 public enum Incoming {
     /// The bytes received end inside a frame head or payload.
     NeedMore,
@@ -21,6 +23,7 @@ public enum Incoming {
     Close(u16),
 }
 
+/// Assembles frames into messages and checks them (fragments, control frames, limits, UTF-8, close codes), without I/O.
 public struct MessageReader {
     private role: Role;
     private maxFrameBytes: u64;
@@ -48,6 +51,7 @@ public struct MessageReader {
     private compressed: Vector<u8>;
     private inflater: Inflater;
 
+    /// A reader for this end's `role` (which masking it expects), with the frame and message limits (1009 past them).
     public fn create(role: Role, maxFrameBytes: u64, maxMessageBytes: u64) -> MessageReader => MessageReader {
         role: role,
         maxFrameBytes: maxFrameBytes,

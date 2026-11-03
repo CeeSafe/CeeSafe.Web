@@ -1,5 +1,6 @@
 // Base64 (RFC 4648 §4, the standard alphabet with padding), for the handshake's keys.
 
+/// Base64 with the standard alphabet and padding (RFC 4648 §4).
 public struct Base64 {
     /// Appends the encoding of `bytes` to `out`.
     public fn encode(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {

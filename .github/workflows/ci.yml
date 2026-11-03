@@ -9,7 +9,7 @@ on:
   pull_request:
 
 env:
-  CEESAFE_VERSION: v0.6.0
+  CEESAFE_VERSION: v0.10.1 # main's minimum (docs/toolchain.md)
 
 jobs:
   test:
@@ -49,6 +49,33 @@ jobs:
       - name: Toolchain
         shell: bash
         run: ceesafec --version
+
+      # web_tls links OpenSSL >= 3.0 (Web ADR 0002 §3.1; its manifest names where, per system).
+      - name: OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libssl-dev
+
+      - name: OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: brew list openssl@3 > /dev/null 2>&1 || brew install openssl@3
+
+      - name: OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The MSVC import libraries of a Shining Light install (lib\VC\<arch>\MD), as web_tls's manifest expects.
+          function Find-Lib { Get-ChildItem -Recurse -Filter libssl.lib -Path 'C:\Program Files\OpenSSL*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '\\MD$' } | Select-Object -First 1 }
+          $lib = Find-Lib
+          if (-not $lib) { choco install openssl --no-progress -y; $lib = Find-Lib }
+          if (-not $lib) { throw "no OpenSSL MSVC libraries found" }
+          $root = $lib.Directory
+          while ($root -and -not (Test-Path (Join-Path $root.FullName 'include\openssl\ssl.h'))) { $root = $root.Parent }
+          if (-not $root) { throw "no OpenSSL headers above $($lib.DirectoryName)" }
+          "OPENSSL_DIR=$($root.FullName)" >> $env:GITHUB_ENV
+          "OPENSSL_LIB_DIR=$($lib.DirectoryName)" >> $env:GITHUB_ENV
+          (Join-Path $root.FullName 'bin') >> $env:GITHUB_PATH
+          Write-Output "OpenSSL: $($root.FullName), libraries $($lib.DirectoryName)"
 
       - name: Select the reactor
         if: matrix.env_name
@@ -100,7 +127,10 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - run: |
+      - env:
+          CEESAFE_VERSION: v0.3.2 # the stage 0 CeeSafe's bootstrap chain is recorded for (its bootstrap/reference.md)
+        run: |
+          sudo apt-get install -y libssl-dev
           curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
           git clone --depth 50 https://github.com/CeeSafe/CeeSafe.git ../CeeSafe
           cd ../CeeSafe && sh tools/bootstrap_release.sh "$HOME/.ceesafe/bin/ceesafec" HEAD out/ceesafec

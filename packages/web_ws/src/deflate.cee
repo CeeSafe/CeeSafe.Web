@@ -67,6 +67,7 @@ fn backReference(
 fn hash3(input: Slice<u8>, i: usize) -> usize =>
     (((input[i] as u32 << 10) ^ (input[i + 1] as u32 << 5) ^ input[i + 2] as u32) & 4095) as usize;
 
+/// permessage-deflate's compressor (RFC 7692): one fixed-Huffman block per message, without context takeover.
 public struct Deflater {
     private windowBytes: usize;
 

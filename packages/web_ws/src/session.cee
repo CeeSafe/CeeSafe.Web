@@ -5,6 +5,7 @@
 import web_core;
 import web_http;
 
+/// How a WebSocket session behaves: limits, keep-alive, the queue, subprotocols, origins and compression.
 public struct WebSocketOptions {
     /// The largest frame accepted (1009 past it).
     public maxFrameBytes: u64;
@@ -27,6 +28,8 @@ public struct WebSocketOptions {
     /// Accept permessage-deflate when the client offers it (RFC 7692, Web ADR 0010 §3.5).
     public deflate: bool;
 
+    /// 1 MiB frames, 16 MiB messages, 64 KiB fragments, a ping after 30 s quiet, 30 s for its pong, 5 s for the
+    /// close, a queue of 64, and permessage-deflate on.
     public fn defaults() -> WebSocketOptions => WebSocketOptions {
         maxFrameBytes: 1048576,
         maxMessageBytes: 16777216,
@@ -113,6 +116,8 @@ enum Wake {
     Timer,
 }
 
+/// A WebSocket session over `L`: an upgraded exchange (`accept`), or a client's connection (web_client's
+/// `clientSession`).
 public struct WebSocket<region r, L: RawLink> {
     private link: borrow mut(r) L;
     /// A client masks every frame it sends, with a key from the system's random source (RFC 6455 §5.3).

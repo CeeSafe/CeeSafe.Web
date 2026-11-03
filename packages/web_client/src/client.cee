@@ -63,8 +63,10 @@ public struct ClientRequest {
         }
     }
 
+    /// The request's method.
     public fn method(borrow this) -> Method => this.verb;
 
+    /// The request's URL.
     public fn url(borrow this) -> borrow Url => borrow this.address;
 
     /// Whether a failed attempt may be sent again as far as the request goes (Web ADR 0009 §3.8 rule 1): an

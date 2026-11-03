@@ -3,6 +3,7 @@
 // boundary (the sync flush of RFC 7692 §7.2.1, whose 00 00 FF FF the receiver appends), so the decoder never resumes
 // mid-block. With context takeover, back-references may reach into earlier messages through `history`.
 
+/// Why inflating failed.
 public enum InflateError {
     /// Not valid deflate data, or data that ends inside a block.
     Corrupt,

@@ -85,6 +85,7 @@ public enum ClientError {
 
 /// Descriptions.
 public struct ClientErrors {
+    /// A short description of `e`, for logs and messages.
     public fn describe(e: borrow ClientError) -> StringView => match (e) {
         ClientError.BadUrl(_) => "bad URL",
         ClientError.BadRequest => "bad request field",

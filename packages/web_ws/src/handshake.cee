@@ -36,6 +36,7 @@ public struct HandshakeAnswer {
     public protocol: usize?;
 }
 
+/// The opening handshake's checks and computations (RFC 6455 §4).
 public struct Handshake {
     /// `Sec-WebSocket-Accept` for `key`: base64(SHA-1(key + the GUID)) (§4.2.2 step 5.4), 28 bytes.
     public fn acceptKey(key: Slice<u8>) -> Result<Vector<u8>, AllocError> {
@@ -307,6 +308,7 @@ struct DeflateParams {
     clientMaxWindowBits: u32;
 }
 
+/// permessage-deflate's negotiation (RFC 7692 §7.1), for both ends.
 public struct Extensions {
     /// The first permessage-deflate offer in `Sec-WebSocket-Extensions` (any number of fields) whose parameters are
     /// all known, unrepeated and in range (§7.1: an offer that is not is declined, and the next one considered).
