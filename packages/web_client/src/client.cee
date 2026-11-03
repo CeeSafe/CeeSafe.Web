@@ -179,25 +179,25 @@ struct Failure {
 public struct Client {
     private options: ClientOptions;
     private pool: ConnectionPool;
-    private tls: Box<dyn Connector>?;
-    private resolver: Box<dyn Resolver>;
-    private dialer: Box<dyn Dialer>;
+    private tls: Box<dyn Connector + Send>?;
+    private resolver: Box<dyn Resolver + Send>;
+    private dialer: Box<dyn Dialer + Send>;
     private h2: H2Registry;
 
     /// A client with the system's resolver and TCP. `tls` makes https connections (a web_tls `TlsConnector`); without
     /// one, https URLs are `NoTls`.
-    public fn create(options: ClientOptions, tls: Box<dyn Connector>?) -> Result<Client, ClientError> {
-        let resolver: Box<dyn Resolver> = boxed(Box.create(SystemResolver {}))?;
-        let dialer: Box<dyn Dialer> = boxed(Box.create(TcpDialer {}))?;
+    public fn create(options: ClientOptions, tls: Box<dyn Connector + Send>?) -> Result<Client, ClientError> {
+        let resolver: Box<dyn Resolver + Send> = boxed(Box.create(SystemResolver {}))?;
+        let dialer: Box<dyn Dialer + Send> = boxed(Box.create(TcpDialer {}))?;
         return Client.withNetwork(options, tls, resolver, dialer);
     }
 
     /// A client with its own resolver and dialer (tests: mocks).
     public fn withNetwork(
         options: ClientOptions,
-        tls: Box<dyn Connector>?,
-        resolver: Box<dyn Resolver>,
-        dialer: Box<dyn Dialer>,
+        tls: Box<dyn Connector + Send>?,
+        resolver: Box<dyn Resolver + Send>,
+        dialer: Box<dyn Dialer + Send>,
     ) -> Result<Client, ClientError> {
         let pool = ConnectionPool.create(options)?;
         let h2 = H2Registry.create()?;
@@ -761,7 +761,9 @@ public struct Client {
         );
         let addresses = net(resolved)?;
         let ordered = net(interleave(addresses))?;
-        let stream = net(await happyEyeballs(ordered, this.dialer, this.options.connectionAttemptDelayMs, deadline))?;
+        let sendable: borrow dyn Dialer + Send = borrow this.dialer;
+        let dialer: borrow dyn Dialer = sendable; // in two steps: upstream U19
+        let stream = net(await happyEyeballs(ordered, dialer, this.options.connectionAttemptDelayMs, deadline))?;
         match (borrow this.tls) {
             Some(c) => {
                 if (url.isSecure()) {

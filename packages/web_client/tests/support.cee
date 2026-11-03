@@ -133,8 +133,8 @@ fn mockClient(
 ) -> Result<Client, TestFailure> {
     let resolver = FixedResolver { first: first, second: second, fail: dnsFails, calls: AtomicU64.create(0) };
     let dialer = MockDialer { scripts: scripts.clone(), slow: slow, slowMs: 1000, failing: failing, dials: AtomicU64.create(0) };
-    let r: Box<dyn Resolver> = testBox(Box.create(resolver))?;
-    let d: Box<dyn Dialer> = testBox(Box.create(dialer))?;
+    let r: Box<dyn Resolver + Send> = testBox(Box.create(resolver))?;
+    let d: Box<dyn Dialer + Send> = testBox(Box.create(dialer))?;
     match (Client.withNetwork(options, null, r, d)) {
         Ok(c) => { return Ok(c); }
         Err(_) => { return Err(TestFailure.create("a client")); }

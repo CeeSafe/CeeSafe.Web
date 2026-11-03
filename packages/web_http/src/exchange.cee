@@ -807,6 +807,18 @@ public struct Exchange<region r> {
         return await this.writeBytes(bytes);
     }
 
+    /// After `switchProtocols`: ends this side's writing to the client (TCP FIN, or TLS close_notify then FIN), which
+    /// may still send; a tunnel does this when its other side has finished sending (Web ADR 0012 §3.8).
+    public async fn shutdownRaw(borrow mut this) -> Result<void, HandlerError> {
+        if (!this.upgraded) {
+            return Err(HandlerError.Internal);
+        }
+        match (await this.conn.shutdownWrite()) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(HandlerError.Io(e)); }
+        }
+    }
+
     /// Pushes a response to a GET for `path` (RFC 9113 §8.4; Web ADR 0011 §3.2): the client is promised it, and the
     /// application handles that request on its own stream as if the client had asked. False over HTTP/1.1, when the
     /// client refuses pushes, or when the connection cannot make one now.
