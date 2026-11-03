@@ -242,3 +242,32 @@ certificate store.
    - with the system's roots, `examples/fetch` gets www.google.com, and example.com after the root is installed;
    - expired.badssl.com and wrong.host.badssl.com are refused;
    - web_tls's 14 tests pass on Windows, macOS and Debian.
+
+## 11. Amendment 5 (2026-11-03, on ceesafec 0.10.0: U14; on the branch `u14-openssl-alloc` until U17)
+
+CeeSafe 0.10.0 adds `CEE_ALLOC_FOREIGN` and `ceesafe/foreign.h` (CeeSafe ADR 0060; upstream U14), so §3.5 and §6.1's
+routing can be built. It is built on this branch.
+
+1. **The routing.**
+   - `wt_cfg_new`, the first thing the shim makes, sets `CRYPTO_set_mem_functions` once (`CRYPTO_THREAD_run_once`,
+     which allocates nothing) to wrappers over `ceesafe_alloc`, `ceesafe_realloc` and `ceesafe_free` with
+     `CEE_ALLOC_FOREIGN`.
+   - If something else in the process used OpenSSL first, OpenSSL refuses and keeps its own allocator. That is safe:
+     every block is freed by the allocator that made it.
+   - A TLS fetch then counts 13,602 allocation attempts, against 79 without OpenSSL's. It ends with `live=0` and
+     `foreign held=8139`, OpenSSL's global state, which is not a leak.
+2. **In every build, not only test builds (§3.5 said test builds).**
+   - A package's C file cannot tell a test build from another: the manifest has no per-profile define.
+   - Without counting (CeeSafe ADR 0059: only a report, `CEESAFE_FAIL_ALLOC_AT` or `ceesafec test` turns it on),
+     `ceesafe_alloc` is the platform's `malloc` behind one branch.
+   - So the routing costs a release build nothing measurable, and it keeps one code path.
+3. **The fuzz harness** compiles the shim without the CeeSafe runtime. `-DWT_STANDALONE` leaves OpenSSL its own
+   allocator there.
+4. **Blocked: OpenSSL's one-time initialisation cannot survive a failed allocation** (upstream **U17**).
+   - In `alpn_is_the_servers_choice`, `ceesafec test --sweep alloc` fails at points 1-5 and 12-14 (status 137, no
+     output). The other sampled points pass.
+   - Each failing point is inside `ossl_init_base`, `ossl_init_load_crypto_nodelete` or `do_err_strings_init`.
+   - `CRYPTO_malloc`'s failure path raises an error, which calls `OPENSSL_init_crypto` inside the `pthread_once`
+     already running. macOS aborts that (`_os_once_gate_recursive_abort`); Linux would deadlock.
+   - The fix needs CeeSafe: an allocator number that is counted but never failed, under which the shim runs
+     `OPENSSL_init_ssl` first. Until then this stays on the branch, and main keeps amendment 2.1.

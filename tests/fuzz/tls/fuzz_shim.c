@@ -7,7 +7,7 @@
  * the fuzzer also explores how records split across reads.
  *
  * Linux (libFuzzer):
- *   clang -g -O1 -fsanitize=fuzzer,address,undefined -I. tests/fuzz/tls/fuzz_shim.c packages/web_tls/c/tls_shim.c \
+ *   clang -g -O1 -fsanitize=fuzzer,address,undefined -DWT_STANDALONE -I. tests/fuzz/tls/fuzz_shim.c packages/web_tls/c/tls_shim.c \
  *     -lssl -lcrypto -o fuzz_shim
  *   C=packages/web_tls/tests/certs; CW_CERT=$C/server.pem CW_KEY=$C/server.key CW_CA=$C/ca.pem \
  *     ./fuzz_shim corpus/ tests/fuzz/tls/seeds/
