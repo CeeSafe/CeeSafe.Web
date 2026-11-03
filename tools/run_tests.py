@@ -21,6 +21,7 @@ Expected values in tests are written by hand from the test's own reasoning or an
 from a run (Web ADR 0005 §2.2).
 """
 import argparse
+import os
 import pathlib
 import shutil
 import subprocess
@@ -39,6 +40,8 @@ def main() -> int:
     ap.add_argument("--cancel-sweep", action="store_true", help="cancel at each suspension point in turn")
     ap.add_argument("--timeout", type=int, default=120)
     args = ap.parse_args()
+    if os.sep in args.ceesafec or "/" in args.ceesafec:
+        args.ceesafec = os.path.abspath(args.ceesafec)  # the tests run from each package's directory
 
     packages = sorted(p.parent for p in (ROOT / "packages").glob("*/tests") if any(p.glob("*.cee")))
     if not packages:

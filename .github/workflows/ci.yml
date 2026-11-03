@@ -96,7 +96,7 @@ jobs:
 
       - name: Tests (ceesafec test, native and interpreter, leak check)
         shell: bash
-        run: python3 tools/run_tests.py
+        run: python3 tools/run_tests.py --timeout 600 # SHA-1's million-byte vector, interpreted on a slow runner
 
       - name: Tests with ASan and UBSan, allocation-failure and cancellation sweeps
         if: matrix.sanitize
