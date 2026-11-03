@@ -70,7 +70,7 @@ async fn two_requests_share_a_connection() -> Result<void, TestFailure> {
         Ok(m) => m,
         Err(_) => { return Check.fail("a mock"); },
     };
-    queue(scripts, mock.withPause(100).withCopiesTo(copies))?;
+    queue(scripts, mock.withPause(30).withCopiesTo(copies))?;
     let client = h2Client(scripts)?;
     let drain = match (Drain.create()) {
         Ok(d) => d,
