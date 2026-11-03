@@ -78,7 +78,7 @@ public enum RouteMatch {
 /// Routes requests to handlers of application state `S`.
 public struct Router<S> {
     private nodes: Vector<Node>;
-    private handlers: Vector<Box<dyn Handler<S>>>;
+    private handlers: Vector<Box<dyn Handler<S> + Send>>;
 
     /// An empty router.
     public fn create() -> Result<Router<S>, RouteError> {
@@ -87,7 +87,7 @@ public struct Router<S> {
             Ok() => {}
             Err(_) => { return Err(RouteError.OutOfMemory); }
         }
-        return Ok(Router { nodes: nodes, handlers: Vector<Box<dyn Handler<S>>>.create() });
+        return Ok(Router { nodes: nodes, handlers: Vector<Box<dyn Handler<S> + Send>>.create() });
     }
 
     /// Routes `method` requests for `pattern` to `handler`. A pattern is `/`, or `/`-separated segments: literal
@@ -96,7 +96,7 @@ public struct Router<S> {
         borrow mut this,
         method: Method,
         pattern: StringView,
-        handler: Box<dyn Handler<S>>,
+        handler: Box<dyn Handler<S> + Send>,
     ) -> Result<void, RouteError> {
         let m = Methods.index(method);
         if (m == 9) {
@@ -136,23 +136,43 @@ public struct Router<S> {
     }
 
     /// GET (and so HEAD) `pattern`.
-    public fn get(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+    public fn get(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send>,
+    ) -> Result<void, RouteError> =>
         this.add(Method.Get, pattern, handler);
 
     /// POST `pattern`.
-    public fn post(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+    public fn post(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send>,
+    ) -> Result<void, RouteError> =>
         this.add(Method.Post, pattern, handler);
 
     /// PUT `pattern`.
-    public fn put(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+    public fn put(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send>,
+    ) -> Result<void, RouteError> =>
         this.add(Method.Put, pattern, handler);
 
     /// DELETE `pattern`.
-    public fn delete(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+    public fn delete(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send>,
+    ) -> Result<void, RouteError> =>
         this.add(Method.Delete, pattern, handler);
 
     /// PATCH `pattern`.
-    public fn patch(borrow mut this, pattern: StringView, handler: Box<dyn Handler<S>>) -> Result<void, RouteError> =>
+    public fn patch(
+        borrow mut this,
+        pattern: StringView,
+        handler: Box<dyn Handler<S> + Send>,
+    ) -> Result<void, RouteError> =>
         this.add(Method.Patch, pattern, handler);
 
     /// The child of `node` for pattern segment `seg`, created if new.
@@ -285,7 +305,8 @@ public struct Router<S> {
     }
 
     /// The handler at `index` (from `RouteMatch.Found`).
-    public fn handler(borrow this, index: u32) -> borrow Box<dyn Handler<S>> => borrow this.handlers[index as usize];
+    public fn handler(borrow this, index: u32) -> borrow Box<dyn Handler<S> + Send> =>
+        borrow this.handlers[index as usize];
 
     /// The name of the parameter matched at `node`.
     fn paramName(borrow this, node: u32) -> Slice<u8> => this.nodes[node as usize].name.view();

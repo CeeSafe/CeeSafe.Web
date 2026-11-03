@@ -1,7 +1,7 @@
 // HTTPS: web_server behind web_tls's TlsAcceptor (Web ADR 0002), for the TLS interop checks (tests/interop/tls.py).
 // Listens on 127.0.0.1:CW_PORT (default 8443) with the certificate chain CW_CERT and key CW_KEY (PEM files),
-// offering ALPN http/1.1. CW_WORKERS (default 256) bounds the connections served at once, handshakes included, and
-// CW_HANDSHAKE_MS (default 10000) each handshake.
+// offering ALPN h2 and http/1.1 (Web ADR 0011 §3.2). CW_WORKERS (default 256) bounds the connections served at
+// once, handshakes included, and CW_HANDSHAKE_MS (default 10000) each handshake.
 //
 //   GET  /       "hello, tls"
 //   POST /echo   the request body back
@@ -58,10 +58,10 @@ impl Handler<App> for Stop {
     }
 }
 
-fn handler<H: Handler<App>>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App>>, RouteError> {
+fn handler<H: Handler<App> + Send>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App> + Send>, RouteError> {
     match (b) {
         Ok(h) => {
-            let d: Box<dyn Handler<App>> = h;
+            let d: Box<dyn Handler<App> + Send> = h;
             return Ok(d);
         }
         Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -129,7 +129,7 @@ async fn say(text: StringView) -> Result<void, NetError> {
     }
 }
 
-async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
+async fn serve(server: Server<App>) -> Result<void, NetError> {
     var chain = Vector<u8>.create();
     var key = Vector<u8>.create();
     await readFile("CW_CERT", mut chain)?;
@@ -141,7 +141,7 @@ async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
             return Ok();
         },
     };
-    var protocols = [Alpn.Http11];
+    var protocols = [Alpn.Http2, Alpn.Http11];
     match (config.setAlpn(protocols[..])) {
         Ok() => {}
         Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }

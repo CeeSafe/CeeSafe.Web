@@ -189,6 +189,25 @@ public struct H2Connection {
     /// The client's streams not yet closed.
     public fn activeStreams(borrow this) -> u32 => this.active;
 
+    /// What we may still send on `id` (its window; 0 if it is not open), before the connection's window.
+    public fn streamSendWindow(borrow this, id: u32) -> i64 => match (this.streams.get(id)) {
+        Some(s) => s.sendWindow,
+        null => 0i64,
+    };
+
+    /// What we may still send on the connection as a whole.
+    public fn connectionSendWindow(borrow this) -> i64 => this.connectionSend;
+
+    /// Whether the client may still send on `id`: open, or half-closed on our side only.
+    public fn remoteOpen(borrow this, id: u32) -> bool => match (this.streams.get(id)) {
+        Some(s) => match (s.state) {
+            StreamState.Open => true,
+            StreamState.HalfClosedLocal => true,
+            _ => false,
+        },
+        null => false,
+    };
+
     /// The peer's settings, as they stand.
     public fn peerSettings(borrow this) -> H2Settings => this.peer;
 

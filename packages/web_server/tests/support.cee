@@ -6,12 +6,14 @@ import web_http1;
 
 /// The test application's state: counters the handlers and middleware write.
 struct St {
-    hits: AtomicU64;
+    /// Shared, so a test can count after `Server.run` has taken the server.
+    hits: Arc<AtomicU64>;
     /// Each `before` appends its id as a decimal digit (the last 18 are kept).
     befores: AtomicU64;
 }
 
-fn state() -> St => St { hits: AtomicU64.create(0), befores: AtomicU64.create(0) };
+fn state() -> Result<St, TestFailure> =>
+    Ok(St { hits: alloc(Arc<AtomicU64>.create(AtomicU64.create(0)))?, befores: AtomicU64.create(0) });
 
 /// `r`, an allocation as the test's failure.
 fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
@@ -41,7 +43,7 @@ impl Handler<St> for Named {
         request: borrow Request,
         exchange: borrow mut Exchange,
     ) -> Result<void, HandlerError> {
-        ctx.state().hits.fetchAdd(1);
+        ctx.state().hits.get().fetchAdd(1);
         var b = [104u8, 0u8];
         b[1] = truncate<u8>(48 + this.id % 10);
         return await exchange.send(Status.ok(), b[..]);
@@ -49,8 +51,8 @@ impl Handler<St> for Named {
 }
 
 /// A boxed `Named`.
-fn named(id: u32) -> Result<Box<dyn Handler<St>>, TestFailure> {
-    let h: Box<dyn Handler<St>> = alloc(Box.create(Named { id: id }))?;
+fn named(id: u32) -> Result<Box<dyn Handler<St> + Send>, TestFailure> {
+    let h: Box<dyn Handler<St> + Send> = alloc(Box.create(Named { id: id }))?;
     return Ok(h);
 }
 
@@ -80,8 +82,8 @@ impl Handler<St> for Params2 {
     }
 }
 
-fn params2() -> Result<Box<dyn Handler<St>>, TestFailure> {
-    let h: Box<dyn Handler<St>> = alloc(Box.create(Params2 {}))?;
+fn params2() -> Result<Box<dyn Handler<St> + Send>, TestFailure> {
+    let h: Box<dyn Handler<St> + Send> = alloc(Box.create(Params2 {}))?;
     return Ok(h);
 }
 
@@ -131,8 +133,8 @@ impl Middleware<St> for Mark {
     }
 }
 
-fn mark(id: u32) -> Result<Box<dyn Middleware<St>>, TestFailure> {
-    let m: Box<dyn Middleware<St>> = alloc(Box.create(Mark { id: id }))?;
+fn mark(id: u32) -> Result<Box<dyn Middleware<St> + Send>, TestFailure> {
+    let m: Box<dyn Middleware<St> + Send> = alloc(Box.create(Mark { id: id }))?;
     return Ok(m);
 }
 

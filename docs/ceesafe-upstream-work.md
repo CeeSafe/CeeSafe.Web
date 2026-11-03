@@ -749,6 +749,35 @@ else, and route every later allocation through `CEE_ALLOC_FOREIGN`.
 **Effect on CeeSafe.Web until then:** OpenSSL keeps its own allocator (Web ADR 0002 amendment 2.1); the routing waits
 on the branch `u14-openssl-alloc`.
 
+## U18 — `ceesafec test --sweep alloc` fails the frame-stack panic that ADR 0056 §3.3 defines   *(found 2026-11-03, M7, ceesafec 0.10.1; wanted, not blocking)*
+
+**Gap:** ADR 0056 §3.3 makes `async frame stack: out of memory` the outcome when a stacked await's chunk cannot be
+allocated, and `tools/fault_injection.py:68` accepts that panic. `ceesafec test --sweep alloc` counts every panic as
+a sweep failure (`src/host/test_runner.cee:601`: "it may not panic"). So the two sweeps disagree on the same program.
+The HTTP/2 driver's first draft ran a handler through a wrapper that implemented `Application` by calling a
+`Box<dyn Application>`. That is a cycle through `dyn`, so the call was stacked, and the test sweep reported 4 failures
+in 2655 runs (`async frame stack: out of memory` at allocations 82, 108 and 125).
+
+**Wanted:** one rule for both. Either the test sweep accepts the §3.3 panic as the fault script does, or it keeps
+failing it and the ADR says so: a library's tests then show where a stacked await can stop the process.
+
+**Effect on CeeSafe.Web until then:** none. The driver no longer stacks the call (U19's two-step lend), and the
+strict sweep is useful here: it found the wrapper.
+
+## U19 — `Box<dyn I + Send>` does not lend a `borrow dyn I` in one step   *(found 2026-11-03, M7, ceesafec 0.10.1; wanted, not blocking)*
+
+**Gap:** a `Box<dyn I>` converts to `borrow dyn I`, and a `borrow dyn I + Send` converts to `borrow dyn I`. But
+`Box<dyn I + Send>` (or `Arc<Box<dyn I + Send>>.get()`) to `borrow dyn I` is N0205 ("expected 'borrow dyn Shape',
+found 'borrow Box<dyn Shape + Send>'"). Probe: a `describe(shape: borrow dyn Shape)` called with a
+`Box<dyn Shape + Send>` fails; called through a `sendable(shape: borrow dyn Shape + Send)` that passes it on, it
+prints the area.
+
+**Wanted:** the two conversions compose, as each one is allowed alone.
+
+**Effect on CeeSafe.Web until then:** `web_http2/src/serve.cee` binds `let sendable: borrow dyn Application + Send =
+app.get();` and then `let application: borrow dyn Application = sendable;`. That is two lines, not a workaround: no
+wrapper, no `unsafe`.
+
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/async-deadline-void-bug.cee`:

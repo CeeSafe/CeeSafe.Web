@@ -220,10 +220,10 @@ fn setting(name: StringView, otherwise: u64) -> u64 {
     };
 }
 
-fn handler<H: Handler<App>>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App>>, RouteError> {
+fn handler<H: Handler<App> + Send>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App> + Send>, RouteError> {
     match (b) {
         Ok(h) => {
-            let d: Box<dyn Handler<App>> = h;
+            let d: Box<dyn Handler<App> + Send> = h;
             return Ok(d);
         }
         Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -245,7 +245,7 @@ fn application() -> Result<Server<App>, RouteError> {
     return Ok(server);
 }
 
-async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
+async fn serve(server: Server<App>) -> Result<void, NetError> {
     let port = truncate<u16>(setting("CW_PORT", 8080));
     let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
     let listener = Listener.bindWith(SocketAddresses.v4Loopback(port), options)?;

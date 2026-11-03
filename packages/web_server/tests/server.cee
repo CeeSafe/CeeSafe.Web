@@ -9,7 +9,7 @@ import web_http;
 /// A server with two middleware (`Mark` 1 then 2) and the routes `GET /users` (h2), `POST /users` (h5),
 /// `GET /users/:id` (`Params2`).
 fn marked() -> Result<Server<St>, TestFailure> {
-    var s = routed(Server<St>.create(state(), quiet()))?;
+    var s = routed(Server<St>.create(state()?, quiet()))?;
     added(s.use(mark(1)?))?;
     added(s.use(mark(2)?))?;
     added(s.router().get("/users", named(2)?))?;
@@ -20,7 +20,7 @@ fn marked() -> Result<Server<St>, TestFailure> {
 
 /// The same routes without middleware.
 fn plain() -> Result<Server<St>, TestFailure> {
-    var s = routed(Server<St>.create(state(), quiet()))?;
+    var s = routed(Server<St>.create(state()?, quiet()))?;
     added(s.router().get("/users", named(2)?))?;
     added(s.router().post("/users", named(5)?))?;
     added(s.router().get("/users/:id", params2()?))?;
@@ -33,14 +33,14 @@ async fn middleware_order_and_short_circuit() -> Result<void, TestFailure> {
     let ok = await exchange(s, "GET /users HTTP/1.1\r\nhost: a\r\n\r\n")?;
     Check.equalBytes("HTTP/1.1 200 OK\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 2\r\n\r\nh2".bytes(), ok.view())?;
     Check.equalU64(12, s.state().befores.load())?;
-    Check.equalU64(1, s.state().hits.load())?;
+    Check.equalU64(1, s.state().hits.get().load())?;
     // `Mark 2` answers 401 itself: `before` 1 and 2 ran, the handler did not, and both `after` hooks still edit the
     // head it sends.
     s.state().befores.store(0);
     let denied = await exchange(s, "GET /users HTTP/1.1\r\nhost: a\r\nx-deny: 2\r\n\r\n")?;
     Check.equalBytes("HTTP/1.1 401 Unauthorized\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 0\r\n\r\n".bytes(), denied.view())?;
     Check.equalU64(12, s.state().befores.load())?;
-    Check.equalU64(1, s.state().hits.load())?;
+    Check.equalU64(1, s.state().hits.get().load())?;
     // `Mark 1` answers first: `before` 2 never runs.
     s.state().befores.store(0);
     let first = await exchange(s, "GET /users HTTP/1.1\r\nhost: a\r\nx-deny: 1\r\n\r\n")?;
@@ -114,12 +114,13 @@ async fn through_the_connection_server() -> Result<void, TestFailure> {
     var limits = ConnectionLimits.defaults();
     limits.workers = 3;
     let drain = net(Drain.create())?;
+    let hits = s.state().hits.clone();
     let report = net(await s.run(incoming, PlainAcceptor {}, limits, drain))?;
     Check.equalU64(6, report.accepted)?;
     Check.equalU64(6, report.served)?;
     Check.equalU64(0, report.failed)?;
     Check.isTrue(!report.forced, "not forced")?;
-    Check.equalU64(12, s.state().hits.load())?;
+    Check.equalU64(12, hits.get().load())?;
     return Ok();
 }
 

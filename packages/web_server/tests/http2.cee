@@ -1,0 +1,112 @@
+// `Server.run`'s protocol choice (Web ADR 0011 §3.2): HTTP/2 by ALPN `h2` or by the cleartext preface (prior
+// knowledge, RFC 9113 §3.3), HTTP/1.1 otherwise, through `HttpService` on mock connections. The request frames are
+// written out by hand: the preface (RFC 9113 §3.4), an empty SETTINGS (§6.5), and a HEADERS block from RFC 7541's
+// static table (Appendix A: 2 `:method GET`, 7 `:scheme https`; `:path` 4 and `:authority` 1 as literal values with
+// incremental indexing, §6.2.1). The response's `:status 200` is static index 8, one byte 0x88 (§6.1).
+import web_core;
+import web_transport;
+import web_http;
+import web_http2;
+
+/// The client's side: the preface, SETTINGS, and `GET /users` on stream 1 with END_STREAM and END_HEADERS.
+fn h2Request() -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    let preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    bytes(mut out, preface.bytes())?;
+    let settings = [0u8, 0, 0, 4, 0, 0, 0, 0, 0]; // SETTINGS, empty
+    bytes(mut out, settings[..])?;
+    let block = [0x82u8, 0x87, 0x44, 6, 0x2F, 0x75, 0x73, 0x65, 0x72, 0x73, 0x41, 1, 0x61];
+    // HEADERS (type 1), flags END_STREAM (0x1) | END_HEADERS (0x4), stream 1, 13 bytes.
+    let headers = [0u8, 0, 13, 1, 5, 0, 0, 0, 1];
+    bytes(mut out, headers[..])?;
+    bytes(mut out, block[..])?;
+    return Ok(out);
+}
+
+/// Serves `conn` with `plain()`'s routes through `HttpService`; what was written. An HTTP/2 connection ends when it
+/// has been idle for 200 ms.
+async fn served(conn: MockTransport) -> Result<Vector<u8>, TestFailure> {
+    var limits = quiet();
+    limits.idleTimeoutMs = 200;
+    var s = routed(Server<St>.create(state()?, limits))?;
+    added(s.router().get("/users", named(2)?))?;
+    added(s.router().post("/users", named(5)?))?;
+    let service = net(serviceOf(s))?;
+    let drain = net(Drain.create())?;
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    var c = conn;
+    netDone(await service.serve(mut c, ctx))?;
+    var out = Vector<u8>.create();
+    bytes(mut out, c.written())?;
+    return Ok(out);
+}
+
+/// The response to `h2Request`: a HEADERS frame on stream 1 whose block starts with 0x88 (`:status 200`), then a
+/// DATA frame on stream 1 with END_STREAM and the handler's "h2".
+fn answeredOverH2(out: Slice<u8>) -> Result<void, TestFailure> {
+    var at: usize = 0;
+    var status = false;
+    var body = false;
+    while (at + 9 <= out.length) {
+        let length = (out[at] as usize << 16) | (out[at + 1] as usize << 8) | out[at + 2] as usize;
+        let kind = out[at + 3];
+        let flags = out[at + 4];
+        let stream = (out[at + 5] as u32 << 24) | (out[at + 6] as u32 << 16) | (out[at + 7] as u32 << 8) | out[at + 8] as u32;
+        let p = out[at + 9..at + 9 + length];
+        if (kind == 1 && stream == 1 && p.length > 0 && p[0] == 0x88) {
+            status = true;
+        }
+        if (kind == 0 && stream == 1 && (flags & 1) == 1 && p.length == 2 && p[0] == 0x68 && p[1] == 0x32) {
+            body = true;
+        }
+        at += 9 + length;
+    }
+    Check.isTrue(at == out.length, "whole frames")?;
+    Check.isTrue(status, "HEADERS :status 200 on stream 1")?;
+    return Check.isTrue(body, "DATA h2 with END_STREAM on stream 1");
+}
+
+@test
+async fn h2c_by_prior_knowledge() -> Result<void, TestFailure> {
+    // One byte per read: the choice waits for the whole preface.
+    let request = h2Request()?;
+    let conn = alloc(MockTransport.create(request.view()))?.withChunk(1).withHang();
+    let out = await served(conn)?;
+    return answeredOverH2(out.view());
+}
+
+@test
+async fn h2_by_alpn() -> Result<void, TestFailure> {
+    let request = h2Request()?;
+    let conn = alloc(MockTransport.create(request.view()))?.withAlpn(Alpn.Http2).withHang();
+    let out = await served(conn)?;
+    return answeredOverH2(out.view());
+}
+
+@test
+async fn http1_after_the_first_bytes() -> Result<void, TestFailure> {
+    // "POST" and "PRI " share their first byte: the choice reads past it, and HTTP/1.1 gets every byte read.
+    let text = "POST /users HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n";
+    let conn = alloc(MockTransport.create(text.bytes()))?.withChunk(1);
+    let out = await served(conn)?;
+    return Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh5".bytes(), out.view());
+}
+
+@test
+async fn http1_shorter_than_the_preface() -> Result<void, TestFailure> {
+    // A whole request in fewer bytes than the preface's 24, in one read: no `Host`, so 400 (RFC 9112 §3.2).
+    let text = "GET /users HTTP/1.1\r\n\r\n";
+    let conn = alloc(MockTransport.create(text.bytes()))?;
+    let out = await served(conn)?;
+    return Check.equalBytes("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".bytes(), out.view());
+}
+
+fn bytes(out: borrow mut Vector<u8>, b: Slice<u8>) -> Result<void, TestFailure> {
+    for (x in b) {
+        match (out.push(x)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("out of memory")); }
+        }
+    }
+    return Ok();
+}

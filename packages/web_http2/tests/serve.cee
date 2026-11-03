@@ -1,0 +1,288 @@
+// The HTTP/2 driver (Web ADR 0011 §3.2) over a scripted client: it sends the preface, SETTINGS and requests as frames,
+// then stays open until `closeAtMs`, and records what the server writes. What comes back is checked frame by frame
+// against RFC 9113 (and the response heads decoded with our HPACK decoder, itself checked against RFC 7541).
+import web_core;
+import web_http;
+
+/// A scripted client: it sends `input`, then waits until `closeAtMs` and ends the stream.
+struct Client {
+    input: Vector<u8>;
+    at: usize;
+    closeAtMs: u64;
+    output: Vector<u8>;
+}
+
+impl Transport for Client {
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        if (this.at < this.input.length) {
+            var n = this.input.length - this.at;
+            if (n > buffer.length) {
+                n = buffer.length;
+            }
+            for (i in 0..n) {
+                buffer[i] = this.input[this.at + i];
+            }
+            this.at += n;
+            return Ok(n);
+        }
+        loop {
+            let now = Timer.now();
+            if (now >= this.closeAtMs) {
+                return Ok(0);
+            }
+            match (await Timer.sleep(this.closeAtMs - now)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.Cancelled); }
+            }
+        }
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        for (b in bytes) {
+            match (this.output.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+        return Ok();
+    }
+
+    async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {
+        var total: usize = 0;
+        for (i in 0..parts.count()) {
+            let p = parts.part(i);
+            await this.write(p)?;
+            total += p.length;
+        }
+        return Ok(total);
+    }
+
+    async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => Ok();
+
+    @effects()
+    fn alpn(borrow this) -> Alpn => Alpn.Http2;
+
+    @effects()
+    fn peerAddress(borrow this) -> SocketAddress? => null;
+
+    @effects()
+    fn localAddress(borrow this) -> SocketAddress? => null;
+
+    @effects(alloc)
+    fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;
+}
+
+/// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css".
+struct Site {}
+
+impl Application for Site {
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> {
+        let path = request.path();
+        if (Ascii.equals(path.bytes(), "/echo")) {
+            var buf = [0u8; 64];
+            var body = Vector<u8>.create();
+            loop {
+                let n = await exchange.read(mut buf[..])?;
+                if (n == 0) {
+                    break;
+                }
+                for (i in 0..n) {
+                    match (body.push(buf[i])) {
+                        Ok() => {}
+                        Err(_) => { return Err(HandlerError.Internal); }
+                    }
+                }
+            }
+            return await exchange.send(Status.ok(), body.view());
+        }
+        if (Ascii.equals(path.bytes(), "/push")) {
+            let pushed = await exchange.push("/style.css")?;
+            return await exchange.send(Status.ok(), if (pushed) "pushed".bytes() else "not pushed".bytes());
+        }
+        if (Ascii.equals(path.bytes(), "/style.css")) {
+            return await exchange.send(Status.ok(), "css".bytes());
+        }
+        return await exchange.send(Status.ok(), "hello".bytes());
+    }
+
+    async fn beforeHead(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// Serves the scripted client's `input` with `Site`, the client leaving after `closeAfterMs`; what the server wrote.
+async fn served(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> {
+    var copy = Vector<u8>.create();
+    for (b in input.view()) {
+        grew(copy.push(b))?;
+    }
+    var client = Client { input: copy, at: 0, closeAtMs: Timer.now() + closeAfterMs, output: Vector<u8>.create() };
+    let site: Box<dyn Application + Send> = match (Box.create(Site {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("a box")); },
+    };
+    let app = match (Arc<Box<dyn Application + Send>>.create(site)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("an arc")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let context = ConnectionContext.create(1, Timer.now(), drain);
+    var limits = Limits.defaults();
+    limits.sendDate = false;
+    match (await serveH2(mut client, context, app, limits, "".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("serveH2 failed")); }
+    }
+    return Ok(client.output);
+}
+
+/// The frames in `out`, one item each: `TYPE STREAM [fFLAGS]`, then for HEADERS `:status` and for DATA its bytes.
+fn frames(out: borrow Vector<u8>) -> Result<Vector<u8>, TestFailure> {
+    var log = Vector<u8>.create();
+    var decoder = match (HpackDecoder.create(4096, 65536)) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a decoder")); },
+    };
+    let all = out.view();
+    var at: usize = 0;
+    while (at + 9 <= all.length) {
+        let h = match (Frames.parseHeader(all[at..])) {
+            Some(h) => h,
+            null => { return Err(TestFailure.create("a frame")); },
+        };
+        let p = all[at + 9..at + 9 + h.length as usize];
+        append(mut log, frameName(h.kind))?;
+        append(mut log, " ")?;
+        number(mut log, h.stream as u64)?;
+        if (h.flags != 0) {
+            append(mut log, " f")?;
+            number(mut log, h.flags as u64)?;
+        }
+        if (h.kind == FrameTypes.headers()) {
+            var fields = HeaderBlock.create();
+            match (decoder.decode(p, mut fields)) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("a response head")); }
+            }
+            append(mut log, " ")?;
+            for (b in fields.value(0)) {
+                grew(log.push(b))?;
+            }
+        } else if (h.kind == FrameTypes.data() && p.length > 0) {
+            append(mut log, " ")?;
+            for (b in p) {
+                grew(log.push(b))?;
+            }
+        } else if (h.kind == FrameTypes.pushPromise()) {
+            var fields = HeaderBlock.create();
+            match (decoder.decode(p[4..], mut fields)) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("a promised head")); }
+            }
+            append(mut log, " promised ")?;
+            number(mut log, read32(p, 0) as u64)?;
+            for (i in 0..fields.count()) {
+                if (Ascii.equals(fields.name(i), ":path")) {
+                    append(mut log, " ")?;
+                    for (b in fields.value(i)) {
+                        grew(log.push(b))?;
+                    }
+                }
+            }
+        } else if (h.kind == FrameTypes.rstStream()) {
+            append(mut log, " code ")?;
+            number(mut log, read32(p, 0) as u64)?;
+        }
+        append(mut log, "; ")?;
+        at += 9 + h.length as usize;
+    }
+    return Ok(log);
+}
+
+@test
+async fn a_get_over_http2() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let get = getBlock("/hello")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    let out = await served(bytes, 200)?;
+    let log = frames(out)?;
+    // Our SETTINGS and window, the client's SETTINGS acknowledged, then the response: HEADERS (200), DATA with
+    // END_STREAM; then GOAWAY when the client leaves.
+    return Check.isTrue(
+        startsWith(log.view(), "settings 0; window 0; settings 0 f1; headers 1 f4 200; data 1 f1 hello; "),
+        "a response on stream 1",
+    );
+}
+
+@test
+async fn a_body_echoed_and_two_streams_interleaved() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let echo = blockOf(":method: POST\n:scheme: https\n:path: /echo\n:authority: example.test\n")?;
+    let get = getBlock("/hello")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, echo.view())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 3, get.view())?;
+    frame(mut bytes, FrameTypes.data(), 0, 1, "abc".bytes())?;
+    frame(mut bytes, FrameTypes.data(), FrameFlags.endStream(), 1, "def".bytes())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    // The two responses interleave: each stream's frames in order, the streams' frames mixed (RFC 9113 §5).
+    Check.isTrue(contains(log.view(), "headers 1 f4 200; "), "stream 1's head")?;
+    Check.isTrue(contains(log.view(), "headers 3 f4 200; "), "stream 3's head")?;
+    Check.isTrue(contains(log.view(), "data 3 f1 hello; "), "stream 3's body")?;
+    return Check.isTrue(contains(log.view(), "data 1 f1 abcdef; "), "stream 1's body echoed");
+}
+
+@test
+async fn a_push_promise() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let get = getBlock("/push")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    Check.isTrue(contains(log.view(), "push 1 f4 promised 2 /style.css; "), "PUSH_PROMISE for stream 2")?;
+    Check.isTrue(contains(log.view(), "data 1 f1 pushed; "), "the response says pushed")?;
+    return Check.isTrue(contains(log.view(), "data 2 f1 css; "), "the pushed response on stream 2");
+}
+
+fn startsWith(hay: Slice<u8>, prefix: StringView) -> bool {
+    let p = prefix.bytes();
+    if (p.length > hay.length) {
+        return false;
+    }
+    for (i in 0..p.length) {
+        if (hay[i] != p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn contains(hay: Slice<u8>, needle: StringView) -> bool {
+    let n = needle.bytes();
+    if (n.length > hay.length) {
+        return false;
+    }
+    for (i in 0..hay.length - n.length + 1) {
+        var found = true;
+        for (k in 0..n.length) {
+            if (hay[i + k] != n[k]) {
+                found = false;
+                break;
+            }
+        }
+        if (found) {
+            return true;
+        }
+    }
+    return false;
+}

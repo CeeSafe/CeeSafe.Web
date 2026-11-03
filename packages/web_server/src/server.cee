@@ -1,17 +1,20 @@
 // The server (Web ADR 0007 §3.4, amendment 2): the application's state, its router and its middleware, served over
-// M1's connection server with the HTTP/1.1 driver. `Server<S>` implements `Application` and `ConnectionHandler` for
-// every state type (CeeSafe ADR 0054's generic impls), so an application writes no glue: it calls
-// `server.run(listener, acceptor, limits, drain)` (Web ADR 0007 amendment 2).
+// M1's connection server. `Server<S>` implements `Application` and `ConnectionHandler` for every state type (CeeSafe
+// ADR 0054's generic impls), so an application writes no glue: it calls `server.run(listener, acceptor, limits,
+// drain)` (Web ADR 0007 amendment 2), which serves HTTP/1.1 and HTTP/2 (Web ADR 0011 §3.2, §4: the server moves into
+// an `Arc` that every HTTP/2 stream task shares).
 import web_core;
 import web_transport;
 import web_http;
 import web_http1;
+import web_http2;
 
-/// An HTTP server for an application whose state is `S`.
-public struct Server<S> {
+/// An HTTP server for an application whose state is `S`. Its state, handlers and middleware are `Send`: HTTP/2 runs
+/// each request in its own task.
+public struct Server<S: Send> {
     private appState: S;
     private routes: Router<S>;
-    private hooks: Vector<Box<dyn Middleware<S>>>;
+    private hooks: Vector<Box<dyn Middleware<S> + Send>>;
     private httpLimits: Limits;
 
     /// A server owning `state`, with no routes and no middleware; `limits` bound each connection's requests.
@@ -20,13 +23,13 @@ public struct Server<S> {
         return Ok(Server {
             appState: state,
             routes: routes,
-            hooks: Vector<Box<dyn Middleware<S>>>.create(),
+            hooks: Vector<Box<dyn Middleware<S> + Send>>.create(),
             httpLimits: limits,
         });
     }
 
     /// Adds `m` after the middleware already added: its `before` runs after theirs, its `after` before theirs.
-    public fn use(borrow mut this, m: Box<dyn Middleware<S>>) -> Result<void, RouteError> {
+    public fn use(borrow mut this, m: Box<dyn Middleware<S> + Send>) -> Result<void, RouteError> {
         match (this.hooks.push(m)) {
             Ok() => { return Ok(); }
             Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -43,18 +46,94 @@ public struct Server<S> {
     public fn limits(borrow this) -> borrow Limits => borrow this.httpLimits;
 
     /// Serves connections from `incoming` (a `Listener`, or a `MockIncoming` in tests) through `acceptor` with M1's
-    /// connection server, until `drain` finishes or `incoming` ends (`ConnectionServer.run`).
+    /// connection server, until `drain` finishes or `incoming` ends (`ConnectionServer.run`). A connection is HTTP/2
+    /// when TLS negotiated `h2`, or when it starts with HTTP/2's preface (prior knowledge, RFC 9113 §3.3); HTTP/1.1
+    /// otherwise. The server moves into an `Arc` shared by every connection and HTTP/2 stream.
     public async fn run(
-        borrow this,
+        this,
         incoming: borrow dyn Incoming,
         acceptor: borrow dyn Acceptor,
         limits: borrow ConnectionLimits,
         drain: borrow Drain,
-    ) -> Result<ServerReport, NetError> =>
-        await ConnectionServer.run(incoming, acceptor, this, limits, drain);
+    ) -> Result<ServerReport, NetError> {
+        let service = serviceOf(this)?;
+        return await ConnectionServer.run(incoming, acceptor, service, limits, drain);
+    }
 }
 
-impl<S> ConnectionHandler for Server<S> {
+/// An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection (Web ADR 0011 §3.2).
+public struct HttpService {
+    private app: Arc<Box<dyn Application + Send>>;
+    private httpLimits: Limits;
+}
+
+impl ConnectionHandler for HttpService {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        let h2 = match (conn.alpn()) {
+            Alpn.Http2 => true,
+            _ => false,
+        };
+        if (h2) {
+            return await serveH2(conn, ctx, this.app, this.httpLimits, "".bytes());
+        }
+        // Cleartext, or TLS without `h2`: the first bytes tell HTTP/2's preface from an HTTP/1.1 request line. They
+        // differ by the second byte at the latest ("PRI" against "POST" or "PUT"), so this reads one segment as a rule.
+        var first = [0u8; 24];
+        var n: usize = 0;
+        let text = clientPreface();
+        let preface = text.bytes();
+        let deadline = Deadline.after(this.httpLimits.headerTimeoutMs);
+        while (n < first.length && prefixOf(first[0..n], preface)) {
+            let got = match (await Transports.readWithin(conn, mut first[n..], deadline)) {
+                Ok(v) => v,
+                Err(NetError.TimedOut) => { return Ok(); },
+                Err(e) => { return Err(e); },
+            };
+            if (got == 0) {
+                return Ok(); // the client closed before a request
+            }
+            n += got;
+        }
+        let sendable: borrow dyn Application + Send = this.app.get();
+        let app: borrow dyn Application = sendable;
+        if (n == first.length && prefixOf(first[..], preface)) {
+            return await serveH2(conn, ctx, this.app, this.httpLimits, first[..]);
+        }
+        return await web_http1.serveFrom(conn, ctx, app, this.httpLimits, first[0..n]);
+    }
+}
+
+/// The service of `server`, which it owns from now on.
+public fn serviceOf<S: Send>(server: Server<S>) -> Result<HttpService, NetError> {
+    let limits = server.httpLimits;
+    let boxed: Box<dyn Application + Send> = match (Box.create(server)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    match (Arc<Box<dyn Application + Send>>.create(boxed)) {
+        Ok(app) => { return Ok(HttpService { app: app, httpLimits: limits }); }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}
+
+/// Whether `bytes` is where `whole` starts.
+fn prefixOf(bytes: Slice<u8>, whole: Slice<u8>) -> bool {
+    if (bytes.length > whole.length) {
+        return false;
+    }
+    for (i in 0..bytes.length) {
+        if (bytes[i] != whole[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+impl<S: Send> ConnectionHandler for Server<S> {
     async fn serve(
         borrow this,
         conn: borrow mut dyn Transport,
@@ -63,7 +142,7 @@ impl<S> ConnectionHandler for Server<S> {
         await web_http1.serve(conn, ctx, this, this.httpLimits);
 }
 
-impl<S> Application for Server<S> {
+impl<S: Send> Application for Server<S> {
     /// Routes the request, runs every middleware's `before` in order, then the route's handler. A path with no
     /// route is 404; a path with routes but none for the method is 405 with `Allow`, or 204 with `Allow` for OPTIONS
     /// (RFC 9110 §9.3.7, §15.5.6). `OPTIONS *` is 204.

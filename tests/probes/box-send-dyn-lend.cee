@@ -1,0 +1,21 @@
+// U19 repro (ceesafec 0.10.1): line 'describe(s)' is N0205; through sendable() it prints 16.
+interface Shape {
+    fn area(borrow this) -> u64;
+}
+struct Square {
+    side: u64;
+}
+impl Shape for Square {
+    fn area(borrow this) -> u64 => this.side * this.side;
+}
+fn describe(shape: borrow dyn Shape) {
+    Console.writeLine(shape.area());
+}
+fn main() {
+    let b: Box<dyn Shape> = Box.create(Square { side: 3 })!;
+    describe(b);
+    let s: Box<dyn Shape + Send> = Box.create(Square { side: 4 })!;
+    describe(s);
+    let a = Arc<Box<dyn Shape + Send>>.create(s)!;
+    describe(a.get());
+}

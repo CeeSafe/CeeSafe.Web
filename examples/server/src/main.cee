@@ -1,5 +1,6 @@
 // The first web_server example (Web ADR 0007 §3.4): typed application state, a router with a parameter, a
-// middleware and a drain, served over HTTP/1.1. Listens on 127.0.0.1:CW_PORT (default 8080).
+// middleware and a drain, served over HTTP/1.1 and, by prior knowledge, HTTP/2 (h2c). Listens on 127.0.0.1:CW_PORT
+// (default 8080).
 //
 //   GET  /              "hello, world"
 //   GET  /hello/:name   "hello, <name>" (percent-decoded)
@@ -150,10 +151,10 @@ fn application() -> Result<Server<App>, RouteError> {
 }
 
 /// A boxed handler, or `OutOfMemory`.
-fn handler<H: Handler<App>>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App>>, RouteError> {
+fn handler<H: Handler<App> + Send>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App> + Send>, RouteError> {
     match (b) {
         Ok(h) => {
-            let d: Box<dyn Handler<App>> = h;
+            let d: Box<dyn Handler<App> + Send> = h;
             return Ok(d);
         }
         Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -161,10 +162,12 @@ fn handler<H: Handler<App>>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Han
 }
 
 /// A boxed middleware, or `OutOfMemory`.
-fn boxed<M: Middleware<App>>(b: Result<Box<M>, AllocError>) -> Result<Box<dyn Middleware<App>>, RouteError> {
+fn boxed<M: Middleware<App> + Send>(
+    b: Result<Box<M>, AllocError>,
+) -> Result<Box<dyn Middleware<App> + Send>, RouteError> {
     match (b) {
         Ok(m) => {
-            let d: Box<dyn Middleware<App>> = m;
+            let d: Box<dyn Middleware<App> + Send> = m;
             return Ok(d);
         }
         Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -182,7 +185,7 @@ fn port() -> u16 {
     };
 }
 
-async fn serve(server: borrow Server<App>) -> Result<void, NetError> {
+async fn serve(server: Server<App>) -> Result<void, NetError> {
     let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
     let listener = Listener.bindWith(SocketAddresses.v4Loopback(port()), options)?;
     let drain = Drain.create()?;

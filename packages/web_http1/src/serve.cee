@@ -19,8 +19,20 @@ public async fn serve(
     connection: borrow ConnectionContext,
     app: borrow dyn Application,
     limits: borrow Limits,
+) -> Result<void, NetError> =>
+    await serveFrom(conn, connection, app, limits, "".bytes());
+
+/// `serve`, for a connection whose first bytes, `already`, were read to choose the protocol (Web ADR 0011 §3.2: a
+/// cleartext connection that does not start with HTTP/2's preface): they are the start of the first request.
+public async fn serveFrom(
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    app: borrow dyn Application,
+    limits: borrow Limits,
+    already: Slice<u8>,
 ) -> Result<void, NetError> {
     var a = buffer(limits.maxHeadBytes)?;
+    a.append(already)?;
     var b = buffer(limits.maxHeadBytes)?;
     var out = buffer(limits.writeBufferBytes)?;
     var pending = buffer(limits.writeBufferBytes)?;
@@ -32,7 +44,9 @@ public async fn serve(
     loop {
         // A complete head in `a`.
         var scanner = HeadScanner.create();
-        var headDeadline = Deadline.never();
+        // A head already begun (bytes read to choose the protocol, or a pipelined request's start) is held to the
+        // header timeout from now; one not begun, from its first byte (below).
+        var headDeadline = if (a.isEmpty()) Deadline.never() else Deadline.after(limits.headerTimeoutMs);
         loop {
             match (scanner.scan(a.readable(), limits)) {
                 Ok(true) => { break; }
