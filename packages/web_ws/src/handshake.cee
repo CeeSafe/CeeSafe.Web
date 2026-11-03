@@ -1,0 +1,179 @@
+// The opening handshake (RFC 6455 §4.2): checking an upgrade request, its origin (Web ADR 0010 §3.4), the
+// subprotocol, and Sec-WebSocket-Accept. Sans-I/O.
+import web_http;
+
+/// Why an upgrade request is refused, and with which status.
+public enum UpgradeRefusal {
+    /// 400: not a valid upgrade (§4.2.1).
+    BadRequest,
+    /// 426 with `Sec-WebSocket-Version: 13` (§4.4).
+    Version,
+    /// 403: an origin that is neither the server's own nor allowed (§10.2).
+    Origin,
+}
+
+public struct Handshake {
+    /// `Sec-WebSocket-Accept` for `key`: base64(SHA-1(key + the GUID)) (§4.2.2 step 5.4), 28 bytes.
+    public fn acceptKey(key: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+        var sha = Sha1.create();
+        sha.update(key);
+        sha.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11".bytes());
+        let digest = sha.finish();
+        var out = Vector<u8>.withCapacity(28)?;
+        Base64.encode(digest[..], mut out)?;
+        return Ok(out);
+    }
+
+    /// Whether `request` is a WebSocket upgrade at all (`Upgrade: websocket`), before checking it fully.
+    public fn isUpgrade(request: borrow Request) -> bool =>
+        request.headers().hasToken(HeaderName.Upgrade, "websocket");
+
+    /// Checks an upgrade request (§4.2.1): `GET` over HTTP/1.1 with a `Host`, `Upgrade: websocket`, `Connection:
+    /// upgrade`, a `Sec-WebSocket-Key` of 16 bytes in base64, `Sec-WebSocket-Version: 13`, and an allowed origin.
+    /// `secure` says whether the connection is TLS, for the origin's scheme.
+    public fn check(
+        request: borrow Request,
+        secure: bool,
+        allowedOrigins: borrow Vector<Vector<u8>>,
+    ) -> Result<void, UpgradeRefusal> {
+        let headers = request.headers();
+        let isGet = match (request.method()) {
+            Method.Get => true,
+            _ => false,
+        };
+        let is11 = match (request.version()) {
+            Version.Http11 => true,
+            _ => false,
+        };
+        if (!isGet || !is11 || headers.countOf(HeaderName.Host) != 1) {
+            return Err(UpgradeRefusal.BadRequest);
+        }
+        if (!headers.hasToken(HeaderName.Upgrade, "websocket") || !headers.hasToken(HeaderName.Connection, "upgrade")) {
+            return Err(UpgradeRefusal.BadRequest);
+        }
+        let key = match (headers.getNamed("sec-websocket-key")) {
+            Some(k) => k,
+            null => { return Err(UpgradeRefusal.BadRequest); },
+        };
+        var decoded = Vector<u8>.create();
+        match (Base64.decode(trim(key), mut decoded)) {
+            Ok(true) => {}
+            _ => { return Err(UpgradeRefusal.BadRequest); }
+        }
+        if (decoded.length != 16) {
+            return Err(UpgradeRefusal.BadRequest);
+        }
+        match (headers.getNamed("sec-websocket-version")) {
+            Some(v) => {
+                if (!same(trim(v), "13".bytes())) {
+                    return Err(UpgradeRefusal.Version);
+                }
+            }
+            null => { return Err(UpgradeRefusal.BadRequest); }
+        }
+        match (headers.get(HeaderName.Origin)) {
+            Some(origin) => {
+                let host = match (headers.get(HeaderName.Host)) {
+                    Some(h) => h,
+                    null => { return Err(UpgradeRefusal.BadRequest); },
+                };
+                if (!Handshake.originAllowed(trim(origin), trim(host), secure, allowedOrigins)) {
+                    return Err(UpgradeRefusal.Origin);
+                }
+            }
+            null => {} // not a browser
+        }
+        return Ok();
+    }
+
+    /// Whether `origin` (`scheme://host[:port]`) is the server's own (`host` from the Host field, with `secure`'s
+    /// scheme; default ports ignored) or one of `allowed` (exact, ignoring ASCII case).
+    public fn originAllowed(
+        origin: Slice<u8>,
+        host: Slice<u8>,
+        secure: bool,
+        allowed: borrow Vector<Vector<u8>>,
+    ) -> bool {
+        for (a in allowed) {
+            if (sameIgnoringCase(origin, a.view())) {
+                return true;
+            }
+        }
+        let scheme = if (secure) "https://".bytes() else "http://".bytes();
+        if (origin.length < scheme.length || !sameIgnoringCase(origin[0..scheme.length], scheme)) {
+            return false;
+        }
+        let defaultPort = if (secure) ":443".bytes() else ":80".bytes();
+        return sameIgnoringCase(withoutPort(origin[scheme.length..], defaultPort), withoutPort(host, defaultPort));
+    }
+
+    /// The index in `preferences` of the subprotocol to use: the first of the server's preferences that the client
+    /// listed in `Sec-WebSocket-Protocol` (any number of fields, comma-separated). Null if none.
+    public fn chooseSubprotocol(request: borrow Request, preferences: borrow Vector<Vector<u8>>) -> usize? {
+        let headers = request.headers();
+        for (p in 0..preferences.length) {
+            for (i in 0..headers.count()) {
+                if (!Ascii.equalsIgnoringCase(headers.nameBytes(i), "sec-websocket-protocol")) {
+                    continue;
+                }
+                let v = headers.value(i);
+                var start: usize = 0;
+                for (k in 0..v.length + 1) {
+                    if (k == v.length || v[k] == 44) {
+                        if (same(trim(v[start..k]), preferences[p].view())) {
+                            return Some(p);
+                        }
+                        start = k + 1;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+}
+
+fn withoutPort<region r>(authority: Slice<r, u8>, defaultPort: Slice<u8>) -> Slice<r, u8> {
+    if (authority.length > defaultPort.length &&
+        same(authority[authority.length - defaultPort.length..], defaultPort)) {
+        return authority[0..authority.length - defaultPort.length];
+    }
+    return authority;
+}
+
+fn trim(v: Slice<u8>) -> Slice<u8> {
+    var a: usize = 0;
+    var b = v.length;
+    while (a < b && (v[a] == 32 || v[a] == 9)) {
+        a += 1;
+    }
+    while (b > a && (v[b - 1] == 32 || v[b - 1] == 9)) {
+        b -= 1;
+    }
+    return v[a..b];
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn lower(c: u8) -> u8 => if (c >= 65 && c <= 90) c + 32 else c;
+
+fn sameIgnoringCase(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (lower(a[i]) != lower(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}

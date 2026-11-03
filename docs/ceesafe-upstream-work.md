@@ -15,7 +15,8 @@ re-check them before editing.
 | **T3** Windows: the runtime warns under `-Wsign-conversion` | **fixed** (`992b1eb`) | `examples/https`, `examples/fetch` and the web_tls tests build without a warning on Windows 11 ARM64 (clang 23) |
 
 M5 (`web_client`) is unblocked and done on 0.9.4 (`docs/milestones/M5.md`). Still open: **U13** and **U14** (wanted,
-blocking nothing) and **U15** (below, wanted).
+blocking nothing) and **U15** (below, wanted). Opened since, while designing M6: **U16** (random bytes from the OS;
+**blocks the WebSocket client**).
 
 ## Status at 0.9.2 (released 2026-11-02, tag `v0.9.2` = CeeSafe `47474db`)
 
@@ -663,6 +664,32 @@ example `IoError.HostNotFound`, described as "host not found"), or a description
 **Effect on CeeSafe.Web until then:** the client reports a DNS failure as `Net(Io(NotFound))`, described as a missing
 file. Web ADR 0009 §5's check ("DNS failure dials nothing") passes either way.
 
+## U16 — Random bytes from the OS   *(found 2026-11-03 while designing M6, Web ADR 0010; blocks the WebSocket client)*
+
+**Gap:** lib/std gives a program no random bytes. The hosted runtime already reads the OS's source
+(`cee_random_fill`, `runtime/hosted/ceesafe_rt_io.c:1776`), but only to seed `HashMap`'s keys
+(`ceesafe_random_key`, used by `lib/std/collections.cee:6`).
+
+**Needed by:** the WebSocket client (Web ADR 0010 §3.6):
+- `Sec-WebSocket-Key`: 16 random bytes per connection (RFC 6455 §4.1);
+- a masking key per frame, which "MUST be derived from a strong source of entropy" (§5.3), so that a script cannot
+  predict the bytes a proxy sees.
+
+Later, HTTP/2 and QUIC need it too (QUIC connection IDs, M10), and so do cookies, session ids and CSRF tokens in
+applications.
+
+**Wanted:** `Random.fill(into: SliceMut<u8>) -> Result<void, IoError>` (or infallible, aborting as the HashMap seed
+does), from the OS's cryptographic source:
+- `getrandom(2)` on Linux;
+- `arc4random_buf` or `getentropy` on macOS and the BSDs;
+- `BCryptGenRandom` (`BCRYPT_USE_SYSTEM_PREFERRED_RNG`) on Windows.
+
+The call must be cheap enough for one per frame, or a user-space CSPRNG seeded from it (ChaCha20, reseeded on
+fork).
+
+**Effect on CeeSafe.Web until then:** the WebSocket client stays on a branch. Servers need no randomness, so the
+rest of M6 goes on.
+
 ## B6 — Bug: `Async.deadline` or `Async.timeout` over `Result<void, E>` crashes `ceesafec check`   *(found 2026-11-02, 0.7.0; fixed in 0.8.0)*
 
 **Repro:** `~/dev/CeeSafe.Web/tests/probes/async-deadline-void-bug.cee`:
@@ -722,7 +749,7 @@ Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner de
 | **0.9.1** (released 2026-11-02) | B8 fixed; U12 | the `Date` field |
 | **0.9.2** (released 2026-11-02) | B9, B10, B11, B12 fixed | `web_server` (M2 task 5) |
 | **0.9.4** (released 2026-11-03) | B13, B14, B15 fixed; T3 | `web_client` (M5) |
-| next | U13, U14, U15 | `web_sse`'s `DropOldest` and batched flushes (M3); OpenSSL's allocations in the leak check; DNS failures described as such |
+| next | U16 (blocks the WebSocket client, M6); U13, U14, U15 | `web_sse`'s `DropOldest` and batched flushes (M3); OpenSSL's allocations in the leak check; DNS failures described as such |
 
 Suggested ADR batching:
 - 0044 covers U1 + U2 (addresses, options and errors: one API surface).

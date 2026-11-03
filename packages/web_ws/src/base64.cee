@@ -1,0 +1,106 @@
+// Base64 (RFC 4648 §4, the standard alphabet with padding), for the handshake's keys.
+
+public struct Base64 {
+    /// Appends the encoding of `bytes` to `out`.
+    public fn encode(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        var i: usize = 0;
+        while (i + 3 <= bytes.length) {
+            let n = (bytes[i] as u32 << 16) | (bytes[i + 1] as u32 << 8) | bytes[i + 2] as u32;
+            out.push(letter(n >> 18))?;
+            out.push(letter(n >> 12))?;
+            out.push(letter(n >> 6))?;
+            out.push(letter(n))?;
+            i += 3;
+        }
+        let left = bytes.length - i;
+        if (left == 1) {
+            let n = bytes[i] as u32 << 16;
+            out.push(letter(n >> 18))?;
+            out.push(letter(n >> 12))?;
+            out.push(61)?;
+            out.push(61)?;
+        } else if (left == 2) {
+            let n = (bytes[i] as u32 << 16) | (bytes[i + 1] as u32 << 8);
+            out.push(letter(n >> 18))?;
+            out.push(letter(n >> 12))?;
+            out.push(letter(n >> 6))?;
+            out.push(61)?;
+        }
+        return Ok();
+    }
+
+    /// Appends the bytes `text` encodes, and returns true, if it is canonical base64: a multiple of 4 characters from
+    /// the alphabet, with padding only at the end and zero bits under it (RFC 4648 §3.5). False otherwise; `out` may
+    /// then hold part of the bytes.
+    public fn decode(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        if (text.length % 4 != 0) {
+            return Ok(false);
+        }
+        var i: usize = 0;
+        while (i < text.length) {
+            let last = i + 4 == text.length;
+            let a = value(text[i]);
+            let b = value(text[i + 1]);
+            if (a > 63 || b > 63) {
+                return Ok(false);
+            }
+            let padC = last && text[i + 2] == 61;
+            let padD = last && text[i + 3] == 61;
+            if (padC && !padD) {
+                return Ok(false);
+            }
+            let c = if (padC) 0u32 else value(text[i + 2]);
+            let d = if (padD) 0u32 else value(text[i + 3]);
+            if (c > 63 || d > 63) {
+                return Ok(false);
+            }
+            let n = (a << 18) | (b << 12) | (c << 6) | d;
+            if (padC && (n & 0xFFFF) != 0 || padD && (n & 0xFF) != 0) {
+                return Ok(false);
+            }
+            out.push(truncate<u8>(n >> 16))?;
+            if (!padC) {
+                out.push(truncate<u8>(n >> 8))?;
+            }
+            if (!padD) {
+                out.push(truncate<u8>(n))?;
+            }
+            i += 4;
+        }
+        return Ok(true);
+    }
+}
+
+fn letter(n: u32) -> u8 {
+    let v = truncate<u8>(n & 63);
+    if (v < 26) {
+        return 65 + v;
+    }
+    if (v < 52) {
+        return 97 + v - 26;
+    }
+    if (v < 62) {
+        return 48 + v - 52;
+    }
+    return if (v == 62) 43 else 47;
+}
+
+/// The letter's value, or 64 for a byte outside the alphabet (padding included).
+fn value(c: u8) -> u32 {
+    if (c >= 65 && c <= 90) {
+        return (c - 65) as u32;
+    }
+    if (c >= 97 && c <= 122) {
+        return (c - 97) as u32 + 26;
+    }
+    if (c >= 48 && c <= 57) {
+        return (c - 48) as u32 + 52;
+    }
+    if (c == 43) {
+        return 62;
+    }
+    if (c == 47) {
+        return 63;
+    }
+    return 64;
+}

@@ -1,0 +1,134 @@
+// Test helpers: bytes from hex, requests from a head's text, and a reader run that records what it yields.
+import web_core;
+import web_http;
+
+fn hex(text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    var high: u8 = 0;
+    var half = false;
+    for (c in text.bytes()) {
+        let v: u8 = if (c >= 48 && c <= 57) c - 48 else if (c >= 97 && c <= 102) c - 87 else if (c >= 65 && c <= 70)
+            c - 55 else 255;
+        if (v == 255) {
+            continue; // spaces between bytes
+        }
+        if (half) {
+            pushed(out.push(high * 16 + v))?;
+        } else {
+            high = v;
+        }
+        half = !half;
+    }
+    return Ok(out);
+}
+
+fn pushed(r: Result<void, AllocError>) -> Result<void, TestFailure> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn bytesOf(text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    for (b in text.bytes()) {
+        pushed(out.push(b))?;
+    }
+    return Ok(out);
+}
+
+/// The fields of `head`: lines `name: value` separated by CR LF, after a request line that is skipped.
+fn fieldsOf<region r>(head: Slice<r, u8>) -> Result<HeaderList<r>, TestFailure> {
+    var list = HeaderList.create(head);
+    var line: usize = 0;
+    var first = true;
+    var i: usize = 0;
+    while (i + 1 < head.length) {
+        if (head[i] == 13 && head[i + 1] == 10) {
+            if (!first && i > line) {
+                var colon = line;
+                while (colon < i && head[colon] != 58) {
+                    colon += 1;
+                }
+                var start = colon + 1;
+                while (start < i && head[start] == 32) {
+                    start += 1;
+                }
+                match (list.push(line, colon, start, i, 64)) {
+                    Ok() => {}
+                    Err(_) => { return Err(TestFailure.create("a field")); }
+                }
+            }
+            first = false;
+            line = i + 2;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    return Ok(list);
+}
+
+/// Feeds `input` to a reader in two pieces split at `split`, and describes what it yields, one letter per event:
+/// T or B (a message, then its bytes in brackets), P (ping), O (pong), C<code>, E<code> (a violation; stops).
+fn readAll(input: Slice<u8>, split: usize, role: Role, maxFrame: u64, maxMessage: u64) -> Result<Vector<u8>, TestFailure> {
+    var reader = MessageReader.create(role, maxFrame, maxMessage);
+    var buffer = match (OwnedBuffer.create(input.length + 1)) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("a buffer")); },
+    };
+    var message = Vector<u8>.create();
+    var log = Vector<u8>.create();
+    var cut = if (split > input.length) input.length else split;
+    for (piece in 0..2usize) {
+        let part = if (piece == 0) input[0..cut] else input[cut..];
+        match (buffer.append(part)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("append")); }
+        }
+        loop {
+            match (reader.next(mut buffer, mut message)) {
+                Ok(Incoming.NeedMore) => { break; }
+                Ok(Incoming.Message(kind)) => {
+                    pushed(log.push(match (kind) {
+                        MessageKind.Text => 84u8,
+                        MessageKind.Binary => 66u8,
+                    }))?;
+                    pushed(log.push(91))?;
+                    for (b in message.view()) {
+                        pushed(log.push(b))?;
+                    }
+                    pushed(log.push(93))?;
+                }
+                Ok(Incoming.Ping) => { pushed(log.push(80))?; }
+                Ok(Incoming.Pong) => { pushed(log.push(79))?; }
+                Ok(Incoming.Close(code)) => {
+                    pushed(log.push(67))?;
+                    number(mut log, code)?;
+                }
+                Err(code) => {
+                    pushed(log.push(69))?;
+                    number(mut log, code)?;
+                    return Ok(log);
+                }
+            }
+        }
+    }
+    return Ok(log);
+}
+
+fn number(log: borrow mut Vector<u8>, code: u16) -> Result<void, TestFailure> {
+    pushed(log.push(48 + truncate<u8>(code / 1000 % 10)))?;
+    pushed(log.push(48 + truncate<u8>(code / 100 % 10)))?;
+    pushed(log.push(48 + truncate<u8>(code / 10 % 10)))?;
+    return pushed(log.push(48 + truncate<u8>(code % 10)));
+}
+
+/// `readAll` at every split of `input` gives `want`.
+fn readsAs(input: Slice<u8>, role: Role, want: StringView) -> Result<void, TestFailure> {
+    for (split in 0..input.length + 1) {
+        let got = readAll(input, split, role, 1048576, 1048576)?;
+        Check.equalBytes(want.bytes(), got.view())?;
+    }
+    return Ok();
+}

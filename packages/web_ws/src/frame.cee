@@ -1,0 +1,221 @@
+// Frames (RFC 6455 §5): heads, opcodes, masking and close codes. Sans-I/O.
+
+public enum Opcode {
+    Continuation,
+    Text,
+    Binary,
+    Close,
+    Ping,
+    Pong,
+}
+
+/// Which end this is: a client masks what it sends, a server must not (§5.1).
+public enum Role {
+    Server,
+    Client,
+}
+
+public struct Opcodes {
+    public fn code(op: Opcode) -> u8 => match (op) {
+        Opcode.Continuation => 0,
+        Opcode.Text => 1,
+        Opcode.Binary => 2,
+        Opcode.Close => 8,
+        Opcode.Ping => 9,
+        Opcode.Pong => 10,
+    };
+
+    /// The opcode, or null for the reserved ones (3-7, 11-15).
+    public fn fromCode(code: u8) -> Opcode? => match (code) {
+        0 => Some(Opcode.Continuation),
+        1 => Some(Opcode.Text),
+        2 => Some(Opcode.Binary),
+        8 => Some(Opcode.Close),
+        9 => Some(Opcode.Ping),
+        10 => Some(Opcode.Pong),
+        _ => null,
+    };
+
+    public fn isControl(op: Opcode) -> bool => match (op) {
+        Opcode.Close => true,
+        Opcode.Ping => true,
+        Opcode.Pong => true,
+        _ => false,
+    };
+}
+
+/// Close codes (§7.4.1) and which may appear on the wire (§7.4.2).
+public struct CloseCodes {
+    public fn normal() -> u16 => 1000;
+    public fn goingAway() -> u16 => 1001;
+    public fn protocolError() -> u16 => 1002;
+    public fn unsupported() -> u16 => 1003;
+    /// Never sent: a Close without a code.
+    public fn noStatus() -> u16 => 1005;
+    /// Never sent: the connection ended without a Close.
+    public fn abnormal() -> u16 => 1006;
+    public fn invalidData() -> u16 => 1007;
+    public fn policy() -> u16 => 1008;
+    public fn tooBig() -> u16 => 1009;
+    public fn extension() -> u16 => 1010;
+    public fn internalError() -> u16 => 1011;
+
+    /// Whether a Close frame may carry `code`: 1000-1003, 1007-1011 and 3000-4999.
+    public fn mayBeSent(code: u16) -> bool =>
+        (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1011) || (code >= 3000 && code <= 4999);
+}
+
+public struct FrameHead {
+    public fin: bool;
+    /// Set on the first frame of a compressed message (RFC 7692 §6).
+    public rsv1: bool;
+    public opcode: Opcode;
+    public masked: bool;
+    public mask: [u8; 4];
+    public length: u64;
+}
+
+/// A frame head and how many bytes it took.
+public struct ParsedHead {
+    public head: FrameHead;
+    public size: usize;
+}
+
+public struct Frames {
+    /// The frame head at the start of `input`: `Ok(null)` if more bytes are needed, `Err(code)` with the close code
+    /// for a frame that breaks §5: RSV bits not negotiated, a reserved opcode, the wrong masking for `role`, a
+    /// fragmented or long control frame, a 64-bit length with its top bit set (1002); a frame longer than
+    /// `maxFrameBytes` (1009).
+    public fn parseHead(
+        input: Slice<u8>,
+        role: Role,
+        maxFrameBytes: u64,
+        rsv1Allowed: bool,
+    ) -> Result<ParsedHead?, u16> {
+        if (input.length < 2) {
+            return Ok(null);
+        }
+        let b0 = input[0];
+        let b1 = input[1];
+        let fin = (b0 & 0x80) != 0;
+        let rsv1 = (b0 & 0x40) != 0;
+        if ((b0 & 0x30) != 0) {
+            return Err(CloseCodes.protocolError());
+        }
+        let opcode = match (Opcodes.fromCode(b0 & 0x0F)) {
+            Some(op) => op,
+            null => { return Err(CloseCodes.protocolError()); },
+        };
+        let control = Opcodes.isControl(opcode);
+        if (rsv1 && (!rsv1Allowed || control)) {
+            return Err(CloseCodes.protocolError());
+        }
+        let masked = (b1 & 0x80) != 0;
+        let wantMasked = match (role) {
+            Role.Server => true,
+            Role.Client => false,
+        };
+        if (masked != wantMasked) {
+            return Err(CloseCodes.protocolError());
+        }
+        let short = (b1 & 0x7F) as u64;
+        var size: usize = 2;
+        var length = short;
+        if (short == 126) {
+            if (input.length < 4) {
+                return Ok(null);
+            }
+            length = (input[2] as u64 << 8) | input[3] as u64;
+            size = 4;
+        } else if (short == 127) {
+            if (input.length < 10) {
+                return Ok(null);
+            }
+            length = 0;
+            for (k in 2..10usize) {
+                length = (length << 8) | input[k] as u64;
+            }
+            if ((length >> 63) != 0) {
+                return Err(CloseCodes.protocolError());
+            }
+            size = 10;
+        }
+        if (control && (!fin || length > 125)) {
+            return Err(CloseCodes.protocolError());
+        }
+        if (length > maxFrameBytes) {
+            return Err(CloseCodes.tooBig());
+        }
+        var mask = [0u8; 4];
+        if (masked) {
+            if (input.length < size + 4) {
+                return Ok(null);
+            }
+            for (k in 0..4usize) {
+                mask[k] = input[size + k];
+            }
+            size += 4;
+        }
+        let head = FrameHead { fin: fin, rsv1: rsv1, opcode: opcode, masked: masked, mask: mask, length: length };
+        return Ok(Some(ParsedHead { head: head, size: size }));
+    }
+
+    /// Appends a frame head to `out`, with the shortest length form; masked with `mask` if given (a client's frames).
+    public fn writeHead(
+        out: borrow mut Vector<u8>,
+        fin: bool,
+        rsv1: bool,
+        opcode: Opcode,
+        length: u64,
+        mask: [u8; 4]?,
+    ) -> Result<void, AllocError> {
+        var b0 = Opcodes.code(opcode);
+        if (fin) {
+            b0 = b0 | 0x80;
+        }
+        if (rsv1) {
+            b0 = b0 | 0x40;
+        }
+        out.push(b0)?;
+        let maskBit: u8 = match (mask) {
+            Some(_) => 0x80,
+            null => 0,
+        };
+        if (length < 126) {
+            out.push(maskBit | truncate<u8>(length))?;
+        } else if (length <= 0xFFFF) {
+            out.push(maskBit | 126)?;
+            out.push(truncate<u8>(length >> 8))?;
+            out.push(truncate<u8>(length))?;
+        } else {
+            out.push(maskBit | 127)?;
+            for (k in 0..8u32) {
+                out.push(truncate<u8>(length >> (56 - 8 * k)))?;
+            }
+        }
+        match (mask) {
+            Some(m) => {
+                for (b in m) {
+                    out.push(b)?;
+                }
+            }
+            null => {}
+        }
+        return Ok();
+    }
+
+    /// Appends `payload` to `out`, masked with `mask` starting at the payload's byte `offset` (§5.3).
+    public fn appendMasked(
+        out: borrow mut Vector<u8>,
+        payload: Slice<u8>,
+        mask: [u8; 4],
+        offset: u64,
+    ) -> Result<void, AllocError> {
+        var j = truncate<usize>(offset % 4);
+        for (b in payload) {
+            out.push(b ^ mask[j])?;
+            j = (j + 1) % 4;
+        }
+        return Ok();
+    }
+}

@@ -1,0 +1,69 @@
+// Incremental UTF-8 validation (RFC 3629 §4): no overlong forms, no surrogates, nothing above U+10FFFF. Bytes may
+// arrive in any pieces; a byte is refused as soon as no valid completion exists ("fail fast", RFC 6455 §8.1).
+
+public struct Utf8Validator {
+    /// Continuation bytes still needed by the current sequence.
+    private need: u8;
+    /// The range the next continuation byte must fall in.
+    private lo: u8;
+    private hi: u8;
+
+    public fn create() -> Utf8Validator => Utf8Validator { need: 0, lo: 0x80, hi: 0xBF };
+
+    public fn reset(borrow mut this) {
+        this.need = 0;
+        this.lo = 0x80;
+        this.hi = 0xBF;
+    }
+
+    /// Feeds `bytes`; false once the input cannot be UTF-8, whatever follows.
+    public fn feed(borrow mut this, bytes: Slice<u8>) -> bool {
+        for (b in bytes) {
+            if (!this.step(b)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Feeds one byte; false if the input cannot be UTF-8.
+    public fn step(borrow mut this, b: u8) -> bool {
+        if (this.need > 0) {
+            if (b < this.lo || b > this.hi) {
+                return false;
+            }
+            this.need -= 1;
+            this.lo = 0x80;
+            this.hi = 0xBF;
+            return true;
+        }
+        if (b < 0x80) {
+            return true;
+        }
+        if (b >= 0xC2 && b <= 0xDF) {
+            this.need = 1;
+        } else if (b == 0xE0) {
+            this.need = 2;
+            this.lo = 0xA0;
+        } else if (b >= 0xE1 && b <= 0xEC || b == 0xEE || b == 0xEF) {
+            this.need = 2;
+        } else if (b == 0xED) {
+            this.need = 2;
+            this.hi = 0x9F; // no surrogates
+        } else if (b == 0xF0) {
+            this.need = 3;
+            this.lo = 0x90;
+        } else if (b >= 0xF1 && b <= 0xF3) {
+            this.need = 3;
+        } else if (b == 0xF4) {
+            this.need = 3;
+            this.hi = 0x8F; // nothing above U+10FFFF
+        } else {
+            return false; // 0x80-0xC1, 0xF5-0xFF
+        }
+        return true;
+    }
+
+    /// Whether the input so far ends at a character boundary.
+    public fn complete(borrow this) -> bool => this.need == 0;
+}

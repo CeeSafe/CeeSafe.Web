@@ -1,0 +1,131 @@
+// Probe for M6 (web_ws, Web ADR 0010): a session struct with a region holds the exchange (itself a struct with a
+// region holding mutable borrows) mutably. Its `receive` method races a read through the exchange against an outbound
+// channel and a timer, using disjoint fields of `this` in the arms, then writes through the exchange after the race.
+// Expected output: 2 (frames read), 3 (queued messages written), 1 (keep-alive pings), then "closed".
+
+struct Exch<region r> {
+    incoming: borrow mut(r) Channel<u8>;
+    written: borrow mut(r) Vector<u8>;
+
+    /// The next byte from the peer; null once it closed.
+    async fn readSome(borrow mut this) -> Result<u8?, AsyncError> => await this.incoming.recvAsync();
+
+    fn write(borrow mut this, b: u8) {
+        let pushed = this.written.push(b);
+    }
+}
+
+enum Wake {
+    Read(u8),
+    Queued(u8),
+    Ping,
+    Closed,
+}
+
+struct Session<region r> {
+    exchange: borrow mut(r) Exch<r>;
+    outbound: Channel<u8>;
+    reads: u64;
+    pings: u64;
+
+    /// The next frame from the peer; queued messages and pings are written meanwhile. 0 once the peer closed.
+    async fn receive(borrow mut this) -> Result<u8, AsyncError> {
+        loop {
+            match (await wake(mut this.exchange, this.outbound)?) {
+                Wake.Read(b) => {
+                    this.reads += 1;
+                    return Ok(b);
+                }
+                Wake.Queued(b) => { this.exchange.write(b); }
+                Wake.Ping => {
+                    this.pings += 1;
+                    this.exchange.write(0);
+                }
+                Wake.Closed => { return Ok(0); }
+            }
+        }
+    }
+}
+
+async fn wake(exchange: borrow mut Exch, outbound: borrow Channel<u8>) -> Result<Wake, AsyncError> {
+    let r: Result<Raced<Wake>, AsyncError> = await Async.race(
+        async () => {
+            match (await exchange.readSome()?) {
+                Some(b) => { return Ok(Wake.Read(b)); }
+                null => { return Ok(Wake.Closed); }
+            }
+        },
+        async () => {
+            let raced: Result<Raced<Wake>, AsyncError> = await Async.race(
+                async () => {
+                    match (await outbound.recvAsync()?) {
+                        Some(b) => { return Ok(Wake.Queued(b)); }
+                        null => { return Ok(Wake.Closed); }
+                    }
+                },
+                async () => {
+                    await Timer.sleep(50)?;
+                    return Ok(Wake.Ping);
+                },
+            );
+            return Ok(raced?.value);
+        },
+    );
+    return Ok(r?.value);
+}
+
+fn accept<region r>(exchange: borrow mut(r) Exch<r>, outbound: borrow Channel<u8>) -> Session<r> =>
+    Session { exchange: exchange, outbound: outbound.clone(), reads: 0, pings: 0 };
+
+async fn serve(incoming: borrow mut Channel<u8>, outbound: borrow Channel<u8>) -> Result<u64, AsyncError> {
+    var written = Vector<u8>.create();
+    var ex = Exch { incoming: incoming, written: borrow mut written };
+    var ws = accept(mut ex, outbound);
+    loop {
+        if (await ws.receive()? == 0) {
+            break;
+        }
+    }
+    let reads = ws.reads;
+    let pings = ws.pings;
+    var queued: u64 = 0;
+    for (b in written.view()) {
+        if (b != 0) {
+            queued += 1;
+        }
+    }
+    return Ok(reads * 100 + queued * 10 + pings);
+}
+
+async fn run() -> Result<u64, AsyncError> {
+    var incoming = Channel<u8>.create(8)!;
+    let peer = incoming.clone();
+    let outbound = Channel<u8>.create(8)!;
+    var got: u64 = 0;
+    await Async.scope(AsyncError.Cancelled, (s) => {
+        s.spawn(async () => {
+            got = await serve(mut incoming, outbound)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            for (i in 1..4u8) {
+                outbound.trySend(i)!;
+            }
+            peer.trySend(7)!;
+            await Timer.sleep(20)?;
+            peer.trySend(8)!;
+            await Timer.sleep(60)?; // one keep-alive ping at 50 ms of quiet
+            peer.close();
+            return Ok();
+        });
+    })?;
+    return Ok(got);
+}
+
+fn main() {
+    let n = Async.run(run())!;
+    Console.writeLine(n / 100);
+    Console.writeLine(n / 10 % 10);
+    Console.writeLine(n % 10);
+    Console.writeLine("closed");
+}

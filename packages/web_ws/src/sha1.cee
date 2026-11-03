@@ -1,0 +1,105 @@
+// SHA-1 (RFC 3174, FIPS 180-4 §6.1), for Sec-WebSocket-Accept only (RFC 6455 §4.2.2). SHA-1 is broken for
+// collision resistance; the handshake uses it as a fixed transform, not for security.
+
+/// A SHA-1 computation: `update` with the input, then `finish`.
+public struct Sha1 {
+    private h: [u32; 5];
+    private block: [u8; 64];
+    private filled: usize;
+    private total: u64;
+
+    public fn create() -> Sha1 => Sha1 {
+        h: [0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
+        block: [0u8; 64],
+        filled: 0,
+        total: 0,
+    };
+
+    public fn update(borrow mut this, bytes: Slice<u8>) {
+        for (b in bytes) {
+            this.block[this.filled] = b;
+            this.filled += 1;
+            if (this.filled == 64) {
+                this.compress();
+                this.filled = 0;
+            }
+        }
+        this.total = this.total.wrappingAdd(bytes.length as u64);
+    }
+
+    /// The digest. The computation is spent afterwards.
+    public fn finish(borrow mut this) -> [u8; 20] {
+        let bits = this.total.wrappingMul(8);
+        this.block[this.filled] = 0x80;
+        this.filled += 1;
+        if (this.filled > 56) {
+            while (this.filled < 64) {
+                this.block[this.filled] = 0;
+                this.filled += 1;
+            }
+            this.compress();
+            this.filled = 0;
+        }
+        while (this.filled < 56) {
+            this.block[this.filled] = 0;
+            this.filled += 1;
+        }
+        for (k in 0..8usize) {
+            this.block[56 + k] = truncate<u8>(bits >> (56 - 8 * truncate<u32>(k)));
+        }
+        this.compress();
+        var out = [0u8; 20];
+        for (i in 0..5usize) {
+            for (k in 0..4usize) {
+                out[4 * i + k] = truncate<u8>(this.h[i] >> (24 - 8 * truncate<u32>(k)));
+            }
+        }
+        return out;
+    }
+
+    fn compress(borrow mut this) {
+        var w = [0u32; 80];
+        for (t in 0..16usize) {
+            w[t] = (this.block[4 * t] as u32 << 24) | (this.block[4 * t + 1] as u32 << 16) |
+                (this.block[4 * t + 2] as u32 << 8) | this.block[4 * t + 3] as u32;
+        }
+        for (t in 16..80usize) {
+            w[t] = rotl(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+        }
+        var a = this.h[0];
+        var b = this.h[1];
+        var c = this.h[2];
+        var d = this.h[3];
+        var e = this.h[4];
+        for (t in 0..80usize) {
+            var f: u32 = 0;
+            var k: u32 = 0;
+            if (t < 20) {
+                f = (b & c) | ((b ^ 0xFFFFFFFF) & d);
+                k = 0x5A827999;
+            } else if (t < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ED9EBA1;
+            } else if (t < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xCA62C1D6;
+            }
+            let temp = rotl(a, 5).wrappingAdd(f).wrappingAdd(e).wrappingAdd(k).wrappingAdd(w[t]);
+            e = d;
+            d = c;
+            c = rotl(b, 30);
+            b = a;
+            a = temp;
+        }
+        this.h[0] = this.h[0].wrappingAdd(a);
+        this.h[1] = this.h[1].wrappingAdd(b);
+        this.h[2] = this.h[2].wrappingAdd(c);
+        this.h[3] = this.h[3].wrappingAdd(d);
+        this.h[4] = this.h[4].wrappingAdd(e);
+    }
+}
+
+fn rotl(x: u32, n: u32) -> u32 => (x << n) | (x >> (32 - n));

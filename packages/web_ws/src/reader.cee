@@ -1,0 +1,211 @@
+// The message reader (RFC 6455 §5.4, §5.5, §8.1): frames from the bytes received, fragments assembled into messages,
+// text validated as it arrives, control frames between fragments. Sans-I/O: the caller feeds an OwnedBuffer and
+// gets a message, a control frame, or a request for more bytes. Any violation ends with the close code to send.
+import web_core;
+
+public enum MessageKind {
+    Text,
+    Binary,
+}
+
+public enum Incoming {
+    /// The bytes received end inside a frame head or payload.
+    NeedMore,
+    /// A whole message, in the caller's `message`.
+    Message(MessageKind),
+    /// A ping; its payload is `control()`.
+    Ping,
+    /// A pong; its payload is `control()`.
+    Pong,
+    /// A Close with its code (1005 when it has none); the reason is `closeReason()`.
+    Close(u16),
+}
+
+public struct MessageReader {
+    private role: Role;
+    private maxFrameBytes: u64;
+    private maxMessageBytes: u64;
+
+    private inFrame: bool;
+    private opcode: Opcode;
+    private fin: bool;
+    private masked: bool;
+    private mask: [u8; 4];
+    private remaining: u64;
+    private offset: u64;
+
+    private messageOpen: bool;
+    private text: bool;
+    private utf8: Utf8Validator;
+
+    private controlBytes: [u8; 125];
+    private controlLength: usize;
+
+    public fn create(role: Role, maxFrameBytes: u64, maxMessageBytes: u64) -> MessageReader => MessageReader {
+        role: role,
+        maxFrameBytes: maxFrameBytes,
+        maxMessageBytes: maxMessageBytes,
+        inFrame: false,
+        opcode: Opcode.Binary,
+        fin: false,
+        masked: false,
+        mask: [0u8; 4],
+        remaining: 0,
+        offset: 0,
+        messageOpen: false,
+        text: false,
+        utf8: Utf8Validator.create(),
+        controlBytes: [0u8; 125],
+        controlLength: 0,
+    };
+
+    /// The last control frame's payload.
+    public fn control(borrow this) -> Slice<u8> => this.controlBytes[0..this.controlLength];
+
+    /// The last Close's reason (UTF-8, already checked).
+    public fn closeReason(borrow this) -> Slice<u8> =>
+        if (this.controlLength >= 2) this.controlBytes[2..this.controlLength] else this.controlBytes[0..0];
+
+    /// Whether a message has begun and not ended.
+    public fn inMessage(borrow this) -> bool => this.messageOpen;
+
+    /// Consumes frames from `input` until a message, a control frame, or the end of the bytes. A data frame's payload
+    /// is appended to `message`, which is cleared when a message begins. `Err(code)` for a violation: the close code
+    /// to send (1002 protocol, 1007 bad UTF-8, 1009 too big, 1011 out of memory).
+    public fn next(
+        borrow mut this,
+        input: borrow mut OwnedBuffer,
+        message: borrow mut Vector<u8>,
+    ) -> Result<Incoming, u16> {
+        loop {
+            if (!this.inFrame) {
+                let parsed = Frames.parseHead(input.readable(), this.role, this.maxFrameBytes, false)?;
+                let p = match (parsed) {
+                    Some(p) => p,
+                    null => { return Ok(Incoming.NeedMore); },
+                };
+                this.begin(p.head, message)?;
+                match (input.consume(p.size)) {
+                    Ok() => {}
+                    Err(_) => { return Err(CloseCodes.internalError()); }
+                }
+            }
+            if (this.remaining > 0) {
+                this.payload(input, message)?;
+                if (this.remaining > 0) {
+                    return Ok(Incoming.NeedMore);
+                }
+            }
+            this.inFrame = false;
+            match (this.ended()?) {
+                Some(event) => { return Ok(event); }
+                null => {}
+            }
+        }
+    }
+
+    /// Checks a new frame against the message state and starts it.
+    fn begin(borrow mut this, head: FrameHead, message: borrow mut Vector<u8>) -> Result<void, u16> {
+        match (head.opcode) {
+            Opcode.Continuation => {
+                if (!this.messageOpen) {
+                    return Err(CloseCodes.protocolError());
+                }
+            }
+            Opcode.Text => { this.open(true, message)?; }
+            Opcode.Binary => { this.open(false, message)?; }
+            _ => { this.controlLength = 0; }
+        }
+        if (!Opcodes.isControl(head.opcode) && message.length as u64 + head.length > this.maxMessageBytes) {
+            return Err(CloseCodes.tooBig());
+        }
+        this.inFrame = true;
+        this.opcode = head.opcode;
+        this.fin = head.fin;
+        this.masked = head.masked;
+        this.mask = head.mask;
+        this.remaining = head.length;
+        this.offset = 0;
+        return Ok();
+    }
+
+    fn open(borrow mut this, text: bool, message: borrow mut Vector<u8>) -> Result<void, u16> {
+        if (this.messageOpen) {
+            return Err(CloseCodes.protocolError()); // a new message inside a fragmented one
+        }
+        this.messageOpen = true;
+        this.text = text;
+        this.utf8.reset();
+        message.clear();
+        return Ok();
+    }
+
+    /// Takes as much of the current frame's payload as `input` holds.
+    fn payload(borrow mut this, input: borrow mut OwnedBuffer, message: borrow mut Vector<u8>) -> Result<void, u16> {
+        let available = input.readable();
+        let n = if (this.remaining < available.length as u64) truncate<usize>(this.remaining) else available.length;
+        let control = Opcodes.isControl(this.opcode);
+        for (i in 0..n) {
+            var b = available[i];
+            if (this.masked) {
+                b = b ^ this.mask[truncate<usize>((this.offset + i as u64) % 4)];
+            }
+            if (control) {
+                this.controlBytes[this.controlLength] = b;
+                this.controlLength += 1;
+            } else {
+                if (this.text && !this.utf8.step(b)) {
+                    return Err(CloseCodes.invalidData());
+                }
+                match (message.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(CloseCodes.internalError()); }
+                }
+            }
+        }
+        match (input.consume(n)) {
+            Ok() => {}
+            Err(_) => { return Err(CloseCodes.internalError()); }
+        }
+        this.remaining -= n as u64;
+        this.offset += n as u64;
+        return Ok();
+    }
+
+    /// What the frame that just ended gives the caller, if anything.
+    fn ended(borrow mut this) -> Result<Incoming?, u16> {
+        match (this.opcode) {
+            Opcode.Ping => { return Ok(Some(Incoming.Ping)); }
+            Opcode.Pong => { return Ok(Some(Incoming.Pong)); }
+            Opcode.Close => { return Ok(Some(Incoming.Close(this.closeCode()?))); }
+            _ => {}
+        }
+        if (!this.fin) {
+            return Ok(null);
+        }
+        if (this.text && !this.utf8.complete()) {
+            return Err(CloseCodes.invalidData());
+        }
+        this.messageOpen = false;
+        return Ok(Some(Incoming.Message(if (this.text) MessageKind.Text else MessageKind.Binary)));
+    }
+
+    /// The received Close's code, checked with its reason (§5.5.1, §7.4).
+    fn closeCode(borrow this) -> Result<u16, u16> {
+        if (this.controlLength == 0) {
+            return Ok(CloseCodes.noStatus());
+        }
+        if (this.controlLength == 1) {
+            return Err(CloseCodes.protocolError());
+        }
+        let code = (this.controlBytes[0] as u16 << 8) | this.controlBytes[1] as u16;
+        if (!CloseCodes.mayBeSent(code)) {
+            return Err(CloseCodes.protocolError());
+        }
+        var reason = Utf8Validator.create();
+        if (!reason.feed(this.controlBytes[2..this.controlLength]) || !reason.complete()) {
+            return Err(CloseCodes.invalidData());
+        }
+        return Ok(code);
+    }
+}

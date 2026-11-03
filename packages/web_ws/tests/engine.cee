@@ -1,0 +1,264 @@
+// web_ws's engine (Web ADR 0010 §3.1). Expected values come from the RFCs: SHA-1 from RFC 3174 §7.3, base64 from
+// RFC 4648 §10, Sec-WebSocket-Accept from RFC 6455 §1.3, frames from RFC 6455 §5.7, UTF-8 from RFC 3629 §4's table,
+// close codes from RFC 6455 §7.4. Every reader input is fed at every split.
+import web_core;
+import web_http;
+
+fn digestIs(input: Slice<u8>, repeat: usize, want: StringView) -> Result<void, TestFailure> {
+    var sha = Sha1.create();
+    for (i in 0..repeat) {
+        sha.update(input);
+    }
+    let d = sha.finish();
+    let w = hex(want)?;
+    return Check.equalBytes(w.view(), d[..]);
+}
+
+fn sameHex(want: StringView, got: borrow Vector<u8>) -> Result<void, TestFailure> {
+    let w = hex(want)?;
+    return Check.equalBytes(w.view(), got.view());
+}
+
+fn readsHex(input: StringView, role: Role, want: StringView) -> Result<void, TestFailure> {
+    let bytes = hex(input)?;
+    return readsAs(bytes.view(), role, want);
+}
+
+fn readHex(input: StringView, split: usize, role: Role, maxFrame: u64, maxMessage: u64) -> Result<Vector<u8>, TestFailure> {
+    let bytes = hex(input)?;
+    return readAll(bytes.view(), split, role, maxFrame, maxMessage);
+}
+
+@test
+fn sha1_rfc3174_vectors() -> Result<void, TestFailure> {
+    digestIs("abc".bytes(), 1, "a9993e364706816aba3e25717850c26c9cd0d89d")?;
+    digestIs("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".bytes(), 1, "84983e441c3bd26ebaae4aa1f95129e5e54670f1")?;
+    digestIs("a".bytes(), 1000000, "34aa973cd4c4daa4f61eeb2bdbad27316534016f")?;
+    return digestIs("0123456701234567012345670123456701234567012345670123456701234567".bytes(), 10, "dea356a2cddd90c7a7ecedc5ebb563934f460452");
+}
+
+fn encodesAs(text: StringView, want: StringView) -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    pushed(Base64.encode(text.bytes(), mut out))?;
+    return Check.equalBytes(want.bytes(), out.view());
+}
+
+fn decodes(text: StringView, want: StringView) -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    match (Base64.decode(text.bytes(), mut out)) {
+        Ok(true) => {}
+        _ => { return Check.fail("refused"); }
+    }
+    return Check.equalBytes(want.bytes(), out.view());
+}
+
+fn refuses(text: StringView) -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let ok = match (Base64.decode(text.bytes(), mut out)) {
+        Ok(false) => true,
+        _ => false,
+    };
+    return Check.isTrue(ok, text);
+}
+
+@test
+fn base64_rfc4648_vectors() -> Result<void, TestFailure> {
+    encodesAs("", "")?;
+    encodesAs("f", "Zg==")?;
+    encodesAs("fo", "Zm8=")?;
+    encodesAs("foo", "Zm9v")?;
+    encodesAs("foob", "Zm9vYg==")?;
+    encodesAs("fooba", "Zm9vYmE=")?;
+    encodesAs("foobar", "Zm9vYmFy")?;
+    decodes("Zg==", "f")?;
+    decodes("Zm8=", "fo")?;
+    decodes("Zm9vYmFy", "foobar")?;
+    refuses("Zg=")?; // not a multiple of 4
+    refuses("Zh==")?; // non-zero bits under the padding (§3.5)
+    refuses("Z===")?;
+    refuses("Zg=a")?;
+    refuses("Zm9v\nYmFy")?;
+    return refuses("Zm9!");
+}
+
+@test
+fn accept_key_rfc6455_example() -> Result<void, TestFailure> {
+    match (Handshake.acceptKey("dGhlIHNhbXBsZSBub25jZQ==".bytes())) {
+        Ok(k) => { return Check.equalBytes("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".bytes(), k.view()); }
+        Err(_) => { return Check.fail("out of memory"); }
+    }
+}
+
+fn utf8(text: StringView) -> Result<bool, TestFailure> {
+    let bytes = hex(text)?;
+    var v = Utf8Validator.create();
+    return Ok(v.feed(bytes.view()) && v.complete());
+}
+
+/// The index of the first byte `feed` refuses, one byte at a time; the length if none.
+fn failsAt(text: StringView) -> Result<u64, TestFailure> {
+    let bytes = hex(text)?;
+    var v = Utf8Validator.create();
+    for (i in 0..bytes.length) {
+        if (!v.step(bytes[i])) {
+            return Ok(i as u64);
+        }
+    }
+    return Ok(bytes.length as u64);
+}
+
+@test
+fn utf8_rfc3629() -> Result<void, TestFailure> {
+    Check.isTrue(utf8("ce ba e1 bd b9 cf 83 ce bc ce b5")?, "kosme")?;
+    Check.isTrue(utf8("00 7f c2 80 df bf e0 a0 80 ef bf bf f0 90 80 80 f4 8f bf bf")?, "boundaries")?;
+    Check.isTrue(!utf8("c0 80")?, "overlong NUL")?;
+    Check.isTrue(!utf8("e0 80 80")?, "overlong 3")?;
+    Check.isTrue(!utf8("f0 80 80 80")?, "overlong 4")?;
+    Check.isTrue(!utf8("ed a0 80")?, "a surrogate")?;
+    Check.isTrue(!utf8("f4 90 80 80")?, "above U+10FFFF")?;
+    Check.isTrue(!utf8("f5 80 80 80")?, "F5")?;
+    Check.isTrue(!utf8("80")?, "a lone continuation")?;
+    Check.isTrue(!utf8("e2 82")?, "truncated")?;
+    Check.isTrue(!utf8("fe")?, "FE")?;
+    // Fail fast: refused at the first byte with no valid completion.
+    Check.equalU64(12, failsAt("ce ba e1 bd b9 cf 83 ce bc ce b5 ed a0 80 65 64 69 74 65 64")?)?;
+    Check.equalU64(1, failsAt("e0 9f")?)?;
+    return Check.equalU64(1, failsAt("f4 90")?);
+}
+
+@test
+fn rfc6455_example_frames_written() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    pushed(Frames.writeHead(mut out, true, false, Opcode.Text, 5, null))?;
+    for (b in "Hello".bytes()) {
+        pushed(out.push(b))?;
+    }
+    sameHex("81 05 48 65 6c 6c 6f", out)?;
+    out.clear();
+    let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+    pushed(Frames.writeHead(mut out, true, false, Opcode.Text, 5, Some(mask)))?;
+    pushed(Frames.appendMasked(mut out, "Hello".bytes(), mask, 0))?;
+    sameHex("81 85 37 fa 21 3d 7f 9f 4d 51 58", out)?;
+    out.clear();
+    pushed(Frames.writeHead(mut out, true, false, Opcode.Binary, 256, null))?;
+    sameHex("82 7e 01 00", out)?;
+    out.clear();
+    pushed(Frames.writeHead(mut out, true, false, Opcode.Binary, 65536, null))?;
+    return sameHex("82 7f 00 00 00 00 00 01 00 00", out);
+}
+
+@test
+fn rfc6455_example_frames_read() -> Result<void, TestFailure> {
+    readsHex("81 05 48 65 6c 6c 6f", Role.Client, "T[Hello]")?;
+    readsHex("81 85 37 fa 21 3d 7f 9f 4d 51 58", Role.Server, "T[Hello]")?;
+    readsHex("01 03 48 65 6c 80 02 6c 6f", Role.Client, "T[Hello]")?;
+    readsHex("89 05 48 65 6c 6c 6f", Role.Client, "P")?;
+    readsHex("8a 85 37 fa 21 3d 7f 9f 4d 51 58", Role.Server, "O")?;
+    // A ping between fragments, then a close with 1000 and a reason.
+    readsHex("01 03 48 65 6c 89 00 80 02 6c 6f 88 04 03 e8 6f 6b", Role.Client, "PT[Hello]C1000")?;
+    // A close without a code.
+    readsHex("88 00", Role.Client, "C1005")?;
+    // 256 bytes, 16-bit length.
+    var big = hex("82 7e 01 00")?;
+    for (i in 0..256usize) {
+        pushed(big.push(65))?;
+    }
+    let got = readAll(big.view(), 3, Role.Client, 1048576, 1048576)?;
+    Check.equalU64(259, got.length as u64)?; // B [ 256 bytes ]
+    return Ok();
+}
+
+@test
+fn frame_violations() -> Result<void, TestFailure> {
+    readsHex("c1 00", Role.Client, "E1002")?; // RSV1 not negotiated
+    readsHex("a1 00", Role.Client, "E1002")?; // RSV2
+    readsHex("83 00", Role.Client, "E1002")?; // reserved opcode 3
+    readsHex("8b 00", Role.Client, "E1002")?; // reserved opcode 11
+    readsHex("81 05 48 65 6c 6c 6f", Role.Server, "E1002")?; // unmasked to a server
+    readsHex("81 85 37 fa 21 3d 7f 9f 4d 51 58", Role.Client, "E1002")?; // masked to a client
+    readsHex("09 00", Role.Client, "E1002")?; // a fragmented ping
+    readsHex("89 7e 00 7e", Role.Client, "E1002")?; // a 126-byte ping
+    readsHex("80 01 61", Role.Client, "E1002")?; // a continuation with no message
+    readsHex("01 01 61 81 01 62", Role.Client, "E1002")?; // a new message inside one
+    readsHex("82 7f 80 00 00 00 00 00 00 00", Role.Client, "E1002")?; // 64-bit length, top bit set
+    readsHex("88 01 03", Role.Client, "E1002")?; // a 1-byte close
+    readsHex("88 02 03 ed", Role.Client, "E1002")?; // 1005 must not be sent
+    readsHex("88 02 03 e7", Role.Client, "E1002")?; // 999
+    readsHex("88 02 07 d0", Role.Client, "E1002")?; // 2000
+    readsHex("88 02 13 88", Role.Client, "E1002")?; // 5000
+    readsHex("88 02 0b b8", Role.Client, "C3000")?; // 3000 is fine
+    readsHex("88 04 03 e8 ed a0", Role.Client, "E1007")?; // a reason that is not UTF-8
+    readsHex("81 02 ce ba", Role.Client, "T[\u{3BA}]")?;
+    readsHex("81 02 c0 80", Role.Client, "E1007")?; // overlong
+    readsHex("01 01 ce 80 01 ba", Role.Client, "T[\u{3BA}]")?; // a character split across fragments
+    readsHex("01 01 ce 80 00", Role.Client, "E1007")?; // ends inside a character
+    // Fail fast: the bad byte is refused before the frame ends.
+    let early = readHex("81 7e 00 80 ed a0", 6, Role.Client, 1048576, 1048576)?;
+    Check.equalBytes("E1007".bytes(), early.view())?;
+    // Limits: a frame over maxFrameBytes, and fragments over maxMessageBytes.
+    let frame = readHex("82 05 61 62 63 64 65", 7, Role.Client, 4, 100)?;
+    Check.equalBytes("E1009".bytes(), frame.view())?;
+    let message = readHex("02 03 61 62 63 80 03 64 65 66", 10, Role.Client, 100, 5)?;
+    return Check.equalBytes("E1009".bytes(), message.view());
+}
+
+fn requestCheck(head: StringView, secure: bool, allowed: borrow Vector<Vector<u8>>) -> Result<u32, TestFailure> {
+    let bytes = head.bytes();
+    let fields = fieldsOf(bytes)?;
+    let request = Request.create(Method.Get, bytes[0..3], "/chat", Version.Http11, fields);
+    return Ok(match (Handshake.check(request, secure, allowed)) {
+        Ok() => 101,
+        Err(UpgradeRefusal.BadRequest) => 400,
+        Err(UpgradeRefusal.Version) => 426,
+        Err(UpgradeRefusal.Origin) => 403,
+    });
+}
+
+@test
+fn upgrade_requests() -> Result<void, TestFailure> {
+    let none = Vector<Vector<u8>>.create();
+    // RFC 6455 §1.2's request.
+    let good = "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: http://example.com\r\nSec-WebSocket-Protocol: chat, superchat\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    Check.equalU64(403, await0(requestCheck(good, false, none))?)?; // another origin
+    var allowed = Vector<Vector<u8>>.create();
+    pushed(allowed.push(bytesOf("http://example.com")?))?;
+    Check.equalU64(101, await0(requestCheck(good, false, allowed))?)?;
+    let same = "GET /chat HTTP/1.1\r\nHost: Server.example.com:80\r\nUpgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: http://server.example.com\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    Check.equalU64(101, await0(requestCheck(same, false, none))?)?; // same origin; default port; any case
+    Check.equalU64(403, await0(requestCheck(same, true, none))?)?; // https would be another origin
+    let noOrigin = "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    Check.equalU64(101, await0(requestCheck(noOrigin, false, none))?)?;
+    let v8 = "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 8\r\n\r\n";
+    Check.equalU64(426, await0(requestCheck(v8, false, none))?)?;
+    let shortKey = "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAA\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    Check.equalU64(400, await0(requestCheck(shortKey, false, none))?)?;
+    let noUpgrade = "GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    Check.equalU64(400, await0(requestCheck(noUpgrade, false, none))?)?;
+    let noConnection = "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    Check.equalU64(400, await0(requestCheck(noConnection, false, none))?)?;
+    let noHost = "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    Check.equalU64(400, await0(requestCheck(noHost, false, none))?)?;
+
+    // The subprotocol: the server's first preference that the client offered.
+    let bytes = good.bytes();
+    let request = Request.create(Method.Get, bytes[0..3], "/chat", Version.Http11, fieldsOf(bytes)?);
+    var prefs = Vector<Vector<u8>>.create();
+    pushed(prefs.push(bytesOf("superchat")?))?;
+    pushed(prefs.push(bytesOf("chat")?))?;
+    let chosen = match (Handshake.chooseSubprotocol(request, prefs)) {
+        Some(i) => i as u64,
+        null => 99,
+    };
+    Check.equalU64(0, chosen)?;
+    var other = Vector<Vector<u8>>.create();
+    pushed(other.push(bytesOf("mqtt")?))?;
+    let unmatched = match (Handshake.chooseSubprotocol(request, other)) {
+        Some(_) => false,
+        null => true,
+    };
+    return Check.isTrue(unmatched, "no common subprotocol");
+}
+
+fn await0(r: Result<u32, TestFailure>) -> Result<u64, TestFailure> {
+    return Ok(r? as u64);
+}

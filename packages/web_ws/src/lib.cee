@@ -1,2 +1,2 @@
-// web_ws: RFC 6455 WebSocket engine and driver.
-// Milestone M6 (docs/implementation-plan.md). Empty until then.
+// web_ws: RFC 6455 WebSockets (Web ADR 0010): a sans-I/O engine (frames, UTF-8, messages, the handshake's keys) and
+// the session over an upgraded exchange.
