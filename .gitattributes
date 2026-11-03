@@ -1,0 +1,6 @@
+# Every text file is LF on every system: ceesafec fmt writes LF, and Windows checkouts (core.autocrlf) would otherwise
+# turn every .cee file into one that `ceesafec fmt --check` lists.
+* text=auto eol=lf
+# Batch files keep CRLF: cmd.exe can misread labels in LF files.
+*.cmd text eol=crlf
+*.bat text eol=crlf

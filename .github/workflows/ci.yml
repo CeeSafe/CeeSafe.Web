@@ -132,6 +132,6 @@ jobs:
         run: |
           sudo apt-get install -y libssl-dev
           curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
-          git clone --depth 50 https://github.com/CeeSafe/CeeSafe.git ../CeeSafe
+          git clone https://github.com/CeeSafe/CeeSafe.git ../CeeSafe # in full: the bootstrap chain builds old commits
           cd ../CeeSafe && sh tools/bootstrap_release.sh "$HOME/.ceesafe/bin/ceesafec" HEAD out/ceesafec
       - run: python3 tools/run_tests.py --ceesafec ../CeeSafe/out/ceesafec
