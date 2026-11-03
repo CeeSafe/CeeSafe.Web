@@ -185,7 +185,7 @@ fn port() -> u16 {
     };
 }
 
-async fn serve(server: Server<App>) -> Result<void, NetError> {
+async fn serve(server: Server<App>) -> Result<ServerReport, NetError> {
     let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
     let listener = Listener.bindWith(SocketAddresses.v4Loopback(port()), options)?;
     let drain = Drain.create()?;
@@ -195,7 +195,7 @@ async fn serve(server: Server<App>) -> Result<void, NetError> {
     }
     let report = await server.run(listener, PlainAcceptor {}, ConnectionLimits.defaults(), drain)?;
     match (await AsyncConsole.writeLine("server: drained")) {
-        Ok() => { return Ok(); }
+        Ok() => { return Ok(report); }
         Err(e) => { return Err(NetErrors.fromAsync(e)); }
     }
 }
@@ -209,7 +209,13 @@ fn main() {
         },
     };
     match (Async.run(serve(server))) {
-        Ok() => {}
+        Ok(report) => {
+            // What the workers counted: a connection whose handler failed was dropped without a graceful close.
+            Console.writeLine("server: accepted, served, failed");
+            Console.writeLine(report.accepted);
+            Console.writeLine(report.served);
+            Console.writeLine(report.failed);
+        }
         Err(e) => { Console.writeLine(NetErrors.describe(e)); }
     }
 }
