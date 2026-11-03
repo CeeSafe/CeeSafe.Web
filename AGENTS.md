@@ -5,8 +5,8 @@
 This package is written in CeeSafe, a memory-safe systems programming language with C#/TypeScript-style syntax that
 `ceesafec` compiles ahead of time to C. Ownership and borrowing are checked at compile time; there is no garbage
 collector. CeeSafe is new: code that looks right from C#, TypeScript or Rust often is not CeeSafe. Check every edit with the
-compiler, and read the guide for agents: https://vkuttyp.github.io/CeeSafe/guide/for-agents (the whole guide and
-specification for a model's context: https://vkuttyp.github.io/CeeSafe/llms-full.txt).
+compiler, and read the guide for agents: https://ceesafe.github.io/CeeSafe/guide/for-agents (the whole guide and
+specification for a model's context: https://ceesafe.github.io/CeeSafe/llms-full.txt).
 
 ## The package
 
@@ -67,7 +67,7 @@ per layer. The section above, between the `CEESAFE` markers, is written by `cees
 1. `docs/implementation-plan.md`: scope, milestones, gates and the owner's decisions (§11).
 2. `docs/decisions/*.md`: CeeSafe.Web's ADRs ("Web ADR 0001" …, numbered apart from CeeSafe's own ADRs).
 3. `docs/ceesafe-upstream-work.md`: what has to land in CeeSafe itself (U1–U10) before the milestones that need it.
-4. CeeSafe's guide and specification (https://vkuttyp.github.io/CeeSafe/; `~/dev/CeeSafe/spec/`).
+4. CeeSafe's guide and specification (https://ceesafe.github.io/CeeSafe/; `~/dev/CeeSafe/spec/`).
 
 ## Rules
 

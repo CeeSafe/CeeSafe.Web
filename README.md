@@ -1,6 +1,6 @@
 # CeeSafe.Web
 
-A networking and web framework written in [CeeSafe](https://vkuttyp.github.io/CeeSafe/): HTTP/1.1, streaming and SSE,
+A networking and web framework written in [CeeSafe](https://ceesafe.github.io/CeeSafe/): HTTP/1.1, streaming and SSE,
 TLS, an HTTP client, WebSockets, HTTP/2, a reverse proxy and HTTP/3. It aims for bounded memory, predictable
 backpressure and standards compliance.
 

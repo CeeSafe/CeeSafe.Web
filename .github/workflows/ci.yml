@@ -36,14 +36,14 @@ jobs:
       - name: Install ceesafec (POSIX)
         if: runner.os != 'Windows'
         run: |
-          curl -fsSL https://vkuttyp.github.io/CeeSafe/install.sh | sh
+          curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
           echo "$HOME/.ceesafe/bin" >> "$GITHUB_PATH"
 
       - name: Install ceesafec (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          irm https://vkuttyp.github.io/CeeSafe/install.ps1 | iex
+          irm https://ceesafe.github.io/CeeSafe/install.ps1 | iex
           "$env:USERPROFILE\.ceesafe\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Toolchain
@@ -88,7 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          curl -fsSL https://vkuttyp.github.io/CeeSafe/install.sh | sh
+          curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
           echo "$HOME/.ceesafe/bin" >> "$GITHUB_PATH"
       - run: |
           cd tests/probes
@@ -101,7 +101,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          curl -fsSL https://vkuttyp.github.io/CeeSafe/install.sh | sh
-          git clone --depth 50 https://github.com/vkuttyp/CeeSafe.git ../CeeSafe
+          curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
+          git clone --depth 50 https://github.com/CeeSafe/CeeSafe.git ../CeeSafe
           cd ../CeeSafe && sh tools/bootstrap_release.sh "$HOME/.ceesafe/bin/ceesafec" HEAD out/ceesafec
       - run: python3 tools/run_tests.py --ceesafec ../CeeSafe/out/ceesafec
