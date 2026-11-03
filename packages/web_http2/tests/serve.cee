@@ -84,7 +84,7 @@ impl Transport for Client {
 }
 
 /// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css";
-/// `/slow`: "slow" after 300 ms; `/big`: 100 000 bytes of `x`, in ten sends.
+/// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends.
 struct Site {}
 
 impl Application for Site {
@@ -125,6 +125,13 @@ impl Application for Site {
                 Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
             }
             return await exchange.send(Status.ok(), "slow".bytes());
+        }
+        if (Ascii.equals(path.bytes(), "/stall")) {
+            match (await Timer.sleep(10000)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+            return await exchange.send(Status.ok(), "stall".bytes());
         }
         if (Ascii.equals(path.bytes(), "/big")) {
             var chunk = [0x78u8; 10000];

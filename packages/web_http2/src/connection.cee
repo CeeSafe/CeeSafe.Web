@@ -35,10 +35,13 @@ public struct H2Guards {
     public resetsPerInterval: u32;
     /// Empty DATA frames and zero-increment updates the peer may send per interval.
     public emptyFramesPerInterval: u32;
+    /// The interval the budgets above are counted over.
     public intervalMs: u64;
     /// Acknowledgements (SETTINGS, PING) the peer may have us owe before the output is written.
     public maxOwedAcks: u32;
 
+    /// Guards for a server whose header lists may be `maxHeaderListSize` bytes: header blocks up to twice that, 200
+    /// resets and 1 000 empty frames a second, 1 000 owed acknowledgements.
     public fn defaults(maxHeaderListSize: u32) -> H2Guards => H2Guards {
         maxBlockBytes: maxHeaderListSize * 2,
         resetsPerInterval: 200,

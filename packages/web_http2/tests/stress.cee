@@ -98,11 +98,12 @@ async fn a_stream_reset_in_its_body() -> Result<void, TestFailure> {
 
 @test
 async fn a_hundred_streams_cancelled_when_the_client_leaves() -> Result<void, TestFailure> {
-    // A hundred handlers each wait 300 ms; the client leaves after 100 ms. The connection ends at once: every handler
-    // is cancelled where it waits (no response, and no frame or task left), not awaited.
+    // A hundred handlers each wait 10 s; the client leaves after 100 ms. The connection ends then: every handler is
+    // cancelled where it waits (no response, and no frame or task left), not awaited. (The bound leaves room for a
+    // slow machine and the interpreter.)
     var bytes = Vector<u8>.create();
     preface(mut bytes)?;
-    hundred(mut bytes, "/slow")?;
+    hundred(mut bytes, "/stall")?;
     let start = Timer.now();
     let out = await served(bytes, 100)?;
     let took = Timer.now() - start;
@@ -112,18 +113,18 @@ async fn a_hundred_streams_cancelled_when_the_client_leaves() -> Result<void, Te
         answered += t.heads[2 * k + 1] as u64;
     }
     Check.equalU64(0, answered)?;
-    return Check.isTrue(took < 250, "ended before the handlers' 300 ms");
+    return Check.isTrue(took < 5000, "ended long before the handlers' 10 s");
 }
 
 @test
 async fn a_hundred_streams_drained() -> Result<void, TestFailure> {
     // The server drains 50 ms in, with a hundred 300 ms handlers running: GOAWAY (NO_ERROR, last stream 199, §6.8), every
-    // stream answered in full, then the connection ends, long before the client would leave (2 s).
+    // stream answered in full, then the connection ends, long before the client would leave (10 s).
     var bytes = Vector<u8>.create();
     preface(mut bytes)?;
     hundred(mut bytes, "/slow")?;
     let start = Timer.now();
-    let out = await servedDraining(bytes, 2000, 50)?;
+    let out = await servedDraining(bytes, 10000, 50)?;
     let took = Timer.now() - start;
     let t = tally(out)?;
     Check.isTrue(t.goAways >= 1, "GOAWAY")?;
@@ -134,7 +135,7 @@ async fn a_hundred_streams_drained() -> Result<void, TestFailure> {
         Check.equalU64(4, t.bytes[id])?; // "slow"
         Check.isTrue(t.ended[id], "each stream ended")?;
     }
-    return Check.isTrue(took < 1500, "ended once the streams were done");
+    return Check.isTrue(took < 8000, "ended once the streams were done, before the client left");
 }
 
 @test

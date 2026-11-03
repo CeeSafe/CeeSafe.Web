@@ -6,15 +6,25 @@ public fn clientPreface() -> StringView => "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Frame types (§6).
 public struct FrameTypes {
+    /// DATA (§6.1): body bytes.
     public fn data() -> u8 => 0x0;
+    /// HEADERS (§6.2): opens a stream with a header block, or ends it with trailers.
     public fn headers() -> u8 => 0x1;
+    /// PRIORITY (§6.3): deprecated priority signals, read and ignored.
     public fn priority() -> u8 => 0x2;
+    /// RST_STREAM (§6.4): ends a stream at once, with an error code.
     public fn rstStream() -> u8 => 0x3;
+    /// SETTINGS (§6.5): the sender's parameters, or an acknowledgement.
     public fn settings() -> u8 => 0x4;
+    /// PUSH_PROMISE (§6.6): a stream the server will push, with its request's header block.
     public fn pushPromise() -> u8 => 0x5;
+    /// PING (§6.7): eight bytes to echo back.
     public fn ping() -> u8 => 0x6;
+    /// GOAWAY (§6.8): the connection is ending; the last stream processed and an error code.
     public fn goAway() -> u8 => 0x7;
+    /// WINDOW_UPDATE (§6.9): more room in a stream's or the connection's flow-control window.
     public fn windowUpdate() -> u8 => 0x8;
+    /// CONTINUATION (§6.10): the rest of a header block.
     public fn continuation() -> u8 => 0x9;
 }
 
@@ -34,29 +44,49 @@ public struct FrameFlags {
 
 /// Error codes (§7), carried by RST_STREAM and GOAWAY.
 public struct ErrorCodes {
+    /// NO_ERROR: a graceful end, not an error.
     public fn noError() -> u32 => 0x0;
+    /// PROTOCOL_ERROR: a generic protocol violation.
     public fn protocolError() -> u32 => 0x1;
+    /// INTERNAL_ERROR: the endpoint failed on its own.
     public fn internalError() -> u32 => 0x2;
+    /// FLOW_CONTROL_ERROR: the peer broke flow control.
     public fn flowControlError() -> u32 => 0x3;
+    /// SETTINGS_TIMEOUT: SETTINGS were not acknowledged in time.
     public fn settingsTimeout() -> u32 => 0x4;
+    /// STREAM_CLOSED: a frame came on a half-closed or closed stream.
     public fn streamClosed() -> u32 => 0x5;
+    /// FRAME_SIZE_ERROR: a frame of the wrong size.
     public fn frameSizeError() -> u32 => 0x6;
+    /// REFUSED_STREAM: the stream was not processed, so the request may be retried.
     public fn refusedStream() -> u32 => 0x7;
+    /// CANCEL: the stream is no longer needed.
     public fn cancel() -> u32 => 0x8;
+    /// COMPRESSION_ERROR: the HPACK context cannot be kept.
     public fn compressionError() -> u32 => 0x9;
+    /// CONNECT_ERROR: a CONNECT tunnel was reset or closed.
     public fn connectError() -> u32 => 0xa;
+    /// ENHANCE_YOUR_CALM: the peer is generating too much load (the flood guards).
     public fn enhanceYourCalm() -> u32 => 0xb;
+    /// INADEQUATE_SECURITY: the transport's security is below what HTTP/2 requires.
     public fn inadequateSecurity() -> u32 => 0xc;
+    /// HTTP_1_1_REQUIRED: the request must be retried over HTTP/1.1.
     public fn http11Required() -> u32 => 0xd;
 }
 
 /// Setting identifiers (§6.5.2).
 public struct SettingIds {
+    /// SETTINGS_HEADER_TABLE_SIZE: the largest HPACK dynamic table the sender's decoder allows.
     public fn headerTableSize() -> u16 => 0x1;
+    /// SETTINGS_ENABLE_PUSH: 0 forbids server push.
     public fn enablePush() -> u16 => 0x2;
+    /// SETTINGS_MAX_CONCURRENT_STREAMS: the most streams the sender lets the peer open.
     public fn maxConcurrentStreams() -> u16 => 0x3;
+    /// SETTINGS_INITIAL_WINDOW_SIZE: each new stream's flow-control window.
     public fn initialWindowSize() -> u16 => 0x4;
+    /// SETTINGS_MAX_FRAME_SIZE: the largest frame payload the sender accepts.
     public fn maxFrameSize() -> u16 => 0x5;
+    /// SETTINGS_MAX_HEADER_LIST_SIZE: the largest header list the sender accepts.
     public fn maxHeaderListSize() -> u16 => 0x6;
 }
 
