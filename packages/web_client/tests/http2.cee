@@ -71,6 +71,9 @@ async fn two_requests_share_a_connection() -> Result<void, TestFailure> {
         Err(_) => { return Check.fail("a mock"); },
     };
     queue(scripts, mock.withPause(30).withCopiesTo(copies))?;
+    // One connection only: a second dial (after a connection failed, as the allocation sweep makes it) fails at once
+    // instead of waiting for a script.
+    scripts.close();
     let client = h2Client(scripts)?;
     let drain = match (Drain.create()) {
         Ok(d) => d,

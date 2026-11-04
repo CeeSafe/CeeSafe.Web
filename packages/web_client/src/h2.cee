@@ -235,14 +235,19 @@ struct H2Registry {
                 Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
             }
         }
-        let start = H2Start { conn: conn, commands: commands.clone(), open: open, slots: slots };
+        // Registered: from here a failure ends its commands, so no request waits on a connection that never starts.
+        let start = H2Start { conn: conn, commands: commands.clone(), open: open.clone(), slots: slots };
         match (await this.starts.sendAsync(start)) {
             Ok() => {}
-            Err(_) => { return Err(ClientError.Shutdown); }
+            Err(SendError.Closed(back)) => { return Err(unqueued(back, commands, open)); }
+            Err(SendError.Cancelled(back)) => { return Err(unqueued(back, commands, open)); }
         }
         match (await this.tokens.sendAsync(1)) {
             Ok() => { return Ok(commands); }
-            Err(_) => { return Err(ClientError.Shutdown); }
+            Err(_) => {
+                endCommands(commands, open, NetError.Closed);
+                return Err(ClientError.Shutdown);
+            }
         }
     }
 }
@@ -273,7 +278,16 @@ async fn runConnections(registry: borrow H2Registry, limits: Limits, drain: borr
             }
             let d = drain.share();
             let q = starts.clone();
-            let spawned = set.trySpawn(async move () => await startOne(q, limits, d));
+            if (!set.trySpawn(async move () => await startOne(q, limits, d))) {
+                // No task for it (out of memory): the queued connection ends unstarted, and its requests go elsewhere.
+                match (starts.tryRecv()) {
+                    Some(s) => {
+                        endCommands(s.commands, s.open, NetError.OutOfMemory);
+                        let freed = s.slots.trySend(0);
+                    }
+                    null => {}
+                }
+            }
         }
     });
     registry.running.get().store(0);
@@ -300,6 +314,37 @@ async fn connectionTask(
     limits: Limits,
     drain: borrow Drain,
 ) -> Result<void, NetError> {
+    var links = HashMap<u32, H2Link>.create();
+    let r = await connectionOn(conn, commands, open, mut links, limits, drain);
+    // Whatever ended the connection, even before its first frame, the streams left learn it; those above GOAWAY's last
+    // stream may be sent again.
+    let error = match (r) {
+        Ok() => NetError.Closed,
+        Err(e) => e,
+    };
+    for (i in 0..links.length()) {
+        let k: u32 = links.keyAt(i);
+        match (links.get(k)) {
+            Some(link) => {
+                let told = link.inbox.parts.trySend(StreamPart.Failed(error, false));
+                link.inbox.parts.close();
+                link.inbox.credit.close();
+            }
+            null => {}
+        }
+    }
+    endCommands(commands, open, error);
+    return r;
+}
+
+async fn connectionOn(
+    conn: borrow mut Box<dyn Transport + Send>,
+    commands: borrow Channel<H2Command>,
+    open: borrow Arc<AtomicU64>,
+    links: borrow mut HashMap<u32, H2Link>,
+    limits: Limits,
+    drain: borrow Drain,
+) -> Result<void, NetError> {
     var engine = match (H2Connection.client(
         H2Settings.client(truncate<u32>(limits.maxHeadBytes as u64)),
         H2Guards.defaults(truncate<u32>(limits.maxHeadBytes as u64)),
@@ -312,22 +357,32 @@ async fn connectionTask(
         Ok(b) => b,
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
-    var links = HashMap<u32, H2Link>.create();
-    let r = await serveConnection(conn, mut engine, mut input, commands, open, mut links, limits, drain);
-    // Whatever ended the connection, the streams left learn it; those above GOAWAY's last stream may be sent again.
-    let error = match (r) {
-        Ok() => NetError.Closed,
-        Err(e) => e,
-    };
-    for (i in 0..links.length()) {
-        let k: u32 = links.keyAt(i);
-        match (links.get(k)) {
-            Some(link) => { let told = link.inbox.parts.trySend(StreamPart.Failed(error, false)); }
-            null => {}
+    return await serveConnection(conn, mut engine, mut input, commands, open, links, limits, drain);
+}
+
+/// A start that could not be queued: its requests go elsewhere and its origin's slot is free again.
+fn unqueued(start: H2Start, commands: borrow Channel<H2Command>, open: borrow Arc<AtomicU64>) -> ClientError {
+    endCommands(commands, open, NetError.Closed);
+    let freed = start.slots.trySend(0);
+    return ClientError.Shutdown;
+}
+
+/// Ends a connection's command queue: it takes no new streams, and each request still queued learns that its stream
+/// never went out, so it may be sent on another connection. Without this, a request queued on a connection that ended
+/// early (out of memory before its first frame, or never started) would wait forever.
+fn endCommands(commands: borrow Channel<H2Command>, open: borrow Arc<AtomicU64>, error: NetError) {
+    open.get().store(0);
+    commands.close();
+    loop {
+        match (commands.tryRecv()) {
+            Some(H2Command.Open(_, _, _, inbox)) => {
+                let told = inbox.parts.trySend(StreamPart.Failed(error, true));
+                inbox.parts.close();
+            }
+            Some(_) => {}
+            null => { return; }
         }
     }
-    commands.close();
-    return r;
 }
 
 async fn serveConnection(
@@ -480,9 +535,11 @@ fn handleCommand(
 ) -> Result<void, NetError> {
     match (c) {
         H2Command.Open(fields, end, headRequest, inbox) => {
+            // A handle of its own, to tell the request if the stream cannot be kept (the link holds the inbox).
+            let parts = inbox.parts.clone();
             match (engine.openRequest(fields, end, headRequest)) {
                 Ok(id) => {
-                    let told = inbox.parts.trySend(StreamPart.Opened(id));
+                    let told = parts.trySend(StreamPart.Opened(id));
                     let link = H2Link {
                         inbox: inbox,
                         want: 0,
@@ -494,17 +551,23 @@ fn handleCommand(
                     };
                     match (links.put(id, link)) {
                         Ok(_) => {}
-                        Err(_) => { return Err(NetError.OutOfMemory); }
+                        Err(_) => {
+                            let failed = parts.trySend(StreamPart.Failed(NetError.OutOfMemory, false));
+                            parts.close();
+                            return Err(NetError.OutOfMemory);
+                        }
                     }
                 }
                 Err(code) => {
                     if (code != ErrorCodes.refusedStream()) {
+                        let failed = parts.trySend(StreamPart.Failed(NetError.OutOfMemory, false));
+                        parts.close();
                         return Err(NetError.OutOfMemory);
                     }
                     if (engine.streamsLeft() == 0) {
                         open.get().store(0); // full or going away: requests look elsewhere until a stream ends
                     }
-                    let told = inbox.parts.trySend(StreamPart.Refused);
+                    let told = parts.trySend(StreamPart.Refused);
                 }
             }
         }
@@ -599,6 +662,9 @@ fn endLink(links: borrow mut HashMap<u32, H2Link>, id: u32, total: borrow mut i6
     match (links.remove(id)) {
         Some(link) => {
             total -= link.outstanding;
+            // Closed, not only dropped: the request holds its own handle, so only a close shows it the end when its
+            // last part could not be delivered (the inbox full).
+            link.inbox.parts.close();
             link.inbox.credit.close();
         }
         null => {}
