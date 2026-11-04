@@ -93,6 +93,32 @@ fn parameters_and_decoding() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// §3.3: a root wildcard (`/*path`, a whole site behind one handler, as a reverse proxy mounts) matches `/` with an
+/// empty rest, as `/files/*rest` matches `/files/`; and a path that matches no route is 404, never a 405 with an empty
+/// `Allow`.
+@test
+fn a_root_wildcard_matches_the_root() -> Result<void, TestFailure> {
+    var r = routed(Router<St>.create())?;
+    added(r.get("/*path", named(1)?))?;
+    added(r.post("/*path", named(2)?))?;
+    Check.equalU64(0, outcome(r, Method.Get, "/"))?;
+    Check.equalU64(1, outcome(r, Method.Post, "/"))?;
+    Check.equalU64(0, outcome(r, Method.Get, "/a/b"))?;
+    Check.equalU64(100 + 7, outcome(r, Method.Put, "/"))?; // GET, HEAD, POST
+    var p = Params.empty();
+    match (r.find(Method.Get, "/".bytes(), mut p)) {
+        RouteMatch.Found(_) => {}
+        _ => { return Check.fail("found"); }
+    }
+    match (r.paramRange(p, "path")) {
+        Some(range) => { Check.equalU64(0, (range.end - range.start) as u64)?; }
+        null => { return Check.fail("an empty rest"); }
+    }
+    var only = routed(Router<St>.create())?;
+    added(only.get("/a", named(1)?))?;
+    return Check.equalU64(999, outcome(only, Method.Get, "/")); // no route at `/`: 404
+}
+
 @test
 fn bad_and_conflicting_routes() -> Result<void, TestFailure> {
     var r = routed(Router<St>.create())?;

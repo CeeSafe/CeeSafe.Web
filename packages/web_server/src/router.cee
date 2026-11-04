@@ -239,7 +239,8 @@ public struct Router<S> {
         if (path.length == 0 || path[0] != 47) {
             return RouteMatch.NotFound;
         }
-        let node = if (path.length == 1) Some(0u32) else this.walk(0, path, 0, params);
+        // `/` is the root's own routes; without any, a root wildcard may match it with an empty rest.
+        let node = if (path.length == 1 && hasRoutes(this.nodes[0])) Some(0u32) else this.walk(0, path, 0, params);
         let n = match (node) {
             Some(v) => v,
             null => { return RouteMatch.NotFound; },
