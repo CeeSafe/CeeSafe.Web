@@ -79,8 +79,9 @@ fn blocks_rfc4632() -> Result<void, TestFailure> {
     Check.isTrue(one.contains(ip("192.0.2.1")?) && !one.contains(ip("192.0.2.2")?), "an address is a /32")?;
     let all = block("0.0.0.0/0")?;
     Check.isTrue(all.contains(ip("203.0.113.9")?), "/0 holds every IPv4 address")?;
-    for (k in 0..5u32) {
+    for (k in 0..6u32) {
         let bad = match (k) {
+            5 => "fe80::1%0/64", // `%0` parses as scope 0 (the zone tests/fuzz/proxy found in TCP6 headers)
             0 => "10.0.0.0/33",
             1 => "::/129",
             2 => "example.com",
@@ -214,4 +215,56 @@ fn forwarding_fields_sent_upstream() -> Result<void, TestFailure> {
     let six = fieldsFor("2001:db8::1", "", TrustedProxies.none(), "example.com")?;
     Check.equalBytes("for=\"[2001:db8::1]\";proto=https;host=example.com".bytes(), six.forwarded.view())?;
     return Check.equalBytes("2001:db8::1".bytes(), six.forwardedFor.view());
+}
+
+/// Found by tests/fuzz/proxy. RFC 9110 §5.6.4: a quoted-pair is the byte after the backslash, so `\"` does not end a
+/// quoted string; RFC 7239 §5.2: a `for` value is read "after potential quoted-string unescaping"; RFC 9110 §5.6.1.2:
+/// empty list elements are ignored.
+@test
+fn quoted_pairs_and_empty_elements() -> Result<void, TestFailure> {
+    let text = "Forwarded: , for=192.0.2.1;host=\"a\\\",b\", ,for=\"192.0.2.\\43\" ,\nForwarded: ,\n";
+    let bytes = text.bytes();
+    let list = listOf(bytes)?;
+    let hops = match (Hops.fromForwarded(list)) {
+        Ok(h) => h,
+        Err(_) => { return Check.fail("out of memory"); },
+    };
+    let zoned = "Forwarded: for=\"[fe80::1%0]\"\n".bytes();
+    match (Hops.fromForwarded(listOf(zoned)?)) {
+        Ok(z) => {
+            match (z.hop(0)) {
+                Hop.Malformed => {}
+                _ => { return Check.fail("an IPv6 node with a zone"); }
+            }
+        }
+        Err(_) => { return Check.fail("out of memory"); }
+    }
+    Check.equalU64(2, hops.count() as u64)?;
+    match (hops.hop(0)) {
+        Hop.Address(a) => { Check.isTrue(sameAddress(a, ip("192.0.2.1")?), "the escaped quote stays in its string")?; }
+        _ => { return Check.fail("an element with a quoted-pair"); }
+    }
+    match (hops.hop(1)) {
+        Hop.Address(a) => { return Check.isTrue(sameAddress(a, ip("192.0.2.43")?), "an escaped digit"); }
+        _ => { return Check.fail("a for value with a quoted-pair"); }
+    }
+}
+
+/// Found by tests/fuzz/proxy: a client could choose the address it is known by. A trusted proxy that extends the
+/// field it received (nginx's `$proxy_add_forwarded`) appends its hop after the client's bytes; an unclosed quote in
+/// those bytes swallowed the hop, so the client's own `for=` was read as the right-most. A field that ends inside a
+/// quoted string cannot be read, so its end is malformed and the walk stops at the trusted peer (Web ADR 0012 §3.4).
+@test
+fn a_client_cannot_swallow_the_trusted_hop() -> Result<void, TestFailure> {
+    let trusted = trusting("10.0.0.0/8")?;
+    let first = ForwardedSource.ForwardedFirst;
+    isAddress(clientIs("10.0.0.1", "Forwarded: for=203.0.113.9;x=\", for=198.51.100.241\n", trusted, first)?,
+        "10.0.0.1")?;
+    isAddress(clientIs("10.0.0.1", "Forwarded: for=_hidden;host=4Y\", for=198.51.100.241;proto=https\n", trusted, first)?,
+        "10.0.0.1")?;
+    isAddress(clientIs("10.0.0.1", "Forwarded: for=203.0.113.9;x=\"\\\", for=198.51.100.241\n", trusted, first)?,
+        "10.0.0.1")?;
+    // The proxy's hop in a field of its own is read whatever the client's field holds.
+    return isAddress(clientIs("10.0.0.1", "Forwarded: for=203.0.113.9;x=\"\nForwarded: for=198.51.100.241\n",
+        trusted, first)?, "198.51.100.241");
 }

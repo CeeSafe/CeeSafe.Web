@@ -80,8 +80,10 @@ fn version_1() -> Result<void, TestFailure> {
             _ => { return Check.fail("UNKNOWN with addresses"); }
         }
     }
-    for (k in 0..7u32) {
+    for (k in 0..9u32) {
         let bad = match (k) {
+            7 => "PROXY TCP6 ::1%0 ::2 1 2\r\n", // found by tests/fuzz/proxy: `%0` parses as scope 0
+            8 => "PROXY TCP6 ::1 ::2%en0 1 2\r\n",
             0 => "PROXY TCP4 192.168.0.1  192.168.0.11 56324 443\r\n",
             1 => "PROXY TCP4 192.168.0.1 192.168.0.11 056324 443\r\n",
             2 => "PROXY TCP4 ::1 ::2 1 2\r\n",
@@ -173,6 +175,63 @@ fn version_2() -> Result<void, TestFailure> {
         Err(ProxyError.TooLong) => { return Ok(); }
         _ => { return Check.fail("past the bound"); }
     }
+}
+
+/// Found by tests/fuzz/proxy. §2.1: after UNKNOWN "the receiver must ignore anything presented before the CRLF".
+@test
+fn unknown_ignores_the_rest_of_its_line() -> Result<void, TestFailure> {
+    for (k in 0..3u32) {
+        let h = match (k) {
+            0 => "PROXY UNKNOWN  two spaces\r\n",
+            1 => "PROXY UNKNOWN a b c d e f g h\r\n",
+            _ => "PROXY UNKNOWN \r\n",
+        };
+        match (readAndParse(h.bytes(), 0)) {
+            Ok(ProxyHeader.Local) => {}
+            _ => { return Check.fail("UNKNOWN with more on its line"); }
+        }
+    }
+    match (readAndParse("PROXY UNKNOWNX\r\n".bytes(), 0)) {
+        Err(_) => { return Ok(); }
+        Ok(_) => { return Check.fail("UNKNOWNX is not UNKNOWN"); }
+    }
+}
+
+/// Found by tests/fuzz/proxy. §2.2: a family or transport other than those listed "must be rejected as invalid by
+/// receivers"; over UNSPEC "the receiver should ignore address information"; and "the receiver must also reject
+/// incoming connections containing partial protocol headers" (AF_UNIX's addresses are 108 bytes each). LOCAL's block
+/// is ignored, family included.
+@test
+fn version_2_families_and_transports() -> Result<void, TestFailure> {
+    let four = [192u8, 0, 2, 1, 198, 51, 100, 2, 0xC8, 0x22, 0x01, 0xBB];
+    let unix = [0u8; 216];
+    for (k in 0..5u32) {
+        let bad = match (k) {
+            0 => v2(0x21, 0x41, four[..])?, // family 4
+            1 => v2(0x21, 0xF1, four[..])?,
+            2 => v2(0x21, 0x13, four[..])?, // transport 3
+            3 => v2(0x21, 0x31, unix[0..100])?, // AF_UNIX, partial
+            _ => v2(0x21, 0x32, unix[0..215])?,
+        };
+        match (readAndParse(bad.view(), 0)) {
+            Err(_) => {}
+            Ok(_) => { return Check.fail("an unassigned family or transport, or a partial block, was accepted"); }
+        }
+    }
+    for (k in 0..4u32) {
+        let local = match (k) {
+            0 => v2(0x21, 0x10, four[..])?, // TCP4 addresses over UNSPEC: ignored
+            1 => v2(0x21, 0x20, four[..])?,
+            2 => v2(0x20, 0x41, four[..])?, // LOCAL ignores the family
+            _ => v2(0x21, 0x32, unix[..])?,
+        };
+        match (readAndParse(local.view(), 0)) {
+            Ok(ProxyHeader.Local) => {}
+            _ => { return Check.fail("the socket's own addresses"); }
+        }
+    }
+    let udp = v2(0x21, 0x12, four[..])?;
+    return isProxied(readAndParse(udp.view(), 0), "192.0.2.1", 51234, "198.51.100.2", 443);
 }
 
 fn address(text: StringView, port: u16) -> Result<SocketAddress, TestFailure> {

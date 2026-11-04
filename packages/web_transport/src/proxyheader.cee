@@ -20,6 +20,9 @@ public struct Cidr {
                 break;
             }
         }
+        if (hasZone(text[0..slash])) {
+            return null; // a zone names a link, not a block (`%0` too, which parses as scope 0)
+        }
         let addressText = match (StringView.fromUtf8(text[0..slash])) {
             Some(t) => t,
             null => { return null; },
@@ -219,6 +222,9 @@ fn parseV1(header: Slice<u8>) -> Result<ProxyHeader, ProxyError> {
         return Err(ProxyError.Malformed);
     }
     let line = header[6..header.length - 2];
+    if (line.length >= 7 && equalsText(line[0..7], "UNKNOWN") && (line.length == 7 || line[7] == 32)) {
+        return Ok(ProxyHeader.Local); // "the receiver must ignore anything presented before the CRLF" (§2.1)
+    }
     var starts = [0usize; 6];
     var ends = [0usize; 6];
     var n: usize = 0;
@@ -236,9 +242,6 @@ fn parseV1(header: Slice<u8>) -> Result<ProxyHeader, ProxyError> {
         start = i + 1;
     }
     let family = line[starts[0]..ends[0]];
-    if (equalsText(family, "UNKNOWN")) {
-        return Ok(ProxyHeader.Local); // the rest of the line is ignored (§2.1)
-    }
     let v6 = equalsText(family, "TCP6");
     if ((!v6 && !equalsText(family, "TCP4")) || n != 5) {
         return Err(ProxyError.Malformed);
@@ -252,6 +255,9 @@ fn parseV1(header: Slice<u8>) -> Result<ProxyHeader, ProxyError> {
 
 /// An address of the family the header named, without a zone.
 fn addressOf(text: Slice<u8>, port: u16, v6: bool) -> Result<SocketAddress, ProxyError> {
+    if (hasZone(text)) {
+        return Err(ProxyError.Malformed);
+    }
     let t = match (StringView.fromUtf8(text)) {
         Some(t) => t,
         null => { return Err(ProxyError.Malformed); },
@@ -310,6 +316,13 @@ fn parseV2(header: Slice<u8>) -> Result<ProxyHeader, ProxyError> {
         return Err(ProxyError.Malformed);
     }
     let family = header[13] >> 4;
+    let transport = header[13] & 15;
+    if (family > 3 || transport > 2) {
+        return Err(ProxyError.Malformed); // "must be rejected as invalid by receivers"
+    }
+    if (family == 0 || transport == 0) {
+        return Ok(ProxyHeader.Local); // UNSPEC: "the receiver should ignore address information"
+    }
     let body = header[16..];
     if (family == 1) {
         if (length < 12) {
@@ -343,7 +356,22 @@ fn parseV2(header: Slice<u8>) -> Result<ProxyHeader, ProxyError> {
             SocketAddress.V6(destination, port16(body, 34), 0),
         ));
     }
-    return Ok(ProxyHeader.Local); // AF_UNSPEC or AF_UNIX: no addresses to use
+    // AF_UNIX: two addresses of 108 bytes, which a socket address cannot hold; a shorter block is a partial header,
+    // which "the receiver must also reject".
+    if (length < 216) {
+        return Err(ProxyError.Malformed);
+    }
+    return Ok(ProxyHeader.Local);
+}
+
+/// Whether `text` holds a `%`, which starts an IPv6 zone: no address in a header or a block has one.
+public fn hasZone(text: Slice<u8>) -> bool {
+    for (b in text) {
+        if (b == 37) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn port16(b: Slice<u8>, at: usize) -> u16 => (b[at] as u16) << 8 | b[at + 1] as u16;
