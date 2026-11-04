@@ -168,13 +168,13 @@ public struct Responses {
     }
 }
 
-/// A field name: not empty, no upper case, and none of NUL, CR, LF, space or ':' (§8.2.1).
+/// A field name: not empty, and no byte of 0x00-0x20, upper case, ':' or 0x7F-0xFF (§8.2.1).
 fn goodName(name: Slice<u8>) -> bool {
     if (name.length == 0) {
         return false;
     }
     for (c in name) {
-        if ((c >= 65 && c <= 90) || c == 0 || c == 10 || c == 13 || c == 32 || c == 58 || c >= 127) {
+        if ((c >= 65 && c <= 90) || c <= 32 || c == 58 || c >= 127) {
             return false;
         }
     }

@@ -571,6 +571,59 @@ fn malformed_requests_rfc9113_8() -> Result<void, TestFailure> {
     return is("req 1; error 1 1; ", feed(mut c, bytes.view())?);
 }
 
+/// A field name with a control byte, 0x01 to 0x1F, is malformed (RFC 9113 §8.2.1: "A field name MUST NOT contain
+/// characters in the ranges 0x00-0x20, 0x41-0x5a, or 0x7f-0xff"), in a request and in a response.
+@test
+fn control_bytes_in_field_names_rfc9113_8_2_1() -> Result<void, TestFailure> {
+    let controls = [1u8, 9, 11, 12, 31];
+    for (c in controls) {
+        var name = Vector<u8>.create();
+        grew(name.push(120))?;
+        grew(name.push(c))?;
+        grew(name.push(97))?;
+        var request = getBlock("/")?;
+        grew(HpackEncoder.field(name.view(), "1".bytes(), false, mut request))?;
+        var s = server()?;
+        var bytes = Vector<u8>.create();
+        preface(mut bytes)?;
+        frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, request.view())?;
+        is("", feed(mut s, bytes.view())?)?;
+        is("settings 0 f1; rst 1 code 1; ", sent(mut s)?)?;
+
+        var k = client()?;
+        let id = opened(mut k, "GET", true)?;
+        var answer = Vector<u8>.create();
+        serverPreface(mut answer)?;
+        var head = blockOf(":status: 200\n")?;
+        grew(HpackEncoder.field(name.view(), "1".bytes(), false, mut head))?;
+        frame(mut answer, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), id, head.view())?;
+        is("error 1 1; ", feed(mut k, answer.view())?)?;
+    }
+    return Ok();
+}
+
+/// A WINDOW_UPDATE of 0 on an idle stream is a connection error (§5.1: on an idle stream, any frame but HEADERS or
+/// PRIORITY), not a stream error: RST_STREAM must not be sent for an idle stream (§6.4). Both roles.
+@test
+fn zero_window_update_on_an_idle_stream_rfc9113_5_1() -> Result<void, TestFailure> {
+    var zero = Vector<u8>.create();
+    for (i in 0..4) {
+        grew(zero.push(0))?;
+    }
+    var s = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    frame(mut bytes, FrameTypes.windowUpdate(), 0, 99, zero.view())?;
+    is("conn 1", feed(mut s, bytes.view())?)?;
+
+    var k = client()?;
+    let id = opened(mut k, "GET", true)?;
+    var answer = Vector<u8>.create();
+    serverPreface(mut answer)?;
+    frame(mut answer, FrameTypes.windowUpdate(), 0, id + 12, zero.view())?;
+    return is("conn 1", feed(mut k, answer.view())?);
+}
+
 @test
 fn concurrent_stream_limit_rfc9113_5_1_2() -> Result<void, TestFailure> {
     let get = getBlock("/")?;

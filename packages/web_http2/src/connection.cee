@@ -887,6 +887,9 @@ public struct H2Connection {
             if (id == 0) {
                 return Err(ErrorCodes.protocolError());
             }
+            if (!this.streams.contains(id) && this.idle(id)) {
+                return Err(ErrorCodes.protocolError()); // on an idle stream (§5.1): no RST_STREAM for it (§6.4)
+            }
             return this.streamError(id, ErrorCodes.protocolError());
         }
         if (id == 0) {
