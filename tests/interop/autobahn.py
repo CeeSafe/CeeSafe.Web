@@ -24,6 +24,7 @@ CLIENT = ROOT / "examples/ws_client/out/ws_client"
 PROXY = ROOT / "examples/proxy/out/proxy"
 PORT = 9001
 GOOD = ("OK", "INFORMATIONAL")
+ALL_CASES = 517  # the image's whole suite (M6's run): a full run that reports fewer stopped early
 
 
 def main():
@@ -116,6 +117,7 @@ def fuzzingclient(args, reports, config):
     if run.returncode != 0:
         print(run.stdout[-2000:], run.stderr[-2000:])
         sys.exit(f"wstest failed: {run.returncode}")
+    (reports / "wstest.log").write_text(run.stdout + run.stderr)
 
 
 def summarise(args, reports, mode):
@@ -128,12 +130,17 @@ def summarise(args, reports, mode):
         elif v["behavior"] not in GOOD or v["behaviorClose"] not in GOOD:
             failed.append((k, v["behavior"], v["behaviorClose"]))
     print(f"autobahn {mode}: {len(cases)} cases: {dict(counts)}; reports in {reports}")
+    short = args.cases == "*" and len(cases) < ALL_CASES
+    if short:
+        print(f"FAIL only {len(cases)} of {ALL_CASES} cases ran; wstest's last lines:")
+        log = reports / "wstest.log"
+        print(log.read_text()[-1500:] if log.exists() else "(no log)")
     for f in failed:
         print("FAIL", *f)
     if unimplemented:
         groups = sorted({k.rsplit(".", 1)[0] for k in unimplemented})
         print(f"unimplemented: {len(unimplemented)} cases ({', '.join(groups[:6])}{', …' if len(groups) > 6 else ''})")
-    sys.exit(1 if failed or (args.require_all and unimplemented) else 0)
+    sys.exit(1 if failed or short or (args.require_all and unimplemented) else 0)
 
 
 if __name__ == "__main__":
