@@ -5,7 +5,7 @@ usage: python3 tests/fuzz/proxy/mutants.py <a copy of the tree> <ceesafec>  (it 
 """
 import os, subprocess, sys
 
-tree, cc = sys.argv[1], sys.argv[2]
+tree, cc = os.path.abspath(sys.argv[1]), sys.argv[2]
 FWD = "packages/web_proxy/src/forwarded.cee"
 PH = "packages/web_transport/src/proxyheader.cee"
 MUTANTS = [

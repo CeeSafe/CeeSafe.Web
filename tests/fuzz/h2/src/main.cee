@@ -16,7 +16,22 @@
 //     the window it opened (§6.9);
 //  6. HPACK: random fields encoded then decoded come back the same, and Huffman too (RFC 7541 §5.2, §6);
 //     damaged blocks never panic, and decode the same way twice.
+//  7. client role (Web ADR 0012 §7): from a valid server conversation answering the client's requests, damaged:
+//     the same events and output fed whole or in pieces; the client's preface, SETTINGS with SETTINGS_ENABLE_PUSH = 0
+//     (§8.4) and requests on odd rising streams (§5.1.1) that decode to what was asked;
+//  8. client role, events: responses only on streams the client opened, one final head each, no 1xx (§8.1), no DATA
+//     before it or after the stream's end; each head and trailer section passes §8.2-§8.3.2, checked here; DATA within
+//     `content-length` and equal to it at the end, except for HEAD, 204 and 304 (§8.1.1; RFC 9110 §8.6, §6.4.1); and
+//     within the windows (§6.9);
+//  9. client role, output: only what the protocol owes (SETTINGS and PING acknowledgements, no more than were asked
+//     for and echoing the PING's data, WINDOW_UPDATE above 0, RST_STREAM on its own streams, GOAWAY naming stream 0
+//     since a server opens none, §6.8), whole frames;
+// 10. HPACK's dynamic table: an encoder and a decoder across several blocks, with table size changes, stay in step
+//     (RFC 7541 §2.3, §4, §6.3): every field comes back, a never-indexed one still never indexed (§6.2.3), both tables
+//     the same size, within the limit, which is the smaller of the peer's and ours (Web ADR 0012 §3.10).
 // A broken invariant prints the input in hex and exits 1; a panic or a sanitizer report ends the run by itself.
+//
+//   CW_FUZZ_ONLY: 0 the server role, 1 the client role, 2 HPACK (both cases); all if unset.
 import web_core;
 import web_http;
 import web_http2;
@@ -27,7 +42,24 @@ struct Seen {
     data: u64;
     resets: u64;
     connectionErrors: u64;
+    responses: u64;
+    clientData: u64;
+    clientStreamErrors: u64;
+    clientConnectionErrors: u64;
+    tableBlocks: u64;
 }
+
+fn noneSeen() -> Seen => Seen {
+    requests: 0,
+    data: 0,
+    resets: 0,
+    connectionErrors: 0,
+    responses: 0,
+    clientData: 0,
+    clientStreamErrors: 0,
+    clientConnectionErrors: 0,
+    tableBlocks: 0,
+};
 
 /// xorshift64*.
 struct Rng {
@@ -102,7 +134,7 @@ fn frame(out: borrow mut Vector<u8>, kind: u8, flags: u8, stream: u32, payload: 
 }
 
 /// A request's header block from our encoder (static table only), with a random extra field now and then.
-fn requestBlock(rng: borrow mut Rng, method: StringView, path: StringView) -> Vector<u8> {
+fn requestBlock(rng: borrow mut Rng, method: StringView, path: StringView, damaged: bool) -> Vector<u8> {
     var b = Vector<u8>.create();
     let m = HpackEncoder.field(":method".bytes(), method.bytes(), false, mut b);
     let s = HpackEncoder.field(":scheme".bytes(), "https".bytes(), false, mut b);
@@ -114,11 +146,16 @@ fn requestBlock(rng: borrow mut Rng, method: StringView, path: StringView) -> Ve
     if (rng.below(3) == 0) {
         let c = HpackEncoder.field("content-type".bytes(), "text/plain".bytes(), false, mut b);
     }
+    if (damaged && rng.below(8) == 0) {
+        var odd = HeaderBlock.create();
+        oddField(rng, mut odd);
+        let o = HpackEncoder.field(odd.name(0), odd.value(0), false, mut b);
+    }
     return b;
 }
 
 /// The client's side of a conversation that the engine accepts whole: what each case damages.
-fn seed(rng: borrow mut Rng, out: borrow mut Vector<u8>) {
+fn seed(rng: borrow mut Rng, out: borrow mut Vector<u8>, damaged: bool) {
     let preface = clientPreface();
     putAll(out, preface.bytes());
     // SETTINGS: header table 4096 (0x1), push off (0x2), initial window 65 535 (0x4).
@@ -131,7 +168,7 @@ fn seed(rng: borrow mut Rng, out: borrow mut Vector<u8>) {
     for (k in 0..streams) {
         let post = rng.below(2) == 0;
         let short = rng.below(2) == 0;
-        let block = requestBlock(rng, if (post) "POST" else "GET", if (short) "/" else "/a/b?c=d");
+        let block = requestBlock(rng, if (post) "POST" else "GET", if (short) "/" else "/a/b?c=d", damaged);
         let all = block.view();
         let flagsEnd: u8 = if (post) 0u8 else 1u8;
         if (rng.below(3) == 0 && all.length > 2) {
@@ -269,6 +306,33 @@ fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
 
 fn equalsText(a: Slice<u8>, text: StringView) -> bool => same(a, text.bytes());
 
+/// §8.2.1: a name with no byte of 0x00-0x20, 0x41-0x5A or 0x7F-0xFF, and no ':' past a pseudo-field's first; a value
+/// without NUL, LF or CR, not starting or ending with SP or HTAB.
+fn fieldOk(name: Slice<u8>, value: Slice<u8>) -> bool {
+    if (name.length == 0) {
+        return false;
+    }
+    for (i in 0..name.length) {
+        let b = name[i];
+        if (b <= 32 || (b >= 65 && b <= 90) || b >= 127 || (b == 58 && i > 0)) {
+            return false;
+        }
+    }
+    for (b in value) {
+        if (b == 0 || b == 10 || b == 13) {
+            return false;
+        }
+    }
+    if (value.length > 0) {
+        let first = value[0];
+        let last = value[value.length - 1];
+        if (first == 32 || first == 9 || last == 32 || last == 9) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// §8.2-§8.3's rules for a request's fields, apart from `Requests` (invariant 4).
 fn wellFormed(head: borrow HeaderBlock) -> bool {
     var regular = false;
@@ -283,10 +347,8 @@ fn wellFormed(head: borrow HeaderBlock) -> bool {
         if (name.length == 0) {
             return false;
         }
-        for (b in name) {
-            if (b >= 65 && b <= 90) {
-                return false; // uppercase (§8.2.1)
-            }
+        if (!fieldOk(name, value)) {
+            return false;
         }
         if (name[0] == 58) {
             if (regular) {
@@ -462,14 +524,15 @@ fn run(input: Slice<u8>, rng: borrow mut Rng, whole: bool, log: borrow mut Vecto
 
 fn engineCase(rng: borrow mut Rng, seen: borrow mut Seen) {
     var input = Vector<u8>.create();
-    seed(rng, mut input);
-    if (rng.below(8) != 0) {
+    let damaged = rng.below(8) != 0;
+    seed(rng, mut input, damaged);
+    if (damaged) {
         mutate(rng, mut input);
     }
     var whole = Vector<u8>.create();
     var pieces = Vector<u8>.create();
     run(input.view(), rng, true, mut whole, seen);
-    var again = Seen { requests: 0, data: 0, resets: 0, connectionErrors: 0 };
+    var again = noneSeen();
     run(input.view(), rng, false, mut pieces, mut again);
     if (!same(whole.view(), pieces.view())) {
         fail("different events or output fed whole and in pieces", input.view());
@@ -560,13 +623,22 @@ fn hpackCase(rng: borrow mut Rng) {
 
 fn main() {
     let seconds = setting("CW_FUZZ_SECONDS", 60);
+    let only = setting("CW_FUZZ_ONLY", 99);
     var rng = Rng { s: setting("CW_FUZZ_SEED", 1).wrappingMul(2654435761).wrappingAdd(1) };
     let started = Timer.now();
     var cases: u64 = 0;
-    var seen = Seen { requests: 0, data: 0, resets: 0, connectionErrors: 0 };
+    var seen = noneSeen();
     while (Timer.now() - started < seconds * 1000) {
-        engineCase(mut rng, mut seen);
-        hpackCase(mut rng);
+        if (only == 99 || only == 0) {
+            engineCase(mut rng, mut seen);
+        }
+        if (only == 99 || only == 1) {
+            clientCase(mut rng, mut seen);
+        }
+        if (only == 99 || only == 2) {
+            hpackCase(mut rng);
+            tableCase(mut rng, mut seen);
+        }
         cases += 1;
     }
     Console.writeLine("fuzz_h2: clean");
@@ -579,4 +651,14 @@ fn main() {
     Console.write(seen.resets);
     Console.write(", connection errors ");
     Console.writeLine(seen.connectionErrors);
+    Console.write("client: responses ");
+    Console.write(seen.responses);
+    Console.write(", data ");
+    Console.write(seen.clientData);
+    Console.write(", stream errors ");
+    Console.write(seen.clientStreamErrors);
+    Console.write(", connection errors ");
+    Console.writeLine(seen.clientConnectionErrors);
+    Console.write("hpack: dynamic-table blocks ");
+    Console.writeLine(seen.tableBlocks);
 }
