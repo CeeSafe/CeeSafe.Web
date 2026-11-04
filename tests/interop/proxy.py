@@ -6,7 +6,8 @@ of a Python backend that reports what reached it, so every expected value comes 
   2. a partial upstream response (Content-Length 1 000 000, 100 000 bytes, then the backend closes) is never
      presented as complete (§3.7): over HTTP/1.1 curl exits 18, "transfer closed with outstanding read data
      remaining"; over h2c the stream is reset and curl exits 92;
-  3. 1 GiB down and 1 GiB up, over HTTP/1.1 and over h2c: the SHA-256 on each side is the same;
+  3. 1 GiB down (ADR 0012 §5's gate) and 1 GiB up (with CW_MAX_BODY raised), over HTTP/1.1 and over h2c: the
+     SHA-256 on each side is the same; at the default limit (8 MiB) a larger upload is 413;
   4. h2load -n 20000 -c 10 -m 10 over h2c through the proxy to examples/server: every request succeeds;
   5. HAProxy (official Docker image) in front, sending PROXY protocol v1 and v2 (§3.4, amendment 2): the backend's
      X-Forwarded-For is the client address HAProxy saw (HAProxy also sends it as x-haproxy-src); a trusted source
@@ -171,11 +172,24 @@ def big(gib, scratch):
         check(f"{gib} GiB down {name}", p.returncode == 0 and size == n and got.hexdigest() == want,
               f"{size} bytes, {time.time() - t:.1f} s, exit {p.returncode}")
         t = time.time()
-        r = curl(*proto, "--data-binary", f"@{upload}", "-H", "content-type: application/octet-stream",
+        # -T streams the file (--data-binary @file would read 1 GiB into curl's memory).
+        r = curl(*proto, "-X", "POST", "-T", str(upload), "-H", "content-type: application/octet-stream",
                  f"http://127.0.0.1:{FRONT}/sha")
         check(f"{gib} GiB up {name}", r.returncode == 0 and r.stdout.decode() == f"{n} {want}",
               f"{r.stdout.decode()[:90]}, {time.time() - t:.1f} s")
     upload.unlink()
+
+
+def limited(scratch):
+    proxy = start(PROXY, {"CW_PORT": str(H2FRONT), "CW_BACKENDS": f"http://127.0.0.1:{BACKEND}"}, "proxy: listening")
+    body = pathlib.Path(scratch) / "nine.bin"
+    body.write_bytes(b"z" * (9 << 20))
+    try:
+        r = curl("-o", os.devnull, "-w", "%{http_code}", "--data-binary", f"@{body}", f"http://127.0.0.1:{H2FRONT}/sha")
+        check("9 MiB up at the default limit: 413", r.stdout == b"413", r.stdout.decode())
+    finally:
+        proxy.kill()
+        body.unlink()
 
 
 def load():
@@ -253,7 +267,8 @@ def main():
     args = ap.parse_args()
     backend = ThreadingServer(("127.0.0.1", BACKEND), Backend)
     threading.Thread(target=backend.serve_forever, daemon=True).start()
-    proxy = start(PROXY, {"CW_PORT": str(FRONT), "CW_BACKENDS": f"http://127.0.0.1:{BACKEND}"}, "proxy: listening")
+    proxy = start(PROXY, {"CW_PORT": str(FRONT), "CW_BACKENDS": f"http://127.0.0.1:{BACKEND}",
+                          "CW_MAX_BODY": str((args.gib << 30) + 1)}, "proxy: listening")
     scratch = tempfile.mkdtemp(prefix="cw-proxy-")
     try:
         forwarding()
@@ -261,6 +276,7 @@ def main():
         big(args.gib, scratch)
     finally:
         proxy.kill()
+    limited(scratch)
     load()
     if not args.skip_haproxy:
         haproxy(scratch)

@@ -7,6 +7,7 @@
 //   CW_PROXY_PROTOCOL   comma-separated blocks that must send a PROXY protocol header (default: none)
 //   CW_POLICY           round-robin (default), least-requests or hash (on the client's address)
 //   CW_CHECK_PATH       a path for active health checks (default: none)
+//   CW_MAX_BODY         the largest request body, in bytes (default: the server's, 8 MiB; a larger one is 413)
 //
 // The proxy's own work (its client's HTTP/2 connections, the active checks) runs beside the server and stops with it.
 import web_core;
@@ -126,7 +127,17 @@ fn proxy() -> ReverseProxy? {
 }
 
 fn application(p: borrow ReverseProxy) -> Result<Server<App>, RouteError> {
-    var server = Server<App>.create(App {}, Limits.defaults())?;
+    var limits = Limits.defaults();
+    match (Environment.variable("CW_MAX_BODY")) {
+        Some(t) => {
+            match (Ascii.parseDecimal(t.bytes())) {
+                Some(n) => { limits.maxBodyBytes = n; }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    var server = Server<App>.create(App {}, limits)?;
     for (k in 0..6u32) {
         let method = match (k) {
             0 => Method.Get,
