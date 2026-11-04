@@ -105,7 +105,9 @@ def fuzzingclient(args, reports, config):
             server.kill()
             sys.exit(f"the proxy did not start: {ready}")
     try:
-        run = subprocess.run(["docker", "run", "--rm", "-v", f"{config}:/config", "-v", f"{reports}:/reports",
+        # On Linux, host.docker.internal is not defined unless asked for (Docker 20.10+).
+        host = ["--add-host", "host.docker.internal:host-gateway"] if sys.platform.startswith("linux") else []
+        run = subprocess.run(["docker", "run", "--rm", *host, "-v", f"{config}:/config", "-v", f"{reports}:/reports",
                               "crossbario/autobahn-testsuite", "wstest", "-m", "fuzzingclient",
                               "-s", "/config/fuzzingclient.json"], capture_output=True, text=True)
     finally:
