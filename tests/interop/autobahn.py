@@ -22,6 +22,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 ECHO = ROOT / "examples/ws_echo/out/ws_echo"
 CLIENT = ROOT / "examples/ws_client/out/ws_client"
 PROXY = ROOT / "examples/proxy/out/proxy"
+LINUX = sys.platform.startswith("linux")
 PORT = 9001
 GOOD = ("OK", "INFORMATIONAL")
 ALL_CASES = 517  # the image's whole suite (M6's run): a full run that reports fewer stopped early
@@ -83,7 +84,7 @@ def fuzzingserver(args, reports, config):
 def fuzzingclient(args, reports, config):
     (config / "fuzzingclient.json").write_text(json.dumps({
         "outdir": "/reports",
-        "servers": [{"agent": "CeeSafe.Web", "url": f"ws://host.docker.internal:{PORT}"}],
+        "servers": [{"agent": "CeeSafe.Web", "url": f"ws://{'127.0.0.1' if LINUX else 'host.docker.internal'}:{PORT}"}],
         "cases": args.cases.split(","),
         "exclude-cases": [],
         "exclude-agent-cases": {},
@@ -105,8 +106,8 @@ def fuzzingclient(args, reports, config):
             server.kill()
             sys.exit(f"the proxy did not start: {ready}")
     try:
-        # On Linux, host.docker.internal is not defined unless asked for (Docker 20.10+).
-        host = ["--add-host", "host.docker.internal:host-gateway"] if sys.platform.startswith("linux") else []
+        # On Linux the container shares the host's network, and the servers' loopback address is reachable.
+        host = ["--network", "host"] if LINUX else []
         run = subprocess.run(["docker", "run", "--rm", *host, "-v", f"{config}:/config", "-v", f"{reports}:/reports",
                               "crossbario/autobahn-testsuite", "wstest", "-m", "fuzzingclient",
                               "-s", "/config/fuzzingclient.json"], capture_output=True, text=True)
