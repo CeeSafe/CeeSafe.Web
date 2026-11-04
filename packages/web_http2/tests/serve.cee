@@ -122,6 +122,10 @@ impl Application for Site {
             }
             return await exchange.send(Status.ok(), body.view());
         }
+        if (Ascii.equals(path.bytes(), "/dated")) {
+            exchange.header("date", "Sun, 06 Nov 1994 08:49:37 GMT".bytes())?;
+            return await exchange.send(Status.ok(), "d".bytes());
+        }
         if (Ascii.equals(path.bytes(), "/rtrailers")) {
             await exchange.write("abc".bytes())?;
             return exchange.trailer("x-sum", "3".bytes());
@@ -182,15 +186,19 @@ impl Application for Site {
 
 /// Serves the scripted client's `input` with `Site`, the client leaving after `closeAfterMs`; what the server wrote.
 async fn served(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedAs(input, closeAfterMs, 0, false, 0);
+    await servedAs(input, closeAfterMs, 0, false, 0, false);
 
 /// `served`, with the server's drain started after `drainAfterMs` (0: never).
 async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedAs(input, closeAfterMs, drainAfterMs, false, 0);
+    await servedAs(input, closeAfterMs, drainAfterMs, false, 0, false);
 
 /// `served`, with a client that half-closes after `closeAfterMs` and keeps reading until `goneAfterMs` (0: always).
 async fn servedHalfClosed(input: borrow Vector<u8>, closeAfterMs: u64, goneAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedAs(input, closeAfterMs, 0, true, goneAfterMs);
+    await servedAs(input, closeAfterMs, 0, true, goneAfterMs, false);
+
+/// `served`, with the server's `Date` on.
+async fn servedDated(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
+    await servedAs(input, closeAfterMs, 0, false, 0, true);
 
 async fn servedAs(
     input: borrow Vector<u8>,
@@ -198,6 +206,7 @@ async fn servedAs(
     drainAfterMs: u64,
     halfClosed: bool,
     goneAfterMs: u64,
+    sendDate: bool,
 ) -> Result<Vector<u8>, TestFailure> {
     var copy = Vector<u8>.create();
     for (b in input.view()) {
@@ -228,12 +237,46 @@ async fn servedAs(
     };
     let context = ConnectionContext.create(1, Timer.now(), drain);
     var limits = Limits.defaults();
-    limits.sendDate = false;
+    limits.sendDate = sendDate;
     match (await serveH2(mut client, context, app, limits, "".bytes())) {
         Ok() => {}
         Err(_) => { return Err(TestFailure.create("serveH2 failed")); }
     }
     return Ok(client.output);
+}
+
+/// The values of every `date` field in the response heads in `out`, each followed by `;`.
+fn dates(out: borrow Vector<u8>) -> Result<Vector<u8>, TestFailure> {
+    var log = Vector<u8>.create();
+    var decoder = match (HpackDecoder.create(4096, 65536)) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a decoder")); },
+    };
+    let all = out.view();
+    var at: usize = 0;
+    while (at + 9 <= all.length) {
+        let h = match (Frames.parseHeader(all[at..])) {
+            Some(h) => h,
+            null => { return Err(TestFailure.create("a frame")); },
+        };
+        if (h.kind == FrameTypes.headers()) {
+            var fields = HeaderBlock.create();
+            match (decoder.decode(all[at + 9..at + 9 + h.length as usize], mut fields)) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("a response head")); }
+            }
+            for (i in 0..fields.count()) {
+                if (Ascii.equals(fields.name(i), "date")) {
+                    for (b in fields.value(i)) {
+                        grew(log.push(b))?;
+                    }
+                    append(mut log, ";")?;
+                }
+            }
+        }
+        at += 9 + h.length as usize;
+    }
+    return Ok(log);
 }
 
 /// The frames in `out`, one item each: `TYPE STREAM [fFLAGS]`, then for HEADERS `:status` and for DATA its bytes.
@@ -413,4 +456,21 @@ fn listedOk(r: Result<void, AllocError>) -> Result<void, HandlerError> {
         Ok() => { return Ok(); }
         Err(_) => { return Err(HandlerError.Internal); }
     }
+}
+
+/// RFC 9110 §6.6.1: a response has one `Date`. A handler that sets its own (a proxy relaying its origin's) keeps it,
+/// and the server adds none; without one, the server's is there (29 bytes, IMF-fixdate).
+@test
+async fn a_handler_date_is_the_only_date() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let dated = getBlock("/dated")?;
+    let plain = getBlock("/hello")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, dated.view())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 3, plain.view())?;
+    let out = await servedDated(bytes, 300)?;
+    let found = dates(out)?;
+    let v = found.view();
+    Check.isTrue(startsWith(v, "Sun, 06 Nov 1994 08:49:37 GMT;"), "the handler's date, first")?;
+    return Check.equalU64(30 + 30, v.length as u64); // two heads, one date each
 }

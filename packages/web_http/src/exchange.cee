@@ -585,7 +585,8 @@ public struct Exchange<region r> {
     }
 
     /// A stream's response head (RFC 9113 §8.3.2): `:status`, the handler's fields with their names in lower case
-    /// (§8.2.1), `content-length` when `length` is known and the status allows content, and `date`. The application's
+    /// (§8.2.1), `content-length` when `length` is known and the status allows content, and `date` unless the handler set
+    /// one. The application's
     /// hook runs first when `hooks`.
     async fn streamHead(borrow mut this, length: u64?, end: bool, hooks: bool) -> Result<void, HandlerError> {
         if (hooks) {
@@ -635,10 +636,13 @@ public struct Exchange<region r> {
             }
             null => {}
         }
-        this.date.refresh();
-        match (this.date.bytes()) {
-            Some(d) => { grown(fields.push("date".bytes(), d, false))?; }
-            null => {}
+        // One `Date` (RFC 9110 §6.6.1): the handler's when it set one (a proxy relays its origin's), else ours.
+        if (!this.response.has("date")) {
+            this.date.refresh();
+            match (this.date.bytes()) {
+                Some(d) => { grown(fields.push("date".bytes(), d, false))?; }
+                null => {}
+            }
         }
         this.sent = true;
         return await this.stream.sendHead(fields, end);
