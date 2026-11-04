@@ -1,0 +1,303 @@
+// The relay (Web ADR 0012 §3.5, §3.7), mounted on a route (§3): a client's request served on a mock connection, the
+// upstream a scripted mock behind a fixed resolver. Expected values: RFC 9110 §7.6.1 (hop-by-hop fields, and those
+// `Connection` names, are not forwarded, either way), RFC 9112 §6.3 (a response shorter than its Content-Length is
+// incomplete: the proxy must not present it as complete), RFC 9110 §15.6.3 (502 for an invalid upstream answer), and
+// §3.4's rule that forwarding fields from an untrusted peer are replaced.
+import web_core;
+import web_transport;
+import web_http;
+import web_client;
+import web_server;
+
+struct St {}
+
+struct FixedResolver {}
+
+impl Resolver for FixedResolver {
+    async fn resolve(borrow this, host: StringView, port: u16) -> Result<Vector<SocketAddress>, NetError> {
+        var v = Vector<SocketAddress>.create();
+        match (v.push(SocketAddress.V4([10u8, 0, 0, 9], port))) {
+            Ok() => { return Ok(v); }
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+}
+
+/// Dials the scripted upstream connections in order; none left is `Closed`.
+struct ScriptDialer {
+    scripts: Channel<MockTransport>;
+}
+
+struct ScriptJob {
+    scripts: Channel<MockTransport>;
+}
+
+impl DialJob for ScriptJob {
+    async fn dial(borrow mut this) -> Result<PlainStream, NetError> {
+        match (this.scripts.tryRecv()) {
+            Some(m) => { return Ok(PlainStream.mock(m)); }
+            null => { return Err(NetError.Closed); }
+        }
+    }
+}
+
+impl Dialer for ScriptDialer {
+    @effects(alloc)
+    fn job(borrow this, address: SocketAddress) -> Result<Box<dyn DialJob>, NetError> {
+        match (Box.create(ScriptJob { scripts: this.scripts.clone() })) {
+            Ok(b) => {
+                let d: Box<dyn DialJob> = b;
+                return Ok(d);
+            }
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+}
+
+fn mock(text: StringView) -> Result<MockTransport, TestFailure> {
+    match (MockTransport.create(text.bytes())) {
+        Ok(m) => { return Ok(m); }
+        Err(_) => { return Err(TestFailure.create("a mock")); }
+    }
+}
+
+fn channel<T: Send>(n: usize) -> Result<Channel<T>, TestFailure> {
+    match (Channel<T>.create(n)) {
+        Ok(c) => { return Ok(c); }
+        Err(_) => { return Err(TestFailure.create("a channel")); }
+    }
+}
+
+fn queued(scripts: borrow Channel<MockTransport>, m: MockTransport) -> Result<void, TestFailure> {
+    match (scripts.trySend(m)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TestFailure.create("the queue is full")); }
+    }
+}
+
+/// A proxy to `backends` backends, all dialing `scripts`, mounted on every path for GET and POST.
+fn proxyServer(scripts: borrow Channel<MockTransport>, backends: u32) -> Result<Server<St>, TestFailure> {
+    var options = ProxyOptions.defaults();
+    options.policy = Policy.RoundRobin;
+    var builder = ProxyBuilder.create(options);
+    for (i in 0..backends) {
+        let url = if (i == 0) "http://a.test:8080/" else "http://b.test:8081/";
+        match (builder.backend(url, 1)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("a backend")); }
+        }
+    }
+    let resolver: Box<dyn Resolver + Send> = boxed(Box.create(FixedResolver {}))?;
+    let dialer: Box<dyn Dialer + Send> = boxed(Box.create(ScriptDialer { scripts: scripts.clone() }))?;
+    let proxy = match (builder.buildWithNetwork(null, resolver, dialer)) {
+        Ok(p) => p,
+        Err(_) => { return Err(TestFailure.create("the proxy")); },
+    };
+    var limits = Limits.defaults();
+    limits.sendDate = false;
+    var server = match (Server<St>.create(St {}, limits)) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("a server")); },
+    };
+    for (k in 0..2u32) {
+        let route: Box<dyn Handler<St> + Send> = boxed(Box.create(proxy.route<St>()))?;
+        let method = if (k == 0) Method.Get else Method.Post;
+        match (server.router().add(method, "/*rest", route)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("a route")); }
+        }
+    }
+    return Ok(server);
+}
+
+fn boxed<T>(r: Result<Box<T>, AllocError>) -> Result<Box<T>, TestFailure> {
+    match (r) {
+        Ok(b) => { return Ok(b); }
+        Err(_) => { return Err(TestFailure.create("a box")); }
+    }
+}
+
+/// Serves `text` from the client at 198.51.100.7 on one connection; what the proxy wrote back.
+async fn served(server: borrow Server<St>, text: StringView) -> Result<Vector<u8>, TestFailure> {
+    let peer = SocketAddress.V4([198u8, 51, 100, 7], 40000);
+    var conn = mock(text)?.withAddresses(Some(peer), null);
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain).withAddresses(Some(peer), null);
+    let ended = await server.serve(mut conn, ctx); // an aborted response ends the connection with an error
+    var out = Vector<u8>.create();
+    for (b in conn.written()) {
+        match (out.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("out of memory")); }
+        }
+    }
+    return Ok(out);
+}
+
+fn drained(copies: borrow Channel<u8>) -> Result<Vector<u8>, TestFailure> {
+    var v = Vector<u8>.create();
+    loop {
+        match (copies.tryRecv()) {
+            Some(b) => {
+                match (v.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(TestFailure.create("out of memory")); }
+                }
+            }
+            null => { return Ok(v); }
+        }
+    }
+}
+
+/// Whether `text` occurs in `bytes`, ignoring ASCII case.
+fn has(bytes: Slice<u8>, text: StringView) -> bool {
+    let t = text.bytes();
+    if (t.length > bytes.length) {
+        return false;
+    }
+    for (i in 0..bytes.length - t.length + 1) {
+        if (Ascii.sameIgnoringCase(bytes[i..i + t.length], t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn startsWith(bytes: Slice<u8>, text: StringView) -> bool {
+    let t = text.bytes();
+    return bytes.length >= t.length && Ascii.sameIgnoringCase(bytes[0..t.length], t);
+}
+
+/// RFC 9110 §7.6.1 both ways, and §3.4: a GET goes upstream with its target, without hop-by-hop fields, those its
+/// `Connection` names, or the client's own forwarding fields, and with forwarding fields naming the client; the answer
+/// comes back without the upstream's hop-by-hop fields.
+@test
+async fn a_get_is_forwarded_without_hop_by_hop_fields() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    let copies = channel<u8>(65536)?;
+    let upstream = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: x-drop\r\nx-drop: 1\r\nkeep-alive: timeout=5\r\nx-up: u\r\n\r\nhello";
+    queued(scripts, mock(upstream)?.withCopiesTo(copies))?;
+    let server = proxyServer(scripts, 1)?;
+    let out = await served(server, "GET /a/b?c=1 HTTP/1.1\r\nhost: example.com\r\nconnection: close, x-secret\r\nx-secret: s\r\nte: trailers\r\nx-forwarded-for: 1.2.3.4\r\nx-keep: k\r\n\r\n")?;
+    let sent = drained(copies)?;
+    Check.isTrue(startsWith(sent.view(), "GET /a/b?c=1 HTTP/1.1\r\n"), "the method and target")?;
+    Check.isTrue(has(sent.view(), "\r\nx-keep: k\r\n"), "an end-to-end field is forwarded")?;
+    Check.isFalse(has(sent.view(), "x-secret"), "a field Connection names is not")?;
+    Check.isFalse(has(sent.view(), "te: trailers"), "TE is hop-by-hop")?;
+    Check.isFalse(has(sent.view(), "1.2.3.4"), "an untrusted X-Forwarded-For is replaced")?;
+    Check.isTrue(has(sent.view(), "\r\nx-forwarded-for: 198.51.100.7\r\n"), "X-Forwarded-For names the client")?;
+    Check.isTrue(has(sent.view(), "\r\nforwarded: for=198.51.100.7;proto=http;host=example.com\r\n"), "Forwarded (RFC 7239)")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 200 OK\r\n"), "the status")?;
+    Check.isTrue(has(out.view(), "\r\nx-up: u\r\n"), "the upstream's end-to-end field")?;
+    Check.isFalse(has(out.view(), "x-drop"), "a field the upstream's Connection names is not relayed")?;
+    Check.isFalse(has(out.view(), "keep-alive"), "Keep-Alive is hop-by-hop")?;
+    Check.isTrue(has(out.view(), "\r\ncontent-length: 5\r\n"), "the length")?;
+    let tail = "\r\n\r\nhello";
+    return Check.isTrue(has(out.view(), tail), "the body");
+}
+
+/// A request body streams to the upstream (U20, CeeSafe ADR 0064 §3.2): every byte, framed by its length.
+@test
+async fn a_post_body_goes_upstream() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    let copies = channel<u8>(65536)?;
+    queued(scripts, mock("HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\nok")?.withCopiesTo(copies))?;
+    let server = proxyServer(scripts, 1)?;
+    let out = await served(server, "POST /up HTTP/1.1\r\nhost: example.com\r\ncontent-length: 11\r\nconnection: close\r\n\r\nhello world")?;
+    let sent = drained(copies)?;
+    Check.isTrue(startsWith(sent.view(), "POST /up HTTP/1.1\r\n"), "the method and target")?;
+    Check.isTrue(has(sent.view(), "\r\ncontent-length: 11\r\n"), "the body's length")?;
+    Check.isTrue(has(sent.view(), "\r\n\r\nhello world"), "the body")?;
+    return Check.isTrue(startsWith(out.view(), "HTTP/1.1 201 Created\r\n"), "the upstream's status");
+}
+
+/// §3.7: an upstream that closes before its answer is a 502 for a POST, which is not sent again.
+@test
+async fn an_upstream_failure_before_the_head_is_502() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    queued(scripts, mock("")?)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")?)?;
+    let server = proxyServer(scripts, 2)?;
+    let out = await served(server, "POST /x HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\nconnection: close\r\n\r\nz")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 502 "), "502, not a retry of a POST")?;
+    match (scripts.tryRecv()) {
+        Some(_) => { return Ok(); }
+        null => { return Check.fail("the second backend was dialed"); }
+    }
+}
+
+/// §3.7: a GET that fails before the head is sent again, to the other backend.
+@test
+async fn a_get_is_retried_on_the_other_backend() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    queued(scripts, mock("")?)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nsecond")?)?;
+    let server = proxyServer(scripts, 2)?;
+    let out = await served(server, "GET /x HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 200 OK\r\n"), "answered by the second")?;
+    return Check.isTrue(has(out.view(), "\r\n\r\nsecond"), "its body");
+}
+
+/// §3.7: an upstream that ends its body short before anything reached the client is a 502, not a truncated 200
+/// (the four bytes were still in the exchange's buffer); the connection goes on.
+@test
+async fn a_short_upstream_body_before_the_head_is_502() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nfour")?)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nnext")?)?;
+    let server = proxyServer(scripts, 1)?;
+    let out = await served(server, "GET /x HTTP/1.1\r\nhost: example.com\r\n\r\nGET /y HTTP/1.1\r\nhost: example.com\r\n\r\n")?;
+    let expected = "HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nnext";
+    return Check.equalBytes(expected.bytes(), out.view());
+}
+
+/// RFC 9112 §6.3, §3.7: once the head has gone out, an upstream that ends its body short is not relayed as complete.
+/// The bytes that came go out, then the client's connection ends short of the stated length (curl's error 18), and a
+/// request behind it on the connection is not answered.
+@test
+async fn a_short_upstream_body_after_the_head_ends_the_connection() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    var upstream = Vector<u8>.create();
+    let head = "HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n";
+    for (b in head.bytes()) {
+        alloc(upstream.push(b))?;
+    }
+    for (k in 0..40000u32) {
+        alloc(upstream.push(97))?;
+    }
+    match (MockTransport.create(upstream.view())) {
+        Ok(m) => { queued(scripts, m)?; }
+        Err(_) => { return Check.fail("a mock"); }
+    }
+    let server = proxyServer(scripts, 1)?;
+    let out = await served(server, "GET /x HTTP/1.1\r\nhost: example.com\r\n\r\nGET /y HTTP/1.1\r\nhost: example.com\r\n\r\n")?;
+    let view = out.view();
+    Check.isTrue(startsWith(view, "HTTP/1.1 200 OK\r\n"), "the head was relayed")?;
+    Check.isTrue(has(view, "\r\ncontent-length: 100000\r\n"), "with the upstream's length")?;
+    var end: usize = 0;
+    for (i in 0..view.length - 3) {
+        if (view[i] == 13 && view[i + 1] == 10 && view[i + 2] == 13 && view[i + 3] == 10) {
+            end = i + 4;
+            break;
+        }
+    }
+    Check.isTrue(end > 0, "the end of the head")?;
+    let body = view[end..];
+    Check.isTrue(body.length > 0 && body.length <= 40000, "part of the body, at most what came")?;
+    for (b in body) {
+        if (b != 97) {
+            return Check.fail("only the upstream's bytes: no second response");
+        }
+    }
+    return Ok();
+}
+
+fn alloc(r: Result<void, AllocError>) -> Result<void, TestFailure> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}

@@ -1,0 +1,955 @@
+// The reverse proxy (Web ADR 0012 §3.1, §3.5, §3.7, §3.8): an application that sends each request to a backend of
+// its upstream and relays the answer. The request's hop-by-hop fields stay behind and the forwarding fields are added;
+// the body streams up, the response streams down with its trailers; a request is retried on another backend only
+// before any answer and within a budget; failures become 502, 503 or 504 before the head, and an aborted response
+// after it. An upgrade becomes a tunnel. `run` drives the client's HTTP/2 connections and the active health checks.
+import web_core;
+import web_transport;
+import web_http;
+import web_client;
+import web_server;
+
+/// What a consistent hash is computed over (Web ADR 0012 §3.2).
+public enum HashOn {
+    /// The client's address (§3.4).
+    ClientAddress,
+    /// A request field (its first value; empty if absent).
+    Field(Vector<u8>),
+}
+
+/// How the proxy treats requests (Web ADR 0012 §3.4-§3.8).
+public struct ProxyOptions {
+    /// The proxies whose forwarding fields are believed.
+    public trusted: TrustedProxies;
+    public source: ForwardedSource;
+    /// Send `Forwarded`, and `X-Forwarded-For`, `-Proto` and `-Host`.
+    public forwarded: bool;
+    public xForwarded: bool;
+    /// The scheme clients reach this proxy with (`X-Forwarded-Proto`, `Forwarded: proto=`): "http" or "https".
+    public scheme: Vector<u8>;
+    /// Keep the client's `Host` (true), or send the backend's.
+    public keepHost: bool;
+    public policy: Policy;
+    public hashOn: HashOn;
+    public health: HealthOptions;
+    /// Active checks: `GET checkPath` every `checkIntervalMs` within `checkTimeoutMs`; an empty path turns them off.
+    public checkPath: Vector<u8>;
+    public checkIntervalMs: u64;
+    public checkTimeoutMs: u64;
+    /// Retries: at most `retryPercent` of requests plus `retryMinimum`, each to another backend, and only while the
+    /// body read so far fits in `retryBufferBytes` (kept to send again).
+    public retryPercent: u32;
+    public retryMinimum: u32;
+    public retryBufferBytes: usize;
+    public maxAttempts: u32;
+    /// A tunnel with no bytes either way for this long is closed.
+    public tunnelIdleMs: u64;
+    /// The upstream client's timeouts and limits (its redirects and its own retries are always off).
+    public client: ClientOptions;
+
+    /// No trusted proxies; both forwarding families; scheme "http"; the client's Host kept; round robin; passive health
+    /// and no active checks; 20 % retries plus 3, a 64 KiB replay buffer, 2 attempts; tunnels idle out after 5 min.
+    public fn defaults() -> ProxyOptions => ProxyOptions {
+        trusted: TrustedProxies.none(),
+        source: ForwardedSource.ForwardedFirst,
+        forwarded: true,
+        xForwarded: true,
+        scheme: textOf("http"),
+        keepHost: true,
+        policy: Policy.RoundRobin,
+        hashOn: HashOn.ClientAddress,
+        health: HealthOptions.defaults(),
+        checkPath: Vector<u8>.create(),
+        checkIntervalMs: 5000,
+        checkTimeoutMs: 2000,
+        retryPercent: 20,
+        retryMinimum: 3,
+        retryBufferBytes: 65536,
+        maxAttempts: 2,
+        tunnelIdleMs: 300000,
+        client: ClientOptions.defaults(),
+    };
+}
+
+fn textOf(t: StringView) -> Vector<u8> {
+    var v = Vector<u8>.create();
+    for (b in t.bytes()) {
+        let pushed = v.push(b);
+    }
+    return v;
+}
+
+/// Why a proxy could not be built.
+public enum ProxySetupError {
+    /// A backend URL that is not an absolute http or https URL with no path, query or fragment.
+    BadBackend,
+    NoBackends,
+    OutOfMemory,
+}
+
+/// What the request handlers and `run` share.
+struct ProxyCore {
+    client: Client;
+    balancer: AsyncMutex<Balancer>;
+    /// Each backend's base (`http://host:port`), by the balancer's index.
+    bases: Vector<Vector<u8>>;
+    options: ProxyOptions;
+    requests: AtomicU64;
+    retries: AtomicU64;
+}
+
+/// Collects an upstream's backends, then builds the proxy.
+public struct ProxyBuilder {
+    private options: ProxyOptions;
+    private bases: Vector<Vector<u8>>;
+    private weights: Vector<u32>;
+
+    /// A proxy with `options` and, so far, no backend.
+    public fn create(options: ProxyOptions) -> ProxyBuilder =>
+        ProxyBuilder { options: options, bases: Vector<Vector<u8>>.create(), weights: Vector<u32>.create() };
+
+    /// Adds the backend at `url` (`http://10.0.0.1:8080`: scheme, host and port only) with `weight`.
+    public fn backend(borrow mut this, url: StringView, weight: u32) -> Result<void, ProxySetupError> {
+        let parsed = match (Url.parse(url.bytes())) {
+            Ok(u) => u,
+            Err(_) => { return Err(ProxySetupError.BadBackend); },
+        };
+        let target = parsed.target();
+        if (target.length != 1 || target[0] != 47) {
+            return Err(ProxySetupError.BadBackend);
+        }
+        var base = Vector<u8>.create();
+        let scheme = if (parsed.isSecure()) "https://" else "http://";
+        setup(appendTo(mut base, scheme.bytes()))?;
+        var authority = Vector<u8>.create();
+        match (parsed.authority(mut authority)) {
+            Ok() => {}
+            Err(_) => { return Err(ProxySetupError.BadBackend); }
+        }
+        setup(appendTo(mut base, authority.view()))?;
+        match (this.bases.push(base)) {
+            Ok() => {}
+            Err(_) => { return Err(ProxySetupError.OutOfMemory); }
+        }
+        match (this.weights.push(weight)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(ProxySetupError.OutOfMemory); }
+        }
+    }
+
+    /// The proxy, its client making https connections with `tls` (null: http backends only).
+    public fn build(this, tls: Box<dyn Connector + Send>?) -> Result<ReverseProxy, ProxySetupError> {
+        let client = match (Client.create(this.clientOptions(), tls)) {
+            Ok(c) => c,
+            Err(_) => { return Err(ProxySetupError.OutOfMemory); },
+        };
+        return this.finish(client);
+    }
+
+    /// The same, its client resolving with `resolver` and dialing with `dialer` (tests: mocks; see
+    /// `Client.withNetwork`).
+    public fn buildWithNetwork(
+        this,
+        tls: Box<dyn Connector + Send>?,
+        resolver: Box<dyn Resolver + Send>,
+        dialer: Box<dyn Dialer + Send>,
+    ) -> Result<ReverseProxy, ProxySetupError> {
+        let client = match (Client.withNetwork(this.clientOptions(), tls, resolver, dialer)) {
+            Ok(c) => c,
+            Err(_) => { return Err(ProxySetupError.OutOfMemory); },
+        };
+        return this.finish(client);
+    }
+
+    /// The upstream client's options: no redirects followed and no retries of its own (the proxy retries, §3.3).
+    fn clientOptions(borrow this) -> ClientOptions {
+        var o = this.options.client;
+        o.maxRedirects = 0;
+        o.retry = RetryPolicy.never();
+        return o;
+    }
+
+    fn finish(this, client: Client) -> Result<ReverseProxy, ProxySetupError> {
+        var b = this;
+        if (b.bases.length == 0) {
+            return Err(ProxySetupError.NoBackends);
+        }
+        var key = [0u8; 16];
+        var seed = [0u8; 8];
+        match (Random.fill(mut key[..])) {
+            Ok() => {}
+            Err(_) => { return Err(ProxySetupError.OutOfMemory); }
+        }
+        match (Random.fill(mut seed[..])) {
+            Ok() => {}
+            Err(_) => { return Err(ProxySetupError.OutOfMemory); }
+        }
+        var s: u64 = 0;
+        for (k in 0..8usize) {
+            s = (s << 8) | seed[k] as u64;
+        }
+        var balancer = Balancer.create(b.options.policy, b.options.health, key, s);
+        for (i in 0..b.bases.length) {
+            match (balancer.add(b.bases[i].view(), b.weights[i])) {
+                Ok(_) => {}
+                Err(_) => { return Err(ProxySetupError.OutOfMemory); }
+            }
+        }
+        let locked = match (AsyncMutex<Balancer>.create(balancer)) {
+            Ok(m) => m,
+            Err(_) => { return Err(ProxySetupError.OutOfMemory); },
+        };
+        let core = ProxyCore {
+            client: client,
+            balancer: locked,
+            bases: b.bases,
+            options: b.options,
+            requests: AtomicU64.create(0),
+            retries: AtomicU64.create(0),
+        };
+        match (Arc<ProxyCore>.create(core)) {
+            Ok(a) => { return Ok(ReverseProxy { core: a }); }
+            Err(_) => { return Err(ProxySetupError.OutOfMemory); }
+        }
+    }
+}
+
+fn setup(r: Result<void, AllocError>) -> Result<void, ProxySetupError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(ProxySetupError.OutOfMemory); }
+    }
+}
+
+/// A reverse proxy to one upstream. Serve requests with `handler()` (as a server's application or on a route), and
+/// run `run` beside the server (Web ADR 0012 §3.1).
+public struct ReverseProxy {
+    private core: Arc<ProxyCore>;
+
+    /// This proxy as a server's whole application.
+    public fn handler(borrow this) -> ProxyHandler => ProxyHandler { core: this.core.clone() };
+
+    /// The proxy as a route's handler, for a `Router<S>` of any state.
+    public fn route<S: Send>(borrow this) -> ProxyRoute<S> => ProxyRoute<S> { core: this.core.clone() };
+
+    /// Drives the upstream client's HTTP/2 connections and, if configured, the active health checks, until `drain`
+    /// starts.
+    public async fn run(borrow this, drain: borrow Drain) -> Result<void, NetError> {
+        let core = this.core.get();
+        await Async.scope(NetError.OutOfMemory, (s) => {
+            s.spawn(async () => await core.client.run(drain));
+            s.spawn(async () => await monitor(core, drain));
+        })?;
+        return Ok();
+    }
+}
+
+/// The active checks: `GET checkPath` on every backend each interval (Web ADR 0012 §3.3).
+async fn monitor(core: borrow ProxyCore, drain: borrow Drain) -> Result<void, NetError> {
+    if (core.options.checkPath.length == 0) {
+        return Ok();
+    }
+    while (!drain.isDraining()) {
+        for (i in 0..core.bases.length) {
+            var url = Vector<u8>.create();
+            grownNet(appendTo(mut url, core.bases[i].view()))?;
+            grownNet(appendTo(mut url, core.options.checkPath.view()))?;
+            let text = match (StringView.fromUtf8(url.view())) {
+                Some(t) => t,
+                null => { continue; },
+            };
+            let r: Result<u16, NetError> = await Async.deadline(
+                Deadline.after(core.options.checkTimeoutMs).instant(),
+                NetError.TimedOut, async () => {
+                    match (await core.client.get(text)) {
+                        Ok(response) => {
+                            var done = response;
+                            let status = done.status();
+                            let finished = await done.finish(core.client);
+                            return Ok(status);
+                        }
+                        Err(_) => { return Err(NetError.Closed); }
+                    }
+                },
+            );
+            let good = match (r) {
+                Ok(status) => status >= 200 && status < 400,
+                Err(NetError.Cancelled) => { return Ok(); },
+                Err(_) => false,
+            };
+            var guard = match (await core.balancer.lock()) {
+                Ok(g) => g,
+                Err(e) => { return Err(NetErrors.fromAsync(e)); },
+            };
+            guard.data().checked(i, good);
+        }
+        let slept: Result<Raced<bool>, NetError> = await Async.race(
+            async () => {
+                match (await Timer.sleep(core.options.checkIntervalMs)) {
+                    Ok() => { return Ok(true); }
+                    Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                }
+            },
+            async () => {
+                await drain.wait()?;
+                return Ok(false);
+            },
+        );
+        let woke = slept?;
+    }
+    return Ok();
+}
+
+/// Serves requests for a `ReverseProxy`.
+public struct ProxyHandler {
+    private core: Arc<ProxyCore>;
+}
+
+impl Application for ProxyHandler {
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> => await proxied(this.core.get(), request, exchange, connection);
+
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// A `ReverseProxy` on one route of a `Router<S>` (Web ADR 0012 §3: a route or the whole server can be a proxy). The
+/// proxy reads none of the application's state; `S` only names the router it is mounted on.
+public struct ProxyRoute<S> {
+    private core: Arc<ProxyCore>;
+}
+
+impl<S: Send> Handler<S> for ProxyRoute<S> {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> => await proxied(this.core.get(), request, exchange, ctx.connection());
+}
+
+/// Whether `name` is a hop-by-hop field (RFC 9110 §7.6.1), or one the proxy writes itself.
+fn hopByHop(name: Slice<u8>) -> bool =>
+    Ascii.equalsIgnoringCase(name, "connection") || Ascii.equalsIgnoringCase(name, "proxy-connection") ||
+        Ascii.equalsIgnoringCase(name, "keep-alive") || Ascii.equalsIgnoringCase(name, "te") ||
+        Ascii.equalsIgnoringCase(name, "transfer-encoding") || Ascii.equalsIgnoringCase(name, "upgrade") ||
+        Ascii.equalsIgnoringCase(name, "trailer") || Ascii.equalsIgnoringCase(name, "proxy-authenticate") ||
+        Ascii.equalsIgnoringCase(name, "proxy-authorization");
+
+/// Whether `name` is listed in any `Connection` field among `values` (RFC 9110 §7.6.1: those are hop-by-hop too).
+fn namedByConnection(name: Slice<u8>, connection: Slice<u8>) -> bool {
+    var start: usize = 0;
+    for (k in 0..connection.length + 1) {
+        if (k < connection.length && connection[k] != 44) {
+            continue;
+        }
+        let token = trimWhitespace(connection[start..k]);
+        if (token.length > 0 && Ascii.sameIgnoringCase(token, name)) {
+            return true;
+        }
+        start = k + 1;
+    }
+    return false;
+}
+
+/// Every `Connection` value of `headers`, joined with commas.
+fn connectionTokens(headers: borrow HeaderList) -> Result<Vector<u8>, HandlerError> {
+    var all = Vector<u8>.create();
+    for (i in 0..headers.count()) {
+        if (Ascii.equalsIgnoringCase(headers.nameBytes(i), "connection")) {
+            grown(all.push(44))?;
+            grown(appendTo(mut all, headers.value(i)))?;
+        }
+    }
+    return Ok(all);
+}
+
+/// The request body, read from the client as the upstream takes it. The bytes read so far are kept while they fit in
+/// `limit`, so a retry can send them again (`rewind`).
+struct ExchangeBody<region r> {
+    exchange: borrow mut(r) Exchange<r>;
+    kept: Vector<u8>;
+    at: usize;
+    limit: usize;
+    overflowed: bool;
+    known: u64?;
+    /// The client's failure (a 413, a slow body), answered as it is rather than as an upstream failure.
+    failure: HandlerError?;
+}
+
+impl<region r> BodySource for ExchangeBody<r> {
+    @effects()
+    fn length(borrow this) -> u64? => this.known;
+
+    async fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, NetError> {
+        if (this.at < this.kept.length) {
+            let ready = this.kept.view();
+            let n = if (into.length < ready.length - this.at) into.length else ready.length - this.at;
+            for (i in 0..n) {
+                into[i] = ready[this.at + i];
+            }
+            this.at += n;
+            return Ok(n);
+        }
+        let n = match (await this.exchange.read(into)) {
+            Ok(n) => n,
+            Err(e) => {
+                this.failure = Some(e);
+                return Err(NetError.Closed);
+            },
+        };
+        if (!this.overflowed) {
+            if (this.kept.length + n > this.limit) {
+                this.overflowed = true;
+                this.kept.clear();
+            } else {
+                for (i in 0..n) {
+                    match (this.kept.push(into[i])) {
+                        Ok() => {}
+                        Err(_) => {
+                            this.overflowed = true;
+                            this.kept.clear();
+                            break;
+                        }
+                    }
+                }
+                this.at = this.kept.length;
+            }
+        }
+        return Ok(n);
+    }
+
+    @effects()
+    fn rewind(borrow mut this) -> bool {
+        if (this.overflowed) {
+            return false;
+        }
+        this.at = 0;
+        return true;
+    }
+}
+
+/// One request through the proxy.
+async fn proxied(
+    core: borrow ProxyCore,
+    request: borrow Request,
+    exchange: borrow mut Exchange,
+    connection: borrow ConnectionContext,
+) -> Result<void, HandlerError> {
+    let headers = request.headers();
+    match (request.method()) {
+        Method.Extension => { return Err(HandlerError.Status(StatusCode.of(501)!)); }
+        _ => {}
+    }
+    let tokens = connectionTokens(headers)?;
+    let upgrade = upgradeOf(headers, tokens.view());
+    // The hash key, for a consistent hash.
+    var key = Vector<u8>.create();
+    match (borrow core.options.hashOn) {
+        HashOn.ClientAddress => {
+            match (grown2(clientOf(connection.peerAddress(), headers, core.options.trusted, core.options.source))?) {
+                ClientIs.Address(a) => { grown(ipText(a, mut key))?; }
+                _ => {}
+            }
+        }
+        HashOn.Field(name) => {
+            for (i in 0..headers.count()) {
+                if (Ascii.sameIgnoringCase(headers.nameBytes(i), name.view())) {
+                    grown(appendTo(mut key, headers.value(i)))?;
+                    break;
+                }
+            }
+        }
+    }
+    let n = core.requests.fetchAdd(1) + 1;
+    let known = exchange.remaining();
+    var body = ExchangeBody {
+        exchange: exchange,
+        kept: Vector<u8>.create(),
+        at: 0,
+        limit: core.options.retryBufferBytes,
+        overflowed: false,
+        known: known,
+        failure: null,
+    };
+    var avoid: usize? = null;
+    var attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let backend = match (await pick(core, key.view(), avoid)?) {
+            Some(i) => i,
+            null => { return Err(HandlerError.Status(StatusCode.of(503)!)); }, // no usable backend
+        };
+        let outgoing = upstreamRequest(core, backend, request, tokens.view(), connection, upgrade.length > 0)?;
+        if (upgrade.length > 0) {
+            return await tunnel(core, backend, outgoing, upgrade.view(), body.exchange);
+        }
+        match (await core.client.send(outgoing, mut body)) {
+            Ok(response) => {
+                var answer = response;
+                let outcome = if (answer.status() >= 500) Outcome.ServerError else Outcome.Answered;
+                let relayed = await relay(core, request, mut answer, body.exchange);
+                await finished(core, backend, match (relayed) {
+                    Ok() => outcome,
+                    Err(_) => Outcome.Failed,
+                });
+                return relayed;
+            }
+            Err(e) => {
+                await finished(core, backend, Outcome.Failed);
+                match (body.failure) {
+                    Some(f) => { return Err(f); } // the client's body failed, not the upstream
+                    null => {}
+                }
+                let again = attempts < core.options.maxAttempts && replayable(request) && body.rewind() &&
+                    withinBudget(core, n);
+                if (!again) {
+                    return Err(HandlerError.Status(statusFor(e)));
+                }
+                let counted = core.retries.fetchAdd(1);
+                avoid = Some(backend);
+            }
+        }
+    }
+}
+
+/// The backend for a request, counted as in flight.
+async fn pick(core: borrow ProxyCore, key: Slice<u8>, avoid: usize?) -> Result<usize?, HandlerError> {
+    var guard = match (await core.balancer.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Err(HandlerError.Internal); },
+    };
+    return Ok(guard.data().pick(key, Timer.now(), avoid));
+}
+
+async fn finished(core: borrow ProxyCore, backend: usize, outcome: Outcome) {
+    match (await core.balancer.lock()) {
+        Ok(g) => {
+            var guard = g;
+            guard.data().finished(backend, outcome, Timer.now());
+        }
+        Err(_) => {}
+    }
+}
+
+/// Whether a failed request may be sent again (Web ADR 0012 §3.7): an idempotent method (RFC 9110 §9.2.2), or an
+/// `Idempotency-Key`.
+fn replayable(request: borrow Request) -> bool {
+    let idempotent = match (request.method()) {
+        Method.Get => true,
+        Method.Head => true,
+        Method.Options => true,
+        Method.Trace => true,
+        Method.Put => true,
+        Method.Delete => true,
+        _ => false,
+    };
+    if (idempotent) {
+        return true;
+    }
+    let headers = request.headers();
+    for (i in 0..headers.count()) {
+        if (Ascii.equalsIgnoringCase(headers.nameBytes(i), "idempotency-key")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether one more retry fits the budget: `retryMinimum` plus `retryPercent` of the requests so far.
+fn withinBudget(core: borrow ProxyCore, requests: u64) -> bool =>
+    core.retries.load() < core.options.retryMinimum as u64 + requests * core.options.retryPercent as u64 / 100;
+
+/// The status for an upstream failure before its answer (Web ADR 0012 §3.7): a timeout (connecting, or waiting for the
+/// head) is 504; every other failure is 502.
+fn statusFor(e: ClientError) -> StatusCode => match (e) {
+    ClientError.Net(NetError.TimedOut) => StatusCode.of(504)!,
+    ClientError.Shutdown => StatusCode.of(503)!,
+    _ => StatusCode.of(502)!,
+};
+
+/// The protocol a request asks to switch to (`Upgrade`, with `upgrade` among its `Connection` tokens, HTTP/1.1
+/// only); empty if none.
+fn upgradeOf(headers: borrow HeaderList, connection: Slice<u8>) -> Vector<u8> {
+    var protocol = Vector<u8>.create();
+    if (!namedByConnection("upgrade".bytes(), connection)) {
+        return protocol;
+    }
+    for (i in 0..headers.count()) {
+        if (Ascii.equalsIgnoringCase(headers.nameBytes(i), "upgrade")) {
+            let copied = appendTo(mut protocol, headers.value(i));
+            return protocol;
+        }
+    }
+    return protocol;
+}
+
+/// The request to send to `backend` (Web ADR 0012 §3.5): the same method and target, the fields less the hop-by-hop
+/// ones and those `Connection` names, less the incoming forwarding fields, plus the forwarding fields; the client's
+/// `Host` as the authority when `keepHost`.
+fn upstreamRequest(
+    core: borrow ProxyCore,
+    backend: usize,
+    request: borrow Request,
+    connection: Slice<u8>,
+    conn: borrow ConnectionContext,
+    upgrading: bool,
+) -> Result<ClientRequest, HandlerError> {
+    var url = Vector<u8>.create();
+    grown(appendTo(mut url, core.bases[backend].view()))?;
+    let target = request.target();
+    grown(appendTo(mut url, target.bytes()))?;
+    let text = match (StringView.fromUtf8(url.view())) {
+        Some(t) => t,
+        null => { return Err(HandlerError.Status(Status.badRequest())); },
+    };
+    var out = match (ClientRequest.create(request.method(), text)) {
+        Ok(r) => r,
+        Err(_) => { return Err(HandlerError.Status(Status.badRequest())); },
+    };
+    let headers = request.headers();
+    var host = Vector<u8>.create();
+    for (i in 0..headers.count()) {
+        let name = headers.nameBytes(i);
+        if (Ascii.equalsIgnoringCase(name, "host")) {
+            host.clear();
+            grown(appendTo(mut host, headers.value(i)))?;
+            continue;
+        }
+        if (hopByHop(name) || namedByConnection(name, connection) || Ascii.equalsIgnoringCase(name, "content-length") ||
+            Ascii.equalsIgnoringCase(name, "forwarded") || Ascii.equalsIgnoringCase(name, "x-forwarded-for") ||
+            Ascii.equalsIgnoringCase(name, "x-forwarded-proto") || Ascii.equalsIgnoringCase(name, "x-forwarded-host")) {
+            continue;
+        }
+        let nameText = match (StringView.fromUtf8(name)) {
+            Some(t) => t,
+            null => { continue; },
+        };
+        match (out.header(nameText, headers.value(i))) {
+            Ok() => {}
+            Err(_) => { return Err(HandlerError.Status(Status.badRequest())); }
+        }
+    }
+    let scheme = match (StringView.fromUtf8(core.options.scheme.view())) {
+        Some(s) => s,
+        null => "http",
+    };
+    let fields = grown2(forwardingFields(
+        conn.peerAddress(), headers, core.options.trusted, scheme, host.view(),
+        core.options.forwarded, core.options.xForwarded,
+    ))?;
+    addField(mut out, "forwarded", fields.forwarded.view())?;
+    addField(mut out, "x-forwarded-for", fields.forwardedFor.view())?;
+    addField(mut out, "x-forwarded-proto", fields.forwardedProto.view())?;
+    addField(mut out, "x-forwarded-host", fields.forwardedHost.view())?;
+    if (core.options.keepHost && host.length > 0) {
+        match (out.setAuthority(host.view())) {
+            Ok() => {}
+            Err(_) => { return Err(HandlerError.Status(Status.badRequest())); }
+        }
+    }
+    return Ok(out);
+}
+
+fn addField(out: borrow mut ClientRequest, name: StringView, value: Slice<u8>) -> Result<void, HandlerError> {
+    if (value.length == 0) {
+        return Ok();
+    }
+    match (out.header(name, value)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+/// Relays the upstream's answer to the client (Web ADR 0012 §3.5, §3.7): its status and fields less the hop-by-hop
+/// ones, its body as it comes, then its trailers. A failure after the head is returned, so the driver aborts the
+/// response (HTTP/1.1 closes short of its end, HTTP/2 resets the stream): it is never presented as complete.
+async fn relay(
+    core: borrow ProxyCore,
+    request: borrow Request,
+    response: borrow mut ClientResponse,
+    exchange: borrow mut Exchange,
+) -> Result<void, HandlerError> {
+    let status = match (StatusCode.of(response.status())) {
+        Some(s) => s,
+        null => { return Err(HandlerError.Status(StatusCode.of(502)!)); },
+    };
+    exchange.setStatus(status);
+    var fields = HeaderBlock.create();
+    match (response.fields(mut fields)) {
+        Ok() => {}
+        Err(_) => { return Err(HandlerError.Status(StatusCode.of(502)!)); }
+    }
+    var connection = Vector<u8>.create();
+    for (i in 0..fields.count()) {
+        if (Ascii.equalsIgnoringCase(fields.name(i), "connection")) {
+            grown(connection.push(44))?;
+            grown(appendTo(mut connection, fields.value(i)))?;
+        }
+    }
+    var length: u64? = null;
+    for (i in 0..fields.count()) {
+        let name = fields.name(i);
+        if (Ascii.equalsIgnoringCase(name, "content-length")) {
+            length = Ascii.parseDecimal(fields.value(i));
+            continue;
+        }
+        if (hopByHop(name) || namedByConnection(name, connection.view())) {
+            continue;
+        }
+        let nameText = match (StringView.fromUtf8(name)) {
+            Some(t) => t,
+            null => { continue; },
+        };
+        exchange.header(nameText, fields.value(i))?;
+    }
+    let head = Methods.same(request.method(), Method.Head);
+    match (length) {
+        Some(n) => {
+            if (status.allowsContent()) {
+                exchange.setContentLength(n);
+            }
+        }
+        null => {}
+    }
+    var buffer = [0u8; 16384];
+    loop {
+        let n = match (await response.read(mut buffer[..])) {
+            Ok(n) => n,
+            Err(e) => {
+                if (!exchange.headSent()) {
+                    return Err(HandlerError.Status(statusFor(e)));
+                }
+                return Err(HandlerError.Io(NetError.Closed)); // after the head: abort, never a truncated success
+            },
+        };
+        if (n == 0) {
+            break;
+        }
+        if (!head) {
+            await exchange.write(buffer[0..n])?;
+        }
+    }
+    let trailers = response.trailers();
+    for (i in 0..trailers.count()) {
+        let nameText = match (StringView.fromUtf8(trailers.name(i))) {
+            Some(t) => t,
+            null => { continue; },
+        };
+        match (exchange.trailer(nameText, trailers.value(i))) {
+            Ok() => {}
+            Err(_) => {} // a field that cannot be a trailer here is left out
+        }
+    }
+    let given = await response.finish(core.client);
+    return Ok();
+}
+
+/// An upgrade (Web ADR 0012 §3.8): asked of the backend; on its 101 the client's connection switches too and bytes
+/// flow both ways until both sides end, or the tunnel idles out; any other answer is relayed as a response.
+async fn tunnel(
+    core: borrow ProxyCore,
+    backend: usize,
+    outgoing: ClientRequest,
+    protocol: Slice<u8>,
+    exchange: borrow mut Exchange,
+) -> Result<void, HandlerError> {
+    var none = NoBody {};
+    let answer = match (await core.client.upgrade(outgoing, protocol, mut none)) {
+        Ok(a) => a,
+        Err(e) => {
+            await finished(core, backend, Outcome.Failed);
+            return Err(HandlerError.Status(statusFor(e)));
+        },
+    };
+    var switched = match (answer) {
+        Upgraded.Switched(s) => s,
+        Upgraded.Answered(r) => {
+            await finished(core, backend, Outcome.Answered);
+            var response = r;
+            exchange.setStatus(StatusCode.of(response.status())!);
+            var body = Vector<u8>.create();
+            match (await response.readToEnd(mut body, 1048576)) {
+                Ok() => {}
+                Err(e) => { return Err(HandlerError.Status(statusFor(e))); }
+            }
+            return await exchange.send(StatusCode.of(response.status())!, body.view());
+        },
+    };
+    await finished(core, backend, Outcome.Answered);
+    var fields = HeaderBlock.create();
+    match (switched.fields(mut fields)) {
+        Ok() => {}
+        Err(_) => { return Err(HandlerError.Status(StatusCode.of(502)!)); }
+    }
+    for (i in 0..fields.count()) {
+        let name = fields.name(i);
+        if (hopByHop(name)) {
+            continue; // `connection` and `upgrade` are written by the switch itself
+        }
+        let nameText = match (StringView.fromUtf8(name)) {
+            Some(t) => t,
+            null => { continue; },
+        };
+        exchange.header(nameText, fields.value(i))?;
+    }
+    let protocolText = match (StringView.fromUtf8(protocol)) {
+        Some(t) => t,
+        null => { return Err(HandlerError.Status(Status.badRequest())); },
+    };
+    await exchange.switchProtocols(protocolText)?;
+    if (switched.early().length > 0) {
+        await exchange.writeRaw(switched.early())?;
+    }
+    return await pump(exchange, mut switched, core.options.tunnelIdleMs);
+}
+
+/// One side of a tunnel's wait.
+enum Moved {
+    FromClient(usize),
+    FromUpstream(usize),
+    Idle,
+}
+
+/// Bytes both ways in one task (Web ADR 0012 §3.8): race a read on each side, then write what came to the other.
+/// When a side ends, the other side's writing is shut down; the tunnel ends when both have, or after `idleMs` quiet.
+async fn pump(exchange: borrow mut Exchange, upstream: borrow mut Switched, idleMs: u64) -> Result<void, HandlerError> {
+    var fromClient = [0u8; 16384];
+    var fromUpstream = [0u8; 16384];
+    var clientDone = false;
+    var upstreamDone = false;
+    while (!clientDone || !upstreamDone) {
+        let moved = await wait(
+            exchange,
+            upstream,
+            mut fromClient[..],
+            mut fromUpstream[..],
+            clientDone,
+            upstreamDone,
+            idleMs,
+        )?;
+        for (k in 0..2u32) {
+            let m = if (k == 0) moved.value else match (moved.other) {
+                Some(o) => o,
+                null => { break; },
+            };
+            match (m) {
+                Moved.FromClient(0) => {
+                    clientDone = true;
+                    match (await upstream.transport().shutdownWrite()) {
+                        Ok() => {}
+                        Err(e) => { return Err(HandlerError.Io(e)); }
+                    }
+                }
+                Moved.FromClient(n) => {
+                    match (await upstream.transport().write(fromClient[0..n])) {
+                        Ok() => {}
+                        Err(e) => { return Err(HandlerError.Io(e)); }
+                    }
+                }
+                Moved.FromUpstream(0) => {
+                    upstreamDone = true;
+                    await exchange.shutdownRaw()?;
+                }
+                Moved.FromUpstream(n) => { await exchange.writeRaw(fromUpstream[0..n])?; }
+                Moved.Idle => { return Ok(); }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// One wait of a tunnel: bytes from the client, bytes from the upstream (sides that ended are not read), or quiet.
+async fn wait(
+    exchange: borrow mut Exchange,
+    upstream: borrow mut Switched,
+    fromClient: SliceMut<u8>,
+    fromUpstream: SliceMut<u8>,
+    clientDone: bool,
+    upstreamDone: bool,
+    idleMs: u64,
+) -> Result<Raced<Moved>, HandlerError> {
+    if (clientDone) {
+        return await Async.race(
+            async () => {
+                match (await upstream.transport().read(fromUpstream)) {
+                    Ok(n) => { return Ok(Moved.FromUpstream(n)); }
+                    Err(e) => { return Err(HandlerError.Io(e)); }
+                }
+            },
+            async () => await idle(idleMs),
+        );
+    }
+    if (upstreamDone) {
+        return await Async.race(
+            async () => {
+                let n = await exchange.readRaw(fromClient)?;
+                return Ok(Moved.FromClient(n));
+            },
+            async () => await idle(idleMs),
+        );
+    }
+    let both: Result<Raced<Moved>, HandlerError> = await Async.race(
+        async () => {
+            let n = await exchange.readRaw(fromClient)?;
+            return Ok(Moved.FromClient(n));
+        },
+        async () => {
+            let inner: Result<Raced<Moved>, HandlerError> = await Async.race(
+                async () => {
+                    match (await upstream.transport().read(fromUpstream)) {
+                        Ok(n) => { return Ok(Moved.FromUpstream(n)); }
+                        Err(e) => { return Err(HandlerError.Io(e)); }
+                    }
+                },
+                async () => await idle(idleMs),
+            );
+            let won = inner?;
+            return Ok(won.value);
+        },
+    );
+    return both;
+}
+
+async fn idle(ms: u64) -> Result<Moved, HandlerError> {
+    match (await Timer.sleep(ms)) {
+        Ok() => { return Ok(Moved.Idle); }
+        Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+    }
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, HandlerError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+fn grown2<T>(r: Result<T, AllocError>) -> Result<T, HandlerError> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+fn grownNet(r: Result<void, AllocError>) -> Result<void, NetError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}
+
+fn appendTo(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        out.push(b)?;
+    }
+    return Ok();
+}
