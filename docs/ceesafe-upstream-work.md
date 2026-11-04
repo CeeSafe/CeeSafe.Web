@@ -778,7 +778,7 @@ prints the area.
 app.get();` and then `let application: borrow dyn Application = sendable;`. That is two lines, not a workaround: no
 wrapper, no `unsafe`.
 
-## U20 — A type that holds loans cannot be a `borrow mut dyn I`   *(found 2026-11-04, M8, ceesafec 0.10.3; **blocks the reverse proxy's request bodies**)*
+## U20 — A type that holds loans cannot be a `borrow mut dyn I`   *(found 2026-11-04, M8, ceesafec 0.10.3; resolved in 0.11.0)*
 
 **Gap:** `web_client`'s `Client.send(request, body: borrow mut dyn BodySource)` takes the request body as a `dyn`.
 
@@ -792,12 +792,12 @@ wrapper, no `unsafe`.
 **Wanted:** CeeSafe ADR 0064 §3.2 (OD-10a): a scoped `T` behind a reference coerces to `borrow dyn I` and
 `borrow mut dyn I`, the `dyn` carrying the reference's loan.
 - Accepted 2026-11-03.
-- Implemented on CeeSafe's working tree 2026-11-04 (ADR 0064 §5.4), not yet released.
+- Implemented on CeeSafe's working tree 2026-11-04 (ADR 0064 §5.4); released in ceesafec 0.11.0 (tag `v0.11.0`, 2026-11-04).
 - ADR 0064 §1's generic methods would also give `send<B: BodySource>` as a second route.
 
-**Effect on CeeSafe.Web until then:** the proxy's relay (M8 stage 3) cannot stream a request body to the upstream.
-- It is not worked around: no copy into memory, no extra task feeding a channel.
-- It waits for the CeeSafe release that carries ADR 0064, and M8's toolchain minimum becomes that release.
+**Resolved in 0.11.0:** `web_proxy/src/proxy.cee` passes its `ExchangeBody` to `Client.send` unchanged and checks on
+0.11.0 (2026-11-04). It was never worked around in the meantime. M8's toolchain minimum is 0.11.0
+(`docs/toolchain.md`).
 
 ## B16 — Bug: a wake lost when a full kqueue change queue drains the wake pipe   *(found 2026-11-03, M7, ceesafec 0.10.1, macOS (kqueue); fixed in 0.10.2)*
 
