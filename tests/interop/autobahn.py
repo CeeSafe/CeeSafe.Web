@@ -9,14 +9,19 @@ when the extension is not offered) are listed apart; `--require-all` fails on th
 With --client, the fuzzingserver listens in the container on port 9001, published to this machine, and the client
 runs every case against ws://127.0.0.1:9001 (Autobahn's protocol: getCaseCount, runCase, updateReports).
 
-Build the example first (cd examples/ws_echo && ceesafec build; examples/ws_client for --client), then:
-    python3 tests/interop/autobahn.py [--client] [--reports DIR] [--cases 1.*,2.*] [--require-all]
+With --proxy, the fuzzingclient reaches ws_echo through examples/proxy (Web ADR 0012 §3.8, M8's gate): the proxy
+listens on 9001 and tunnels each upgrade to ws_echo on 9002.
+
+Build the example first (cd examples/ws_echo && ceesafec build; examples/ws_client for --client; examples/proxy for
+--proxy), then:
+    python3 tests/interop/autobahn.py [--client | --proxy] [--reports DIR] [--cases 1.*,2.*] [--require-all]
 """
 import argparse, collections, json, os, pathlib, socket, subprocess, sys, tempfile, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 ECHO = ROOT / "examples/ws_echo/out/ws_echo"
 CLIENT = ROOT / "examples/ws_client/out/ws_client"
+PROXY = ROOT / "examples/proxy/out/proxy"
 PORT = 9001
 GOOD = ("OK", "INFORMATIONAL")
 
@@ -27,6 +32,7 @@ def main():
     ap.add_argument("--cases", default="*")
     ap.add_argument("--require-all", action="store_true")
     ap.add_argument("--client", action="store_true", help="the fuzzingserver against examples/ws_client")
+    ap.add_argument("--proxy", action="store_true", help="the fuzzingclient against ws_echo through examples/proxy")
     args = ap.parse_args()
     reports = pathlib.Path(args.reports).resolve()
     reports.mkdir(parents=True, exist_ok=True)
@@ -81,17 +87,30 @@ def fuzzingclient(args, reports, config):
         "exclude-cases": [],
         "exclude-agent-cases": {},
     }, indent=2))
-    env = dict(os.environ, CW_PORT=str(PORT), CW_PING_MS="0")
+    echoPort = PORT + 1 if args.proxy else PORT
+    env = dict(os.environ, CW_PORT=str(echoPort), CW_PING_MS="0")
     server = subprocess.Popen([str(ECHO)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     ready = server.stdout.readline().decode().strip()
     if ready != "ws_echo: listening":
         server.kill()
         sys.exit(f"ws_echo did not start: {ready}")
+    proxy = None
+    if args.proxy:
+        penv = dict(os.environ, CW_PORT=str(PORT), CW_BACKENDS=f"http://127.0.0.1:{echoPort}")
+        proxy = subprocess.Popen([str(PROXY)], env=penv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        ready = proxy.stdout.readline().decode().strip()
+        if ready != "proxy: listening":
+            proxy.kill()
+            server.kill()
+            sys.exit(f"the proxy did not start: {ready}")
     try:
         run = subprocess.run(["docker", "run", "--rm", "-v", f"{config}:/config", "-v", f"{reports}:/reports",
                               "crossbario/autobahn-testsuite", "wstest", "-m", "fuzzingclient",
                               "-s", "/config/fuzzingclient.json"], capture_output=True, text=True)
     finally:
+        if proxy:
+            proxy.kill()
+            proxy.wait()
         server.kill()
         server.wait()
     if run.returncode != 0:

@@ -1,0 +1,12 @@
+[package]
+name = "proxy"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+web_core = { path = "../../packages/web_core" }
+web_transport = { path = "../../packages/web_transport" }
+web_http = { path = "../../packages/web_http" }
+web_client = { path = "../../packages/web_client" }
+web_server = { path = "../../packages/web_server" }
+web_proxy = { path = "../../packages/web_proxy" }
