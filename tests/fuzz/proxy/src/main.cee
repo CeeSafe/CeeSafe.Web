@@ -1,0 +1,1849 @@
+// A mutational fuzzer for the proxy's parsers (Web ADR 0012 §5, "a PROXY-protocol and `Forwarded` parser fuzzer"):
+// web_transport's PROXY protocol header and CIDR blocks, and web_proxy's `Forwarded` and `X-Forwarded-For` chains.
+// Built natively with ASan and UBSan; CEESAFE_ALLOC_REPORT=1 checks that nothing leaks.
+//
+//   CW_FUZZ_SECONDS (default 60), CW_FUZZ_SEED (default 1), CW_FUZZ_ONLY (default 0, every invariant; 1, 2, 3, 4
+//   (with 5) or 6 for one)
+//
+// The expected values come from the specifications, written here apart from the code under test: HAProxy's
+// proxy-protocol.txt (versions 1 and 2), RFC 7239 §4 and §6 (`Forwarded`), RFC 9110 §5.6.1.2 (empty list elements)
+// and §5.6.4 (quoted strings), RFC 4291 §2.2 and RFC 5952 (IPv6 text), RFC 4632 (prefixes), and Web ADR 0012 §3.4
+// (who the client is). Invariants:
+//  1. a valid header of either version, followed by other bytes, is read exactly to its end, whole or in pieces,
+//     and says what was written;
+//  2. any input, damaged at random, reads the same whole and in pieces, never past 107 bytes (v1) or
+//     `ProxyProtocol.maxV2Bytes` (v2); a header it accepts satisfies the specification's grammar and says what an
+//     independent decoding of its bytes says;
+//  3. a CIDR block parses back from its text, and contains an address exactly when their first prefix bits agree
+//     (an IPv4-mapped address counted as IPv4); `ipText` writes RFC 5952's form;
+//  4. a `Forwarded` or `X-Forwarded-For` chain written from random hops, with parameters, quoted strings, empty
+//     elements and several fields, parses to those hops, and `clientOf` names the client §3.4's rule names;
+//  5. the fields `forwardingFields` sends parse back to the chain extended by this hop, and its `host` to the host;
+//  6. whatever a client puts in the fields, a trusted proxy's hop appended after it decides who the client is: the
+//     client is that hop or, if the chain cannot be read, the trusted peer, never an address or a hidden hop the
+//     client wrote.
+// A broken invariant prints the input in hex and exits 1; a panic or a sanitizer report ends the run by itself.
+import web_core;
+import web_transport;
+import web_http;
+import web_proxy;
+
+/// xorshift64*.
+struct Rng {
+    s: u64;
+    fn next(borrow mut this) -> u64 {
+        this.s = this.s ^ (this.s >> 12);
+        this.s = this.s ^ (this.s << 25);
+        this.s = this.s ^ (this.s >> 27);
+        return this.s.wrappingMul(2685821657736338717);
+    }
+    fn below(borrow mut this, n: u64) -> u64 => if (n == 0) 0 else this.next() % n;
+}
+
+/// What the run saw, printed at the end, so a run that never reaches a path shows it.
+struct Stats {
+    v1: u64;
+    v2: u64;
+    damagedAccepted: u64;
+    damagedRefused: u64;
+    blocks: u64;
+    chains: u64;
+    clientsNamed: u64;
+    fallbacks: u64;
+}
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    var v: u64 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57) {
+            return otherwise;
+        }
+        v = v * 10 + (b - 48) as u64;
+    }
+    return v;
+}
+
+fn fail(what: StringView, input: Slice<u8>) {
+    Console.writeLine("fuzz_proxy: invariant broken:");
+    Console.writeLine(what);
+    var line = Vector<u8>.create();
+    let digits = "0123456789abcdef".bytes();
+    for (b in input) {
+        put(mut line, digits[(b >> 4) as usize]);
+        put(mut line, digits[(b & 15) as usize]);
+    }
+    match (StringView.fromUtf8(line.view())) {
+        Some(t) => { Console.writeLine(t); }
+        null => {}
+    }
+    Process.exit(1);
+}
+
+// ---- Bytes and text, written from the specifications ----
+
+fn put(out: borrow mut Vector<u8>, b: u8) {
+    match (out.push(b)) {
+        Ok() => {}
+        Err(_) => {
+            Console.writeLine("fuzz_proxy: out of memory");
+            Process.exit(2);
+        }
+    }
+}
+
+fn putAll(out: borrow mut Vector<u8>, bytes: Slice<u8>) {
+    for (b in bytes) {
+        put(out, b);
+    }
+}
+
+fn putText(out: borrow mut Vector<u8>, text: StringView) {
+    putAll(out, text.bytes());
+}
+
+fn putDecimal(out: borrow mut Vector<u8>, n: u64) {
+    if (n >= 10) {
+        putDecimal(out, n / 10);
+    }
+    put(out, 48 + truncate<u8>(n % 10));
+}
+
+fn hexDigit(n: u64, upper: bool) -> u8 {
+    let d = truncate<u8>(n & 15);
+    return if (d < 10) 48 + d else if (upper) 55 + d else 87 + d;
+}
+
+fn putHex(out: borrow mut Vector<u8>, n: u64, upper: bool) {
+    if (n >= 16) {
+        putHex(out, n / 16, upper);
+    }
+    put(out, hexDigit(n, upper));
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn startsWith(a: Slice<u8>, prefix: StringView) -> bool {
+    let p = prefix.bytes();
+    if (a.length < p.length) {
+        return false;
+    }
+    for (i in 0..p.length) {
+        if (a[i] != p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Dotted decimal (RFC 791's notation).
+fn v4Text(out: borrow mut Vector<u8>, a: [u8; 4]) {
+    for (k in 0..4usize) {
+        if (k > 0) {
+            put(out, 46);
+        }
+        putDecimal(out, a[k] as u64);
+    }
+}
+
+fn isMapped(a: [u8; 16]) -> bool {
+    for (k in 0..10usize) {
+        if (a[k] != 0) {
+            return false;
+        }
+    }
+    return a[10] == 255 && a[11] == 255;
+}
+
+fn groupOf(a: [u8; 16], k: usize) -> u64 => (a[2 * k] as u64) << 8 | a[2 * k + 1] as u64;
+
+/// IPv6 text (RFC 4291 §2.2) in one of four styles: 0, eight groups of four digits; 1, RFC 5952 (the longest run of
+/// two or more zero groups as `::`, the first if tied; lower case; an IPv4-mapped address as `::ffff:a.b.c.d`);
+/// 2, compressed in upper case; 3, compressed in lower case with the mapped form in hex.
+fn v6Text(out: borrow mut Vector<u8>, a: [u8; 16], style: u64) {
+    if (style == 0) {
+        for (k in 0..8usize) {
+            if (k > 0) {
+                put(out, 58);
+            }
+            let g = groupOf(a, k);
+            put(out, hexDigit(g >> 12, false));
+            put(out, hexDigit(g >> 8, false));
+            put(out, hexDigit(g >> 4, false));
+            put(out, hexDigit(g, false));
+        }
+        return;
+    }
+    if (style == 1 && isMapped(a)) {
+        putText(out, "::ffff:");
+        v4Text(out, [a[12], a[13], a[14], a[15]]);
+        return;
+    }
+    let upper = style == 2;
+    var bestStart: usize = 8;
+    var bestLength: usize = 0;
+    var k: usize = 0;
+    while (k < 8) {
+        if (groupOf(a, k) != 0) {
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while (k < 8 && groupOf(a, k) == 0) {
+            k += 1;
+        }
+        if (k - start >= 2 && k - start > bestLength) {
+            bestStart = start;
+            bestLength = k - start;
+        }
+    }
+    var g: usize = 0;
+    while (g < 8) {
+        if (g == bestStart) {
+            putText(out, "::");
+            g += bestLength;
+            continue;
+        }
+        if (g > 0 && g != bestStart + bestLength) {
+            put(out, 58);
+        }
+        putHex(out, groupOf(a, g), upper);
+        g += 1;
+    }
+}
+
+/// Strict dotted decimal: four parts of 1 to 3 digits, each at most 255, without a leading zero.
+fn decodeV4(text: Slice<u8>, out: borrow mut [u8; 4]) -> bool {
+    var part: usize = 0;
+    var start: usize = 0;
+    for (i in 0..text.length + 1) {
+        if (i < text.length && text[i] != 46) {
+            continue;
+        }
+        if (part == 4) {
+            return false;
+        }
+        let digits = i - start;
+        if (digits == 0 || digits > 3 || (digits > 1 && text[start] == 48)) {
+            return false;
+        }
+        var v: u64 = 0;
+        for (k in start..i) {
+            let c = text[k];
+            if (c < 48 || c > 57) {
+                return false;
+            }
+            v = v * 10 + (c - 48) as u64;
+        }
+        if (v > 255) {
+            return false;
+        }
+        out[part] = truncate<u8>(v);
+        part += 1;
+        start = i + 1;
+    }
+    return part == 4;
+}
+
+fn hexValue(c: u8) -> u64 {
+    if (c >= 48 && c <= 57) {
+        return (c - 48) as u64;
+    }
+    if (c >= 97 && c <= 102) {
+        return (c - 87) as u64;
+    }
+    if (c >= 65 && c <= 70) {
+        return (c - 55) as u64;
+    }
+    return 16;
+}
+
+/// IPv6 text (RFC 4291 §2.2): groups of 1 to 4 hex digits, at most one `::` standing for one or more zero groups,
+/// and a dotted IPv4 address as the last 32 bits.
+fn decodeV6(text: Slice<u8>, out: borrow mut [u8; 16]) -> bool {
+    var groups = [0u64; 8];
+    var n: usize = 0;
+    var gap: usize = 9;
+    var i: usize = 0;
+    if (text.length >= 2 && text[0] == 58 && text[1] == 58) {
+        gap = 0;
+        i = 2;
+    } else if (text.length == 0 || text[0] == 58) {
+        return false;
+    }
+    while (i < text.length) {
+        var j = i;
+        while (j < text.length && text[j] != 58) {
+            j += 1;
+        }
+        let token = text[i..j];
+        var dotted = false;
+        for (c in token) {
+            if (c == 46) {
+                dotted = true;
+            }
+        }
+        if (dotted) {
+            var v4 = [0u8; 4];
+            if (j != text.length || n > 6 || !decodeV4(token, mut v4)) {
+                return false;
+            }
+            groups[n] = (v4[0] as u64) << 8 | v4[1] as u64;
+            groups[n + 1] = (v4[2] as u64) << 8 | v4[3] as u64;
+            n += 2;
+            break;
+        }
+        if (token.length == 0 || token.length > 4 || n == 8) {
+            return false;
+        }
+        var v: u64 = 0;
+        for (c in token) {
+            let h = hexValue(c);
+            if (h == 16) {
+                return false;
+            }
+            v = v * 16 + h;
+        }
+        groups[n] = v;
+        n += 1;
+        if (j == text.length) {
+            break;
+        }
+        if (j + 1 < text.length && text[j + 1] == 58) {
+            if (gap != 9) {
+                return false;
+            }
+            gap = n;
+            i = j + 2;
+        } else {
+            i = j + 1;
+            if (i == text.length) {
+                return false; // a trailing single colon
+            }
+        }
+    }
+    if (gap == 9 && n != 8) {
+        return false;
+    }
+    if (gap != 9 && n > 7) {
+        return false;
+    }
+    var full = [0u64; 8];
+    if (gap == 9) {
+        full = groups;
+    } else {
+        for (k in 0..gap) {
+            full[k] = groups[k];
+        }
+        let tail = n - gap;
+        for (k in 0..tail) {
+            full[8 - tail + k] = groups[gap + k];
+        }
+    }
+    for (k in 0..8usize) {
+        out[2 * k] = truncate<u8>(full[k] >> 8);
+        out[2 * k + 1] = truncate<u8>(full[k]);
+    }
+    return true;
+}
+
+/// A port as proxy-protocol.txt §2.1 writes it: 0 to 65535 in decimal, no leading zero; 70000 if it is not one.
+fn decodePort(text: Slice<u8>) -> u32 {
+    if (text.length == 0 || text.length > 5 || (text.length > 1 && text[0] == 48)) {
+        return 70000;
+    }
+    var v: u32 = 0;
+    for (c in text) {
+        if (c < 48 || c > 57) {
+            return 70000;
+        }
+        v = v * 10 + (c - 48) as u32;
+    }
+    return if (v > 65535) 70000 else v;
+}
+
+// ---- Addresses ----
+
+fn randV4(rng: borrow mut Rng) -> [u8; 4] {
+    let r = truncate<u8>(rng.next());
+    return match (rng.below(6)) {
+        0 => [10u8, truncate<u8>(rng.below(3)), 0, r],
+        1 => [192u8, 0, 2, r],
+        2 => [198u8, 51, 100, r],
+        3 => [127u8, 0, 0, 1],
+        _ => [truncate<u8>(rng.next()), truncate<u8>(rng.next()), truncate<u8>(rng.next()), r],
+    };
+}
+
+fn randV6(rng: borrow mut Rng) -> [u8; 16] {
+    var a = [0u8; 16];
+    let kind = rng.below(5);
+    if (kind == 0) {
+        a[10] = 255;
+        a[11] = 255;
+        let v = randV4(rng);
+        for (k in 0..4usize) {
+            a[12 + k] = v[k];
+        }
+        return a;
+    }
+    if (kind == 1) {
+        a[0] = 0x20;
+        a[1] = 0x01;
+        a[2] = 0x0d;
+        a[3] = 0xb8;
+        a[15] = truncate<u8>(rng.below(4));
+        return a;
+    }
+    for (k in 0..16usize) {
+        a[k] = truncate<u8>(rng.next());
+    }
+    if (kind == 2) {
+        for (g in 0..8usize) {
+            if (rng.below(2) == 0) {
+                a[2 * g] = 0;
+                a[2 * g + 1] = 0;
+            }
+        }
+    }
+    return a;
+}
+
+fn randPort(rng: borrow mut Rng) -> u16 => match (rng.below(5)) {
+    0 => 0,
+    1 => 80,
+    2 => 65535,
+    _ => truncate<u16>(rng.below(65536)),
+};
+
+fn sameAddress(a: SocketAddress, b: SocketAddress) -> bool {
+    match (a) {
+        SocketAddress.V4(x, p) => {
+            match (b) {
+                SocketAddress.V4(y, q) => {
+                    return p == q && x[0] == y[0] && x[1] == y[1] && x[2] == y[2] && x[3] == y[3];
+                }
+                _ => { return false; }
+            }
+        }
+        SocketAddress.V6(x, p, s) => {
+            match (b) {
+                SocketAddress.V6(y, q, t) => {
+                    if (p != q || s != t) {
+                        return false;
+                    }
+                    for (k in 0..16usize) {
+                        if (x[k] != y[k]) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+/// The address as a forwarding field names it: no port, no zone.
+fn bare(a: SocketAddress) -> SocketAddress => match (a) {
+    SocketAddress.V4(x, _) => SocketAddress.V4(x, 0),
+    SocketAddress.V6(x, _, _) => SocketAddress.V6(x, 0, 0),
+};
+
+// ---- 1, 2: the PROXY protocol ----
+
+/// v2's signature (proxy-protocol.txt §2.2).
+fn v2Signature() -> [u8; 12] => [13u8, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10];
+
+/// A valid v1 header (§2.1) in `out`; what it says.
+fn v1Header(rng: borrow mut Rng, out: borrow mut Vector<u8>) -> ProxyHeader {
+    putText(out, "PROXY ");
+    let kind = rng.below(5);
+    if (kind == 4) {
+        putText(out, "UNKNOWN");
+        if (rng.below(2) == 0) {
+            // "the receiver must ignore anything presented before the CRLF": printable bytes, spaces included
+            put(out, 32);
+            let n = rng.below(85);
+            for (k in 0..n) {
+                put(out, 32 + truncate<u8>(rng.below(95)));
+            }
+        }
+        putText(out, "\r\n");
+        return ProxyHeader.Local;
+    }
+    let sp = randPort(rng);
+    let dp = randPort(rng);
+    if (kind < 2) {
+        let s = randV4(rng);
+        let d = randV4(rng);
+        putText(out, "TCP4 ");
+        v4Text(out, s);
+        put(out, 32);
+        v4Text(out, d);
+        put(out, 32);
+        putDecimal(out, sp as u64);
+        put(out, 32);
+        putDecimal(out, dp as u64);
+        putText(out, "\r\n");
+        return ProxyHeader.Proxied(SocketAddress.V4(s, sp), SocketAddress.V4(d, dp));
+    }
+    let s = randV6(rng);
+    let d = randV6(rng);
+    putText(out, "TCP6 ");
+    v6Text(out, s, rng.below(4));
+    put(out, 32);
+    v6Text(out, d, rng.below(4));
+    put(out, 32);
+    putDecimal(out, sp as u64);
+    put(out, 32);
+    putDecimal(out, dp as u64);
+    putText(out, "\r\n");
+    return ProxyHeader.Proxied(SocketAddress.V6(s, sp, 0), SocketAddress.V6(d, dp, 0));
+}
+
+/// A valid v2 header (§2.2) in `out`: one of the protocol bytes §2.2 lists, TLVs after the addresses; what it says.
+/// LOCAL's block is ignored, whatever its family; PROXY with UNSPEC (either nibble) ignores the addresses.
+fn v2Header(rng: borrow mut Rng, out: borrow mut Vector<u8>) -> ProxyHeader {
+    let signature = v2Signature();
+    for (b in signature) {
+        put(out, b);
+    }
+    let local = rng.below(5) == 0;
+    put(out, if (local) 0x20 else 0x21);
+    let family = rng.below(4);
+    let transport = if (family == 0) 0 else if (rng.below(6) == 0) 0 else 1 + rng.below(2);
+    put(out, truncate<u8>(family << 4 | transport));
+    var body = Vector<u8>.create();
+    var said = ProxyHeader.Local;
+    let sp = randPort(rng);
+    let dp = randPort(rng);
+    if (family == 1) {
+        let s = randV4(rng);
+        let d = randV4(rng);
+        putAll(mut body, s[..]);
+        putAll(mut body, d[..]);
+        put(mut body, truncate<u8>(sp >> 8));
+        put(mut body, truncate<u8>(sp));
+        put(mut body, truncate<u8>(dp >> 8));
+        put(mut body, truncate<u8>(dp));
+        if (!local && transport != 0) {
+            said = ProxyHeader.Proxied(SocketAddress.V4(s, sp), SocketAddress.V4(d, dp));
+        }
+    } else if (family == 2) {
+        let s = randV6(rng);
+        let d = randV6(rng);
+        putAll(mut body, s[..]);
+        putAll(mut body, d[..]);
+        put(mut body, truncate<u8>(sp >> 8));
+        put(mut body, truncate<u8>(sp));
+        put(mut body, truncate<u8>(dp >> 8));
+        put(mut body, truncate<u8>(dp));
+        if (!local && transport != 0) {
+            said = ProxyHeader.Proxied(SocketAddress.V6(s, sp, 0), SocketAddress.V6(d, dp, 0));
+        }
+    } else if (family == 3) {
+        for (k in 0..216u32) {
+            put(mut body, truncate<u8>(rng.below(128)));
+        }
+    }
+    let tlvs = rng.below(4);
+    for (k in 0..tlvs) {
+        let length = rng.below(40);
+        put(mut body, truncate<u8>(rng.next()));
+        put(mut body, 0);
+        put(mut body, truncate<u8>(length));
+        for (i in 0..length) {
+            put(mut body, truncate<u8>(rng.next()));
+        }
+    }
+    put(out, truncate<u8>(body.length >> 8));
+    put(out, truncate<u8>(body.length));
+    putAll(out, body.view());
+    return said;
+}
+
+/// What a connection sends after its header: nothing, a request, random bytes, or another header.
+fn trailing(rng: borrow mut Rng, out: borrow mut Vector<u8>) {
+    match (rng.below(4)) {
+        0 => {}
+        1 => { putText(out, "GET / HTTP/1.1\r\nHost: a\r\n\r\n"); }
+        2 => {
+            let n = rng.below(64);
+            for (k in 0..n) {
+                put(out, truncate<u8>(rng.next()));
+            }
+        }
+        _ => { putText(out, "PROXY UNKNOWN\r\n"); }
+    }
+}
+
+fn sameHeader(a: ProxyHeader, b: ProxyHeader) -> bool {
+    match (a) {
+        ProxyHeader.Proxied(s, d) => {
+            match (b) {
+                ProxyHeader.Proxied(t, e) => { return sameAddress(s, t) && sameAddress(d, e); }
+                ProxyHeader.Local => { return false; }
+            }
+        }
+        ProxyHeader.Local => {
+            match (b) {
+                ProxyHeader.Local => { return true; }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+enum Read {
+    /// The header and how many bytes it took.
+    Got(ProxyHeader, usize),
+    /// Refused after this many bytes.
+    Refused(usize),
+    /// The input ended first.
+    Short(usize),
+}
+
+/// What `readProxyHeader` does, over `stream`: each read asks for `ProxyProtocol.more`'s count and gets that many,
+/// or (in pieces) a random part of them.
+fn readFrom(stream: Slice<u8>, rng: borrow mut Rng, whole: bool) -> Read {
+    var got: usize = 0;
+    loop {
+        if (got > ProxyProtocol.maxV2Bytes() || (stream.length > 0 && stream[0] == 80 && got > 107)) {
+            fail("2: read past the header's bound", stream);
+        }
+        let want = match (ProxyProtocol.more(stream[0..got])) {
+            Ok(n) => n,
+            Err(_) => { return Read.Refused(got); },
+        };
+        if (want == 0) {
+            break;
+        }
+        if (got == stream.length) {
+            return Read.Short(got);
+        }
+        var n = want;
+        if (n > stream.length - got) {
+            n = stream.length - got;
+        }
+        if (!whole) {
+            n = 1 + rng.below(n as u64) as usize;
+        }
+        got += n;
+    }
+    return match (ProxyProtocol.parse(stream[0..got])) {
+        Ok(h) => Read.Got(h, got),
+        Err(_) => Read.Refused(got),
+    };
+}
+
+fn validCase(rng: borrow mut Rng, stats: borrow mut Stats) {
+    var stream = Vector<u8>.create();
+    let v1 = rng.below(2) == 0;
+    let said = if (v1) v1Header(rng, mut stream) else v2Header(rng, mut stream);
+    let length = stream.length;
+    trailing(rng, mut stream);
+    let s = stream.view();
+    for (pass in 0..2u32) {
+        match (readFrom(s, rng, pass == 0)) {
+            Read.Got(h, n) => {
+                if (n != length) {
+                    fail("1: a valid header was not read exactly to its end", s);
+                }
+                if (!sameHeader(h, said)) {
+                    fail("1: a valid header says something else", s[0..length]);
+                }
+            }
+            _ => { fail("1: a valid header was refused", s[0..length]); }
+        }
+    }
+    // `parse` itself, given the header and the byte after it, refuses: a header is exactly its own length.
+    if (s.length > length) {
+        match (ProxyProtocol.parse(s[0..length + 1])) {
+            Ok(_) => { fail("1: parse accepted a byte past the header", s[0..length + 1]); }
+            Err(_) => {}
+        }
+    }
+    if (v1) {
+        stats.v1 += 1;
+    } else {
+        stats.v2 += 1;
+    }
+}
+
+/// Damage: flipped bits, random or special bytes, a cut, a case change, bytes inserted.
+fn mutate(rng: borrow mut Rng, data: borrow mut Vector<u8>, rounds: u64) {
+    let specials = " \"\\,;=:[]_.\r\n\t%/0".bytes();
+    let n = 1 + rng.below(rounds);
+    for (k in 0..n) {
+        if (data.length == 0) {
+            put(data, specials[rng.below(specials.length as u64) as usize]);
+            continue;
+        }
+        let at = rng.below(data.length as u64) as usize;
+        match (rng.below(7)) {
+            0 => { data[at] = data[at] ^ (1u8 << truncate<u32>(rng.below(8))); }
+            1 => { data[at] = truncate<u8>(rng.next()); }
+            2 => { data.truncate(at); }
+            3 => { data[at] = specials[rng.below(specials.length as u64) as usize]; }
+            4 => { data[at] = data[at] ^ 32; }
+            5 => {
+                // insert a special byte at `at`
+                let b = specials[rng.below(specials.length as u64) as usize];
+                put(data, 0);
+                var i = data.length - 1;
+                while (i > at) {
+                    data[i] = data[i - 1];
+                    i -= 1;
+                }
+                data[at] = b;
+            }
+            _ => {
+                // the v2 length or family byte
+                if (data.length > 15) {
+                    data[12 + rng.below(4) as usize] = truncate<u8>(rng.next());
+                }
+            }
+        }
+    }
+}
+
+/// Splits `line` at single spaces; false if two spaces meet or there are more than `max` fields.
+fn fields(
+    line: Slice<u8>,
+    starts: borrow mut [usize; 8],
+    ends: borrow mut [usize; 8],
+    count: borrow mut usize,
+) -> bool {
+    var n: usize = 0;
+    var start: usize = 0;
+    for (i in 0..line.length + 1) {
+        if (i < line.length && line[i] != 32) {
+            continue;
+        }
+        if (i == start || n == 8) {
+            return false;
+        }
+        starts[n] = start;
+        ends[n] = i;
+        n += 1;
+        start = i + 1;
+    }
+    count = n;
+    return true;
+}
+
+/// A header `ProxyProtocol.parse` accepted, decoded again from the specification.
+fn checkAccepted(header: Slice<u8>, h: ProxyHeader) {
+    if (header.length > 0 && header[0] == 80) {
+        if (header.length > 107 || !startsWith(header, "PROXY ")) {
+            fail("2: an accepted v1 header is too long or does not start with \"PROXY \"", header);
+        }
+        for (i in 0..header.length - 1) {
+            if (header[i] == 13 && header[i + 1] == 10 && i + 2 != header.length) {
+                fail("2: an accepted v1 header goes past its CRLF", header);
+            }
+        }
+        if (header.length < 8 || header[header.length - 2] != 13 || header[header.length - 1] != 10) {
+            fail("2: an accepted v1 header does not end with CRLF", header);
+        }
+        let line = header[6..header.length - 2];
+        match (h) {
+            ProxyHeader.Local => {
+                if (!startsWith(line, "UNKNOWN") || (line.length > 7 && line[7] != 32)) {
+                    fail("2: a v1 header was taken as LOCAL without UNKNOWN", header);
+                }
+            }
+            ProxyHeader.Proxied(source, destination) => {
+                var starts = [0usize; 8];
+                var ends = [0usize; 8];
+                var n: usize = 0;
+                if (!fields(line, mut starts, mut ends, mut n) || n != 5) {
+                    fail("2: an accepted v1 header does not have five fields with single spaces", header);
+                }
+                let family = line[starts[0]..ends[0]];
+                let v6 = same(family, "TCP6".bytes());
+                if (!v6 && !same(family, "TCP4".bytes())) {
+                    fail("2: an accepted v1 header names neither TCP4 nor TCP6", header);
+                }
+                let sp = decodePort(line[starts[3]..ends[3]]);
+                let dp = decodePort(line[starts[4]..ends[4]]);
+                var expected = [SocketAddress.V4([0u8; 4], 0), SocketAddress.V4([0u8; 4], 0)];
+                for (k in 0..2usize) {
+                    let text = line[starts[1 + k]..ends[1 + k]];
+                    let port = if (k == 0) sp else dp;
+                    if (port == 70000) {
+                        fail("2: an accepted v1 header has a port the grammar refuses", header);
+                    }
+                    if (v6) {
+                        var a = [0u8; 16];
+                        if (!decodeV6(text, mut a)) {
+                            fail("2: an accepted TCP6 header has an address RFC 4291 refuses", header);
+                        }
+                        expected[k] = SocketAddress.V6(a, truncate<u16>(port), 0);
+                    } else {
+                        var a = [0u8; 4];
+                        if (!decodeV4(text, mut a)) {
+                            fail("2: an accepted TCP4 header has an address that is not dotted decimal", header);
+                        }
+                        expected[k] = SocketAddress.V4(a, truncate<u16>(port));
+                    }
+                }
+                if (!sameAddress(source, expected[0]) || !sameAddress(destination, expected[1])) {
+                    fail("2: an accepted v1 header says other addresses than its text", header);
+                }
+            }
+        }
+        return;
+    }
+    let signature = v2Signature();
+    if (header.length < 16 || !same(header[0..12], signature[..])) {
+        fail("2: an accepted v2 header is short or lacks the signature", header);
+    }
+    let length = (header[14] as usize) << 8 | header[15] as usize;
+    if (header[12] >> 4 != 2 || header.length != 16 + length) {
+        fail("2: an accepted v2 header has another version, or a length that is not its own", header);
+    }
+    let command = header[12] & 15;
+    let family = header[13] >> 4;
+    let transport = header[13] & 15;
+    if (command > 1) {
+        fail("2: a v2 header with an unassigned command was accepted", header);
+    }
+    if (command == 1 && (family > 3 || transport > 2)) {
+        fail("2: a v2 PROXY header with an unassigned family or transport was accepted", header);
+    }
+    let body = header[16..];
+    match (h) {
+        ProxyHeader.Local => {
+            if (command == 1 && (family == 1 || family == 2) && transport != 0) {
+                fail("2: a v2 PROXY header with addresses was taken as LOCAL", header);
+            }
+            if (command == 1 && family == 3 && transport != 0 && length < 216) {
+                fail("2: a v2 AF_UNIX header shorter than its addresses was accepted", header);
+            }
+        }
+        ProxyHeader.Proxied(source, destination) => {
+            if (command != 1 || transport == 0) {
+                fail("2: a v2 header that is not PROXY over a transport gave addresses", header);
+            }
+            if (family == 1 && length >= 12) {
+                let ok = sameAddress(
+                    source,
+                    SocketAddress.V4([body[0], body[1], body[2], body[3]], (body[8] as u16) << 8 | body[9] as u16),
+                ) &&
+                    sameAddress(
+                        destination,
+                        SocketAddress.V4(
+                            [body[4], body[5], body[6], body[7]],
+                            (body[10] as u16) << 8 | body[11] as u16,
+                        ),
+                    );
+                if (!ok) {
+                    fail("2: an accepted v2 IPv4 header says other addresses than its bytes", header);
+                }
+            } else if (family == 2 && length >= 36) {
+                var s = [0u8; 16];
+                var d = [0u8; 16];
+                for (k in 0..16usize) {
+                    s[k] = body[k];
+                    d[k] = body[16 + k];
+                }
+                let ok = sameAddress(source, SocketAddress.V6(s, (body[32] as u16) << 8 | body[33] as u16, 0)) &&
+                    sameAddress(destination, SocketAddress.V6(d, (body[34] as u16) << 8 | body[35] as u16, 0));
+                if (!ok) {
+                    fail("2: an accepted v2 IPv6 header says other addresses than its bytes", header);
+                }
+            } else {
+                fail("2: a v2 header gave addresses its family and length do not hold", header);
+            }
+        }
+    }
+}
+
+fn damagedCase(rng: borrow mut Rng, stats: borrow mut Stats) {
+    var stream = Vector<u8>.create();
+    let said = if (rng.below(2) == 0) v1Header(rng, mut stream) else v2Header(rng, mut stream);
+    trailing(rng, mut stream);
+    mutate(rng, mut stream, 4);
+    let s = stream.view();
+    let whole = readFrom(s, rng, true);
+    let pieces = readFrom(s, rng, false);
+    match (whole) {
+        Read.Got(h, n) => {
+            match (pieces) {
+                Read.Got(g, m) => {
+                    if (n != m || !sameHeader(h, g)) {
+                        fail("2: whole and in pieces read differently", s);
+                    }
+                }
+                _ => { fail("2: accepted whole, refused in pieces", s); }
+            }
+            checkAccepted(s[0..n], h);
+            stats.damagedAccepted += 1;
+        }
+        _ => {
+            match (pieces) {
+                Read.Got(_, _) => { fail("2: refused whole, accepted in pieces", s); }
+                _ => {}
+            }
+            stats.damagedRefused += 1;
+        }
+    }
+}
+
+// ---- 3: blocks and address text ----
+
+/// A block as the oracle sees it.
+struct Block {
+    bytes: [u8; 16];
+    v4: bool;
+    prefix: u64;
+}
+
+/// Whether `address` is in `block`: the first `prefix` bits agree, an IPv4-mapped address counting as IPv4
+/// (RFC 4291 §2.5.5.2), and the families agree.
+fn inBlock(block: borrow Block, address: SocketAddress) -> bool {
+    var bytes = [0u8; 16];
+    var v4 = false;
+    match (address) {
+        SocketAddress.V4(a, _) => {
+            v4 = true;
+            for (k in 0..4usize) {
+                bytes[k] = a[k];
+            }
+        }
+        SocketAddress.V6(a, _, _) => {
+            if (isMapped(a)) {
+                v4 = true;
+                for (k in 0..4usize) {
+                    bytes[k] = a[12 + k];
+                }
+            } else {
+                bytes = a;
+            }
+        }
+    }
+    if (v4 != block.v4) {
+        return false;
+    }
+    for (bit in 0..block.prefix) {
+        let k = (bit / 8) as usize;
+        let mask = 128u8 >> truncate<u32>(bit % 8);
+        if (bytes[k] & mask != block.bytes[k] & mask) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn randBlock(rng: borrow mut Rng, near: SocketAddress?) -> Block {
+    var bytes = [0u8; 16];
+    var v4 = rng.below(2) == 0;
+    match (near) {
+        Some(SocketAddress.V4(a, _)) => {
+            v4 = true;
+            for (k in 0..4usize) {
+                bytes[k] = a[k];
+            }
+        }
+        Some(SocketAddress.V6(a, _, _)) => {
+            if (isMapped(a)) {
+                v4 = true;
+                for (k in 0..4usize) {
+                    bytes[k] = a[12 + k];
+                }
+            } else {
+                v4 = false;
+                bytes = a;
+            }
+        }
+        null => {
+            if (v4) {
+                let a = randV4(rng);
+                for (k in 0..4usize) {
+                    bytes[k] = a[k];
+                }
+            } else {
+                bytes = randV6(rng);
+            }
+        }
+    }
+    let bits: u64 = if (v4) 32 else 128;
+    let prefix = if (rng.below(3) == 0) bits else rng.below(bits + 1);
+    return Block { bytes: bytes, v4: v4, prefix: prefix };
+}
+
+/// The block's text, the address part in any style; without `/prefix` sometimes when it is the whole address.
+fn blockText(rng: borrow mut Rng, block: borrow Block, prefix: u64, out: borrow mut Vector<u8>) {
+    if (block.v4) {
+        v4Text(out, [block.bytes[0], block.bytes[1], block.bytes[2], block.bytes[3]]);
+    } else {
+        v6Text(out, block.bytes, rng.below(4));
+    }
+    let bits: u64 = if (block.v4) 32 else 128;
+    if (prefix != bits || rng.below(2) == 0) {
+        put(out, 47);
+        putDecimal(out, prefix);
+    }
+}
+
+/// An address near `block`: inside it, just outside it, its family's other form, or anywhere.
+fn probe(rng: borrow mut Rng, block: borrow Block) -> SocketAddress {
+    var bytes = block.bytes;
+    let bits: u64 = if (block.v4) 32 else 128;
+    if (rng.below(4) != 0 && bits > 0) {
+        let bit = rng.below(bits);
+        bytes[(bit / 8) as usize] = bytes[(bit / 8) as usize] ^ (128u8 >> truncate<u32>(bit % 8));
+    }
+    if (rng.below(6) == 0) {
+        return if (rng.below(2) == 0) SocketAddress.V4(randV4(rng), 1) else SocketAddress.V6(randV6(rng), 1, 0);
+    }
+    if (block.v4) {
+        if (rng.below(3) == 0) {
+            var m = [0u8; 16];
+            m[10] = 255;
+            m[11] = 255;
+            for (k in 0..4usize) {
+                m[12 + k] = bytes[k];
+            }
+            return SocketAddress.V6(m, randPort(rng), 0);
+        }
+        return SocketAddress.V4([bytes[0], bytes[1], bytes[2], bytes[3]], randPort(rng));
+    }
+    return SocketAddress.V6(bytes, randPort(rng), if (rng.below(5) == 0) 3 else 0);
+}
+
+fn blockCase(rng: borrow mut Rng, stats: borrow mut Stats) {
+    let block = randBlock(rng, null);
+    let bits: u64 = if (block.v4) 32 else 128;
+    let over = rng.below(8) == 0;
+    let prefix = if (over) bits + 1 + rng.below(8) else block.prefix;
+    var text = Vector<u8>.create();
+    blockText(rng, block, prefix, mut text);
+    let parsed = Cidr.parse(text.view());
+    if (over) {
+        match (parsed) {
+            Some(_) => { fail("3: a prefix longer than the address was accepted", text.view()); }
+            null => {}
+        }
+        return;
+    }
+    let cidr = match (parsed) {
+        Some(c) => c,
+        null => {
+            fail("3: a block's text did not parse", text.view());
+            return;
+        },
+    };
+    var trusted = TrustedProxies.none();
+    var others = Vector<Block>.create();
+    let extra = rng.below(3);
+    for (k in 0..extra) {
+        let b = randBlock(rng, null);
+        var t = Vector<u8>.create();
+        blockText(rng, b, b.prefix, mut t);
+        match (StringView.fromUtf8(t.view())) {
+            Some(sv) => {
+                match (trusted.add(sv)) {
+                    Ok(true) => {}
+                    _ => { fail("3: TrustedProxies refused a block", t.view()); }
+                }
+            }
+            null => { fail("3: a block's text is not UTF-8", t.view()); }
+        }
+        match (others.push(b)) {
+            Ok() => {}
+            Err(_) => { Process.exit(2); }
+        }
+    }
+    match (StringView.fromUtf8(text.view())) {
+        Some(sv) => {
+            match (trusted.add(sv)) {
+                Ok(true) => {}
+                _ => { fail("3: TrustedProxies refused a block", text.view()); }
+            }
+        }
+        null => {}
+    }
+    for (k in 0..8u32) {
+        let a = probe(rng, block);
+        let inside = inBlock(block, a);
+        if (cidr.contains(a) != inside) {
+            fail("3: Cidr.contains disagrees with the prefix bits", text.view());
+        }
+        var anywhere = inside;
+        for (i in 0..others.length) {
+            if (inBlock(others[i], a)) {
+                anywhere = true;
+            }
+        }
+        if (trusted.trusts(a) != anywhere) {
+            fail("3: TrustedProxies.trusts disagrees with its blocks", text.view());
+        }
+    }
+    // ipText: RFC 5952's form, no port, no zone.
+    let address = probe(rng, block);
+    var written = Vector<u8>.create();
+    match (ipText(address, mut written)) {
+        Ok() => {}
+        Err(_) => { Process.exit(2); }
+    }
+    var expected = Vector<u8>.create();
+    match (address) {
+        SocketAddress.V4(a, _) => { v4Text(mut expected, a); }
+        SocketAddress.V6(a, _, _) => { v6Text(mut expected, a, 1); }
+    }
+    if (!same(written.view(), expected.view())) {
+        fail("3: ipText is not RFC 5952's form", written.view());
+    }
+    stats.blocks += 1;
+}
+
+// ---- 4, 5, 6: forwarding chains ----
+
+fn sameHop(a: Hop, b: Hop) -> bool {
+    match (a) {
+        Hop.Address(x) => {
+            match (b) {
+                Hop.Address(y) => { return sameAddress(x, y); }
+                _ => { return false; }
+            }
+        }
+        Hop.Hidden => {
+            match (b) {
+                Hop.Hidden => { return true; }
+                _ => { return false; }
+            }
+        }
+        Hop.Malformed => {
+            match (b) {
+                Hop.Malformed => { return true; }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+fn sameClient(a: ClientIs, b: ClientIs) -> bool {
+    match (a) {
+        ClientIs.Address(x) => {
+            match (b) {
+                ClientIs.Address(y) => { return sameAddress(x, y); }
+                _ => { return false; }
+            }
+        }
+        ClientIs.Hidden => {
+            match (b) {
+                ClientIs.Hidden => { return true; }
+                _ => { return false; }
+            }
+        }
+        ClientIs.Unknown => {
+            match (b) {
+                ClientIs.Unknown => { return true; }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+fn pushHop(list: borrow mut Vector<Hop>, hop: Hop) {
+    match (list.push(hop)) {
+        Ok() => {}
+        Err(_) => { Process.exit(2); }
+    }
+}
+
+/// `text` as a quoted string (RFC 9110 §5.6.4): `"` and `\` escaped, and now and then another byte as well.
+fn quoted(rng: borrow mut Rng, text: Slice<u8>, out: borrow mut Vector<u8>) {
+    put(out, 34);
+    for (b in text) {
+        if (b == 34 || b == 92 || rng.below(12) == 0) {
+            put(out, 92);
+        }
+        put(out, b);
+    }
+    put(out, 34);
+}
+
+/// Random bytes for a quoted string, from those a field value holds, the delimiters among them.
+fn quotable(rng: borrow mut Rng, out: borrow mut Vector<u8>) {
+    let set = "abcXYZ019 ,;=\"\\()[]:_-.".bytes();
+    let n = rng.below(10);
+    for (k in 0..n) {
+        put(out, set[rng.below(set.length as u64) as usize]);
+    }
+}
+
+fn obfuscated(rng: borrow mut Rng, out: borrow mut Vector<u8>) {
+    let set = "abcdefXYZ0123456789._-".bytes();
+    put(out, 95);
+    let n = 1 + rng.below(8);
+    for (k in 0..n) {
+        put(out, set[rng.below(set.length as u64) as usize]);
+    }
+}
+
+/// A `node` (RFC 7239 §6) for a `for=` value, unquoted; what it names.
+fn node(rng: borrow mut Rng, out: borrow mut Vector<u8>, needsQuotes: borrow mut bool) -> Hop {
+    match (rng.below(5)) {
+        0 => {
+            let a = randV4(rng);
+            v4Text(out, a);
+            if (rng.below(2) == 0) {
+                put(out, 58);
+                needsQuotes = true;
+                if (rng.below(4) == 0) {
+                    obfuscated(rng, out);
+                    return Hop.Address(SocketAddress.V4(a, 0));
+                }
+                let p = randPort(rng);
+                putDecimal(out, p as u64);
+                return Hop.Address(SocketAddress.V4(a, p));
+            }
+            return Hop.Address(SocketAddress.V4(a, 0));
+        }
+        1 => {
+            let a = randV6(rng);
+            put(out, 91);
+            v6Text(out, a, rng.below(4));
+            put(out, 93);
+            needsQuotes = true;
+            if (rng.below(2) == 0) {
+                put(out, 58);
+                let p = randPort(rng);
+                putDecimal(out, p as u64);
+                return Hop.Address(SocketAddress.V6(a, p, 0));
+            }
+            return Hop.Address(SocketAddress.V6(a, 0, 0));
+        }
+        2 => {
+            let spellings = ["unknown", "UNKNOWN", "Unknown", "unKnown"];
+            putText(out, spellings[rng.below(4) as usize]);
+            return Hop.Hidden;
+        }
+        _ => {
+            obfuscated(rng, out);
+            return Hop.Hidden;
+        }
+    }
+}
+
+/// One `forwarded-element` (RFC 7239 §4) in `out`, its pairs in random order; the hop it names, or `Malformed` if it
+/// has no `for`.
+fn element(rng: borrow mut Rng, out: borrow mut Vector<u8>) -> Hop {
+    let others = rng.below(4);
+    let withFor = rng.below(8) != 0;
+    let forAt = rng.below(others + 1);
+    var hop = Hop.Malformed;
+    for (k in 0..others + 1) {
+        if (k > 0) {
+            put(out, 59);
+        }
+        if (k == forAt && withFor) {
+            let names = ["for", "FOR", "For", "fOr"];
+            putText(out, names[rng.below(4) as usize]);
+            put(out, 61);
+            var text = Vector<u8>.create();
+            var needsQuotes = false;
+            hop = node(rng, mut text, mut needsQuotes);
+            if (needsQuotes || rng.below(3) == 0) {
+                quoted(rng, text.view(), out);
+            } else {
+                putAll(out, text.view());
+            }
+            continue;
+        }
+        if (k == forAt) {
+            putText(out, "proto=https");
+            continue;
+        }
+        match (rng.below(4)) {
+            0 => { putText(out, if (rng.below(2) == 0) "proto=http" else "Proto=\"https\""); }
+            1 => {
+                putText(out, "by=");
+                var text = Vector<u8>.create();
+                var needsQuotes = false;
+                let ignored = node(rng, mut text, mut needsQuotes);
+                if (needsQuotes) {
+                    quoted(rng, text.view(), out);
+                } else {
+                    putAll(out, text.view());
+                }
+            }
+            2 => {
+                putText(out, "host=");
+                var text = Vector<u8>.create();
+                quotable(rng, mut text);
+                quoted(rng, text.view(), out);
+            }
+            _ => {
+                putText(out, "x-ext");
+                putDecimal(out, rng.below(10));
+                put(out, 61);
+                var text = Vector<u8>.create();
+                quotable(rng, mut text);
+                if (rng.below(2) == 0 && Ascii.isToken(text.view())) {
+                    putAll(out, text.view());
+                } else {
+                    quoted(rng, text.view(), out);
+                }
+            }
+        }
+    }
+    return hop;
+}
+
+/// Optional whitespace (RFC 9110 §5.6.3).
+fn ows(rng: borrow mut Rng, out: borrow mut Vector<u8>) {
+    let n = rng.below(3);
+    for (k in 0..n) {
+        put(out, if (rng.below(3) == 0) 9 else 32);
+    }
+}
+
+/// A list separator: `OWS "," OWS`, with empty elements now and then (RFC 9110 §5.6.1.2).
+fn separator(rng: borrow mut Rng, out: borrow mut Vector<u8>) {
+    ows(rng, out);
+    put(out, 44);
+    while (rng.below(6) == 0) {
+        ows(rng, out);
+        put(out, 44);
+    }
+    ows(rng, out);
+}
+
+/// Header lines, `name: value\n`, and the list over them.
+struct Head {
+    text: Vector<u8>;
+}
+
+fn line(head: borrow mut Head, name: StringView, value: Slice<u8>) {
+    putText(mut head.text, name);
+    putText(mut head.text, ": ");
+    for (b in value) {
+        put(mut head.text, if (b == 10) 32u8 else b);
+    }
+    put(mut head.text, 10);
+}
+
+fn listOf<region r>(text: Slice<r, u8>) -> HeaderList<r> {
+    var list = HeaderList.create(text);
+    var start: usize = 0;
+    for (i in 0..text.length) {
+        if (text[i] != 10) {
+            continue;
+        }
+        var colon = start;
+        while (text[colon] != 58) {
+            colon += 1;
+        }
+        match (list.push(start, colon, colon + 2, i, 64)) {
+            Ok() => {}
+            Err(_) => { fail("a header line did not fit", text); }
+        }
+        start = i + 1;
+    }
+    return list;
+}
+
+/// `Forwarded` fields (one to three, names in any case) holding `elements` elements; their hops in `hops`.
+fn forwardedFields(rng: borrow mut Rng, head: borrow mut Head, elements: u64, hops: borrow mut Vector<Hop>) {
+    var value = Vector<u8>.create();
+    let names = ["Forwarded", "forwarded", "FORWARDED"];
+    for (k in 0..elements) {
+        if (value.length > 0 && rng.below(3) == 0) {
+            line(head, names[rng.below(3) as usize], value.view());
+            value.clear();
+        }
+        if (value.length > 0) {
+            separator(rng, mut value);
+        } else if (rng.below(6) == 0) {
+            put(mut value, 44); // a field that starts with an empty element
+            ows(rng, mut value);
+        }
+        pushHop(hops, element(rng, mut value));
+    }
+    if (value.length > 0) {
+        line(head, names[rng.below(3) as usize], value.view());
+    }
+}
+
+/// An `X-Forwarded-For` element: an address, with or without a port, or `unknown`; what it names.
+fn xffElement(rng: borrow mut Rng, out: borrow mut Vector<u8>) -> Hop {
+    match (rng.below(6)) {
+        0 => {
+            let a = randV4(rng);
+            v4Text(out, a);
+            return Hop.Address(SocketAddress.V4(a, 0));
+        }
+        1 => {
+            let a = randV4(rng);
+            let p = randPort(rng);
+            v4Text(out, a);
+            put(out, 58);
+            putDecimal(out, p as u64);
+            return Hop.Address(SocketAddress.V4(a, p));
+        }
+        2 => {
+            let a = randV6(rng);
+            v6Text(out, a, rng.below(4));
+            return Hop.Address(SocketAddress.V6(a, 0, 0));
+        }
+        3 => {
+            let a = randV6(rng);
+            let p = randPort(rng);
+            put(out, 91);
+            v6Text(out, a, rng.below(4));
+            putText(out, "]:");
+            putDecimal(out, p as u64);
+            return Hop.Address(SocketAddress.V6(a, p, 0));
+        }
+        4 => {
+            putText(out, "unknown");
+            return Hop.Hidden;
+        }
+        _ => {
+            let a = randV6(rng);
+            put(out, 91);
+            v6Text(out, a, rng.below(4));
+            put(out, 93);
+            return Hop.Address(SocketAddress.V6(a, 0, 0));
+        }
+    }
+}
+
+fn xffFields(rng: borrow mut Rng, head: borrow mut Head, elements: u64, hops: borrow mut Vector<Hop>) {
+    var value = Vector<u8>.create();
+    for (k in 0..elements) {
+        if (value.length > 0 && rng.below(3) == 0) {
+            line(head, "X-Forwarded-For", value.view());
+            value.clear();
+        }
+        if (value.length > 0) {
+            ows(rng, mut value);
+            put(mut value, 44);
+            ows(rng, mut value);
+        }
+        pushHop(hops, xffElement(rng, mut value));
+    }
+    if (value.length > 0) {
+        line(head, "x-forwarded-for", value.view());
+    }
+}
+
+fn checkHops(what: StringView, got: borrow Hops, want: borrow Vector<Hop>, input: Slice<u8>) {
+    if (got.count() != want.length) {
+        fail(what, input);
+    }
+    for (i in 0..want.length) {
+        if (!sameHop(got.hop(i), want[i])) {
+            fail(what, input);
+        }
+    }
+}
+
+/// Web ADR 0012 §3.4's rule, over the hops the fields were written from.
+fn expectedClient(
+    peer: SocketAddress?,
+    blocks: borrow Vector<Block>,
+    forwarded: borrow Vector<Hop>,
+    xff: borrow Vector<Hop>,
+    source: ForwardedSource,
+) -> ClientIs {
+    let p = match (peer) {
+        Some(a) => a,
+        null => { return ClientIs.Unknown; },
+    };
+    if (!trustedBy(blocks, p)) {
+        return ClientIs.Address(p);
+    }
+    let useForwarded = match (source) {
+        ForwardedSource.ForwardedFirst => forwarded.length > 0,
+        ForwardedSource.XForwardedForFirst => xff.length == 0,
+    };
+    var last = p;
+    var i = if (useForwarded) forwarded.length else xff.length;
+    while (i > 0) {
+        i -= 1;
+        let hop = if (useForwarded) forwarded[i] else xff[i];
+        match (hop) {
+            Hop.Address(a) => {
+                if (!trustedBy(blocks, a)) {
+                    return ClientIs.Address(a);
+                }
+                last = a;
+            }
+            Hop.Hidden => { return ClientIs.Hidden; }
+            Hop.Malformed => { return ClientIs.Address(last); }
+        }
+    }
+    return ClientIs.Address(last);
+}
+
+fn trustedBy(blocks: borrow Vector<Block>, a: SocketAddress) -> bool {
+    for (i in 0..blocks.length) {
+        if (inBlock(blocks[i], a)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Trusted blocks, some around the peer and the chain's addresses; the same as `TrustedProxies` in `trusted`.
+fn trustedSet(
+    rng: borrow mut Rng,
+    peer: SocketAddress?,
+    hops: borrow Vector<Hop>,
+    blocks: borrow mut Vector<Block>,
+    trusted: borrow mut TrustedProxies,
+) {
+    let n = rng.below(4);
+    for (k in 0..n) {
+        var near: SocketAddress? = null;
+        let pick = rng.below(3);
+        if (pick == 0) {
+            near = peer;
+        } else if (pick == 1 && hops.length > 0) {
+            match (hops[rng.below(hops.length as u64) as usize]) {
+                Hop.Address(a) => { near = Some(a); }
+                _ => {}
+            }
+        }
+        let b = randBlock(rng, near);
+        var text = Vector<u8>.create();
+        blockText(rng, b, b.prefix, mut text);
+        match (StringView.fromUtf8(text.view())) {
+            Some(sv) => {
+                match (trusted.add(sv)) {
+                    Ok(true) => {}
+                    _ => { fail("4: TrustedProxies refused a block", text.view()); }
+                }
+            }
+            null => {}
+        }
+        match (blocks.push(b)) {
+            Ok() => {}
+            Err(_) => { Process.exit(2); }
+        }
+    }
+}
+
+fn randPeer(rng: borrow mut Rng) -> SocketAddress? => match (rng.below(8)) {
+    0 => null,
+    1 => Some(SocketAddress.V6(randV6(rng), randPort(rng), 0)),
+    _ => Some(SocketAddress.V4(randV4(rng), randPort(rng))),
+};
+
+fn chainCase(rng: borrow mut Rng, stats: borrow mut Stats) {
+    var head = Head { text: Vector<u8>.create() };
+    var forwarded = Vector<Hop>.create();
+    var xff = Vector<Hop>.create();
+    if (rng.below(4) != 0) {
+        let n = 1 + rng.below(6);
+        forwardedFields(rng, mut head, n, mut forwarded);
+    }
+    if (rng.below(2) == 0) {
+        line(mut head, "X-Other", "for=6.6.6.6".bytes());
+    }
+    if (rng.below(2) == 0) {
+        let n = 1 + rng.below(6);
+        xffFields(rng, mut head, n, mut xff);
+    }
+    let peer = randPeer(rng);
+    var blocks = Vector<Block>.create();
+    var trusted = TrustedProxies.none();
+    var all = Vector<Hop>.create();
+    for (i in 0..forwarded.length) {
+        pushHop(mut all, forwarded[i]);
+    }
+    for (i in 0..xff.length) {
+        pushHop(mut all, xff[i]);
+    }
+    trustedSet(rng, peer, all, mut blocks, mut trusted);
+    let text = head.text.view();
+    let list = listOf(text);
+    match (Hops.fromForwarded(list)) {
+        Ok(h) => { checkHops("4: the Forwarded chain parsed to other hops", h, forwarded, text); }
+        Err(_) => { Process.exit(2); }
+    }
+    match (Hops.fromXForwardedFor(list)) {
+        Ok(h) => { checkHops("4: the X-Forwarded-For chain parsed to other hops", h, xff, text); }
+        Err(_) => { Process.exit(2); }
+    }
+    let source = if (rng.below(2) == 0) ForwardedSource.ForwardedFirst else ForwardedSource.XForwardedForFirst;
+    let want = expectedClient(peer, blocks, forwarded, xff, source);
+    match (clientOf(peer, list, trusted, source)) {
+        Ok(c) => {
+            if (!sameClient(c, want)) {
+                fail("4: clientOf names another client than §3.4's rule", text);
+            }
+        }
+        Err(_) => { Process.exit(2); }
+    }
+    stats.chains += 1;
+
+    // 5: what this hop sends on.
+    let hosts = ["example.com", "example.com:8080", "[2001:db8::1]:443", "a\"b\\c"];
+    var host = Vector<u8>.create();
+    if (rng.below(5) == 0) {
+        let n = rng.below(12);
+        for (k in 0..n) {
+            put(mut host, 33 + truncate<u8>(rng.below(94)));
+        }
+    } else {
+        putText(mut host, hosts[rng.below(4) as usize]);
+    }
+    let scheme = if (rng.below(2) == 0) "http" else "https";
+    let believed = match (peer) {
+        Some(p) => trustedBy(blocks, p),
+        null => false,
+    };
+    let out = match (forwardingFields(peer, list, trusted, scheme, host.view(), true, true)) {
+        Ok(o) => o,
+        Err(_) => {
+            Process.exit(2);
+            return;
+        },
+    };
+    var sentHead = Head { text: Vector<u8>.create() };
+    line(mut sentHead, "forwarded", out.forwarded.view());
+    if (out.forwardedFor.length > 0) {
+        line(mut sentHead, "x-forwarded-for", out.forwardedFor.view());
+    }
+    var wantForwarded = Vector<Hop>.create();
+    var wantXff = Vector<Hop>.create();
+    if (believed) {
+        for (i in 0..forwarded.length) {
+            pushHop(mut wantForwarded, forwarded[i]);
+        }
+        for (i in 0..xff.length) {
+            pushHop(mut wantXff, xff[i]);
+        }
+    }
+    match (peer) {
+        Some(p) => {
+            pushHop(mut wantForwarded, Hop.Address(bare(p)));
+            pushHop(mut wantXff, Hop.Address(bare(p)));
+        }
+        null => { pushHop(mut wantForwarded, Hop.Hidden); }
+    }
+    let sentText = sentHead.text.view();
+    let sent = listOf(sentText);
+    match (Hops.fromForwarded(sent)) {
+        Ok(h) => {
+            checkHops(
+                "5: the Forwarded field sent on does not parse to the chain and this hop",
+                h,
+                wantForwarded,
+                sentText,
+            );
+        }
+        Err(_) => { Process.exit(2); }
+    }
+    if (wantXff.length == 0) {
+        if (out.forwardedFor.length != 0) {
+            fail("5: an X-Forwarded-For was sent with nothing to say", out.forwardedFor.view());
+        }
+    } else {
+        match (Hops.fromXForwardedFor(sent)) {
+            Ok(h) => {
+                checkHops(
+                    "5: the X-Forwarded-For sent on does not parse to the chain and this hop",
+                    h,
+                    wantXff,
+                    sentText,
+                );
+            }
+            Err(_) => { Process.exit(2); }
+        }
+    }
+    var sentHost = Vector<u8>.create();
+    let found = lastHost(out.forwarded.view(), mut sentHost);
+    if (found != (host.length > 0) || !same(sentHost.view(), host.view())) {
+        fail("5: the Forwarded host does not unquote to the request's host", out.forwarded.view());
+    }
+}
+
+/// The `host` of the last element of a `Forwarded` value, unquoted (RFC 9110 §5.6.4); false if it has none.
+fn lastHost(value: Slice<u8>, out: borrow mut Vector<u8>) -> bool {
+    var start: usize = 0;
+    var inQuotes = false;
+    var i: usize = 0;
+    while (i < value.length) {
+        let b = value[i];
+        if (inQuotes && b == 92) {
+            i += 2;
+            continue;
+        }
+        if (b == 34) {
+            inQuotes = !inQuotes;
+        } else if (b == 44 && !inQuotes) {
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let element = trimWhitespace(value[start..]);
+    var pairStart: usize = 0;
+    inQuotes = false;
+    i = 0;
+    while (i <= element.length) {
+        if (i < element.length) {
+            let b = element[i];
+            if (inQuotes && b == 92) {
+                i += 2;
+                continue;
+            }
+            if (b == 34) {
+                inQuotes = !inQuotes;
+            }
+            if (inQuotes || b != 59) {
+                i += 1;
+                continue;
+            }
+        }
+        let pair = element[pairStart..(if (i > element.length) element.length else i)];
+        pairStart = i + 1;
+        i += 1;
+        if (pair.length >= 5 && Ascii.equalsIgnoringCase(pair[0..5], "host=")) {
+            let v = pair[5..];
+            if (v.length >= 2 && v[0] == 34) {
+                var k: usize = 1;
+                while (k < v.length - 1) {
+                    if (v[k] == 92 && k + 1 < v.length - 1) {
+                        k += 1;
+                    }
+                    put(out, v[k]);
+                    k += 1;
+                }
+            } else {
+                putAll(out, v);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 6: a client's bytes, then a trusted proxy's hop.
+fn spoofCase(rng: borrow mut Rng, stats: borrow mut Stats) {
+    var claim = Vector<u8>.create();
+    let n = 1 + rng.below(3);
+    for (k in 0..n) {
+        if (k > 0) {
+            separator(rng, mut claim);
+        }
+        let ignored = if (rng.below(3) == 0) xffElement(rng, mut claim) else element(rng, mut claim);
+    }
+    mutate(rng, mut claim, 6);
+    let client = [198u8, 51, 100, truncate<u8>(rng.next())];
+    let peer = SocketAddress.V4([10u8, 0, 0, 1 + truncate<u8>(rng.below(200))], 40000);
+    var trusted = TrustedProxies.none();
+    match (trusted.add("10.0.0.0/8")) {
+        Ok(true) => {}
+        _ => { Process.exit(2); }
+    }
+    var head = Head { text: Vector<u8>.create() };
+    let xffField = rng.below(2) == 0;
+    let together = rng.below(2) == 0;
+    var hop = Vector<u8>.create();
+    if (!xffField) {
+        putText(mut hop, "for=");
+    }
+    v4Text(mut hop, client);
+    if (!xffField && rng.below(2) == 0) {
+        putText(mut hop, ";proto=https");
+    }
+    let name = if (xffField) "x-forwarded-for" else "forwarded";
+    if (together) {
+        // the proxy extends the field it received (nginx's $proxy_add_x_forwarded_for, and joinAll here)
+        var value = Vector<u8>.create();
+        putAll(mut value, claim.view());
+        putText(mut value, ", ");
+        putAll(mut value, hop.view());
+        line(mut head, name, value.view());
+    } else {
+        line(mut head, name, claim.view());
+        line(mut head, name, hop.view());
+    }
+    let text = head.text.view();
+    let list = listOf(text);
+    let source = if (xffField) ForwardedSource.XForwardedForFirst else ForwardedSource.ForwardedFirst;
+    match (clientOf(Some(peer), list, trusted, source)) {
+        Ok(ClientIs.Address(a)) => {
+            if (sameAddress(a, SocketAddress.V4(client, 0))) {
+                stats.clientsNamed += 1;
+            } else if (sameAddress(a, peer)) {
+                stats.fallbacks += 1;
+            } else {
+                fail("6: the client chose the address it is known by", text);
+            }
+        }
+        Ok(_) => { fail("6: the client hid itself behind a trusted proxy's hop", text); }
+        Err(_) => { Process.exit(2); }
+    }
+}
+
+fn main() {
+    let seconds = setting("CW_FUZZ_SECONDS", 60);
+    let only = setting("CW_FUZZ_ONLY", 0);
+    var rng = Rng { s: setting("CW_FUZZ_SEED", 1).wrappingMul(2654435761).wrappingAdd(1) };
+    var stats = Stats {
+        v1: 0,
+        v2: 0,
+        damagedAccepted: 0,
+        damagedRefused: 0,
+        blocks: 0,
+        chains: 0,
+        clientsNamed: 0,
+        fallbacks: 0,
+    };
+    let started = Timer.now();
+    var cases: u64 = 0;
+    while (Timer.now() - started < seconds * 1000) {
+        if (only == 0 || only == 1) {
+            validCase(mut rng, mut stats);
+        }
+        if (only == 0 || only == 2) {
+            damagedCase(mut rng, mut stats);
+        }
+        if (only == 0 || only == 3) {
+            blockCase(mut rng, mut stats);
+        }
+        if (only == 0 || only == 4) {
+            chainCase(mut rng, mut stats);
+        }
+        if (only == 0 || only == 6) {
+            spoofCase(mut rng, mut stats);
+        }
+        cases += 1;
+    }
+    Console.writeLine("fuzz_proxy: clean");
+    Console.writeLine(cases);
+    Console.writeLine(
+        "valid v1, valid v2, damaged accepted, damaged refused, blocks, chains, clients named, fallbacks",
+    );
+    Console.writeLine(stats.v1);
+    Console.writeLine(stats.v2);
+    Console.writeLine(stats.damagedAccepted);
+    Console.writeLine(stats.damagedRefused);
+    Console.writeLine(stats.blocks);
+    Console.writeLine(stats.chains);
+    Console.writeLine(stats.clientsNamed);
+    Console.writeLine(stats.fallbacks);
+}
