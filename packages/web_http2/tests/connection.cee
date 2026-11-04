@@ -317,6 +317,31 @@ fn closed_and_half_closed_streams_rfc9113_5_1() -> Result<void, TestFailure> {
     return is("", feed(mut c, more.view())?);
 }
 
+/// A handler's DATA or HEADERS reaching the engine after the client reset its stream is dropped as STREAM_CLOSED
+/// (§5.4.2: the stream is closed), which the driver ignores, never INTERNAL_ERROR, which ends the connection. (Found
+/// by h2spec §5.1 #10 failing about one run in a hundred: the driver dropped the connection without its GOAWAY.)
+@test
+fn sends_after_the_peer_reset_are_stream_closed() -> Result<void, TestFailure> {
+    var c = server()?;
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let get = getBlock("/")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    frameHex(mut bytes, FrameTypes.rstStream(), 0, 1, "00000008")?;
+    is("req 1 end; reset 1 8; ", feed(mut c, bytes.view())?)?;
+    match (c.sendData(1, "hello".bytes(), true)) {
+        Err(code) => { Check.equalU64(ErrorCodes.streamClosed() as u64, code as u64)?; }
+        Ok() => { return Check.fail("DATA on a reset stream was sent"); }
+    }
+    var response = HeaderBlock.create();
+    grew(response.push(":status".bytes(), "200".bytes(), false))?;
+    match (c.sendHeaders(1, response, false)) {
+        Err(code) => { Check.equalU64(ErrorCodes.streamClosed() as u64, code as u64)?; }
+        Ok() => { return Check.fail("HEADERS on a reset stream were sent"); }
+    }
+    return is("settings 0 f1; ", sent(mut c)?);
+}
+
 @test
 fn closed_by_whom_rfc9113_5_1() -> Result<void, TestFailure> {
     let get = getBlock("/")?;

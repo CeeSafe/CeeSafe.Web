@@ -129,7 +129,7 @@ async fn say(text: StringView) -> Result<void, NetError> {
     }
 }
 
-async fn serve(server: Server<App>) -> Result<void, NetError> {
+async fn serve(server: Server<App>) -> Result<ServerReport?, NetError> {
     var chain = Vector<u8>.create();
     var key = Vector<u8>.create();
     await readFile("CW_CERT", mut chain)?;
@@ -138,7 +138,7 @@ async fn serve(server: Server<App>) -> Result<void, NetError> {
         Ok(c) => c,
         Err(_) => {
             await say("https: the certificate or key could not be used")?;
-            return Ok();
+            return Ok(null);
         },
     };
     var protocols = [Alpn.Http2, Alpn.Http11];
@@ -159,7 +159,8 @@ async fn serve(server: Server<App>) -> Result<void, NetError> {
     limits.handshakeMs = setting("CW_HANDSHAKE_MS", 10000);
     await say("https: listening")?;
     let report = await server.run(listener, acceptor, limits, drain)?;
-    return await say("https: drained");
+    await say("https: drained")?;
+    return Ok(Some(report));
 }
 
 fn main() {
@@ -171,7 +172,15 @@ fn main() {
         },
     };
     match (Async.run(serve(server))) {
-        Ok() => {}
+        Ok(null) => {}
+        Ok(Some(report)) => {
+            // What the workers counted: a connection whose handler failed was dropped without a graceful close.
+            Console.writeLine("https: accepted, handshakes failed, served, failed");
+            Console.writeLine(report.accepted);
+            Console.writeLine(report.handshakesFailed);
+            Console.writeLine(report.served);
+            Console.writeLine(report.failed);
+        }
         Err(e) => { Console.writeLine(NetErrors.describe(e)); }
     }
 }
