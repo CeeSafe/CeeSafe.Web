@@ -1,6 +1,6 @@
 [package]
 name = "web_tls"
-version = "0.3.0"
+version = "0.3.1"
 kind = "library"
 # @threadSafe on TlsConfig, TlsTransport and TlsSession is this package's claim (CeeSafe ADR 0025 §3.2; Web ADR 0009 §1).
 trusted = true
