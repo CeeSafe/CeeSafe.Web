@@ -126,7 +126,8 @@ async fn events_then_the_end() -> Result<void, TestFailure> {
     return Ok();
 }
 
-/// A quiet stream sends a heartbeat every 50 ms: two before an event published at 125 ms, then the end.
+/// A quiet stream sends a heartbeat every 100 ms: two before an event published at 250 ms, then the end. The margins
+/// (50 ms) are over three ticks of Windows' 15.6 ms clock.
 @test
 async fn heartbeats_while_quiet() -> Result<void, TestFailure> {
     var conn = peer(null);
@@ -138,7 +139,7 @@ async fn heartbeats_while_quiet() -> Result<void, TestFailure> {
     // The scope's error type is `NetError`, as in M1's tests: a droppable one hits CeeSafe B13.
     let r: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (s) => {
         s.spawn(async () => {
-            match (await streamed(mut conn, q, StreamOptions { heartbeatMs: 50 }, Silent {})) {
+            match (await streamed(mut conn, q, StreamOptions { heartbeatMs: 100 }, Silent {})) {
                 Ok(e) => { end = e; }
                 Err(_) => {
                     failed = true;
@@ -148,7 +149,7 @@ async fn heartbeats_while_quiet() -> Result<void, TestFailure> {
             return Ok();
         });
         s.spawn(async () => {
-            match (await Timer.sleep(125)) {
+            match (await Timer.sleep(250)) {
                 Ok() => {}
                 Err(_) => { return Err(NetError.Cancelled); }
             }

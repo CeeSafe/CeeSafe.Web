@@ -9,11 +9,13 @@ import web_http;
 /// shut down its sending side, and reads until `goneAtMs` (0: always). If `drainAtMs` is not 0, the server's drain starts then (through `drain`, a handle to the
 /// connection's). With `piece` above 0 the input comes `piece` bytes a read, each read first pausing 1 ms with
 /// cancellation ignored, so a read cancelled in its pause still returns its bytes: a completion-based read (io_uring,
-/// IOCP) that finished as it was cancelled (CeeSafe ADR 0035 §3.4).
+/// IOCP) that finished as it was cancelled (CeeSafe ADR 0035 §3.4). The close then counts from the last input byte
+/// read (`closeAfterInputMs`), since a 1 ms pause lasts about 25 ms on Windows (its clock ticks every 15.6 ms).
 struct Client {
     input: Vector<u8>;
     at: usize;
     piece: usize;
+    closeAfterInputMs: u64;
     closeAtMs: u64;
     halfClosed: bool;
     goneAtMs: u64;
@@ -39,6 +41,10 @@ impl Transport for Client {
                 buffer[i] = this.input[this.at + i];
             }
             this.at += n;
+            if (this.at == this.input.length && this.closeAfterInputMs != 0) {
+                this.closeAtMs = Timer.now() + this.closeAfterInputMs;
+                this.closeAfterInputMs = 0;
+            }
             return Ok(n);
         }
         loop {
@@ -235,7 +241,9 @@ async fn servedAs(
         input: copy,
         at: 0,
         piece: piece,
-        closeAtMs: start + closeAfterMs,
+        closeAfterInputMs: if (piece > 0) closeAfterMs else 0u64,
+        // In pieces, open until the input has been read (then `closeAfterInputMs`).
+        closeAtMs: if (piece > 0) 0xFFFFFFFFFFFFFFFFu64 else start + closeAfterMs,
         halfClosed: halfClosed,
         goneAtMs: if (goneAfterMs == 0) 0u64 else start + goneAfterMs,
         drainAtMs: if (drainAfterMs == 0) 0u64 else start + drainAfterMs,
