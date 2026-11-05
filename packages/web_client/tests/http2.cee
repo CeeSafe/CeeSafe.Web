@@ -159,3 +159,70 @@ async fn http2_without_run_is_refused() -> Result<void, TestFailure> {
         Ok(_) => { return Check.fail("answered without run"); }
     }
 }
+
+/// A read that completed as the wait's other arm won (a stream's command; io_uring, CeeSafe ADR 0035 §3.4) keeps its
+/// bytes: `Async.race` returns them as `other`. Dropped, the connection's framing broke and the body never came whole.
+@test
+async fn a_read_completed_as_it_was_cancelled_keeps_its_bytes() -> Result<void, TestFailure> {
+    var server = Vector<u8>.create();
+    frameTo(mut server, FrameTypes.settings(), 0, 0, "".bytes())?;
+    let ok = block(":status: 200\n")?;
+    frameTo(mut server, FrameTypes.headers(), FrameFlags.endHeaders(), 1, ok.view())?;
+    var body = Vector<u8>.create();
+    for (i in 0..3000) {
+        match (body.push(48 + truncate<u8>(i % 10))) {
+            Ok() => {}
+            Err(_) => { return Check.fail("out of memory"); }
+        }
+    }
+    let all = body.view();
+    for (k in 0..30usize) {
+        let flags = if (k == 29) FrameFlags.endStream() else 0u8;
+        frameTo(mut server, FrameTypes.data(), flags, 1, all[k * 100..k * 100 + 100])?;
+    }
+    let scripts = scriptsOf(1)?;
+    var mock = match (MockTransport.create(server.view())) {
+        Ok(m) => m,
+        Err(_) => { return Check.fail("a mock"); },
+    };
+    queue(scripts, mock.withChunk(5).withPause(2).withCompletingReads().withHang())?;
+    scripts.close();
+    let client = h2Client(scripts)?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a drain"); },
+    };
+    var got = Vector<u8>.create();
+    var failure: ClientError? = null;
+    let raced: Result<Raced<bool>, NetError> = await Async.race(
+        async () => {
+            await client.run(drain)?;
+            return Ok(false);
+        },
+        async () => {
+            let rs: Result<void, ClientError> = await Async.scope(ClientError.Shutdown, (s) => {
+                s.spawn(async () => {
+                    var r = await client.get("http://example.test/body")?;
+                    await r.readToEnd(mut got, 4096)?;
+                    return Ok();
+                });
+            });
+            match (rs) {
+                Ok() => { return Ok(true); }
+                Err(e) => {
+                    failure = Some(e);
+                    return Ok(false);
+                }
+            }
+        },
+    );
+    match (failure) {
+        Some(e) => { return Check.fail(ClientErrors.describe(e)); }
+        null => {}
+    }
+    match (raced) {
+        Ok(won) => { Check.isTrue(won.value, "the request answered")?; }
+        Err(e) => { return Check.fail(NetErrors.describe(e)); }
+    }
+    return Check.equalBytes(body.view(), got.view());
+}

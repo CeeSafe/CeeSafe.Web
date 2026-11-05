@@ -209,24 +209,43 @@ public struct WebSocket<region r, L: RawLink> {
                 return Ok(this.end(CloseCodes.internalError())); // a frame head larger than the buffer cannot happen
             }
             let waitMs = this.untilTimer();
-            match (await wake(mut this.link, mut this.input, this.queue, waitMs)) {
-                Ok(Wake.Read(0)) => { return Ok(this.end(CloseCodes.abnormal())); }
-                Ok(Wake.Read(n)) => {
-                    match (this.input.commit(n)) {
-                        Ok() => {}
-                        Err(_) => { return Err(HandlerError.Internal); }
+            let woke = match (await wake(mut this.link, mut this.input, this.queue, waitMs)) {
+                Ok(w) => w,
+                Err(HandlerError.Io(NetError.Cancelled)) => { return Err(HandlerError.Io(NetError.Cancelled)); },
+                Err(_) => { return Ok(this.end(CloseCodes.abnormal())); },
+            };
+            // Both of a race's children may have finished: a read the kernel completed as it was cancelled (io_uring,
+            // CeeSafe ADR 0035 §3.4) comes back as `other`, and its bytes are already in `input`.
+            var current: Wake? = Some(woke.value);
+            var later: Wake? = woke.other;
+            var closed = false;
+            loop {
+                let w = match (current) {
+                    Some(x) => x,
+                    null => { break; },
+                };
+                current = later;
+                later = null;
+                match (w) {
+                    Wake.Read(0) => { closed = true; }
+                    Wake.Read(n) => {
+                        match (this.input.commit(n)) {
+                            Ok() => {}
+                            Err(_) => { return Err(HandlerError.Internal); }
+                        }
+                    }
+                    Wake.Queued(message) => { await this.sendQueued(message)?; }
+                    Wake.QueueEnded => {}
+                    Wake.Timer => {
+                        match (await this.timerFired()?) {
+                            Some(code) => { return Ok(this.end(code)); }
+                            null => {}
+                        }
                     }
                 }
-                Ok(Wake.Queued(message)) => { await this.sendQueued(message)?; }
-                Ok(Wake.QueueEnded) => {}
-                Ok(Wake.Timer) => {
-                    match (await this.timerFired()?) {
-                        Some(code) => { return Ok(this.end(code)); }
-                        null => {}
-                    }
-                }
-                Err(HandlerError.Io(NetError.Cancelled)) => { return Err(HandlerError.Io(NetError.Cancelled)); }
-                Err(_) => { return Ok(this.end(CloseCodes.abnormal())); }
+            }
+            if (closed) {
+                return Ok(this.end(CloseCodes.abnormal()));
             }
         }
     }
@@ -464,14 +483,16 @@ async fn maskKey() -> Result<[u8; 4], HandlerError> {
     }
 }
 
-/// One wait: bytes from the peer (into `input`'s spare room), a queued message, or `waitMs` passing.
+/// One wait: bytes from the peer (into `input`'s spare room), a queued message, or `waitMs` passing. Both of the race's
+/// children may have finished, so both values come back (`value`, then `other`); a message taken as the timer won is
+/// kept, and the timer's wake dropped (the next wait finds the timer due at once).
 async fn wake<L: RawLink>(
     link: borrow mut L,
     input: borrow mut OwnedBuffer,
     queue: borrow Channel<Outbound>,
     waitMs: u64,
-) -> Result<Wake, HandlerError> {
-    let raced: Result<Raced<Wake>, HandlerError> = await Async.race(
+) -> Result<Raced<Wake>, HandlerError> {
+    return await Async.race(
         async () => {
             let n = await link.readSome(input.spare())?;
             return Ok(Wake.Read(n));
@@ -499,11 +520,15 @@ async fn wake<L: RawLink>(
                 },
             );
             let won = inner?;
-            return Ok(won.value);
+            if (won.winner == 0) {
+                return Ok(won.value); // the data won: `other`, if any, is the timer's
+            }
+            return match (won.other) {
+                Some(m) => Ok(m),
+                null => Ok(won.value),
+            };
         },
     );
-    let won = raced?;
-    return Ok(won.value);
 }
 
 /// Answers an upgrade request: checks it (Web ADR 0010 §3.1, §3.4), agrees the subprotocol, switches the exchange,

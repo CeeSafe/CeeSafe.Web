@@ -167,6 +167,30 @@ async fn mock_cancelled_paused_read_loses_nothing() -> Result<void, TestFailure>
 }
 
 @test
+async fn mock_completing_read_returns_its_bytes_when_it_loses() -> Result<void, TestFailure> {
+    // A completing read (io_uring, CeeSafe ADR 0035 §3.4) paused 20 ms loses to a 5 ms timer, yet finishes: its bytes
+    // come back as the race's `other`, and they are consumed.
+    var r = mockText("data")?.withPause(20).withCompletingReads();
+    var buf = [0u8; 8];
+    let raced: Result<Raced<usize>, NetError> = await Async.race(
+        async () => await r.read(mut buf[..]),
+        async () => {
+            match (await Timer.sleep(5)) {
+                Ok() => { return Ok(99usize); }
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+        },
+    );
+    let won = net(raced)?;
+    Check.isTrue(won.winner == 1 && won.value == 99, "the timer won")?;
+    Check.isTrue(match (won.other) {
+        Some(n) => n == 4,
+        null => false,
+    }, "the read's 4 bytes as other")?;
+    return Check.isTrue(r.consumed() == 4 && buf[0] == 100 && buf[3] == 97, "consumed into the buffer");
+}
+
+@test
 fn mock_alpn() -> Result<void, TestFailure> {
     let a = mockText("")?.withAlpn(Alpn.Http2);
     Check.isTrue(match (a.alpn()) {

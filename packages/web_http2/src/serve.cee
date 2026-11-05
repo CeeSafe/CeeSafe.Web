@@ -226,24 +226,36 @@ async fn run(
         }
         input.compact();
         let waitMs = if (links.length() == 0) lastActive + limits.idleTimeoutMs - now else 1000;
-        match (await wake(conn, input, outgoing, if (waitMs > 1000) 1000 else waitMs, !peerDone)) {
-            Ok(Wake.Read(0)) => {
-                peerDone = true;
-                if (!leaving) {
-                    engineOk(engine.goAway(ErrorCodes.noError()))?;
-                    leaving = true;
+        let woke = await wake(conn, input, outgoing, if (waitMs > 1000) 1000 else waitMs, !peerDone)?;
+        // Both of a race's children may have finished: a read the kernel completed as it was cancelled (io_uring,
+        // CeeSafe ADR 0035 §3.4) comes back as `other`, and its bytes are already in `input`.
+        var current: Wake? = Some(woke.value);
+        var later: Wake? = woke.other;
+        loop {
+            let w = match (current) {
+                Some(x) => x,
+                null => { break; },
+            };
+            current = later;
+            later = null;
+            match (w) {
+                Wake.Read(0) => {
+                    peerDone = true;
+                    if (!leaving) {
+                        engineOk(engine.goAway(ErrorCodes.noError()))?;
+                        leaving = true;
+                    }
+                }
+                Wake.Read(n) => { input.commit(n)?; }
+                Wake.Message(m) => {
+                    await handle(set, connection, app, limits, engine, links, outgoing, m, mut total)?;
+                }
+                Wake.Timer => {
+                    if (peerDone && links.length() > 0) {
+                        engineOk(engine.ping([0u8; 8]))?;
+                    }
                 }
             }
-            Ok(Wake.Read(n)) => { input.commit(n)?; }
-            Ok(Wake.Message(m)) => {
-                await handle(set, connection, app, limits, engine, links, outgoing, m, mut total)?;
-            }
-            Ok(Wake.Timer) => {
-                if (peerDone && links.length() > 0) {
-                    engineOk(engine.ping([0u8; 8]))?;
-                }
-            }
-            Err(e) => { return Err(e); }
         }
     }
 }
@@ -522,29 +534,30 @@ async fn writeOutput(
     return Ok();
 }
 
-/// One wait: bytes from the client (when `reading`), a stream's message, or `waitMs` passing.
+/// One wait: bytes from the client (when `reading`), a stream's message, or `waitMs` passing. Both of the race's
+/// children may have finished, so both values come back (`value`, then `other`).
 async fn wake(
     conn: borrow mut dyn Transport,
     input: borrow mut OwnedBuffer,
     outgoing: borrow Channel<Outgoing>,
     waitMs: u64,
     reading: bool,
-) -> Result<Wake, NetError> {
+) -> Result<Raced<Wake>, NetError> {
     if (!reading) {
-        return await quietWake(outgoing, waitMs);
+        let w = await quietWake(outgoing, waitMs)?;
+        return Ok(Raced<Wake> { winner: 1, value: w, other: null });
     }
-    let raced: Result<Raced<Wake>, NetError> = await Async.race(
+    return await Async.race(
         async () => {
             let n = await conn.read(input.spare())?;
             return Ok(Wake.Read(n));
         },
         async () => await quietWake(outgoing, waitMs),
     );
-    let won = raced?;
-    return Ok(won.value);
 }
 
-/// One wait without reading: a stream's message, or `waitMs` passing.
+/// One wait without reading: a stream's message, or `waitMs` passing. A message taken as the timer won is kept: the
+/// timer's wake is the one dropped.
 async fn quietWake(outgoing: borrow Channel<Outgoing>, waitMs: u64) -> Result<Wake, NetError> {
     let raced: Result<Raced<Wake>, NetError> = await Async.race(
         async () => {
@@ -562,7 +575,13 @@ async fn quietWake(outgoing: borrow Channel<Outgoing>, waitMs: u64) -> Result<Wa
         },
     );
     let won = raced?;
-    return Ok(won.value);
+    if (won.winner == 0) {
+        return Ok(won.value); // the data won: `other`, if any, is the timer's
+    }
+    return match (won.other) {
+        Some(m) => Ok(m),
+        null => Ok(won.value),
+    };
 }
 
 // ---- The stream's task ----

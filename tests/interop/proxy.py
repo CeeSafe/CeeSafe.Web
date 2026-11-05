@@ -23,6 +23,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 PROXY = ROOT / "examples/proxy/out/proxy"
 SERVER = ROOT / "examples/server/out/server"
 BACKEND, FRONT, H2BACKEND, H2FRONT, PPFRONT, HAPROXY = 18101, 18100, 18103, 18102, 18104, 18105
+# examples/proxy listens on 127.0.0.1, which a bridged container reaches only through Docker Desktop's
+# host.docker.internal; on Linux HAProxy shares the host's network instead.
+LINUX = sys.platform.startswith("linux")
 BLOCK = hashlib.sha256(b"cw-m8").digest() * 2048  # 64 KiB, the download's repeating content
 
 results = []
@@ -208,6 +211,8 @@ def load():
 
 
 def haproxy(scratch):
+    upstream = "127.0.0.1" if LINUX else "host.docker.internal"
+    v1, v2 = (HAPROXY, HAPROXY + 1) if LINUX else (8001, 8002)
     cfg = pathlib.Path(scratch) / "haproxy.cfg"
     cfg.write_text(f"""global
     log stdout format raw local0
@@ -217,22 +222,23 @@ defaults
     timeout client 30s
     timeout server 30s
 frontend v1
-    bind :8001
+    bind :{v1}
     http-request set-header x-haproxy-src %[src]
     default_backend v1
 frontend v2
-    bind :8002
+    bind :{v2}
     http-request set-header x-haproxy-src %[src]
     default_backend v2
 backend v1
-    server p host.docker.internal:{PPFRONT} send-proxy
+    server p {upstream}:{PPFRONT} send-proxy
 backend v2
-    server p host.docker.internal:{PPFRONT} send-proxy-v2
+    server p {upstream}:{PPFRONT} send-proxy-v2
 """)
     name = f"cw-haproxy-{os.getpid()}"
-    run = subprocess.run(["docker", "run", "-d", "--rm", "--name", name, "-p", f"{HAPROXY}:8001",
-                          "-p", f"{HAPROXY + 1}:8002", "-v", f"{cfg}:/usr/local/etc/haproxy/haproxy.cfg:ro",
-                          "haproxy:3.0"], capture_output=True, text=True)
+    network = ["--network", "host"] if LINUX else ["-p", f"{HAPROXY}:8001", "-p", f"{HAPROXY + 1}:8002"]
+    run = subprocess.run(["docker", "run", "-d", "--rm", "--name", name, *network,
+                          "-v", f"{cfg}:/usr/local/etc/haproxy/haproxy.cfg:ro", "haproxy:3.0"],
+                         capture_output=True, text=True)
     if run.returncode != 0:
         check("HAProxy started", False, run.stderr.strip()[-200:])
         return

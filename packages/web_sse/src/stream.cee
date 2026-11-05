@@ -185,7 +185,15 @@ async fn wake(exchange: borrow mut Exchange, queue: borrow EventQueue, heartbeat
                 },
             );
             let won = inner?;
-            return Ok(won.value);
+            // An event taken as the heartbeat won is kept (a cancelled `next` returns what it took, CeeSafe
+            // `recvAsync`); the heartbeat is the one dropped.
+            if (won.winner == 0) {
+                return Ok(won.value); // the data won: `other`, if any, is the timer's
+            }
+            return match (won.other) {
+                Some(e) => Ok(e),
+                null => Ok(won.value),
+            };
         },
     );
     let won = r?;

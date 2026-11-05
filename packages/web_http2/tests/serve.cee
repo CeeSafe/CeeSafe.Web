@@ -7,10 +7,13 @@ import web_http;
 /// A scripted client: it sends `input`, then waits until `closeAtMs` and ends the stream. From `goneAtMs` (by default
 /// `closeAtMs`) it has gone, so a write fails as it would after the peer's TCP reset; a `halfClosed` client has only
 /// shut down its sending side, and reads until `goneAtMs` (0: always). If `drainAtMs` is not 0, the server's drain starts then (through `drain`, a handle to the
-/// connection's).
+/// connection's). With `piece` above 0 the input comes `piece` bytes a read, each read first pausing 1 ms with
+/// cancellation ignored, so a read cancelled in its pause still returns its bytes: a completion-based read (io_uring,
+/// IOCP) that finished as it was cancelled (CeeSafe ADR 0035 §3.4).
 struct Client {
     input: Vector<u8>;
     at: usize;
+    piece: usize;
     closeAtMs: u64;
     halfClosed: bool;
     goneAtMs: u64;
@@ -25,6 +28,12 @@ impl Transport for Client {
             var n = this.input.length - this.at;
             if (n > buffer.length) {
                 n = buffer.length;
+            }
+            if (this.piece > 0) {
+                if (n > this.piece) {
+                    n = this.piece;
+                }
+                let paused: Result<void, AsyncError> = await Async.shield(100, async () => await Timer.sleep(1));
             }
             for (i in 0..n) {
                 buffer[i] = this.input[this.at + i];
@@ -186,19 +195,23 @@ impl Application for Site {
 
 /// Serves the scripted client's `input` with `Site`, the client leaving after `closeAfterMs`; what the server wrote.
 async fn served(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedAs(input, closeAfterMs, 0, false, 0, false);
+    await servedAs(input, closeAfterMs, 0, false, 0, false, 0);
 
 /// `served`, with the server's drain started after `drainAfterMs` (0: never).
 async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedAs(input, closeAfterMs, drainAfterMs, false, 0, false);
+    await servedAs(input, closeAfterMs, drainAfterMs, false, 0, false, 0);
 
 /// `served`, with a client that half-closes after `closeAfterMs` and keeps reading until `goneAfterMs` (0: always).
 async fn servedHalfClosed(input: borrow Vector<u8>, closeAfterMs: u64, goneAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedAs(input, closeAfterMs, 0, true, goneAfterMs, false);
+    await servedAs(input, closeAfterMs, 0, true, goneAfterMs, false, 0);
 
 /// `served`, with the server's `Date` on.
 async fn servedDated(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedAs(input, closeAfterMs, 0, false, 0, true);
+    await servedAs(input, closeAfterMs, 0, false, 0, true, 0);
+
+/// `served`, the input coming `piece` bytes a read, each read completing even when cancelled (`Client`).
+async fn servedInPieces(input: borrow Vector<u8>, closeAfterMs: u64, piece: usize) -> Result<Vector<u8>, TestFailure> =>
+    await servedAs(input, closeAfterMs, 0, false, 0, false, piece);
 
 async fn servedAs(
     input: borrow Vector<u8>,
@@ -207,6 +220,7 @@ async fn servedAs(
     halfClosed: bool,
     goneAfterMs: u64,
     sendDate: bool,
+    piece: usize,
 ) -> Result<Vector<u8>, TestFailure> {
     var copy = Vector<u8>.create();
     for (b in input.view()) {
@@ -220,6 +234,7 @@ async fn servedAs(
     var client = Client {
         input: copy,
         at: 0,
+        piece: piece,
         closeAtMs: start + closeAfterMs,
         halfClosed: halfClosed,
         goneAtMs: if (goneAfterMs == 0) 0u64 else start + goneAfterMs,
@@ -377,6 +392,36 @@ async fn a_body_echoed_and_two_streams_interleaved() -> Result<void, TestFailure
     return Check.isTrue(contains(log.view(), "data 1 f1 abcdef; "), "stream 1's body echoed");
 }
 
+/// A read that completed as the wait's other arm won (a stream's message; io_uring, CeeSafe ADR 0035 §3.4) keeps its
+/// bytes: `Async.race` returns them as `other`. Dropped, the connection's framing broke and the echo never came.
+@test
+async fn a_read_completed_as_it_was_cancelled_keeps_its_bytes() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let echo = blockOf(":method: POST\n:scheme: https\n:path: /echo\n:authority: example.test\n")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, echo.view())?;
+    var body = Vector<u8>.create();
+    for (i in 0..1000) {
+        grew(body.push(48 + truncate<u8>(i % 10)))?;
+    }
+    let all = body.view();
+    for (k in 0..20usize) {
+        let flags = if (k == 19) FrameFlags.endStream() else 0u8;
+        frame(mut bytes, FrameTypes.data(), flags, 1, all[k * 50..k * 50 + 50])?;
+    }
+    let out = await servedInPieces(bytes, 2000, 7)?;
+    let log = frames(out)?;
+    var want = Vector<u8>.create();
+    for (b in "data 1 f1 ".bytes()) {
+        grew(want.push(b))?;
+    }
+    for (b in body.view()) {
+        grew(want.push(b))?;
+    }
+    Check.isTrue(contains(log.view(), "headers 1 f4 200; "), "the echo's head")?;
+    return Check.isTrue(containsBytes(log.view(), want.view()), "the 1 000 bytes echoed whole");
+}
+
 /// A request's trailers (HEADERS with END_STREAM after its DATA, RFC 9113 §8.1) reach the handler once it has read
 /// the body.
 @test
@@ -431,8 +476,9 @@ fn startsWith(hay: Slice<u8>, prefix: StringView) -> bool {
     return true;
 }
 
-fn contains(hay: Slice<u8>, needle: StringView) -> bool {
-    let n = needle.bytes();
+fn contains(hay: Slice<u8>, needle: StringView) -> bool => containsBytes(hay, needle.bytes());
+
+fn containsBytes(hay: Slice<u8>, n: Slice<u8>) -> bool {
     if (n.length > hay.length) {
         return false;
     }

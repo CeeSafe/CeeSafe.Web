@@ -878,7 +878,7 @@ async fn wait(
     idleMs: u64,
 ) -> Result<Raced<Moved>, HandlerError> {
     if (clientDone) {
-        return await Async.race(
+        return busy(await Async.race(
             async () => {
                 match (await upstream.transport().read(fromUpstream)) {
                     Ok(n) => { return Ok(Moved.FromUpstream(n)); }
@@ -886,16 +886,16 @@ async fn wait(
                 }
             },
             async () => await idle(idleMs),
-        );
+        ));
     }
     if (upstreamDone) {
-        return await Async.race(
+        return busy(await Async.race(
             async () => {
                 let n = await exchange.readRaw(fromClient)?;
                 return Ok(Moved.FromClient(n));
             },
             async () => await idle(idleMs),
-        );
+        ));
     }
     let both: Result<Raced<Moved>, HandlerError> = await Async.race(
         async () => {
@@ -913,10 +913,31 @@ async fn wait(
                 async () => await idle(idleMs),
             );
             let won = inner?;
-            return Ok(won.value);
+            // A read the kernel completed as the idle timer won (io_uring, CeeSafe ADR 0035 §3.4) is kept; the idle
+            // wake is the one dropped.
+            if (won.winner == 0) {
+                return Ok(won.value); // the data won: `other`, if any, is the timer's
+            }
+            return match (won.other) {
+                Some(m) => Ok(m),
+                null => Ok(won.value),
+            };
         },
     );
     return both;
+}
+
+/// A race of a read against the idle timer: a read the kernel completed as the timer won (io_uring, CeeSafe ADR 0035
+/// §3.4) is kept, and the idle wake dropped, so the tunnel does not end with those bytes unwritten.
+fn busy(r: Result<Raced<Moved>, HandlerError>) -> Result<Raced<Moved>, HandlerError> {
+    let raced = r?;
+    if (raced.winner == 0) {
+        return Ok(raced); // the read won: `other`, if any, is the idle timer's
+    }
+    return match (raced.other) {
+        Some(m) => Ok(Raced<Moved> { winner: 0, value: m, other: null }),
+        null => Ok(raced),
+    };
 }
 
 async fn idle(ms: u64) -> Result<Moved, HandlerError> {

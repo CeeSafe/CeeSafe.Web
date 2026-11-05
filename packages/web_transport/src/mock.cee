@@ -25,6 +25,7 @@ public struct MockTransport {
     private hang: bool;
     private pauseMs: u64;
     private paused: bool;
+    private completing: bool;
     private out: Vector<u8>;
     private step: usize;
     private failAfter: usize;
@@ -52,6 +53,7 @@ public struct MockTransport {
             hang: false,
             pauseMs: 0,
             paused: false,
+            completing: false,
             out: Vector<u8>.create(),
             step: 0,
             failAfter: 0,
@@ -117,6 +119,15 @@ public struct MockTransport {
         var m = this;
         m.pauseMs = ms;
         m.paused = true;
+        return m;
+    }
+
+    /// With a pause (`withPause`), a read cancelled in its pause still returns its bytes: a completion-based read
+    /// (io_uring, IOCP) that finished as it was cancelled (CeeSafe ADR 0035 §3.4). Reads at the end of a hanging input
+    /// still wait until cancelled.
+    public fn withCompletingReads(this) -> MockTransport {
+        var m = this;
+        m.completing = true;
         return m;
     }
 
@@ -222,7 +233,12 @@ impl Transport for MockTransport {
         if (buffer.length == 0) {
             return Err(NetError.LimitExceeded);
         }
-        await this.pause()?;
+        if (this.completing && this.paused) {
+            let ms = this.pauseMs;
+            let paused: Result<void, AsyncError> = await Async.shield(ms + 100, async () => await Timer.sleep(ms));
+        } else {
+            await this.pause()?;
+        }
         if (this.resetArmed && this.at >= this.resetAt) {
             return Err(NetError.Reset);
         }
