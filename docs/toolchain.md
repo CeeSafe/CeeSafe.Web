@@ -19,14 +19,16 @@ that needs an unreleased compiler is not merged to main.
 | M6 WebSockets | **0.10.0** | nothing new for the server (0.9.4); the client needs U16 (`Random.fill`, ADR 0060) | done (`docs/milestones/M6.md`) |
 | M7 HTTP/2 | **0.10.3** | B16 (a wake lost on kqueue past ~30 connections), fixed in 0.10.2; B17 (cancellation and the wake list quadratic in parked tasks, CeeSafe ADR 0062), fixed in 0.10.3 | gate passed, on main, released in v0.3.0 (`docs/milestones/M7.md`) |
 | M8 reverse proxy | **0.11.0** | U20 (a type that holds loans as a `borrow mut dyn I`, CeeSafe ADR 0064 §3.2) for the request-body relay; ADR 0064 §1's generic methods for `ReverseProxy.route<S>()` | in progress (`docs/milestones/M8.md`) |
-| M9 sendfile | 0.9.0 | U7 (ADR 0051) | released |
+| M9 low-level I/O | 0.9.0; **0.19.1** from stage 3 | U7 sendfile (ADR 0051); `readAt`/`length` (ADR 0075) for TLS and HTTP/2 file bodies; U22 for `web_static` | in progress (Web ADR 0013) |
 | M10 HTTP/3 | 0.9.0 | U6 UDP (ADR 0050) | released |
 
 ## Current machine (2026-11-06)
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`), `~/.ceesafe/bin/ceesafec-0.18.2` | 0.18.2 (release, tag `v0.18.2` = CeeSafe `932bb1c`, osx-arm64; installed 2026-11-06, the two files byte-identical) | the latest release |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`) | 0.20.0 (release, osx-arm64; found 2026-11-06) | checks every manifest; not yet tested |
+| `~/.ceesafe/bin/ceesafec-0.19.1` | 0.19.1 (release, tag `v0.19.1` = CeeSafe `619145e`, osx-arm64) | `File.readAt`, `length` (CeeSafe ADR 0075), for M9 stage 3 |
+| `~/.ceesafe/bin/ceesafec-0.18.2` | 0.18.2 (release, tag `v0.18.2` = CeeSafe `932bb1c`, osx-arm64) | C backend only |
 | `~/.ceesafe/bin/ceesafec-0.18.1` | 0.18.1 (release, osx-arm64; `SHA256SUMS` checked, 2026-11-05) | B18 fixed |
 | `~/.ceesafe/bin/ceesafec-0.18.0` | 0.18.0 (release, osx-arm64) | B18's repro only: it does not check CeeSafe.Web |
 | `~/.ceesafe/bin/ceesafec-0.17.0` | 0.17.0 (release, osx-arm64) | the last release that builds M8 unchanged |
@@ -62,6 +64,14 @@ diagnostic, `fmt --check` is clean, and `tools/run_tests.py` with the sanitizers
 every package's tests pass in every mode (`python3 tools/run_tests.py --ceesafec ceesafec-0.18.2 --sanitize
 --alloc-sweep --cancel-sweep`: 43 runs, web_tls's interpreter run skipped), and every example and fuzzer checks
 (2026-11-06, macOS arm64). M8's minimum stays 0.11.0.
+
+0.19.1 (CeeSafe ADR 0075) adds positioned reads (`File.readAt`, `AsyncFiles.readAt`), `length`, `Clock.monotonicNanos`
+and `UnixTime`. With M9's tree at `258adf8` every manifest checks with no diagnostic, `fmt --check` is clean, and
+`python3 tools/run_tests.py --ceesafec ceesafec-0.19.1 --sanitize --alloc-sweep --cancel-sweep` passes 43 runs, web_tls's
+interpreter run skipped (2026-11-06, macOS arm64). Still open upstream: U18, U19 (`tests/probes/box-send-dyn-lend.cee`
+still N0205), U21, and U22 (an open file's modification time and kind), which `web_static` waits for. M9's minimum
+becomes 0.19.1 when stage 3 uses `readAt`. 0.20.0 checks every manifest (27, the benchmark included) with no
+diagnostic; its tests have not been run.
 
 0.10.3 (B16, B17, CeeSafe ADR 0062) is M7's minimum: the HTTP/2 server needs both fixes past ~30 connections and
 ~2 000 streams. With M7 merged it is main's minimum, and CI pins it.

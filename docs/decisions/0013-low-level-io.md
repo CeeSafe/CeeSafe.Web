@@ -104,7 +104,7 @@ What M0–M8 provide (checked 2026-11-06 on `main` at `10fc4e6`, ceesafec 0.11.0
   Its routes are a fixed 13-byte body, a 4 KiB body, a 64 KiB body, a streamed 1 MiB body and a POST echo.
 - **The baseline is recorded before stage 2 starts** (`docs/milestones/M9.md`), with the tree, the compiler, the
   machine and each command.
-- **nginx 1.27 on the same machine is the reference**: the same routes, one worker per core, `sendfile on`. It is
+- **nginx on the same machine is the reference** (its version recorded with the numbers): the same routes, one worker per core, `sendfile on`. It is
   reported next to our numbers, not used as a target.
 
 ### 3.2 Stage 2: buffers and vectored writes, where the profile points
