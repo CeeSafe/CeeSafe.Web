@@ -127,6 +127,10 @@ async fn run(
     // a client that may still read them (Web ADR 0012 §3.10). Each idle second a PING probes it: a client that has gone
     // answers with a TCP reset, so a later write fails, and that failure is this connection's normal end.
     var peerDone = false;
+    // A turn that granted credit leaves its output for the next: the granted streams are waiting in `write` with the
+    // bytes in hand, so their DATA comes at once and goes out in the same write as their HEADERS. At most one turn in
+    // a row, so nothing waits on a stream for longer than that.
+    var deferred = false;
     loop {
         // Every complete frame in the input.
         loop {
@@ -197,10 +201,14 @@ async fn run(
                 null => { break; }
             }
         }
-        match (await writeOutput(conn, engine, limits)) {
-            Ok() => {}
-            Err(e) => { return Err(if (peerDone) NetError.Closed else e); }
+        let awaited = total > 0 && !deferred;
+        if (!awaited) {
+            match (await writeOutput(conn, engine, limits)) {
+                Ok() => {}
+                Err(e) => { return Err(if (peerDone) NetError.Closed else e); }
+            }
         }
+        deferred = awaited;
         if (links.length() > 0) {
             lastActive = Timer.now();
         }
@@ -224,7 +232,10 @@ async fn run(
         }
         input.compact();
         let waitMs = if (links.length() == 0) lastActive + limits.idleTimeoutMs - now else 1000;
-        let woke = await wake(conn, input, outgoing, if (waitMs > 1000) 1000 else waitMs, !peerDone)?;
+        // While DATA is awaited, only the streams are waited on (a read would be cancelled by their message), and for
+        // at most 10 ms, should a granted stream not send.
+        let cap: u64 = if (awaited) 10 else 1000;
+        let woke = await wake(conn, input, outgoing, if (waitMs > cap) cap else waitMs, !peerDone && !awaited)?;
         // Both of a race's children may have finished: a read the kernel completed as it was cancelled (io_uring,
         // CeeSafe ADR 0035 §3.4) comes back as `other`, and its bytes are already in `input`.
         var current: Wake? = Some(woke.value);
