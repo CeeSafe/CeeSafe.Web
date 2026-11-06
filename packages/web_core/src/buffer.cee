@@ -13,9 +13,7 @@ public struct OwnedBuffer {
     /// A buffer of `capacity` bytes, all of them spare.
     public fn create(capacity: usize) -> Result<OwnedBuffer, AllocError> {
         var data = Vector<u8>.withCapacity(capacity)?;
-        while (data.length < capacity) {
-            data.push(0)?; // within the capacity reserved above: no allocation
-        }
+        data.resize(capacity, 0)?; // within the capacity reserved above: no allocation, one fill
         return Ok(OwnedBuffer { data: data, start: 0, end: 0 });
     }
 

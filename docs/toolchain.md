@@ -19,7 +19,7 @@ that needs an unreleased compiler is not merged to main.
 | M6 WebSockets | **0.10.0** | nothing new for the server (0.9.4); the client needs U16 (`Random.fill`, ADR 0060) | done (`docs/milestones/M6.md`) |
 | M7 HTTP/2 | **0.10.3** | B16 (a wake lost on kqueue past ~30 connections), fixed in 0.10.2; B17 (cancellation and the wake list quadratic in parked tasks, CeeSafe ADR 0062), fixed in 0.10.3 | gate passed, on main, released in v0.3.0 (`docs/milestones/M7.md`) |
 | M8 reverse proxy | **0.11.0** | U20 (a type that holds loans as a `borrow mut dyn I`, CeeSafe ADR 0064 §3.2) for the request-body relay; ADR 0064 §1's generic methods for `ReverseProxy.route<S>()` | gate passed, on main (#3, 2026-11-06); released with M9 as v0.4 (`docs/milestones/M8.md`) |
-| M9 low-level I/O | 0.9.0; **0.19.1** from stage 3 | U7 sendfile (ADR 0051); `readAt`/`length` (ADR 0075) for TLS and HTTP/2 file bodies; U22 for `web_static` | in progress (Web ADR 0013) |
+| M9 low-level I/O | **0.19.1** | `Vector.resize` (ADR 0071, 0.15.0) for `OwnedBuffer.create`; U7 sendfile (ADR 0051); `readAt`/`length` (ADR 0075) for TLS and HTTP/2 file bodies; U22 for `web_static` | in progress (Web ADR 0013) |
 | M10 HTTP/3 | 0.9.0 | U6 UDP (ADR 0050) | released |
 
 ## Current machine (2026-11-06)
@@ -70,7 +70,8 @@ and `UnixTime`. With M9's tree at `258adf8` every manifest checks with no diagno
 `python3 tools/run_tests.py --ceesafec ceesafec-0.19.1 --sanitize --alloc-sweep --cancel-sweep` passes 43 runs, web_tls's
 interpreter run skipped (2026-11-06, macOS arm64). Still open upstream: U18, U19 (`tests/probes/box-send-dyn-lend.cee`
 still N0205), U21, and U22 (an open file's modification time and kind), which `web_static` waits for. M9's minimum
-becomes 0.19.1 when stage 3 uses `readAt`. 0.20.0 checks every manifest (27, the benchmark included) with no
+is 0.19.1 from stage 2 (the owner's choice, 2026-11-06): `OwnedBuffer.create` fills with `Vector.resize`, and
+stage 3 uses `readAt`. CI pins v0.19.1 on `m9-io`. 0.20.0 checks every manifest (27, the benchmark included) with no
 diagnostic; its tests have not been run.
 
 0.10.3 (B16, B17, CeeSafe ADR 0062) is M7's minimum: the HTTP/2 server needs both fixes past ~30 connections and
