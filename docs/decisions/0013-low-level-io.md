@@ -1,6 +1,12 @@
 # Web ADR 0013 — Low-level I/O: profiling, buffers, vectored writes, sending files, static files
 
-**Status:** proposed 2026-11-06 (M9). The questions are in §6.
+**Status:** accepted 2026-11-06 (M9). The owner accepted each recommendation in §6:
+- U22 (an open file's modification time and kind) in CeeSafe;
+- a new `web_static` package;
+- symbolic links under the root followed, with lexical path rules;
+- several ranges in one request ignored (200, the whole file);
+- a strong `ETag` from the size and the modification time in nanoseconds;
+- io_uring measured, and recommended to CeeSafe, not overridden here.
 **Scope:** implementation plan §7 M9. It covers:
 - a first profile, and buffers pooled by what it shows;
 - a vectored write fast path;
@@ -36,19 +42,19 @@ What M0–M8 provide (checked 2026-11-06 on `main` at `10fc4e6`, ceesafec 0.11.0
   Whether the remaining copies matter is for the profile to say (§3.1).
 - **`BufferPool` exists and nothing uses it** (`web_core/src/buffer.cee:114`). It keeps up to `maxIdle` buffers of
   one size. Each connection allocates its own read and write buffers.
-- **The file API is thin** (CeeSafe spec `type-system.md` §26.3, §26.8, §26.10):
+- **The file API** (CeeSafe spec `type-system.md` §26.3, §26.8, §26.10; checked again with 0.19.1, 2026-11-06):
   - `File.open` and `read`, which reads sequentially;
+  - since 0.19.0 (CeeSafe ADR 0075 §2.1, §2.2), `f.readAt(buffer, offset)` and `f.length()`, which take
+    `borrow this` (0.19.1) and do not move the position, with `AsyncFiles` versions on a worker thread;
   - `File.kind(path)`, which follows symbolic links;
-  - `Directory.list`;
-  - `AsyncFiles` runs each call on a worker thread.
+  - `Directory.list`.
 
-  There is no file size, no modification time and no read at an offset.
-  - A static-file handler needs the size for `Content-Length` and `Content-Range`, and the time for `ETag` and
-    `Last-Modified`.
-  - Read + encrypt from an offset needs a positioned read. Reading and discarding up to the offset is O(offset) a
-    request: 4 GiB read to serve the last byte.
+  So the size and a positioned read exist. A static-file handler still lacks:
+  - **the modification time**, needed for `ETag` and `Last-Modified`;
+  - **the kind of an open file.** `File.kind` takes a path, and opening a FIFO to check it blocks until a writer
+    comes.
 
-  None of these can be written in CeeSafe.Web without C, so they go upstream (§3.4, U22).
+  Neither can be written in CeeSafe.Web without C, so they go upstream (§3.4, U22).
 - **Measuring.**
   - `wrk`, `h2load` and `ab` are installed on this Mac, and Instruments is available. The Debian host has `perf`.
   - `CEESAFE_ALLOC_REPORT=1` prints a program's allocation counts (CeeSafe's `allocount.c`).
@@ -129,8 +135,8 @@ What M0–M8 provide (checked 2026-11-06 on `main` at `10fc4e6`, ceesafec 0.11.0
   Each implementation:
   - **`PlainStream` and `TcpTransport`:** `AsyncTcpStream.sendFileAll`. It copies nothing on Linux, macOS and
     Windows IOCP, and falls back to lib/std's bounded copy where the kernel refuses.
-  - **`web_tls`:** positioned reads (U22) of up to one TLS record (16 KiB) into a pooled buffer, each encrypted and
-    written.
+  - **`web_tls`:** positioned reads (`AsyncFiles.readAt`) of up to one TLS record (16 KiB) into a pooled buffer,
+    each encrypted and written.
   - **`NoTransport`:** fails, as its `write` does.
   - **`MockTransport` and the test doubles:** copy. The mock counts the calls, so that tests can see which path was
     taken.
@@ -146,24 +152,24 @@ What M0–M8 provide (checked 2026-11-06 on `main` at `10fc4e6`, ceesafec 0.11.0
     RST_STREAM.
   - A file that grows is sent to the declared length only.
 
-### 3.4 Upstream: U22, a file's metadata and a positioned read
+### 3.4 Upstream: U22, a file's modification time and kind
 
-A new entry in `docs/ceesafe-upstream-work.md`, for the owner to do in CeeSafe (implementation plan §11 item 3):
+`readAt` and `length` arrived in 0.19.0 (CeeSafe ADR 0075), so U22 is what remains. It is a new entry in
+`docs/ceesafe-upstream-work.md`, for the owner to do in CeeSafe (implementation plan §11 item 3):
 
 ```ceesafe
-// File (type-system.md §26.3)
-public fn info(borrow this) -> Result<FileInfo, IoError>;            // fstat / GetFileInformationByHandleEx
-// pread / ReadFile with an OVERLAPPED offset
-public fn readAt(borrow this, buffer: SliceMut<u8>, offset: u64) -> Result<usize, IoError>;
-// FileInfo: size: u64; modified: WallTime (ADR 0055); kind: PathKind
-// AsyncFiles.readAt and AsyncFiles.info: the same, on a worker thread
+// File (type-system.md §26.3), from the open file: fstat / GetFileInformationByHandleEx
+public fn modified(borrow this) -> Result<UnixTime, IoError>;   // §26.11's type; nanoseconds where kept
+public fn kind(borrow this) -> Result<PathKind, IoError>;
+// File.openFile(path): open for reading without blocking on a FIFO (O_NONBLOCK, cleared after open), or refuse a
+// path that is not a regular file. Either form is enough.
+// AsyncFiles.modified and AsyncFiles.kind: the same, on a worker thread
 ```
 
-- **`info` on the open file** (`fstat`), not on the path. This means the size and time describe the file that is
-  sent, not one renamed into its place in between.
-- **`readAt` takes `borrow this`.** It does not move the position, so one file can be read by many tasks, matching
-  `sendFile`.
-- **Stages 1 and 2 do not need U22.** Stage 3 needs it only for TLS and HTTP/2. Stage 4 needs it throughout.
+- **Both read the open file** (`fstat`), not the path. So the time and kind describe the file that is sent, not one
+  renamed into its place in between.
+- **Stages 1 to 3 do not need U22.** Stage 3 uses `readAt`. Stage 4 needs U22 for its validators, and to refuse
+  FIFOs and devices safely.
 
 ### 3.5 Stage 4: `web_static`
 
@@ -184,7 +190,7 @@ A new package on `web_core`, `web_http` and `web_server` (Web ADR 0004 §3 gains
   - A regular file is served. A directory is served as its `index.html` if `options.index` is set (it is by
     default); otherwise it is 404. There is no listing.
   - Anything else is 404: a device, a socket or a FIFO.
-  - The file is opened first, then `info` is read from the open file (U22).
+  - The file is opened without blocking, then its kind, length and time are read from the open file (U22).
 - **Validators** (RFC 9110 §8.8):
   - The `ETag` is strong: `"<size in hex>-<modification time in nanoseconds, in hex>"`, the same idea as nginx's.
   - `Last-Modified` is the modification time, in IMF-fixdate.
@@ -228,7 +234,7 @@ A new package on `web_core`, `web_http` and `web_server` (Web ADR 0004 §3 gains
   None is known outside this repo.
 - **Static files without TLS over HTTP/1.1 cost no user-space copy.** With TLS or over HTTP/2 they cost one read
   into a pooled buffer, as in other servers.
-- **`web_static` and stage 3's TLS path wait for U22.** Stages 1 and 2 do not, and run first.
+- **`web_static` waits for U22.** Stages 1 to 3 do not, and run first.
 - **The path rules are lexical**, so a symbolic link under the root can point outside it (§6.3). This is
   documented in `web_static`'s README, as nginx documents it.
 
@@ -237,7 +243,7 @@ A new package on `web_core`, `web_http` and `web_server` (Web ADR 0004 §3 gains
 Stages, each committed and checked:
 1. the profile;
 2. pooled buffers and vectored writes;
-3. `sendFile` (plain first; TLS and HTTP/2 after U22);
+3. `sendFile` over every transport and protocol;
 4. `web_static`;
 5. io_uring;
 6. the gate.
@@ -268,12 +274,12 @@ Tests, with oracles outside the code:
 - **Sweeps** over `web_static` and the changed packages, every package on Debian and Windows, and M8's gate again.
 - **io_uring:** the numbers, and M8's gate under it.
 
-## 6. Questions for the owner
+## 6. Questions for the owner (answered 2026-11-06: each as recommended)
 
-1. **U22 in CeeSafe?** Recommended: **yes.** It needs `File.info()` (size, modification time, kind, from the open
-   file) and `File.readAt(buffer, offset)`, with `AsyncFiles` versions. Without it there is no `Content-Length`, no
-   validators, and no TLS or HTTP/2 file body that does not read and discard from the start. Stages 1 and 2 go
-   first meanwhile.
+1. **U22 in CeeSafe?** Recommended: **yes.** It needs an open file's modification time and kind, and a way to
+   open a path without blocking on a FIFO, with `AsyncFiles` versions. 0.19.0 already brought `readAt` and
+   `length`. Without U22 there are no validators (`ETag`, `Last-Modified`, 304, `If-Range`). Stages 1 to 3 go first
+   meanwhile.
 2. **A new `web_static` package?** Recommended: **yes**, so that a server without static files does not depend on
    file code. The alternative is a module in `web_server`.
 3. **Symbolic links under the root?** Recommended: **followed, with lexical path rules**, as nginx does by default.

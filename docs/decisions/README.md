@@ -18,7 +18,7 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0010](0010-websockets.md) | WebSockets: the engine, the upgrade, the session, permessage-deflate, the client | Accepted 2026-11-03 | M6 |
 | [0011](0011-http2.md) | HTTP/2: HPACK, frames, streams as tasks, flow control, push, the flood guards | Accepted 2026-11-03 | M7 |
 | [0012](0012-reverse-proxy.md) | The reverse proxy, and what M7 left open | Accepted 2026-11-03 | M8 |
-| [0013](0013-low-level-io.md) | Low-level I/O: profiling, buffers, vectored writes, sending files, static files | Proposed 2026-11-06 | M9 |
+| [0013](0013-low-level-io.md) | Low-level I/O: profiling, buffers, vectored writes, sending files, static files | Accepted 2026-11-06 | M9 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 
@@ -58,4 +58,9 @@ The language facts the ADRs rely on are checked by the programs in `tests/probes
 | 0012 §6.5 | Forwarding fields by default? | both `Forwarded` and `X-Forwarded-*` |
 | 0012 §6.6 | A connect timeout? | 504 |
 | 0012 (M8, h2spec §8.1.2.6) | Hold responses until a declared-length body ends? | no: early responses stay, and §8.1.2.6 #1 and #2 are a recorded h2spec timing case (`docs/milestones/M8.md`) |
-
+| 0013 §6.1 | U22, an open file's modification time and kind, in CeeSafe? | yes |
+| 0013 §6.2 | Static files in a new package? | yes: `web_static` |
+| 0013 §6.3 | Symbolic links under the root? | followed, with lexical path rules |
+| 0013 §6.4 | Several ranges in one request? | ignored: 200 with the whole file |
+| 0013 §6.5 | The `ETag`'s form? | strong, from the size and the modification time in nanoseconds |
+| 0013 §6.6 | io_uring as the Linux default? | measured, and recommended to CeeSafe; not overridden here |

@@ -2,8 +2,21 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.10.1", "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.19.1", "Status at 0.10.1", "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.19.1 (released 2026-11-06, tag `v0.19.1` = CeeSafe `619145e`)
+
+Checked from CeeSafe.Web on 2026-11-06 (macOS arm64): every package, example and fuzzer checks with no diagnostic.
+The tests are in `docs/toolchain.md`.
+
+| Item | Status | Checked by |
+|---|---|---|
+| a positioned read and a file's length (CeeSafe ADR 0075 §2.1, §2.2) | **released** in 0.19.0, with `borrow this` from 0.19.1: `f.readAt(buffer, offset)`, `f.length()`, `AsyncFiles.readAt`, `AsyncFiles.length` | the spec, `type-system.md` §26.3; M9 uses them (Web ADR 0013 §3.3) |
+| **U22** an open file's modification time and kind | **open**, needed for M9's stage 4 (`web_static`) | below |
+| **U18** the test sweep and the frame-stack panic | **open**. 0.19.0's sweep classes (ADR 0075 §2.16, G15) leave the panic "failed", which is one of the two answers U18 asked for. The ADR does not say so | ADR 0075 §2.16 |
+| **U19** `Box<dyn I + Send>` to `borrow dyn I` in one step | **open** | `tests/probes/box-send-dyn-lend.cee`: N0205 on 0.19.1 |
+| **U21** Windows timers | **open**: `Timer.now()` is still `GetTickCount64` (`runtime/hosted/ceesafe_rt_async.c:826`). `Clock.monotonicNanos` (ADR 0075 §2.6) uses `QueryPerformanceCounter`, but timers do not use it | the source |
 
 ## Status at 0.10.1 (released 2026-11-03, tag `v0.10.1` = CeeSafe `1de2747`)
 
@@ -792,6 +805,29 @@ advances once a system tick, about 15.6 ms. A short sleep wakes, finds the clock
 **Wanted:** a millisecond clock on Windows (`QueryPerformanceCounter`, or `QueryUnbiasedInterruptTimePrecise`), and
 waits that end on time (a high-resolution waitable timer, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`), so a 1 ms sleep
 lasts about 1 ms as on Linux and macOS.
+
+## U22 — An open file's modification time and kind   *(found 2026-11-06 designing M9, Web ADR 0013 §3.4; accepted by the owner; needed for M9's stage 4)*
+
+**Gap:** a static-file handler (`web_static`, Web ADR 0013 §3.5) answers with validators and refuses what is not a
+regular file. CeeSafe 0.19.1 gives an open file's length and a positioned read (ADR 0075). It does not give:
+- **the modification time.** `ETag` (strong, from the size and the time in nanoseconds), `Last-Modified`, 304 and
+  `If-Range` need it (RFC 9110 §8.8, §13);
+- **the kind of an open file.** `File.kind(path)` reads the path, which can change between the check and the open.
+  Opening a FIFO to check it waits for a writer, so a request for a FIFO under the root would hold its worker.
+
+**Wanted:**
+
+```ceesafe
+// File (type-system.md §26.3), read from the open file: fstat / GetFileInformationByHandleEx
+public fn modified(borrow this) -> Result<UnixTime, IoError>;   // §26.11's UnixTime, nanoseconds where kept
+public fn kind(borrow this) -> Result<PathKind, IoError>;
+// One of: File.open never waits on a FIFO (O_NONBLOCK, cleared once open); or a File.openRegular(path) that
+// refuses anything but a regular file (open with O_NONBLOCK, fstat, then clear it).
+// AsyncFiles.modified and AsyncFiles.kind: the same, on a worker thread.
+```
+
+**Effect on CeeSafe.Web until then:** M9's stages 1 to 3 go first: the profile, buffers and vectored writes, and
+`sendFile`. `web_static` waits for U22.
 
 ## B18 — Bug: a `borrow S<r>` result of `borrow this` is refused as a deep result   *(found 2026-11-05, M8, ceesafec 0.18.0; fixed in 0.18.1)*
 
