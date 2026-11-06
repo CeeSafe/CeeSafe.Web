@@ -110,6 +110,31 @@ impl Transport for Client {
 /// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends;
 /// `/trailers`: reads the body, then answers each trailer as `name=value;`; `/rtrailers`: "abc" and the trailer
 /// `x-sum: 3`.
+/// `r` in decimal, or "-" for null, then ";".
+fn remainingOf(r: u64?, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    match (r) {
+        null => { out.push(45)?; }
+        Some(v) => {
+            var digits = [0u8; 20];
+            var n = 0usize;
+            var x = v;
+            loop {
+                digits[n] = 48 + truncate<u8>(x % 10);
+                n += 1;
+                x = x / 10;
+                if (x == 0) {
+                    break;
+                }
+            }
+            while (n > 0) {
+                n -= 1;
+                out.push(digits[n])?;
+            }
+        }
+    }
+    return out.push(59);
+}
+
 struct Site {}
 
 impl Application for Site {
@@ -136,6 +161,15 @@ impl Application for Site {
                 }
             }
             return await exchange.send(Status.ok(), body.view());
+        }
+        if (Ascii.equals(path.bytes(), "/remaining")) {
+            // `remaining()` before the body is read and after its end: "6;0;" with content-length 6, "-;0;" without.
+            var listed = Vector<u8>.create();
+            listedOk(remainingOf(exchange.remaining(), mut listed))?;
+            var buf = [0u8; 4];
+            while (await exchange.read(mut buf[..])? > 0) {}
+            listedOk(remainingOf(exchange.remaining(), mut listed))?;
+            return await exchange.send(Status.ok(), listed.view());
         }
         if (Ascii.equals(path.bytes(), "/dated")) {
             exchange.header("date", "Sun, 06 Nov 1994 08:49:37 GMT".bytes())?;
@@ -428,6 +462,33 @@ async fn a_read_completed_as_it_was_cancelled_keeps_its_bytes() -> Result<void, 
     }
     Check.isTrue(contains(log.view(), "headers 1 f4 200; "), "the echo's head")?;
     return Check.isTrue(containsBytes(log.view(), want.view()), "the 1 000 bytes echoed whole");
+}
+
+/// `Exchange.remaining()` over HTTP/2 is the declared `content-length` less what has been read (RFC 9113 §8.1.1), and
+/// null without a declaration, as for a chunked HTTP/1.1 body.
+@test
+async fn remaining_is_the_declared_length() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let post = blockOf(":method: POST\n:scheme: https\n:path: /remaining\n:authority: example.test\ncontent-length: 6\n")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, post.view())?;
+    frame(mut bytes, FrameTypes.data(), 0, 1, "abc".bytes())?;
+    frame(mut bytes, FrameTypes.data(), FrameFlags.endStream(), 1, "def".bytes())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    return Check.isTrue(contains(log.view(), "data 1 f1 6;0;; "), "6 before the body, 0 after");
+}
+
+@test
+async fn remaining_without_a_declared_length_is_null() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let post = blockOf(":method: POST\n:scheme: https\n:path: /remaining\n:authority: example.test\n")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, post.view())?;
+    frame(mut bytes, FrameTypes.data(), FrameFlags.endStream(), 1, "abc".bytes())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    return Check.isTrue(contains(log.view(), "data 1 f1 -;0;; "), "null before the body, 0 after");
 }
 
 /// A request's trailers (HEADERS with END_STREAM after its DATA, RFC 9113 §8.1) reach the handler once it has read

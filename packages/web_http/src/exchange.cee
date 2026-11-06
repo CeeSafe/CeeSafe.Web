@@ -57,6 +57,8 @@ public struct Exchange<region r> {
 
     private body: BodyState;
     private left: u64;
+    /// A multiplexed request's declared length less what has been read, or null without a declaration.
+    private streamLeft: u64?;
     private decoder: ChunkDecoder;
     private rate: MinRate;
     private continuePending: bool;
@@ -127,6 +129,7 @@ public struct Exchange<region r> {
             date: date,
             body: state,
             left: length,
+            streamLeft: null,
             decoder: decoder,
             rate: rate,
             continuePending: expectContinue && hasBody,
@@ -164,6 +167,11 @@ public struct Exchange<region r> {
         pending.clear();
         response.reset();
         let decoder = ChunkDecoder.create(limits);
+        // The engine has checked a declared length against the DATA (RFC 9113 §8.1.1).
+        let declared = match (request.headers().get(HeaderName.ContentLength)) {
+            Some(v) => Ascii.parseDecimal(v),
+            null => null,
+        };
         return Exchange {
             conn: conn,
             stream: stream,
@@ -178,6 +186,7 @@ public struct Exchange<region r> {
             date: date,
             body: if (hasBody) BodyState.Stream else BodyState.Done,
             left: 0,
+            streamLeft: if (hasBody) declared else null,
             decoder: decoder,
             rate: MinRate.off(),
             continuePending: false,
@@ -213,6 +222,13 @@ public struct Exchange<region r> {
         }
         if (this.multiplexed) {
             let n = await this.stream.readBody(buffer)?;
+            match (this.streamLeft) {
+                Some(left) => {
+                    let got = n as u64;
+                    this.streamLeft = Some(if (got < left) left - got else 0u64);
+                }
+                null => {}
+            }
             if (n == 0) {
                 this.body = BodyState.Done;
                 grown(this.stream.copyTrailers(mut this.trailerFields))?;
@@ -380,12 +396,13 @@ public struct Exchange<region r> {
         }
     }
 
-    /// The body bytes not yet read, if the body has a length; 0 once it is read; null for a chunked body.
+    /// The body bytes not yet read, if the body has a length (over HTTP/2, a declared `content-length`); 0 once it is
+    /// read; null for a chunked body or an HTTP/2 body without a declared length.
     public fn remaining(borrow this) -> u64? => match (this.body) {
         BodyState.Done => Some(0u64),
         BodyState.Length => Some(this.left),
         BodyState.Chunked => null,
-        BodyState.Stream => null,
+        BodyState.Stream => this.streamLeft,
     };
 
     /// Reads more of the connection into `carry`, bounded by the minimum-rate deadline.

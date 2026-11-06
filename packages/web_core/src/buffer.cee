@@ -86,9 +86,9 @@ public struct OwnedBuffer {
         if (bytes.length > this.data.length - this.end) {
             return Err(NetError.LimitExceeded);
         }
-        for (i in 0..bytes.length) {
-            this.data[this.end + i] = bytes[i];
-        }
+        let all = this.data.viewMut();
+        let to = borrow mut all[this.end..this.end + bytes.length];
+        to.copyFrom(bytes); // one memcpy (type system §16.5)
         this.end += bytes.length;
         return Ok();
     }
