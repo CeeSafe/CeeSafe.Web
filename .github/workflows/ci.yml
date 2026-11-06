@@ -19,7 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15 # macos-14 is no longer offered (2026-11-06)
             sanitize: true
           # The sweeps run on 24.04 (OpenSSL 3.0.13): 22.04's OpenSSL 3.0.2 leaks its own global state when an
           # allocation fails, which LeakSanitizer reports (Web ADR 0002 amendment 5.8). 22.04 still runs every test
