@@ -193,9 +193,7 @@ public struct H2Connection {
     public fn start(borrow mut this, connectionWindow: u32) -> Result<void, AllocError> {
         if (this.isClient) {
             let preface = clientPreface();
-            for (b in preface.bytes()) {
-                this.out.push(b)?;
-            }
+            this.out.extend(preface.bytes())?;
             var clientIds = [
                 SettingIds.headerTableSize(),
                 SettingIds.enablePush(),
@@ -472,10 +470,8 @@ public struct H2Connection {
         // Padding counts against the windows but is never read: it is given back now.
         this.giveBack(id, payload.length - content.length)?;
         data.clear();
-        for (b in content) {
-            if (failed(data.push(b))) {
-                return Err(ErrorCodes.internalError());
-            }
+        if (failed(data.extend(content))) {
+            return Err(ErrorCodes.internalError());
         }
         if (end) {
             this.remoteEnded(id);
@@ -637,10 +633,8 @@ public struct H2Connection {
         if (this.block.length + fragment.length > this.guards.maxBlockBytes as usize) {
             return Err(ErrorCodes.enhanceYourCalm()); // the CONTINUATION flood guard (Web ADR 0011 §3.4)
         }
-        for (b in fragment) {
-            if (failed(this.block.push(b))) {
-                return Err(ErrorCodes.internalError());
-            }
+        if (failed(this.block.extend(fragment))) {
+            return Err(ErrorCodes.internalError());
         }
         if (!last) {
             return Ok(null);
@@ -1105,10 +1099,8 @@ public struct H2Connection {
         if (failed(Frames.writeDataHeader(mut this.out, id, truncate<u32>(bytes.length), endStream))) {
             return Err(ErrorCodes.internalError());
         }
-        for (b in bytes) {
-            if (failed(this.out.push(b))) {
-                return Err(ErrorCodes.internalError());
-            }
+        if (failed(this.out.extend(bytes))) {
+            return Err(ErrorCodes.internalError());
         }
         if (endStream) {
             this.localEnded(id);

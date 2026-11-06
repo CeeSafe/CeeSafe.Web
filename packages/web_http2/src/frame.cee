@@ -154,9 +154,7 @@ public struct Frames {
     /// A PING with these 8 bytes, or its acknowledgement (§6.7).
     public fn writePing(out: borrow mut Vector<u8>, data: [u8; 8], ack: bool) -> Result<void, AllocError> {
         Frames.writeHeader(out, 8, FrameTypes.ping(), if (ack) FrameFlags.ack() else 0, 0)?;
-        for (b in data) {
-            out.push(b)?;
-        }
+        out.extend(data[..])?;
         return Ok();
     }
 
@@ -170,9 +168,7 @@ public struct Frames {
         Frames.writeHeader(out, truncate<u32>(8 + debug.length), FrameTypes.goAway(), 0, 0)?;
         push32(out, lastStream & 0x7FFFFFFF)?;
         push32(out, code)?;
-        for (b in debug) {
-            out.push(b)?;
-        }
+        out.extend(debug)?;
         return Ok();
     }
 
@@ -280,8 +276,6 @@ fn push32(out: borrow mut Vector<u8>, v: u32) -> Result<void, AllocError> {
 }
 
 fn appendBytes(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
-    for (b in bytes) {
-        out.push(b)?;
-    }
+    out.extend(bytes)?;
     return Ok();
 }

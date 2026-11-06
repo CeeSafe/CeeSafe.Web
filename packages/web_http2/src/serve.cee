@@ -151,9 +151,7 @@ async fn run(
                     match (links.getMut(id)) {
                         Some(link) => {
                             known = true;
-                            for (b in data.view()) {
-                                alloc(link.backlog.push(b))?;
-                            }
+                            alloc(link.backlog.extend(data.view()))?;
                             if (end) {
                                 link.ended = true;
                             }
@@ -475,9 +473,7 @@ fn grant(engine: borrow H2Connection, links: borrow mut HashMap<u32, Link>, id: 
 fn deliver(link: borrow mut Link) -> Result<void, NetError> {
     if (link.backlog.length > 0) {
         var chunk = Vector<u8>.create();
-        for (b in link.backlog.view()) {
-            alloc(chunk.push(b))?;
-        }
+        alloc(chunk.extend(link.backlog.view()))?;
         match (link.body.trySend(BodyPart.Data(chunk))) {
             Ok() => { link.backlog.clear(); }
             Err(_) => { return Ok(); } // full: the next Consumed tries again
@@ -605,9 +601,8 @@ impl StreamSink for StreamPort {
             if (this.at < this.current.length) {
                 let ready = this.current.view();
                 let n = if (into.length < ready.length - this.at) into.length else ready.length - this.at;
-                for (i in 0..n) {
-                    into[i] = ready[this.at + i];
-                }
+                let to = borrow mut into[0..n];
+                to.copyFrom(ready[this.at..this.at + n]);
                 this.at += n;
                 await post(this.outgoing, Outgoing.Consumed(this.id, n))?;
                 return Ok(n);
@@ -654,10 +649,8 @@ impl StreamSink for StreamPort {
             };
             let n = if (granted < left) granted else left;
             var chunk = Vector<u8>.create();
-            for (b in bytes[at..at + n]) {
-                if (failed(chunk.push(b))) {
-                    return Err(HandlerError.Internal);
-                }
+            if (failed(chunk.extend(bytes[at..at + n]))) {
+                return Err(HandlerError.Internal);
             }
             at += n;
             await post(this.outgoing, Outgoing.Data(this.id, chunk, endStream && at == bytes.length))?;
@@ -667,10 +660,8 @@ impl StreamSink for StreamPort {
 
     async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError> {
         var copy = Vector<u8>.create();
-        for (b in path) {
-            if (failed(copy.push(b))) {
-                return Err(HandlerError.Internal);
-            }
+        if (failed(copy.extend(path))) {
+            return Err(HandlerError.Internal);
         }
         await post(this.outgoing, Outgoing.Push(this.id, copy))?;
         match (await this.replies.recvAsync()) {
@@ -897,9 +888,7 @@ fn named(a: Slice<u8>, text: StringView) -> bool {
 }
 
 fn copyInto(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, NetError> {
-    for (b in bytes) {
-        alloc(out.push(b))?;
-    }
+    alloc(out.extend(bytes))?;
     return Ok();
 }
 

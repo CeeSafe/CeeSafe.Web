@@ -329,13 +329,10 @@ impl Transport for TlsTransport {
 /// Appends `bytes` to `to`; false if it could not grow.
 @effects(alloc)
 fn fill(to: borrow mut Vector<u8>, bytes: Slice<u8>) -> bool {
-    for (b in bytes) {
-        match (to.push(b)) {
-            Ok() => {}
-            Err(_) => { return false; }
-        }
+    match (to.extend(bytes)) {
+        Ok() => { return true; }
+        Err(_) => { return false; }
     }
-    return true;
 }
 
 /// Reads from the plain stream by `deadline`. It calls `PlainStream` directly, not through `dyn Transport`

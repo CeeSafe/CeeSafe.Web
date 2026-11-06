@@ -85,9 +85,7 @@ struct DynamicTable {
 fn entrySize(name: usize, value: usize) -> u32 => truncate<u32>(name + value + 32);
 
 fn appendAll(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
-    for (b in bytes) {
-        out.push(b)?;
-    }
+    out.extend(bytes)?;
     return Ok();
 }
 

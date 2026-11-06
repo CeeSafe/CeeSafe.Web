@@ -253,9 +253,8 @@ public struct Exchange<region r> {
                     if (n as u64 > this.left) {
                         n = truncate<usize>(this.left);
                     }
-                    for (i in 0..n) {
-                        buffer[i] = available[i];
-                    }
+                    let to = borrow mut buffer[0..n];
+                    to.copyFrom(available[0..n]);
                     this.consumeCarry(n)?;
                     this.left -= n as u64;
                     if (this.left == 0) {
@@ -273,9 +272,8 @@ public struct Exchange<region r> {
                             return Err(HandlerError.Status(ProtocolErrors.status(e)));
                         },
                     };
-                    for (i in 0..step.dataLength) {
-                        buffer[i] = input[step.dataStart + i];
-                    }
+                    let to = borrow mut buffer[0..step.dataLength];
+                    to.copyFrom(input[step.dataStart..step.dataStart + step.dataLength]);
                     for (i in 0..step.trailerLength) {
                         grown(this.trailerLines.push(input[step.trailerStart + i]))?;
                     }
@@ -804,9 +802,8 @@ public struct Exchange<region r> {
         if (!this.carry.isEmpty()) {
             let held = this.carry.readable();
             let n = if (held.length < buffer.length) held.length else buffer.length;
-            for (i in 0..n) {
-                buffer[i] = held[i];
-            }
+            let to = borrow mut buffer[0..n];
+            to.copyFrom(held[0..n]);
             match (this.carry.consume(n)) {
                 Ok() => {}
                 Err(_) => { return Err(HandlerError.Internal); }
