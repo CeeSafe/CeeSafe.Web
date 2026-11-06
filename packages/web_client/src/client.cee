@@ -4,8 +4,10 @@ import web_core;
 import web_transport;
 import web_http;
 import web_http1;
+import web_http2;
 
-/// A request: a method, a URL and fields. Framing fields and `host` are the client's to write.
+/// A request: a method, a URL and fields. Framing fields and `host` are the client's to write; `setAuthority` changes
+/// the `host` it writes.
 @noncopy
 public struct ClientRequest {
     private verb: Method;
@@ -13,6 +15,8 @@ public struct ClientRequest {
     private names: Vector<Vector<u8>>;
     private values: Vector<Vector<u8>>;
     private keyed: bool;
+    /// The authority sent as `host` instead of the URL's (empty: the URL's).
+    private authorityText: Vector<u8>;
 
     /// A request for `url` (absolute http or https). `Method.Extension` is refused: it has no token to send.
     public fn create(method: Method, url: StringView) -> Result<ClientRequest, ClientError> {
@@ -30,6 +34,7 @@ public struct ClientRequest {
             names: Vector<Vector<u8>>.create(),
             values: Vector<Vector<u8>>.create(),
             keyed: false,
+            authorityText: Vector<u8>.create(),
         });
     }
 
@@ -63,6 +68,24 @@ public struct ClientRequest {
         }
     }
 
+    /// Sends `authority` (`host[:port]`, RFC 9110 §7.2) as `host` instead of the URL's, while the URL still chooses
+    /// where the request goes: a reverse proxy keeps the client's `host` this way (Web ADR 0012 §3.5). A redirect to
+    /// another origin goes back to that origin's own authority. Empty, or a byte that cannot be in an authority
+    /// (whitespace, a control, `/`, `?`, `#`, `@`), is `BadRequest`.
+    public fn setAuthority(borrow mut this, authority: Slice<u8>) -> Result<void, ClientError> {
+        if (authority.length == 0) {
+            return Err(ClientError.BadRequest);
+        }
+        for (b in authority) {
+            if (b <= 32 || b >= 127 || b == 47 || b == 63 || b == 35 || b == 64) {
+                return Err(ClientError.BadRequest);
+            }
+        }
+        this.authorityText.clear();
+        copyBytes(mut this.authorityText, authority)?;
+        return Ok();
+    }
+
     /// The request's method.
     public fn method(borrow this) -> Method => this.verb;
 
@@ -94,6 +117,13 @@ public interface BodySource {
     /// Back to the start, to send again (a retry, a 307 or 308); false if it cannot.
     @effects()
     fn rewind(borrow mut this) -> bool;
+
+    /// Adds its trailer fields (RFC 9110 §6.5) to `into`; asked once `read` has returned 0. They go in the last chunk
+    /// of a chunked body over HTTP/1.1, or as HEADERS ending the stream over HTTP/2. A body with a known length over
+    /// HTTP/1.1 has nowhere to put them (RFC 9112 §7.1.2), so they are not asked for there, and fields that frame or
+    /// route a message are never sent.
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError>;
 }
 
 /// No body.
@@ -107,6 +137,9 @@ impl BodySource for NoBody {
 
     @effects()
     fn rewind(borrow mut this) -> bool => true;
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> => Ok();
 }
 
 /// A body held in memory: its length is known, and it can always replay.
@@ -144,6 +177,9 @@ impl BodySource for BytesBody {
         this.at = 0;
         return true;
     }
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> => Ok();
 }
 
 /// A failed attempt, and whether sending it again is safe as far as the connection goes (§3.8 rule 2).
@@ -156,28 +192,38 @@ struct Failure {
 public struct Client {
     private options: ClientOptions;
     private pool: ConnectionPool;
-    private tls: Box<dyn Connector>?;
-    private resolver: Box<dyn Resolver>;
-    private dialer: Box<dyn Dialer>;
+    private tls: Box<dyn Connector + Send>?;
+    private resolver: Box<dyn Resolver + Send>;
+    private dialer: Box<dyn Dialer + Send>;
+    private h2: H2Registry;
 
     /// A client with the system's resolver and TCP. `tls` makes https connections (a web_tls `TlsConnector`); without
     /// one, https URLs are `NoTls`.
-    public fn create(options: ClientOptions, tls: Box<dyn Connector>?) -> Result<Client, ClientError> {
-        let resolver: Box<dyn Resolver> = boxed(Box.create(SystemResolver {}))?;
-        let dialer: Box<dyn Dialer> = boxed(Box.create(TcpDialer {}))?;
+    public fn create(options: ClientOptions, tls: Box<dyn Connector + Send>?) -> Result<Client, ClientError> {
+        let resolver: Box<dyn Resolver + Send> = boxed(Box.create(SystemResolver {}))?;
+        let dialer: Box<dyn Dialer + Send> = boxed(Box.create(TcpDialer {}))?;
         return Client.withNetwork(options, tls, resolver, dialer);
     }
 
     /// A client with its own resolver and dialer (tests: mocks).
     public fn withNetwork(
         options: ClientOptions,
-        tls: Box<dyn Connector>?,
-        resolver: Box<dyn Resolver>,
-        dialer: Box<dyn Dialer>,
+        tls: Box<dyn Connector + Send>?,
+        resolver: Box<dyn Resolver + Send>,
+        dialer: Box<dyn Dialer + Send>,
     ) -> Result<Client, ClientError> {
         let pool = ConnectionPool.create(options)?;
-        return Ok(Client { options: options, pool: pool, tls: tls, resolver: resolver, dialer: dialer });
+        let h2 = H2Registry.create()?;
+        return Ok(Client { options: options, pool: pool, tls: tls, resolver: resolver, dialer: dialer, h2: h2 });
     }
+
+    /// Reads and writes the client's HTTP/2 connections until `drain` starts, then lets each finish its streams
+    /// (Web ADR 0012 §7). Run it beside the code that sends requests, in the same scope. While it runs, https origins
+    /// whose connector negotiates ALPN `h2`, and http origins with `http2Cleartext`, are spoken to over HTTP/2, many
+    /// requests sharing a connection; without it the client speaks HTTP/1.1, and a connection that negotiated `h2`
+    /// fails with `Http2NotRunning`.
+    public async fn run(borrow this, drain: borrow Drain) -> Result<void, NetError> =>
+        await runConnections(this.h2, this.options.limits, drain);
 
     /// GET `url`, without a body.
     public async fn get(borrow this, url: StringView) -> Result<ClientResponse, ClientError> {
@@ -203,13 +249,22 @@ public struct Client {
         var none = NoBody {};
         loop {
             attempts += 1;
-            let r = if (withBody) await this.attempt(url, method, request, strip, body, total) else await this.attempt(
+            let r = if (withBody) await this.attempt(
+                url,
+                method,
+                request,
+                strip,
+                body,
+                total,
+                "".bytes(),
+            ) else await this.attempt(
                 url,
                 method,
                 request,
                 strip,
                 mut none,
                 total,
+                "".bytes(),
             );
             match (r) {
                 Ok(response) => {
@@ -266,6 +321,36 @@ public struct Client {
         return await handshake(conn, address, options, total, this.options.limits);
     }
 
+    /// Sends `request` asking to switch to `protocol` (RFC 9110 §7.8: `connection: upgrade` and `upgrade: protocol`,
+    /// which the client writes in place of the request's own). No redirect is followed and nothing is retried. A 101
+    /// gives the connection, which leaves the pool, as `Switched`; any other answer is an ordinary response.
+    /// `protocol` is one or more `name[/version]` tokens separated by commas; anything else is `BadRequest`.
+    public async fn upgrade(
+        borrow this,
+        request: borrow ClientRequest,
+        protocol: Slice<u8>,
+        body: borrow mut dyn BodySource,
+    ) -> Result<Upgraded, ClientError> {
+        if (protocol.length == 0) {
+            return Err(ClientError.BadRequest);
+        }
+        for (b in protocol) {
+            if (!Ascii.isTokenChar(b) && b != 47 && b != 44 && b != 32) {
+                return Err(ClientError.BadRequest);
+            }
+        }
+        let total = if (this.options.totalMs == 0) Deadline.never() else Deadline.after(this.options.totalMs);
+        let url = urlCopy(request.url())?;
+        let response = match (await this.attempt(url, request.method(), request, false, body, total, protocol)) {
+            Ok(r) => r,
+            Err(f) => { return Err(f.error); },
+        };
+        if (response.status() != 101) {
+            return Ok(Upgraded.Answered(response));
+        }
+        return Ok(Upgraded.Switched(response.switched()?));
+    }
+
     /// Closes the idle connections; requests that start afterwards fail with `Shutdown`.
     public async fn shutdown(borrow this) {
         await this.pool.shutdown();
@@ -280,8 +365,82 @@ public struct Client {
         strip: bool,
         body: borrow mut dyn BodySource,
         total: Deadline,
+        upgrade: Slice<u8>,
     ) -> Result<ClientResponse, Failure> {
-        let pooled = match (await this.pool.idleFor(url)) {
+        // A connection the HTTP/2 path made and found to speak HTTP/1.1 (at most one).
+        var predialed = Vector<Box<dyn Transport + Send>>.create();
+        // An HTTP/2 connection to the origin, if one takes another stream (never for an upgrade: HTTP/2 has none).
+        if (upgrade.length == 0) {
+            match (await this.h2Existing(url, method, request, strip, body, total)) {
+                Ok(Some(r)) => { return Ok(r); }
+                Ok(null) => {}
+                Err(f) => { return Err(f); }
+            }
+            // The first connection to an origin that may speak HTTP/2 is made by one request at a time: the others wait
+            // and share it if it does. Prior knowledge says it will; an https origin may, until it negotiates HTTP/1.1.
+            let cleartext = !url.isSecure() && this.options.http2Cleartext;
+            let mayShare = this.h2.isRunning() &&
+                (cleartext || (url.isSecure() && !this.tlsMissing() && !await this.h2.knownHttp1(url)));
+            if (mayShare) {
+                var dialed: Channel<H2Command>? = null;
+                {
+                    var guard = match (await this.h2.dialing.lock()) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            return Err(Failure { error: ClientError.Net(NetErrors.fromAsync(e)), resendable: false });
+                        },
+                    };
+                    match (await this.h2Existing(url, method, request, strip, body, total)) {
+                        Ok(Some(r)) => { return Ok(r); }
+                        Ok(null) => {}
+                        Err(f) => { return Err(f); }
+                    }
+                    if (cleartext || !await this.h2.knownHttp1(url)) {
+                        let conn = match (await this.freshConnection(url, total)) {
+                            Ok(c) => c,
+                            Err(f) => { return Err(f); },
+                        };
+                        let h2 = match (conn.alpn()) {
+                            Alpn.Http2 => true,
+                            _ => cleartext,
+                        };
+                        if (h2) {
+                            let slots = match (await this.pool.slots(url)) {
+                                Ok(s) => s,
+                                Err(e) => { return Err(Failure { error: e, resendable: false }); },
+                            };
+                            match (await this.h2.add(url, conn, slots)) {
+                                Ok(c) => { dialed = Some(c); }
+                                Err(e) => { return Err(Failure { error: e, resendable: false }); }
+                            }
+                        } else {
+                            await this.h2.markHttp1(url);
+                            match (predialed.push(conn)) {
+                                Ok() => {}
+                                Err(_) => {
+                                    return Err(
+                                        Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                match (dialed) {
+                    Some(commands) => {
+                        match (await this.h2Attempt(commands, url, method, request, strip, body, total)) {
+                            Ok(Some(r)) => { return Ok(r); }
+                            Ok(null) => {
+                                return Err(Failure { error: ClientError.Net(NetError.Closed), resendable: true });
+                            }
+                            Err(f) => { return Err(f); }
+                        }
+                    }
+                    null => {}
+                }
+            }
+        }
+        let pooled = if (predialed.length > 0) null else match (await this.pool.idleFor(url)) {
             Ok(p) => p,
             Err(e) => { return Err(Failure { error: e, resendable: false }); },
         };
@@ -291,19 +450,38 @@ public struct Client {
         };
         var conn = match (pooled) {
             Some(c) => c,
-            null => match (await this.freshConnection(url, total)) {
-                Ok(c) => c,
-                Err(f) => { return Err(f); },
+            null => match (predialed.pop()) {
+                Some(c) => c,
+                null => match (await this.freshConnection(url, total)) {
+                    Ok(c) => c,
+                    Err(f) => { return Err(f); },
+                },
             },
         };
         let slots = match (await this.pool.slots(url)) {
             Ok(s) => s,
             Err(e) => { return Err(Failure { error: e, resendable: false }); },
         };
+        let speaksH2 = match (conn.alpn()) {
+            Alpn.Http2 => true,
+            _ => !url.isSecure() && this.options.http2Cleartext,
+        };
+        if (!reused && upgrade.length == 0 && speaksH2) {
+            // The new connection becomes the origin's HTTP/2 connection, run by `run`; it keeps its slot until it ends.
+            let commands = match (await this.h2.add(url, conn, slots.clone())) {
+                Ok(c) => c,
+                Err(e) => { return Err(Failure { error: e, resendable: false }); },
+            };
+            match (await this.h2Attempt(commands, url, method, request, strip, body, total)) {
+                Ok(Some(r)) => { return Ok(r); }
+                Ok(null) => { return Err(Failure { error: ClientError.Net(NetError.Closed), resendable: true }); }
+                Err(f) => { return Err(f); }
+            }
+        }
         // From here the connection owns a slot: a failure releases it when `conn` is dropped (Held).
         var held = Held { slots: slots, live: true };
         var written: u64 = 0;
-        match (await this.writeRequest(mut conn, url, method, request, strip, body, mut written)) {
+        match (await this.writeRequest(mut conn, url, method, request, strip, body, mut written, upgrade)) {
             Ok() => {}
             Err(e) => { return Err(Failure { error: e, resendable: written == 0 }); }
         }
@@ -313,7 +491,15 @@ public struct Client {
             Ok(b) => b,
             Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
         };
-        match (await readHead(mut conn, method, mut head, mut carry, firstByte, this.options.limits)) {
+        match (await readHead(
+            mut conn,
+            method,
+            mut head,
+            mut carry,
+            firstByte,
+            this.options.limits,
+            upgrade.length > 0,
+        )) {
             Ok() => {}
             Err(e) => {
                 // A pooled connection that ended before any response byte lost a race with the server closing it.
@@ -358,6 +544,187 @@ public struct Client {
             },
             keepAlive: keepAlive,
             readDeadline: total,
+            stream: Vector<H2Stream>.create(),
+            streamHead: HeaderBlock.create(),
+            trailerLines: Vector<u8>.create(),
+            trailerFields: HeaderBlock.create(),
+        });
+    }
+
+    /// The request on an existing HTTP/2 connection to `url`'s origin, trying each that takes another stream; null if
+    /// none does.
+    async fn h2Existing(
+        borrow this,
+        url: borrow Url,
+        method: Method,
+        request: borrow ClientRequest,
+        strip: bool,
+        body: borrow mut dyn BodySource,
+        total: Deadline,
+    ) -> Result<ClientResponse?, Failure> {
+        loop {
+            let found = match (await this.h2.find(url)) {
+                Ok(f) => f,
+                Err(e) => { return Err(Failure { error: e, resendable: false }); },
+            };
+            match (found) {
+                Some(commands) => {
+                    match (await this.h2Attempt(commands, url, method, request, strip, body, total)) {
+                        Ok(Some(r)) => { return Ok(Some(r)); }
+                        Ok(null) => {} // full or going away: look again
+                        Err(f) => { return Err(f); }
+                    }
+                }
+                null => { return Ok(null); }
+            }
+        }
+    }
+
+    /// One request on an HTTP/2 connection (`commands`, its connection task's channel): the head as RFC 9113 §8.3.1's
+    /// pseudo-fields and the fields lowercased, less the connection-specific ones (§8.2.2); then the body as the
+    /// windows allow; then the response's head. Null if the connection would not open the stream (at its limit, or
+    /// going away): nothing was sent.
+    async fn h2Attempt(
+        borrow this,
+        commands: Channel<H2Command>,
+        url: borrow Url,
+        method: Method,
+        request: borrow ClientRequest,
+        strip: bool,
+        body: borrow mut dyn BodySource,
+        total: Deadline,
+    ) -> Result<ClientResponse?, Failure> {
+        let head = match (h2Head(url, method, request, strip, body.length())) {
+            Ok(h) => h,
+            Err(e) => { return Err(Failure { error: e, resendable: false }); },
+        };
+        let noBody = match (body.length()) {
+            Some(n) => n == 0,
+            null => false,
+        };
+        let parts = match (Channel<StreamPart>.create(16)) {
+            Ok(c) => c,
+            Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
+        };
+        let credit = match (Channel<u32>.create(1)) {
+            Ok(c) => c,
+            Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
+        };
+        let inbox = StreamInbox { parts: parts.clone(), credit: credit.clone() };
+        let headRequest = Methods.same(method, Method.Head);
+        match (await command(commands, H2Command.Open(head, noBody, headRequest, inbox))) {
+            Ok() => {}
+            Err(_) => { return Ok(null); } // the connection has ended
+        }
+        let id = match (await parts.recvAsync()) {
+            Ok(Some(StreamPart.Opened(id))) => id,
+            Ok(Some(StreamPart.Refused)) => { return Ok(null); },
+            Ok(_) => { return Ok(null); },
+            Err(e) => { return Err(Failure { error: ClientError.Net(NetErrors.fromAsync(e)), resendable: false }); },
+        };
+        // From here a stream is open: dropping `stream` before its end resets it.
+        var stream = H2Stream {
+            id: id,
+            commands: commands.clone(),
+            inbox: StreamInbox { parts: parts.clone(), credit: credit.clone() },
+            current: Vector<u8>.create(),
+            at: 0,
+            ended: false,
+            trailers: HeaderBlock.create(),
+        };
+        if (!noBody) {
+            match (await sendBody(commands, stream.inbox, id, body)) {
+                Ok() => {}
+                Err(e) => {
+                    // A server may answer before taking the whole body (RFC 9113 §8.1); its head may be waiting.
+                    match (parts.tryRecv()) {
+                        Some(StreamPart.Head(fields, end)) => {
+                            return Ok(Some(this.h2Response(url, stream, fields, end, total)?));
+                        }
+                        _ => { return Err(Failure { error: e, resendable: false }); }
+                    }
+                }
+            }
+        }
+        let firstByte = Deadline.after(this.options.firstByteMs).earlier(total);
+        let first: Result<StreamPart?, NetError> = if (firstByte.isNever()) recvPart(
+            await parts.recvAsync(),
+        ) else await Async.deadline(
+            firstByte.instant(),
+            NetError.TimedOut,
+            async () => recvPart(await parts.recvAsync()),
+        );
+        match (first) {
+            Ok(Some(StreamPart.Head(fields, end))) => {
+                return Ok(Some(this.h2Response(url, stream, fields, end, total)?));
+            }
+            Ok(Some(StreamPart.Failed(e, unprocessed))) => {
+                stream.ended = true; // the connection task has dropped it already
+                return Err(Failure { error: ClientError.Net(e), resendable: unprocessed });
+            }
+            Ok(_) => { return Err(Failure { error: ClientError.Net(NetError.Closed), resendable: false }); }
+            Err(e) => { return Err(Failure { error: ClientError.Net(e), resendable: false }); }
+        }
+    }
+
+    /// The `ClientResponse` of an HTTP/2 stream whose head is `fields`.
+    fn h2Response(
+        borrow this,
+        url: borrow Url,
+        stream: H2Stream,
+        fields: HeaderBlock,
+        end: bool,
+        total: Deadline,
+    ) -> Result<ClientResponse, Failure> {
+        var code: u16 = 0;
+        for (i in 0..fields.count()) {
+            if (sameText(fields.name(i), ":status")) {
+                let v = fields.value(i);
+                code = (v[0] - 48) as u16 * 100 + (v[1] - 48) as u16 * 10 + (v[2] - 48) as u16; // checked by the engine
+            }
+        }
+        let finalUrl = match (urlCopy(url)) {
+            Ok(u) => u,
+            Err(e) => { return Err(Failure { error: e, resendable: false }); },
+        };
+        var unlimited = this.options.limits;
+        unlimited.maxBodyBytes = 0xFFFFFFFFFFFFFFFF;
+        let carry = match (OwnedBuffer.create(16)) {
+            Ok(b) => b,
+            Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
+        };
+        var s = stream;
+        if (end) {
+            s.ended = true;
+        }
+        var streams = Vector<H2Stream>.create();
+        match (streams.push(s)) {
+            Ok() => {}
+            Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); }
+        }
+        let slots = match (Channel<u8>.create(1)) {
+            Ok(c) => c,
+            Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
+        };
+        return Ok(ClientResponse {
+            limits: this.options.limits,
+            maxDrain: this.options.maxDrainBytes,
+            address: finalUrl,
+            conn: Vector<Box<dyn Transport + Send>>.create(),
+            slots: slots, // unused: the connection's slot belongs to its task
+            head: Vector<u8>.create(),
+            code: code,
+            framing: ResponseBody.Empty,
+            left: 0,
+            decoder: ChunkDecoder.create(unlimited),
+            carry: carry,
+            done: end,
+            keepAlive: false,
+            readDeadline: total,
+            stream: streams,
+            streamHead: fields,
+            trailerLines: Vector<u8>.create(),
+            trailerFields: HeaderBlock.create(),
         });
     }
 
@@ -407,7 +774,9 @@ public struct Client {
         );
         let addresses = net(resolved)?;
         let ordered = net(interleave(addresses))?;
-        let stream = net(await happyEyeballs(ordered, this.dialer, this.options.connectionAttemptDelayMs, deadline))?;
+        let sendable: borrow dyn Dialer + Send = borrow this.dialer;
+        let dialer: borrow dyn Dialer = sendable; // in two steps: upstream U19
+        let stream = net(await happyEyeballs(ordered, dialer, this.options.connectionAttemptDelayMs, deadline))?;
         match (borrow this.tls) {
             Some(c) => {
                 if (url.isSecure()) {
@@ -440,11 +809,16 @@ public struct Client {
         strip: bool,
         body: borrow mut dyn BodySource,
         written: borrow mut u64,
+        upgrade: Slice<u8>,
     ) -> Result<void, ClientError> {
         var authority = Vector<u8>.create();
-        match (url.authority(mut authority)) {
-            Ok() => {}
-            Err(e) => { return Err(ClientError.BadUrl(e)); }
+        if (request.authorityText.length > 0 && !strip) {
+            copyBytes(mut authority, request.authorityText.view())?;
+        } else {
+            match (url.authority(mut authority)) {
+                Ok() => {}
+                Err(e) => { return Err(ClientError.BadUrl(e)); }
+            }
         }
         var head = Vector<u8>.create();
         var w = RequestWriter.start(mut head, Methods.text(method).bytes(), url.target(), authority.view());
@@ -455,7 +829,16 @@ public struct Client {
                 Ascii.equalsIgnoringCase(name, "proxy-authorization"))) {
                 continue;
             }
+            // An upgrade's own `connection` and `upgrade` are the client's to write.
+            if (upgrade.length > 0 && (Ascii.equalsIgnoringCase(name, "connection") ||
+                Ascii.equalsIgnoringCase(name, "upgrade"))) {
+                continue;
+            }
             w.field(mut head, name, request.values[i].view());
+        }
+        if (upgrade.length > 0) {
+            w.field(mut head, "connection".bytes(), "upgrade".bytes());
+            w.field(mut head, "upgrade".bytes(), upgrade);
         }
         let length = body.length();
         let declareZero = Methods.same(method, Method.Post) || Methods.same(method, Method.Put) ||
@@ -481,17 +864,56 @@ public struct Client {
                 var size = [0u8; 24];
                 loop {
                     let got = net(await body.read(mut chunk[8..]))?;
+                    if (got == 0) {
+                        // The last chunk, its trailer section (RFC 9112 §7.1.2), and the empty line.
+                        var trailers = HeaderBlock.create();
+                        allocated(body.copyTrailers(mut trailers))?;
+                        var last = Vector<u8>.create();
+                        copyBytes(mut last, "0\r\n".bytes())?;
+                        for (i in 0..trailers.count()) {
+                            if (trailerSendable(trailers.name(i), trailers.value(i))) {
+                                copyBytes(mut last, trailers.name(i))?;
+                                copyBytes(mut last, ": ".bytes())?;
+                                copyBytes(mut last, trailers.value(i))?;
+                                copyBytes(mut last, "\r\n".bytes())?;
+                            }
+                        }
+                        copyBytes(mut last, "\r\n".bytes())?;
+                        await sendCounted(conn, last.view(), written)?;
+                        break;
+                    }
                     let start = chunkHeader(got, mut size);
                     await sendCounted(conn, size[start..], written)?;
-                    if (got == 0) {
-                        break; // "0\r\n\r\n": the last chunk and no trailers
-                    }
                     await sendCounted(conn, chunk[8..8 + got], written)?;
                     await sendCounted(conn, "\r\n".bytes(), written)?;
                 }
             }
         }
         return Ok();
+    }
+}
+
+/// Whether a request trailer may be sent: a token for a name, no control byte in its value, and not a field that frames
+/// or routes a message (RFC 9110 §6.5.1).
+fn trailerSendable(name: Slice<u8>, value: Slice<u8>) -> bool {
+    if (!Ascii.isToken(name) || Ascii.equalsIgnoringCase(name, "content-length") ||
+        Ascii.equalsIgnoringCase(name, "transfer-encoding") || Ascii.equalsIgnoringCase(name, "host") ||
+        Ascii.equalsIgnoringCase(name, "connection") || Ascii.equalsIgnoringCase(name, "te") ||
+        Ascii.equalsIgnoringCase(name, "trailer") || (name.length > 0 && name[0] == 58)) {
+        return false;
+    }
+    for (b in value) {
+        if (!Ascii.isFieldValueChar(b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn allocated(r: Result<void, AllocError>) -> Result<void, ClientError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
     }
 }
 
@@ -548,6 +970,7 @@ async fn readHead(
     carry: borrow mut OwnedBuffer,
     deadline: Deadline,
     limits: Limits,
+    switching: bool,
 ) -> Result<void, ClientError> {
     var scanner = HeadScanner.create();
     var buf = [0u8; 4096];
@@ -560,10 +983,10 @@ async fn readHead(
                     Err(e) => { return Err(ClientError.Protocol(e)); },
                 };
                 let status = p.status;
-                if (status == 101) {
+                if (status == 101 && !switching) {
                     return Err(ClientError.Protocol(ProtocolError.BadStatusLine)); // never asked for
                 }
-                if (status >= 200) {
+                if (status >= 200 || status == 101) {
                     // Keep the head only; move the rest to `carry`.
                     let all = head.view();
                     match (carry.append(all[end..])) {
@@ -608,6 +1031,31 @@ async fn readBoxed(
     return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await conn.read(into));
 }
 
+/// What `Client.upgrade` got: the connection switched, or an ordinary answer.
+public enum Upgraded {
+    Switched(Switched),
+    Answered(ClientResponse),
+}
+
+/// A connection after `101 Switching Protocols`: the bytes are the new protocol's, both ways.
+@noncopy
+public struct Switched {
+    private conn: Box<dyn Transport + Send>;
+    private head: Vector<u8>;
+    private earlyBytes: OwnedBuffer;
+    private limits: Limits;
+
+    /// Appends a copy of the 101's fields to `into` (`ClientResponse.fields`).
+    public fn fields(borrow this, into: borrow mut HeaderBlock) -> Result<void, ClientError> =>
+        fieldsOf(this.head.view(), this.limits, into);
+
+    /// The bytes the server sent after its 101 that were read with it: the new protocol's first, before any read.
+    public fn early(borrow this) -> Slice<u8> => this.earlyBytes.readable();
+
+    /// The connection, to read and write the new protocol.
+    public fn transport(borrow mut this) -> borrow mut Box<dyn Transport + Send> => borrow mut this.conn;
+}
+
 /// Frees a slot when dropped while `live`.
 struct Held {
     slots: Channel<u8>;
@@ -639,6 +1087,12 @@ public struct ClientResponse {
     private done: bool;
     private keepAlive: bool;
     private readDeadline: Deadline;
+    /// An HTTP/2 response's stream (at most one: a vector, so the response can be built without one), and its head.
+    private stream: Vector<H2Stream>;
+    private streamHead: HeaderBlock;
+    /// The trailer section: its lines as they arrive (HTTP/1.1 chunked), then its fields once the body has ended.
+    private trailerLines: Vector<u8>;
+    private trailerFields: HeaderBlock;
 
     /// The status code.
     public fn status(borrow this) -> u16 => this.code;
@@ -648,6 +1102,18 @@ public struct ClientResponse {
 
     /// A copy of the first value of field `name`, if present.
     public fn header(borrow this, name: StringView) -> Vector<u8>? {
+        if (this.stream.length > 0) {
+            for (i in 0..this.streamHead.count()) {
+                if (Ascii.equalsIgnoringCase(this.streamHead.name(i), name)) {
+                    var copy = Vector<u8>.create();
+                    match (copyBytes(mut copy, this.streamHead.value(i))) {
+                        Ok() => { return Some(copy); }
+                        Err(_) => { return null; }
+                    }
+                }
+            }
+            return null;
+        }
         let h = this.head.view();
         let parsed = match (parseResponseHead(h, 0, h.length, Method.Get, this.limits)) {
             Ok(p) => p,
@@ -663,6 +1129,51 @@ public struct ClientResponse {
             Err(_) => { return null; }
         }
     }
+
+    /// The connection after a 101, out of the pool: its slot is freed, since a switched connection is no request.
+    fn switched(this) -> Result<Switched, ClientError> {
+        var r = this;
+        let conn = match (r.conn.pop()) {
+            Some(c) => c,
+            null => { return Err(ClientError.Net(NetError.Closed)); },
+        };
+        let freed = r.slots.trySend(0);
+        var head = Vector<u8>.create();
+        copyBytes(mut head, r.head.view())?;
+        let rest = r.carry.readable();
+        var early = match (OwnedBuffer.create(if (rest.length == 0) 1 else rest.length)) {
+            Ok(b) => b,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        match (early.append(rest)) {
+            Ok() => {}
+            Err(e) => { return Err(ClientError.Net(e)); }
+        }
+        return Ok(Switched { conn: conn, head: head, earlyBytes: early, limits: r.limits });
+    }
+
+    /// Appends a copy of every response field to `into`, in order, names lowercased (Web ADR 0012 §3.5: a proxy relays
+    /// them).
+    public fn fields(borrow this, into: borrow mut HeaderBlock) -> Result<void, ClientError> {
+        if (this.stream.length > 0) {
+            for (i in 0..this.streamHead.count()) {
+                let name = this.streamHead.name(i);
+                if (name.length > 0 && name[0] == 58) {
+                    continue; // :status is `status()`
+                }
+                pushedOk(into.push(name, this.streamHead.value(i), this.streamHead.span(i).sensitive))?;
+            }
+            return Ok();
+        }
+        return fieldsOf(this.head.view(), this.limits, into);
+    }
+
+    /// The response's trailer fields (RFC 9110 §6.5): empty until `read` has returned 0, and empty if there were none.
+    /// From a chunked body's trailer section over HTTP/1.1, from the HEADERS that ended the stream over HTTP/2.
+    public fn trailers(borrow this) -> borrow HeaderBlock => borrow this.trailerFields;
+
+    /// Whether the response came over HTTP/2.
+    public fn isHttp2(borrow this) -> bool => this.stream.length > 0;
 
     /// The `location` resolved against `base`, for a redirect.
     fn location(borrow this, base: borrow Url) -> Url? {
@@ -680,6 +1191,14 @@ public struct ClientResponse {
     public async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, ClientError> {
         if (this.done || buffer.length == 0) {
             return Ok(0);
+        }
+        if (this.stream.length > 0) {
+            let n = await this.stream[0].read(buffer)?;
+            if (n == 0) {
+                this.done = true;
+                pushedOk(this.trailerFields.pushAll(this.stream[0].trailers))?;
+            }
+            return Ok(n);
         }
         loop {
             match (this.framing) {
@@ -721,9 +1240,14 @@ public struct ClientResponse {
                     for (i in 0..step.dataLength) {
                         buffer[i] = input[step.dataStart + i];
                     }
+                    for (i in 0..step.trailerLength) {
+                        pushedOk(this.trailerLines.push(input[step.trailerStart + i]))?;
+                    }
                     consumed(mut this.carry, step.consumed)?;
                     if (step.finished) {
                         this.done = true;
+                        pushedOk(this.trailerFields.pushLines(this.trailerLines.view()))?;
+                        this.trailerLines.clear();
                     }
                     if (step.dataLength > 0) {
                         return Ok(step.dataLength);
@@ -772,6 +1296,9 @@ public struct ClientResponse {
         while (!this.done && drained <= this.maxDrain) {
             let n = await this.read(mut buf[..])?;
             drained += n as u64;
+        }
+        if (this.stream.length > 0) {
+            return Ok(); // the stream ended, or is reset when the response is dropped; the connection stays
         }
         if (!this.done || !this.keepAlive || !this.carry.isEmpty()) {
             return Ok(); // the connection closes when the response is dropped
@@ -857,4 +1384,104 @@ fn boxed<T>(r: Result<Box<T>, AllocError>) -> Result<Box<T>, ClientError> {
         Ok(b) => { return Ok(b); }
         Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
     }
+}
+
+fn pushedOk(r: Result<void, AllocError>) -> Result<void, ClientError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+    }
+}
+
+/// The fields of the response head `h`, appended to `into`, names lowercased.
+fn fieldsOf(h: Slice<u8>, limits: Limits, into: borrow mut HeaderBlock) -> Result<void, ClientError> {
+    let parsed = match (parseResponseHead(h, 0, h.length, Method.Get, limits)) {
+        Ok(p) => p,
+        Err(e) => { return Err(ClientError.Protocol(e)); },
+    };
+    var lower = Vector<u8>.create();
+    for (i in 0..parsed.headers.count()) {
+        lower.clear();
+        for (c in parsed.headers.nameBytes(i)) {
+            pushedOk(lower.push(if (c >= 65 && c <= 90) c + 32 else c))?;
+        }
+        let name = lower.view();
+        pushedOk(into.push(name, parsed.headers.value(i), HeaderBlock.sensitiveByDefault(name)))?;
+    }
+    return Ok();
+}
+
+fn recvPart(r: Result<StreamPart?, AsyncError>) -> Result<StreamPart?, NetError> {
+    match (r) {
+        Ok(p) => { return Ok(p); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+fn sameText(a: Slice<u8>, text: StringView) -> bool => Ascii.equals(a, text);
+
+/// An HTTP/2 request head (RFC 9113 §8.3.1): `:method`, `:scheme`, `:authority` (the request's own unless `strip`) and
+/// `:path`, then the request's fields lowercased, less `host` and the connection-specific ones (§8.2.2), and across
+/// origins less credentials; `content-length` when the body's length is known.
+fn h2Head(
+    url: borrow Url,
+    method: Method,
+    request: borrow ClientRequest,
+    strip: bool,
+    length: u64?,
+) -> Result<HeaderBlock, ClientError> {
+    var head = HeaderBlock.create();
+    pushedOk(head.push(":method".bytes(), Methods.text(method).bytes(), false))?;
+    pushedOk(head.push(":scheme".bytes(), if (url.isSecure()) "https".bytes() else "http".bytes(), false))?;
+    var authority = Vector<u8>.create();
+    if (request.authorityText.length > 0 && !strip) {
+        copyBytes(mut authority, request.authorityText.view())?;
+    } else {
+        match (url.authority(mut authority)) {
+            Ok() => {}
+            Err(e) => { return Err(ClientError.BadUrl(e)); }
+        }
+    }
+    pushedOk(head.push(":authority".bytes(), authority.view(), false))?;
+    pushedOk(head.push(":path".bytes(), url.target(), false))?;
+    var lower = Vector<u8>.create();
+    for (i in 0..request.names.length) {
+        let name = request.names[i].view();
+        if (strip && (Ascii.equalsIgnoringCase(name, "authorization") || Ascii.equalsIgnoringCase(name, "cookie") ||
+            Ascii.equalsIgnoringCase(name, "proxy-authorization"))) {
+            continue;
+        }
+        if (Ascii.equalsIgnoringCase(name, "connection") || Ascii.equalsIgnoringCase(name, "keep-alive") ||
+            Ascii.equalsIgnoringCase(name, "proxy-connection") || Ascii.equalsIgnoringCase(name, "upgrade") ||
+            Ascii.equalsIgnoringCase(name, "transfer-encoding")) {
+            continue;
+        }
+        let value = request.values[i].view();
+        if (Ascii.equalsIgnoringCase(name, "te") && !Ascii.equalsIgnoringCase(value, "trailers")) {
+            continue; // only "trailers" may be sent (§8.2.2)
+        }
+        lower.clear();
+        for (c in name) {
+            pushedOk(lower.push(if (c >= 65 && c <= 90) c + 32 else c))?;
+        }
+        let n = lower.view();
+        pushedOk(head.push(n, value, HeaderBlock.sensitiveByDefault(n)))?;
+    }
+    match (length) {
+        Some(n) => {
+            if (n > 0) {
+                var digits = [0u8; 20];
+                var at: usize = 20;
+                var v = n;
+                while (v > 0) {
+                    at -= 1;
+                    digits[at] = 48 + truncate<u8>(v % 10);
+                    v /= 10;
+                }
+                pushedOk(head.push("content-length".bytes(), digits[at..], false))?;
+            }
+        }
+        null => {}
+    }
+    return Ok(head);
 }

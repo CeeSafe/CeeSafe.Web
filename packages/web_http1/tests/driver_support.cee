@@ -84,10 +84,12 @@ impl Transport for Script {
 }
 
 /// Routes on the path:
-/// - `/stream`: writes "part1", flushes, writes "part2" (a streamed, chunked response);
+/// - `/stream`: writes "part1", flushes, writes "part2" (a streamed, chunked response); `/stream-trailers` the same,
+///   with the trailer `x-sum: 10`; `/whole-trailers`: writes "whole" without flushing, with the trailer `x-sum: 5`;
 /// - `/ignore`: answers "ok" without reading the body;
 /// - `/fail`: fails with 404;
 /// - `/big`: 20000 bytes of `x`, length not declared; `/bigknown`: the same, declared;
+/// - `/trailers`: reads the body, then answers `/trailers:` and each trailer as `name=value;`;
 /// - anything else: reads the body and answers `<path>:<body>`.
 /// Its hook adds `x-hook: 1` to every response.
 struct App {
@@ -104,6 +106,16 @@ impl Application for App {
         let n = this.handled.fetchAdd(1);
         let path = request.path();
         let p = path.bytes();
+        if (Ascii.equals(p, "/stream-trailers")) {
+            await exchange.write("part1".bytes())?;
+            await exchange.flush()?;
+            await exchange.write("part2".bytes())?;
+            return exchange.trailer("x-sum", "10".bytes());
+        }
+        if (Ascii.equals(p, "/whole-trailers")) {
+            await exchange.write("whole".bytes())?;
+            return exchange.trailer("x-sum", "5".bytes());
+        }
         if (Ascii.equals(p, "/stream")) {
             await exchange.write("part1".bytes())?;
             await exchange.flush()?;
@@ -131,6 +143,23 @@ impl Application for App {
             Err(_) => { return Err(HandlerError.Internal); },
         };
         await exchange.readToEnd(mut body)?;
+        if (Ascii.equals(p, "/trailers")) {
+            var listed = Vector<u8>.create();
+            let t = exchange.trailers();
+            for (i in 0..t.count()) {
+                for (b in t.name(i)) {
+                    grownTest(listed.push(b))?;
+                }
+                grownTest(listed.push(61))?;
+                for (b in t.value(i)) {
+                    grownTest(listed.push(b))?;
+                }
+                grownTest(listed.push(59))?;
+            }
+            await exchange.write(p)?;
+            await exchange.write(":".bytes())?;
+            return await exchange.write(listed.view());
+        }
         await exchange.write(p)?;
         await exchange.write(":".bytes())?;
         await exchange.write(body.readable())?;
@@ -168,4 +197,11 @@ fn quiet() -> Limits {
     var l = Limits.defaults();
     l.sendDate = false;
     return l;
+}
+
+fn grownTest(r: Result<void, AllocError>) -> Result<void, HandlerError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
 }

@@ -1,4 +1,4 @@
-// Whether a decoded header list is a well-formed HTTP/2 request or trailer section (RFC 9113 §8.1-8.3). A malformed one
+// Whether a decoded header list is a well-formed HTTP/2 request, response or trailer section (RFC 9113 §8.1-8.3). A malformed one
 // is a stream error of type PROTOCOL_ERROR (§8.1.1). Sans-I/O.
 import web_http;
 
@@ -106,13 +106,75 @@ public struct Requests {
     }
 }
 
-/// A field name: not empty, no upper case, and none of NUL, CR, LF, space or ':' (§8.2.1).
+/// What a response's head says.
+public struct ResponseShape {
+    /// The `:status`, 100 to 999.
+    public status: u16;
+    /// The `content-length`, if given.
+    public contentLength: u64?;
+}
+
+/// Response checks (RFC 9113 §8.3.2), for the client role.
+public struct Responses {
+    /// Checks a response's head: one `:status` of three digits, first, and no other pseudo-header; the same rules as a
+    /// request's for names, values and connection-specific fields; one well-formed `content-length` at most. Null if
+    /// malformed (§8.1.1).
+    public fn checkResponse(head: borrow HeaderBlock) -> ResponseShape? {
+        var status: u16 = 0;
+        var regular = false;
+        var length: u64? = null;
+        for (i in 0..head.count()) {
+            let name = head.name(i);
+            let value = head.value(i);
+            if (!goodValue(value)) {
+                return null;
+            }
+            if (name.length > 0 && name[0] == 58) {
+                if (regular || status != 0 || !isText(name, ":status") || value.length != 3) {
+                    return null;
+                }
+                for (b in value) {
+                    if (b < 48 || b > 57) {
+                        return null;
+                    }
+                }
+                status = (value[0] - 48) as u16 * 100 + (value[1] - 48) as u16 * 10 + (value[2] - 48) as u16;
+                if (status < 100) {
+                    return null;
+                }
+                continue;
+            }
+            regular = true;
+            if (!goodName(name) || connectionSpecific(name)) {
+                return null;
+            }
+            if (isText(name, "content-length")) {
+                let n = decimal(value)?;
+                match (length) {
+                    Some(m) => {
+                        if (m != n) {
+                            return null;
+                        }
+                    }
+                    null => {}
+                }
+                length = Some(n);
+            }
+        }
+        if (status == 0) {
+            return null;
+        }
+        return Some(ResponseShape { status: status, contentLength: length });
+    }
+}
+
+/// A field name: not empty, and no byte of 0x00-0x20, upper case, ':' or 0x7F-0xFF (§8.2.1).
 fn goodName(name: Slice<u8>) -> bool {
     if (name.length == 0) {
         return false;
     }
     for (c in name) {
-        if ((c >= 65 && c <= 90) || c == 0 || c == 10 || c == 13 || c == 32 || c == 58 || c >= 127) {
+        if ((c >= 65 && c <= 90) || c <= 32 || c == 58 || c >= 127) {
             return false;
         }
     }

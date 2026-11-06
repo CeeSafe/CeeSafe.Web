@@ -4,10 +4,14 @@
 import web_core;
 import web_http;
 
+/// With `pauseMs` above 0, each read of the input first pauses that long with cancellation ignored, so a read cancelled
+/// in its pause still returns its bytes: a completion-based read (io_uring, IOCP) that finished as it was cancelled
+/// (CeeSafe ADR 0035 §3.4).
 struct Peer {
     input: Vector<u8>;
     at: usize;
     chunk: usize;
+    pauseMs: u64;
     closeAtMs: u64?;
     output: Vector<u8>;
 }
@@ -15,6 +19,10 @@ struct Peer {
 impl Transport for Peer {
     async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
         if (this.at < this.input.length) {
+            if (this.pauseMs > 0) {
+                let ms = this.pauseMs;
+                let paused: Result<void, AsyncError> = await Async.shield(ms + 100, async () => await Timer.sleep(ms));
+            }
             var n = this.input.length - this.at;
             if (n > this.chunk) {
                 n = this.chunk;
@@ -83,7 +91,11 @@ impl Transport for Peer {
 }
 
 fn peer(input: Vector<u8>, chunk: usize, closeAtMs: u64?) -> Peer =>
-    Peer { input: input, at: 0, chunk: chunk, closeAtMs: closeAtMs, output: Vector<u8>.create() };
+    Peer { input: input, at: 0, chunk: chunk, pauseMs: 0, closeAtMs: closeAtMs, output: Vector<u8>.create() };
+
+/// `peer`, each read pausing `pauseMs` and completing even when cancelled.
+fn completingPeer(input: Vector<u8>, chunk: usize, pauseMs: u64) -> Peer =>
+    Peer { input: input, at: 0, chunk: chunk, pauseMs: pauseMs, closeAtMs: null, output: Vector<u8>.create() };
 
 struct NoHooks {}
 

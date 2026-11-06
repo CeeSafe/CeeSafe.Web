@@ -1,7 +1,10 @@
 // An HTTP client with web_client (Web ADR 0009), for the client interop checks (tests/interop/client.py).
 // Sends CW_METHOD (GET, the default, or POST) to CW_URL, with CW_BODY as a POST's body, CW_REPEAT times (default 1)
 // over one client, so later requests may reuse a pooled connection. https URLs are verified against the roots in
-// CW_CA (PEM), or the system's without it. For each request it prints the status, the final URL and the body:
+// CW_CA (PEM), or the system's without it. With CW_HTTP2=1 it offers ALPN h2, speaks HTTP/2 by prior knowledge to http
+// URLs, and runs the client's HTTP/2 connections (`Client.run`, Web ADR 0012 §7); CW_PARALLEL (default 1) requests
+// then go at once, repeated CW_REPEAT times. For each request it prints the status, the final URL, `h2` if the answer
+// came over HTTP/2, the body, and its trailers (`fetch: trailer name: value`):
 //
 //   fetch: 200 http://127.0.0.1:8080/final
 //   <the body>
@@ -76,7 +79,7 @@ async fn sayBytes(bytes: Slice<u8>) -> Result<void, NetError> {
 }
 
 /// The https connector: the roots in CW_CA, or the system's.
-async fn connector() -> Result<Box<dyn Connector>, NetError> {
+async fn connector(http2: bool) -> Result<Box<dyn Connector + Send>, NetError> {
     var config = match (TlsConfig.client()) {
         Ok(c) => c,
         Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
@@ -97,7 +100,7 @@ async fn connector() -> Result<Box<dyn Connector>, NetError> {
             }
         }
     }
-    var protocols = [Alpn.Http11];
+    var protocols = if (http2) [Alpn.Http2, Alpn.Http11] else [Alpn.Http11, Alpn.None];
     match (config.setAlpn(protocols[..])) {
         Ok() => {}
         Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
@@ -108,7 +111,7 @@ async fn connector() -> Result<Box<dyn Connector>, NetError> {
     };
     match (Box.create(tls)) {
         Ok(b) => {
-            let d: Box<dyn Connector> = b;
+            let d: Box<dyn Connector + Send> = b;
             return Ok(d);
         }
         Err(_) => { return Err(NetError.OutOfMemory); }
@@ -156,8 +159,21 @@ async fn once(client: borrow Client, url: StringView, post: bool, payload: Strin
         Err(_) => { return Err(NetError.OutOfMemory); }
     }
     append(mut line, location.view())?;
+    if (response.isHttp2()) {
+        append(mut line, " h2".bytes())?;
+    }
     await sayBytes(line.view())?;
-    return await sayBytes(content.view());
+    await sayBytes(content.view())?;
+    let trailers = response.trailers();
+    for (i in 0..trailers.count()) {
+        var t = Vector<u8>.create();
+        append(mut t, "fetch: trailer ".bytes())?;
+        append(mut t, trailers.name(i))?;
+        append(mut t, ": ".bytes())?;
+        append(mut t, trailers.value(i))?;
+        await sayBytes(t.view())?;
+    }
+    return Ok();
 }
 
 async fn failed(e: ClientError) -> Result<void, NetError> {
@@ -180,15 +196,41 @@ async fn run() -> Result<void, NetError> {
         Some(b) => b,
         null => "",
     };
-    let tls = await connector()?;
-    let client = match (Client.create(ClientOptions.defaults(), Some(tls))) {
+    let http2 = setting("CW_HTTP2", 0) == 1;
+    let tls = await connector(http2)?;
+    var options = ClientOptions.defaults();
+    options.http2Cleartext = http2;
+    let client = match (Client.create(options, Some(tls))) {
         Ok(c) => c,
         Err(e) => { return await failed(e); },
     };
     let repeat = setting("CW_REPEAT", 1);
-    for (i in 0..repeat) {
-        await once(client, url, post, payload)?;
+    if (!http2) {
+        for (i in 0..repeat) {
+            await once(client, url, post, payload)?;
+        }
+        await client.shutdown();
+        return Ok();
     }
+    let parallel = setting("CW_PARALLEL", 1);
+    let drain = Drain.create()?;
+    let raced: Result<Raced<bool>, NetError> = await Async.race(
+        async () => {
+            await client.run(drain)?;
+            return Ok(false);
+        },
+        async () => {
+            for (i in 0..repeat) {
+                await Async.scope(NetError.OutOfMemory, (s) => {
+                    for (k in 0..parallel) {
+                        s.spawn(async () => await once(client, url, post, payload));
+                    }
+                })?;
+            }
+            return Ok(true);
+        },
+    );
+    let won = raced?;
     await client.shutdown();
     return Ok();
 }

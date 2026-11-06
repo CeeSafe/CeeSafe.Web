@@ -27,3 +27,7 @@ source = "path+../../packages/web_tls"
 [[package]]
 name = "web_transport"
 source = "path+../../packages/web_transport"
+
+[[package]]
+name = "web_ws"
+source = "path+../../packages/web_ws"

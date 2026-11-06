@@ -1,0 +1,224 @@
+// A reverse proxy (Web ADR 0012): every path, for GET (and HEAD), POST, PUT, DELETE, OPTIONS and PATCH, goes to the
+// backends, mounted on a route of a web_server router. Listens on 127.0.0.1:CW_PORT (default 8080), over HTTP/1.1 and,
+// by prior knowledge, HTTP/2 (h2c). Upgrades (WebSocket) are tunnelled.
+//
+//   CW_BACKENDS         comma-separated backends, `http://127.0.0.1:9001` (required), each with weight 1
+//   CW_TRUSTED          comma-separated blocks whose forwarding fields are believed (default: none)
+//   CW_PROXY_PROTOCOL   comma-separated blocks that must send a PROXY protocol header (default: none)
+//   CW_POLICY           round-robin (default), least-requests or hash (on the client's address)
+//   CW_CHECK_PATH       a path for active health checks (default: none)
+//   CW_MAX_BODY         the largest request body, in bytes (default: the server's, 8 MiB; a larger one is 413)
+//   CW_UPSTREAM_H2C     1: reach the backends over HTTP/2 by prior knowledge (h2c), not HTTP/1.1
+//
+// The proxy's own work (its client's HTTP/2 connections, the active checks) runs beside the server and stops with it.
+import web_core;
+import web_transport;
+import web_http;
+import web_client;
+import web_server;
+import web_proxy;
+
+struct App {}
+
+fn port() -> u16 {
+    let text = match (Environment.variable("CW_PORT")) {
+        Some(t) => t,
+        null => { return 8080; },
+    };
+    return match (Ascii.parseDecimal(text.bytes())) {
+        Some(v) => if (v > 0 && v < 65536) truncate<u16>(v) else 8080,
+        null => 8080,
+    };
+}
+
+/// The comma-separated items of the variable `name`, each passed to `each`; false if `each` refuses one.
+fn items(name: StringView, each: borrow mut fn(StringView) -> bool) -> bool {
+    let value = match (Environment.variable(name)) {
+        Some(v) => v,
+        null => { return true; },
+    };
+    let bytes = value.bytes();
+    var start: usize = 0;
+    for (k in 0..bytes.length + 1) {
+        if (k < bytes.length && bytes[k] != 44) {
+            continue;
+        }
+        var a = start;
+        var b = k;
+        while (a < b && bytes[a] == 32) {
+            a += 1;
+        }
+        while (b > a && bytes[b - 1] == 32) {
+            b -= 1;
+        }
+        start = k + 1;
+        if (a == b) {
+            continue;
+        }
+        let item = match (StringView.fromUtf8(bytes[a..b])) {
+            Some(t) => t,
+            null => { return false; },
+        };
+        if (!each(item)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn blocks(name: StringView) -> TrustedProxies? {
+    var t = TrustedProxies.none();
+    let ok = items(name, (item) => match (t.add(item)) {
+        Ok(true) => true,
+        _ => false,
+    });
+    return if (ok) Some(t) else null;
+}
+
+fn options() -> ProxyOptions? {
+    var o = ProxyOptions.defaults();
+    match (blocks("CW_TRUSTED")) {
+        Some(t) => { o.trusted = t; }
+        null => { return null; }
+    }
+    match (Environment.variable("CW_POLICY")) {
+        Some(p) => {
+            if (p == "least-requests") {
+                o.policy = Policy.LeastRequests;
+            } else if (p == "hash") {
+                o.policy = Policy.ConsistentHash;
+            } else if (p != "round-robin") {
+                return null;
+            }
+        }
+        null => {}
+    }
+    match (Environment.variable("CW_CHECK_PATH")) {
+        Some(p) => {
+            o.checkPath.clear();
+            for (b in p.bytes()) {
+                match (o.checkPath.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return null; }
+                }
+            }
+        }
+        null => {}
+    }
+    match (Environment.variable("CW_UPSTREAM_H2C")) {
+        Some(v) => { o.client.http2Cleartext = v == "1"; }
+        null => {}
+    }
+    return Some(o);
+}
+
+fn proxy() -> ReverseProxy? {
+    let o = match (options()) {
+        Some(x) => x,
+        null => { return null; },
+    };
+    var builder = ProxyBuilder.create(o);
+    let ok = items("CW_BACKENDS", (url) => match (builder.backend(url, 1)) {
+        Ok() => true,
+        Err(_) => false,
+    });
+    if (!ok) {
+        return null;
+    }
+    return match (builder.build(null)) {
+        Ok(p) => Some(p),
+        Err(_) => null,
+    };
+}
+
+fn application(p: borrow ReverseProxy) -> Result<Server<App>, RouteError> {
+    var limits = Limits.defaults();
+    match (Environment.variable("CW_MAX_BODY")) {
+        Some(t) => {
+            match (Ascii.parseDecimal(t.bytes())) {
+                Some(n) => { limits.maxBodyBytes = n; }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    var server = Server<App>.create(App {}, limits)?;
+    for (k in 0..6u32) {
+        let method = match (k) {
+            0 => Method.Get,
+            1 => Method.Post,
+            2 => Method.Put,
+            3 => Method.Delete,
+            4 => Method.Options,
+            _ => Method.Patch,
+        };
+        let route: Box<dyn Handler<App> + Send> = match (Box.create(p.route<App>())) {
+            Ok(b) => b,
+            Err(_) => { return Err(RouteError.OutOfMemory); },
+        };
+        server.router().add(method, "/*path", route)?;
+    }
+    return Ok(server);
+}
+
+async fn serve(
+    p: borrow ReverseProxy,
+    server: Server<App>,
+    limits: ConnectionLimits,
+) -> Result<ServerReport, NetError> {
+    let service = serviceOf(server)?;
+    let listenOptions = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = Listener.bindWith(SocketAddresses.v4Loopback(port()), listenOptions)?;
+    let drain = Drain.create()?;
+    match (await AsyncConsole.writeLine("proxy: listening")) {
+        Ok() => {}
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    var report: ServerReport? = null;
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            report = Some(await ConnectionServer.run(listener, PlainAcceptor {}, service, limits, drain)?);
+            drain.start(); // the server has stopped: so does the proxy's own work
+            return Ok();
+        });
+        s.spawn(async () => await p.run(drain));
+    })?;
+    return match (report) {
+        Some(r) => Ok(r),
+        null => Err(NetError.Closed),
+    };
+}
+
+fn main() {
+    let p = match (proxy()) {
+        Some(x) => x,
+        null => {
+            Console.writeLine("proxy: set CW_BACKENDS (and CW_TRUSTED, CW_PROXY_PROTOCOL, CW_POLICY) correctly");
+            return;
+        },
+    };
+    let server = match (application(p)) {
+        Ok(s) => s,
+        Err(_) => {
+            Console.writeLine("proxy: could not build the routes");
+            return;
+        },
+    };
+    var limits = ConnectionLimits.defaults();
+    match (blocks("CW_PROXY_PROTOCOL")) {
+        Some(t) => { limits.proxyProtocolFrom = t; }
+        null => {
+            Console.writeLine("proxy: CW_PROXY_PROTOCOL is not a list of blocks");
+            return;
+        }
+    }
+    match (Async.run(serve(p, server, limits))) {
+        Ok(report) => {
+            Console.writeLine("proxy: accepted, served, failed");
+            Console.writeLine(report.accepted);
+            Console.writeLine(report.served);
+            Console.writeLine(report.failed);
+        }
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

@@ -1,7 +1,8 @@
 import web_core;
 import web_http;
 
-// The HTTP/2 connection, server side (RFC 9113 §3-6; Web ADR 0011 §3.1): frames in, events out; the frames the
+// The HTTP/2 connection, server side and client side (RFC 9113 §3-6; Web ADR 0011 §3.1, Web ADR 0012 §7): frames in,
+// events out; the frames the
 // protocol owes (acknowledgements, WINDOW_UPDATE, RST_STREAM) and the ones the driver asks for go to an output buffer.
 // Sans-I/O: the driver reads and writes, and passes the time in for the guards.
 
@@ -9,8 +10,11 @@ import web_http;
 public enum H2Event {
     /// No complete frame yet: read more.
     NeedMore,
-    /// A request's head is in `head`: its stream, and whether the request has no body (END_STREAM).
+    /// A request's head is in `head`: its stream, and whether the request has no body (END_STREAM). Server role.
     Request(u32, bool),
+    /// A final response's head is in `head` (1xx heads are skipped): its stream, and whether the response has no body.
+    /// Client role.
+    Response(u32, bool),
     /// Body bytes for a stream are in `data`, and whether they are its last.
     Data(u32, bool),
     /// A trailer section is in `head`, ending the stream's body.
@@ -39,15 +43,19 @@ public struct H2Guards {
     public intervalMs: u64;
     /// Acknowledgements (SETTINGS, PING) the peer may have us owe before the output is written.
     public maxOwedAcks: u32;
+    /// The most our HPACK encoder's dynamic table holds, whatever the peer's SETTINGS_HEADER_TABLE_SIZE allows (memory
+    /// per connection; Web ADR 0012 §3.10).
+    public encoderTableBytes: u32;
 
     /// Guards for a server whose header lists may be `maxHeaderListSize` bytes: header blocks up to twice that, 200
-    /// resets and 1 000 empty frames a second, 1 000 owed acknowledgements.
+    /// resets and 1 000 empty frames a second, 1 000 owed acknowledgements, an encoder table of 4 096 bytes.
     public fn defaults(maxHeaderListSize: u32) -> H2Guards => H2Guards {
         maxBlockBytes: maxHeaderListSize * 2,
         resetsPerInterval: 200,
         emptyFramesPerInterval: 1000,
         intervalMs: 1000,
         maxOwedAcks: 1000,
+        encoderTableBytes: 4096,
     };
 }
 
@@ -73,24 +81,34 @@ struct Stream {
     received: u64;
     /// Counts toward SETTINGS_MAX_CONCURRENT_STREAMS (a client's stream that is not closed).
     counted: bool;
+    /// Client role: the final response head has come, so a further HEADERS is its trailers.
+    headSeen: bool;
+    /// Client role: the request was HEAD, so the response's `content-length` describes no content (RFC 9110 §9.3.2).
+    headRequest: bool;
 }
 
 /// A header block being collected across HEADERS and CONTINUATIONs.
 enum BlockKind {
     None,
     Request,
+    /// Client role: a response's head on one of our streams.
+    Response,
     Trailers,
     /// For a stream we will not serve (refused, or after GOAWAY): decoded only to keep HPACK in step.
     Discard,
 }
 
-/// The server's side of one HTTP/2 connection.
+/// One side of an HTTP/2 connection: the server's (`create`) or the client's (`client`).
 @noncopy
 public struct H2Connection {
+    private isClient: bool;
+    /// Client role: the next stream we open (odd, §5.1.1).
+    private nextOwn: u32;
     private local: H2Settings;
     private peer: H2Settings;
     private guards: H2Guards;
     private decoder: HpackDecoder;
+    private encoder: HpackEncoder;
     private streams: HashMap<u32, Stream>;
     private out: Vector<u8>;
     private scratch: Vector<u8>;
@@ -118,21 +136,36 @@ public struct H2Connection {
     private emptyFrames: u32;
     private owedAcks: u32;
 
-    /// A connection that announces `local`; `start` queues the server's preface.
-    public fn create(local: H2Settings, guards: H2Guards) -> Result<H2Connection, AllocError> {
+    /// A server's connection that announces `local`; `start` queues the server's preface.
+    public fn create(local: H2Settings, guards: H2Guards) -> Result<H2Connection, AllocError> =>
+        H2Connection.build(local, guards, false);
+
+    /// A client's connection that announces `local` (its SETTINGS_ENABLE_PUSH is sent as 0: we accept no push);
+    /// `start` queues the client's preface. Open requests with `openRequest`.
+    public fn client(local: H2Settings, guards: H2Guards) -> Result<H2Connection, AllocError> =>
+        H2Connection.build(local, guards, true);
+
+    fn build(local: H2Settings, guards: H2Guards, isClient: bool) -> Result<H2Connection, AllocError> {
         let decoder = match (HpackDecoder.create(local.headerTableSize, local.maxHeaderListSize as u64)) {
             Ok(d) => d,
             Err(e) => { return Err(e); },
         };
+        let encoder = match (HpackEncoder.create(guards.encoderTableBytes)) {
+            Ok(e) => e,
+            Err(e) => { return Err(e); },
+        };
         return Ok(H2Connection {
+            isClient: isClient,
+            nextOwn: 1,
             local: local,
             peer: H2Settings.initial(),
             guards: guards,
             decoder: decoder,
+            encoder: encoder,
             streams: HashMap<u32, Stream>.create(),
             out: Vector<u8>.create(),
             scratch: Vector<u8>.create(),
-            prefaceRead: false,
+            prefaceRead: isClient, // a client reads no preface but the server's SETTINGS (§3.4)
             settingsSeen: false,
             goingAway: false,
             lastStream: 0,
@@ -155,9 +188,37 @@ public struct H2Connection {
         });
     }
 
-    /// Queues the server's preface (§3.4): its SETTINGS, and a WINDOW_UPDATE raising the connection's window to
-    /// `connectionWindow`.
+    /// Queues our preface (§3.4): for a client, the connection preface string first; then SETTINGS, and a
+    /// WINDOW_UPDATE raising the connection's window to `connectionWindow`.
     public fn start(borrow mut this, connectionWindow: u32) -> Result<void, AllocError> {
+        if (this.isClient) {
+            let preface = clientPreface();
+            for (b in preface.bytes()) {
+                this.out.push(b)?;
+            }
+            var clientIds = [
+                SettingIds.headerTableSize(),
+                SettingIds.enablePush(),
+                SettingIds.maxConcurrentStreams(),
+                SettingIds.initialWindowSize(),
+                SettingIds.maxFrameSize(),
+                SettingIds.maxHeaderListSize(),
+            ];
+            var clientValues = [
+                this.local.headerTableSize,
+                0u32,
+                this.local.maxConcurrentStreams,
+                this.local.initialWindowSize,
+                this.local.maxFrameSize,
+                this.local.maxHeaderListSize,
+            ];
+            Frames.writeSettings(mut this.out, clientIds[..], clientValues[..])?;
+            if (connectionWindow > 65535) {
+                Frames.writeWindowUpdate(mut this.out, 0, connectionWindow - 65535)?;
+                this.connectionReceive = connectionWindow as i64;
+            }
+            return Ok();
+        }
         var ids = [
             SettingIds.headerTableSize(),
             SettingIds.maxConcurrentStreams(),
@@ -350,7 +411,7 @@ public struct H2Connection {
             null => {
                 // Not a live stream: give the connection's window back either way.
                 this.giveBack(0, payload.length)?;
-                if (id > this.lastStream) {
+                if (if (this.isClient) this.idle(id) else id > this.lastStream) {
                     return Err(ErrorCodes.protocolError()); // DATA on an idle stream (§5.1)
                 }
                 // §5.1, closed: after our RST_STREAM, frames already in flight are ignored; after the peer's, DATA is a
@@ -371,6 +432,14 @@ public struct H2Connection {
                 return this.streamError(id, ErrorCodes.streamClosed()); // §5.1
             }
             _ => {}
+        }
+        let beforeHead = match (this.streams.get(id)) {
+            Some(s) => !s.headSeen,
+            null => false,
+        };
+        if (beforeHead) {
+            this.giveBack(0, payload.length)?;
+            return this.streamError(id, ErrorCodes.protocolError()); // DATA before the response's head (§8.1)
         }
         var overflow = false;
         var mismatch = false;
@@ -432,6 +501,9 @@ public struct H2Connection {
         let selfDependent = prioritized && read32(unpadded, 0) & 0x7FFFFFFF == id;
         let fragment = unpadded[if (prioritized) 5 else 0..];
         let end = h.flags & FrameFlags.endStream() != 0;
+        if (this.isClient) {
+            return this.responseHeaders(id, fragment, end, h.flags & FrameFlags.endHeaders() != 0, selfDependent, head);
+        }
         let known = match (this.streams.get(id)) {
             Some(s) => Some(s.state),
             null => null,
@@ -469,6 +541,90 @@ public struct H2Connection {
             }
         }
         return r;
+    }
+
+    /// Client role: HEADERS on `id`. On one of our open streams it is the response's head (after any 1xx heads), then
+    /// its trailers; on a stream we reset, decoded only to keep HPACK in step; on an even stream (a push we did not
+    /// allow, §8.4) or one we never opened, a connection error.
+    fn responseHeaders(
+        borrow mut this,
+        id: u32,
+        fragment: Slice<u8>,
+        end: bool,
+        last: bool,
+        selfDependent: bool,
+        head: borrow mut HeaderBlock,
+    ) -> Result<H2Event?, u32> {
+        var kind = BlockKind.Discard;
+        match (this.streams.get(id)) {
+            Some(s) => {
+                match (s.state) {
+                    StreamState.HalfClosedRemote => {}
+                    _ => { kind = if (s.headSeen) BlockKind.Trailers else BlockKind.Response; }
+                }
+            }
+            null => {
+                if (this.idle(id)) {
+                    return Err(ErrorCodes.protocolError()); // §5.1: HEADERS on an idle stream, or a push (§8.4)
+                }
+            }
+        }
+        this.blockStream = id;
+        this.blockKind = kind;
+        this.blockEndStream = end;
+        this.block.clear();
+        let r = this.blockFragment(fragment, last, head);
+        if (selfDependent) {
+            match (r) {
+                Ok(_) => { return this.streamError(id, ErrorCodes.protocolError()); } // §5.3.1
+                Err(e) => { return Err(e); }
+            }
+        }
+        return r;
+    }
+
+    /// Client role: a response's head, decoded into `head`. A 1xx head is skipped (§8.1: zero or more interim
+    /// responses), unless it ends the stream or is 101, which HTTP/2 does not have (§8.6).
+    fn responseHead(
+        borrow mut this,
+        id: u32,
+        end: bool,
+        tooLarge: bool,
+        head: borrow HeaderBlock,
+    ) -> Result<H2Event?, u32> {
+        if (tooLarge) {
+            return this.streamError(id, ErrorCodes.protocolError());
+        }
+        let shape = match (Responses.checkResponse(head)) {
+            Some(r) => r,
+            null => { return this.streamError(id, ErrorCodes.protocolError()); }, // malformed (§8.1.1)
+        };
+        if (shape.status < 200) {
+            if (end || shape.status == 101) {
+                return this.streamError(id, ErrorCodes.protocolError());
+            }
+            return Ok(null);
+        }
+        var mismatch = false;
+        match (this.streams.getMut(id)) {
+            Some(s) => {
+                s.headSeen = true;
+                let noContent = s.headRequest || shape.status == 204 || shape.status == 304;
+                s.contentLength = if (noContent) null else shape.contentLength;
+                match (s.contentLength) {
+                    Some(n) => { mismatch = end && n != 0; }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        if (mismatch) {
+            return this.streamError(id, ErrorCodes.protocolError()); // content-length without the content (§8.1.1)
+        }
+        if (end) {
+            this.remoteEnded(id);
+        }
+        return Ok(Some(H2Event.Response(id, end)));
     }
 
     /// Adds a fragment to the block being collected, and handles the block once it is complete.
@@ -527,6 +683,7 @@ public struct H2Connection {
                 this.remoteEnded(id);
                 return Ok(Some(H2Event.Trailers(id)));
             }
+            BlockKind.Response => { return this.responseHead(id, end, tooLarge, head); }
             _ => {}
         }
         // A new request.
@@ -562,6 +719,8 @@ public struct H2Connection {
             contentLength: contentLength,
             received: 0,
             counted: true,
+            headSeen: true,
+            headRequest: false,
         };
         match (this.streams.put(id, stream)) {
             Ok(_) => {}
@@ -638,7 +797,8 @@ public struct H2Connection {
             let value = read32(payload, at + 2);
             at += 6;
             if (id == SettingIds.headerTableSize()) {
-                this.peer.headerTableSize = value; // our encoder never indexes, so any size will do
+                this.peer.headerTableSize = value;
+                this.encoder.setLimit(value); // announced at the start of our next block (RFC 7541 §4.2)
             } else if (id == SettingIds.enablePush()) {
                 if (value > 1) {
                     return Err(ErrorCodes.protocolError());
@@ -727,6 +887,9 @@ public struct H2Connection {
             if (id == 0) {
                 return Err(ErrorCodes.protocolError());
             }
+            if (!this.streams.contains(id) && this.idle(id)) {
+                return Err(ErrorCodes.protocolError()); // on an idle stream (§5.1): no RST_STREAM for it (§6.4)
+            }
             return this.streamError(id, ErrorCodes.protocolError());
         }
         if (id == 0) {
@@ -756,7 +919,12 @@ public struct H2Connection {
     }
 
     /// Whether `id` was never opened: a client's stream above the last one, or a push stream not yet promised.
-    fn idle(borrow this, id: u32) -> bool => if (id % 2 == 1) id > this.lastStream else id >= this.nextPush;
+    fn idle(borrow this, id: u32) -> bool {
+        if (this.isClient) {
+            return if (id % 2 == 1) id >= this.nextOwn else true; // a server opens no stream: no push (§8.4)
+        }
+        return if (id % 2 == 1) id > this.lastStream else id >= this.nextPush;
+    }
 
     /// A stream error (§5.4.2): RST_STREAM, the stream closed, and an event so its handler is cancelled.
     fn streamError(borrow mut this, id: u32, code: u32) -> Result<H2Event?, u32> {
@@ -889,9 +1057,12 @@ public struct H2Connection {
             return Err(ErrorCodes.streamClosed());
         }
         this.scratch.clear();
+        if (failed(this.encoder.begin(mut this.scratch))) {
+            return Err(ErrorCodes.internalError());
+        }
         for (i in 0..fields.count()) {
             if (failed(
-                HpackEncoder.field(fields.name(i), fields.value(i), fields.span(i).sensitive, mut this.scratch),
+                this.encoder.encode(fields.name(i), fields.value(i), fields.span(i).sensitive, mut this.scratch),
             )) {
                 return Err(ErrorCodes.internalError());
             }
@@ -1004,8 +1175,13 @@ public struct H2Connection {
         let id = this.nextPush;
         this.nextPush += 2;
         this.scratch.clear();
+        if (failed(this.encoder.begin(mut this.scratch))) {
+            return Err(ErrorCodes.internalError());
+        }
         for (i in 0..request.count()) {
-            if (failed(HpackEncoder.field(request.name(i), request.value(i), false, mut this.scratch))) {
+            if (failed(
+                this.encoder.encode(request.name(i), request.value(i), request.span(i).sensitive, mut this.scratch),
+            )) {
                 return Err(ErrorCodes.internalError());
             }
         }
@@ -1020,12 +1196,82 @@ public struct H2Connection {
             contentLength: null,
             received: 0,
             counted: false,
+            headSeen: true,
+            headRequest: false,
         };
         match (this.streams.put(id, stream)) {
             Ok(_) => { return Ok(Some(id)); }
             Err(_) => { return Err(ErrorCodes.internalError()); }
         }
     }
+
+    /// Queues a PING (§6.7) carrying `data`. The driver sends one to probe a client that has stopped sending: writing
+    /// it to a peer that has gone makes the peer's TCP reset the connection, so a later write fails.
+    public fn ping(borrow mut this, data: [u8; 8]) -> Result<void, u32> {
+        match (Frames.writePing(mut this.out, data, false)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(ErrorCodes.internalError()); }
+        }
+    }
+
+    /// Client role: opens a stream for a request whose head is `fields` (pseudo-fields first, RFC 9113 §8.3.1), with
+    /// END_STREAM when `endStream` (no body). `headRequest` says the method is HEAD. The new stream's ID, or
+    /// `Err(refusedStream)` when the peer's SETTINGS_MAX_CONCURRENT_STREAMS is reached, the peer is going away or the
+    /// IDs are used up: open another connection.
+    public fn openRequest(
+        borrow mut this,
+        fields: borrow HeaderBlock,
+        endStream: bool,
+        headRequest: bool,
+    ) -> Result<u32, u32> {
+        if (!this.isClient) {
+            return Err(ErrorCodes.internalError());
+        }
+        if (this.goingAway || this.nextOwn > 0x7FFFFFFF || this.active >= this.peer.maxConcurrentStreams) {
+            return Err(ErrorCodes.refusedStream());
+        }
+        let id = this.nextOwn;
+        this.scratch.clear();
+        if (failed(this.encoder.begin(mut this.scratch))) {
+            return Err(ErrorCodes.internalError());
+        }
+        for (i in 0..fields.count()) {
+            if (failed(
+                this.encoder.encode(fields.name(i), fields.value(i), fields.span(i).sensitive, mut this.scratch),
+            )) {
+                return Err(ErrorCodes.internalError());
+            }
+        }
+        if (failed(Frames.writeHeaders(mut this.out, id, this.scratch.view(), endStream, this.peer.maxFrameSize))) {
+            return Err(ErrorCodes.internalError());
+        }
+        this.nextOwn += 2;
+        let stream = Stream {
+            state: if (endStream) StreamState.HalfClosedLocal else StreamState.Open,
+            sendWindow: this.peer.initialWindowSize as i64,
+            receiveWindow: this.local.initialWindowSize as i64,
+            unacked: 0,
+            contentLength: null,
+            received: 0,
+            counted: true,
+            headSeen: false,
+            headRequest: headRequest,
+        };
+        match (this.streams.put(id, stream)) {
+            Ok(_) => {}
+            Err(_) => { return Err(ErrorCodes.internalError()); }
+        }
+        this.active += 1;
+        return Ok(id);
+    }
+
+    /// Whether either side has sent GOAWAY: no new stream.
+    public fn isGoingAway(borrow this) -> bool => this.goingAway;
+
+    /// Client role: how many more streams the peer allows now (SETTINGS_MAX_CONCURRENT_STREAMS less those open).
+    public fn streamsLeft(borrow this) -> u32 =>
+        if (this.goingAway || this.nextOwn > 0x7FFFFFFF ||
+            this.active >= this.peer.maxConcurrentStreams) 0 else this.peer.maxConcurrentStreams - this.active;
 
     /// Queues GOAWAY with `code` and the last stream the client opened; new streams are ignored from now on.
     public fn goAway(borrow mut this, code: u32) -> Result<void, u32> {

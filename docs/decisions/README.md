@@ -17,6 +17,7 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0009](0009-http-client.md) | The HTTP client: engine, pool, Happy Eyeballs, redirects, retries | Accepted 2026-11-02 | M5 on |
 | [0010](0010-websockets.md) | WebSockets: the engine, the upgrade, the session, permessage-deflate, the client | Accepted 2026-11-03 | M6 |
 | [0011](0011-http2.md) | HTTP/2: HPACK, frames, streams as tasks, flow control, push, the flood guards | Accepted 2026-11-03 | M7 |
+| [0012](0012-reverse-proxy.md) | The reverse proxy, and what M7 left open | Accepted 2026-11-03 | M8 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 
@@ -49,4 +50,11 @@ The language facts the ADRs rely on are checked by the programs in `tests/probes
 | 0011 §6.2 | HTTP/2 in the client too? | not in M7 |
 | 0011 §6.3 | Stream priority? | ignored; streams served fairly |
 | 0011 §6.4 | Server push? | supported |
+| 0012 §6.1 | Full duplex for requests in M8? | no: requests relay the body, then the response; tunnels are full duplex |
+| 0012 §6.2 | HTTP/2 to upstreams in M8? | yes, through the client's HTTP/2 |
+| 0012 §6.3 | Consistent hashing? | rendezvous |
+| 0012 §6.4 | An untrusted source on a PROXY-protocol listener? | closed |
+| 0012 §6.5 | Forwarding fields by default? | both `Forwarded` and `X-Forwarded-*` |
+| 0012 §6.6 | A connect timeout? | 504 |
+| 0012 (M8, h2spec §8.1.2.6) | Hold responses until a declared-length body ends? | no: early responses stay, and §8.1.2.6 #1 and #2 are a recorded h2spec timing case (`docs/milestones/M8.md`) |
 

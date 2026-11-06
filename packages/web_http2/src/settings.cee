@@ -1,5 +1,5 @@
 // HTTP/2 settings (RFC 9113 §6.5.2): what an endpoint announces, the protocol's initial values, and the server's
-// defaults (Web ADR 0011 §3.3).
+// (Web ADR 0011 §3.3) and the client's (Web ADR 0012 §7) defaults.
 
 /// One endpoint's settings.
 public struct H2Settings {
@@ -28,6 +28,16 @@ public struct H2Settings {
 
     /// What the server announces (Web ADR 0011 §3.3), with `maxHeaderListSize` from the server's limits.
     public fn server(maxHeaderListSize: u32) -> H2Settings => H2Settings {
+        headerTableSize: 4096,
+        enablePush: false,
+        maxConcurrentStreams: 100,
+        initialWindowSize: 65535,
+        maxFrameSize: 16384,
+        maxHeaderListSize: maxHeaderListSize,
+    };
+
+    /// What a client announces (Web ADR 0012 §7): no push, and `maxHeaderListSize` from the client's limits.
+    public fn client(maxHeaderListSize: u32) -> H2Settings => H2Settings {
         headerTableSize: 4096,
         enablePush: false,
         maxConcurrentStreams: 100,

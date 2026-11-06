@@ -1,0 +1,24 @@
+// CeeSafe bug B18 (found 2026-11-05, ceesafec 0.18.0): a method `fn f(borrow this) -> borrow S<r>` returning
+// `borrow this.field` is refused with N0245 as a "deep result" (ADR 0074 §2.4): 0.18.0's §25.6 elides no region of a
+// result that names one inside, so the reference's own region is not tied to `this`. The elided form the hint
+// suggests (`-> borrow S`), or `borrow(this)`, is refused in turn where a caller needs `r` back (`firstOf`).
+// 0.17.0 and 0.11.0 accept both, and 0.18.1 fixes it (CeeSafe ADR 0074 §8). Expected: checks, and prints 1.
+// `web_http`'s `Request.headers` has this shape.
+struct Inner<region r> {
+    text: Slice<r, u8>;
+    fn first(borrow this) -> Slice<r, u8> => this.text[0..1];
+}
+
+struct Outer<region r> {
+    held: Inner<r>;
+    fn inner(borrow this) -> borrow Inner<r> => borrow this.held;
+}
+
+fn firstOf<region r>(o: borrow Outer<r>) -> Slice<r, u8> => o.inner().first();
+
+fn main() {
+    let bytes = "abc".bytes();
+    let o = Outer { held: Inner { text: bytes } };
+    let f = firstOf(o);
+    Console.writeLine(f.length);
+}

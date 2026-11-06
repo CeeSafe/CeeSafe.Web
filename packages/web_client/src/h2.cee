@@ -1,0 +1,951 @@
+// The client's HTTP/2 (Web ADR 0012 §7): connection tasks run by `Client.run`, and the request side of a stream.
+//
+// A request that finds an origin's HTTP/2 connection (or makes one: ALPN `h2`, or prior knowledge) sends `Open` on the
+// connection's command channel with its stream's inbox. The connection task, the only reader and writer of the
+// transport, opens the stream in the engine (web_http2's client role) and routes what comes back to the inbox: the
+// response's head, its DATA, its end with the trailers, or a failure. Request DATA goes out as flow control allows:
+// the stream asks (`WantSend`), the task grants credit, the stream sends. A stream dropped before its end is reset.
+import web_core;
+import web_transport;
+import web_http;
+import web_http2;
+
+/// What a request's stream tells its connection task.
+enum H2Command {
+    /// Open a stream: the request's head, whether it has no body, whether it is HEAD, and the stream's inbox.
+    Open(HeaderBlock, bool, bool, StreamInbox),
+    /// Request body bytes for a stream, and whether they are its last.
+    Data(u32, Vector<u8>, bool),
+    /// The stream wants to send this many bytes: grant credit.
+    WantSend(u32, u32),
+    /// The caller read this many response bytes: give their window back.
+    Consumed(u32, usize),
+    /// Reset the stream with this code (the caller gave it up).
+    Reset(u32, u32),
+    /// The request's trailers, ending its stream.
+    Trailers(u32, HeaderBlock),
+}
+
+/// A stream's channels, which the request makes and the connection task keeps.
+struct StreamInbox {
+    parts: Channel<StreamPart>;
+    credit: Channel<u32>;
+}
+
+/// What a connection task tells a stream.
+enum StreamPart {
+    /// The stream is open with this ID.
+    Opened(u32),
+    /// The connection could not open it (at the server's stream limit, or going away): try another connection.
+    Refused,
+    /// The response's head, and whether it ends the response.
+    Head(HeaderBlock, bool),
+    Data(Vector<u8>),
+    /// The response's end, with its trailers (empty if none).
+    End(HeaderBlock),
+    /// The stream failed. `true` when the server never processed it (above GOAWAY's last stream, RFC 9113 §6.8), so
+    /// the request may be sent again.
+    Failed(NetError, bool),
+}
+
+/// The connection task's side of one stream.
+struct H2Link {
+    inbox: StreamInbox;
+    want: u32;
+    outstanding: i64;
+    /// Response DATA waiting for room in the inbox.
+    backlog: Vector<u8>;
+    ended: bool;
+    endSent: bool;
+    trailers: Vector<HeaderBlock>;
+}
+
+/// An origin.
+struct OriginKey {
+    secure: bool;
+    host: Vector<u8>;
+    port: u16;
+}
+
+/// A live HTTP/2 connection, as the registry knows it.
+struct H2Entry {
+    secure: bool;
+    host: Vector<u8>;
+    port: u16;
+    commands: Channel<H2Command>;
+    /// 1 while the connection takes new streams; 0 once it is going away or gone.
+    open: Arc<AtomicU64>;
+}
+
+/// A connection for `Client.run` to start.
+struct H2Start {
+    conn: Box<dyn Transport + Send>;
+    commands: Channel<H2Command>;
+    open: Arc<AtomicU64>;
+    /// The origin's slot, freed when the connection ends.
+    slots: Channel<u8>;
+}
+
+/// The client's HTTP/2 connections, by origin, and the queue of connections for `run` to start.
+struct H2Registry {
+    entries: AsyncMutex<Vector<H2Entry>>;
+    starts: Channel<H2Start>;
+    /// A token per queued start: `run` spawns a task for each, which takes a start from `starts` (a set child holds no
+    /// loan and cannot take a value from its closure, so it takes its connection from the queue itself).
+    tokens: Channel<u8>;
+    /// 1 while `Client.run` runs.
+    running: Arc<AtomicU64>;
+    /// Held while a request makes the first connection to an origin that may speak HTTP/2, so requests that start
+    /// together wait for it and share it instead of each making their own.
+    dialing: AsyncMutex<u8>;
+    /// https origins whose connection negotiated HTTP/1.1: requests to them dial without waiting for each other.
+    http1Origins: AsyncMutex<Vector<OriginKey>>;
+
+    fn create() -> Result<H2Registry, ClientError> {
+        let entries = match (AsyncMutex<Vector<H2Entry>>.create(Vector<H2Entry>.create())) {
+            Ok(m) => m,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        let starts = match (Channel<H2Start>.create(64)) {
+            Ok(c) => c,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        let tokens = match (Channel<u8>.create(64)) {
+            Ok(c) => c,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        let running = match (Arc<AtomicU64>.create(AtomicU64.create(0))) {
+            Ok(a) => a,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        let dialing = match (AsyncMutex<u8>.create(0)) {
+            Ok(m) => m,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        let http1Origins = match (AsyncMutex<Vector<OriginKey>>.create(Vector<OriginKey>.create())) {
+            Ok(m) => m,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        return Ok(H2Registry {
+            entries: entries,
+            starts: starts,
+            tokens: tokens,
+            running: running,
+            dialing: dialing,
+            http1Origins: http1Origins,
+        });
+    }
+
+    /// Whether `run` is running.
+    fn isRunning(borrow this) -> bool => this.running.get().load() == 1;
+
+    /// Whether `url`'s origin has negotiated HTTP/1.1.
+    async fn knownHttp1(borrow this, url: borrow Url) -> bool {
+        var guard = match (await this.http1Origins.lock()) {
+            Ok(g) => g,
+            Err(_) => { return false; },
+        };
+        let known = guard.data();
+        for (i in 0..known.length) {
+            let o = borrow known[i];
+            if (o.secure == url.isSecure() && o.port == url.port() && sameBytes(o.host.view(), url.hostName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remembers that `url`'s origin negotiated HTTP/1.1.
+    async fn markHttp1(borrow this, url: borrow Url) {
+        if (await this.knownHttp1(url)) {
+            return;
+        }
+        var host = Vector<u8>.create();
+        match (copyBytes(mut host, url.hostName())) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+        var guard = match (await this.http1Origins.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; },
+        };
+        let pushed = guard.data().push(OriginKey { secure: url.isSecure(), host: host, port: url.port() });
+    }
+
+    /// The command channel of a connection to `url`'s origin that takes new streams, dropping the ones gone.
+    async fn find(borrow this, url: borrow Url) -> Result<Channel<H2Command>?, ClientError> {
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(e) => { return Err(ClientError.Net(NetErrors.fromAsync(e))); },
+        };
+        let entries = guard.data();
+        var i: usize = 0;
+        var found: Channel<H2Command>? = null;
+        while (i < entries.length) {
+            if (entries[i].open.get().load() == 0 && entries[i].commands.isClosed()) {
+                let last = entries.length - 1;
+                entries.swap(i, last);
+                let gone = entries.pop();
+                continue;
+            }
+            let e = borrow entries[i];
+            if (e.secure == url.isSecure() && e.port == url.port() && sameBytes(e.host.view(), url.hostName())) {
+                found = Some(e.commands.clone());
+                break;
+            }
+            i += 1;
+        }
+        return Ok(found);
+    }
+
+    /// Registers a new connection to `url`'s origin and queues it for `run`. `Http2NotRunning` if `run` is not
+    /// running: then nothing would read the connection.
+    async fn add(
+        borrow this,
+        url: borrow Url,
+        conn: Box<dyn Transport + Send>,
+        slots: Channel<u8>,
+    ) -> Result<Channel<H2Command>, ClientError> {
+        if (this.running.get().load() == 0) {
+            let freed = slots.trySend(0);
+            return Err(ClientError.Http2NotRunning);
+        }
+        let commands = match (Channel<H2Command>.create(256)) {
+            Ok(c) => c,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        let open = match (Arc<AtomicU64>.create(AtomicU64.create(1))) {
+            Ok(a) => a,
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); },
+        };
+        var host = Vector<u8>.create();
+        copyBytes(mut host, url.hostName())?;
+        {
+            var guard = match (await this.entries.lock()) {
+                Ok(g) => g,
+                Err(e) => { return Err(ClientError.Net(NetErrors.fromAsync(e))); },
+            };
+            let entry = H2Entry {
+                secure: url.isSecure(),
+                host: host,
+                port: url.port(),
+                commands: commands.clone(),
+                open: open.clone(),
+            };
+            match (guard.data().push(entry)) {
+                Ok() => {}
+                Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+            }
+        }
+        // Registered: from here a failure ends its commands, so no request waits on a connection that never starts.
+        let start = H2Start { conn: conn, commands: commands.clone(), open: open.clone(), slots: slots };
+        match (await this.starts.sendAsync(start)) {
+            Ok() => {}
+            Err(SendError.Closed(back)) => { return Err(unqueued(back, commands, open)); }
+            Err(SendError.Cancelled(back)) => { return Err(unqueued(back, commands, open)); }
+        }
+        match (await this.tokens.sendAsync(1)) {
+            Ok() => { return Ok(commands); }
+            Err(_) => {
+                endCommands(commands, open, NetError.Closed);
+                return Err(ClientError.Shutdown);
+            }
+        }
+    }
+}
+
+/// Runs the HTTP/2 connections that requests hand over, until `drain` starts; then each connection sends GOAWAY and
+/// ends once its streams have (Web ADR 0012 §7).
+async fn runConnections(registry: borrow H2Registry, limits: Limits, drain: borrow Drain) -> Result<void, NetError> {
+    registry.running.get().store(1);
+    let starts = registry.starts.clone();
+    let r = await Async.tasks(1024, NetError.OutOfMemory, async (set) => {
+        loop {
+            let next: Result<Raced<bool>, NetError> = await Async.race(
+                async () => {
+                    match (await registry.tokens.recvAsync()) {
+                        Ok(Some(_)) => { return Ok(true); }
+                        Ok(null) => { return Ok(false); }
+                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                    }
+                },
+                async () => {
+                    await drain.wait()?;
+                    return Ok(false);
+                },
+            );
+            let won = next?;
+            // A token taken as the drain began still starts its connection, which then drains: left unstarted, its
+            // requests would never be ended.
+            let taken = won.value || match (won.other) {
+                Some(t) => t,
+                null => false,
+            };
+            if (!taken) {
+                return Ok();
+            }
+            let d = drain.share();
+            let q = starts.clone();
+            if (!set.trySpawn(async move () => await startOne(q, limits, d))) {
+                // No task for it (out of memory): the queued connection ends unstarted, and its requests go elsewhere.
+                match (starts.tryRecv()) {
+                    Some(s) => {
+                        endCommands(s.commands, s.open, NetError.OutOfMemory);
+                        let freed = s.slots.trySend(0);
+                    }
+                    null => {}
+                }
+            }
+        }
+    });
+    registry.running.get().store(0);
+    return r;
+}
+
+/// Takes one queued connection and runs it; its origin's slot is freed when it ends.
+async fn startOne(starts: borrow Channel<H2Start>, limits: Limits, drain: borrow Drain) -> Result<void, NetError> {
+    var start = match (starts.tryRecv()) {
+        Some(s) => s,
+        null => { return Ok(); },
+    };
+    let ended = await connectionTask(mut start.conn, start.commands, start.open, limits, drain);
+    start.open.get().store(0);
+    let freed = start.slots.trySend(0);
+    return Ok();
+}
+
+/// One HTTP/2 connection: the client's preface, then frames in and out until the server or the drain ends it.
+async fn connectionTask(
+    conn: borrow mut Box<dyn Transport + Send>,
+    commands: borrow Channel<H2Command>,
+    open: borrow Arc<AtomicU64>,
+    limits: Limits,
+    drain: borrow Drain,
+) -> Result<void, NetError> {
+    var links = HashMap<u32, H2Link>.create();
+    let r = await connectionOn(conn, commands, open, mut links, limits, drain);
+    // Whatever ended the connection, even before its first frame, the streams left learn it; those above GOAWAY's last
+    // stream may be sent again.
+    let error = match (r) {
+        Ok() => NetError.Closed,
+        Err(e) => e,
+    };
+    for (i in 0..links.length()) {
+        let k: u32 = links.keyAt(i);
+        match (links.get(k)) {
+            Some(link) => {
+                let told = link.inbox.parts.trySend(StreamPart.Failed(error, false));
+                link.inbox.parts.close();
+                link.inbox.credit.close();
+            }
+            null => {}
+        }
+    }
+    endCommands(commands, open, error);
+    return r;
+}
+
+async fn connectionOn(
+    conn: borrow mut Box<dyn Transport + Send>,
+    commands: borrow Channel<H2Command>,
+    open: borrow Arc<AtomicU64>,
+    links: borrow mut HashMap<u32, H2Link>,
+    limits: Limits,
+    drain: borrow Drain,
+) -> Result<void, NetError> {
+    var engine = match (H2Connection.client(
+        H2Settings.client(truncate<u32>(limits.maxHeadBytes as u64)),
+        H2Guards.defaults(truncate<u32>(limits.maxHeadBytes as u64)),
+    )) {
+        Ok(e) => e,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    grown(engine.start(1048576))?;
+    var input = match (OwnedBuffer.create(32768)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    return await serveConnection(conn, mut engine, mut input, commands, open, links, limits, drain);
+}
+
+/// A start that could not be queued: its requests go elsewhere and its origin's slot is free again.
+fn unqueued(start: H2Start, commands: borrow Channel<H2Command>, open: borrow Arc<AtomicU64>) -> ClientError {
+    endCommands(commands, open, NetError.Closed);
+    let freed = start.slots.trySend(0);
+    return ClientError.Shutdown;
+}
+
+/// Ends a connection's command queue: it takes no new streams, and each request still queued learns that its stream
+/// never went out, so it may be sent on another connection. Without this, a request queued on a connection that ended
+/// early (out of memory before its first frame, or never started) would wait forever.
+fn endCommands(commands: borrow Channel<H2Command>, open: borrow Arc<AtomicU64>, error: NetError) {
+    open.get().store(0);
+    commands.close();
+    loop {
+        match (commands.tryRecv()) {
+            Some(H2Command.Open(_, _, _, inbox)) => {
+                let told = inbox.parts.trySend(StreamPart.Failed(error, true));
+                inbox.parts.close();
+            }
+            Some(_) => {}
+            null => { return; }
+        }
+    }
+}
+
+async fn serveConnection(
+    conn: borrow mut Box<dyn Transport + Send>,
+    engine: borrow mut H2Connection,
+    input: borrow mut OwnedBuffer,
+    commands: borrow Channel<H2Command>,
+    open: borrow Arc<AtomicU64>,
+    links: borrow mut HashMap<u32, H2Link>,
+    limits: Limits,
+    drain: borrow Drain,
+) -> Result<void, NetError> {
+    var head = HeaderBlock.create();
+    var data = Vector<u8>.create();
+    var total: i64 = 0;
+    var leaving = false;
+    var lastActive = Timer.now();
+    loop {
+        loop {
+            let event = match (engine.next(input, mut head, mut data, Timer.now())) {
+                Ok(e) => e,
+                Err(code) => {
+                    let sent = engine.goAway(code);
+                    let written = await writeOut(conn, engine, limits);
+                    return Err(NetError.Closed);
+                },
+            };
+            match (event) {
+                H2Event.NeedMore => { break; }
+                H2Event.Response(id, end) => {
+                    let taken = head;
+                    head = HeaderBlock.create();
+                    match (links.getMut(id)) {
+                        Some(link) => {
+                            if (end) {
+                                link.ended = true;
+                            }
+                            let told = link.inbox.parts.trySend(StreamPart.Head(taken, end));
+                            if (end) {
+                                link.endSent = true;
+                                endLink(links, id, mut total);
+                            }
+                        }
+                        null => {}
+                    }
+                }
+                H2Event.Data(id, end) => {
+                    let n = data.length;
+                    var known = false;
+                    match (links.getMut(id)) {
+                        Some(link) => {
+                            known = true;
+                            for (b in data.view()) {
+                                grown(link.backlog.push(b))?;
+                            }
+                            if (end) {
+                                link.ended = true;
+                            }
+                            deliver(link)?;
+                        }
+                        null => {}
+                    }
+                    if (!known) {
+                        engineOk(engine.consumed(id, n))?;
+                    }
+                    finishIfDone(links, id, mut total);
+                }
+                H2Event.Trailers(id) => {
+                    let taken = head;
+                    head = HeaderBlock.create();
+                    match (links.getMut(id)) {
+                        Some(link) => {
+                            link.ended = true;
+                            grown(link.trailers.push(taken))?;
+                            deliver(link)?;
+                        }
+                        null => {}
+                    }
+                    finishIfDone(links, id, mut total);
+                }
+                H2Event.Reset(id, code) => {
+                    failLink(links, id, NetError.Reset, code == ErrorCodes.refusedStream(), mut total);
+                }
+                H2Event.StreamError(id, _) => { failLink(links, id, NetError.Closed, false, mut total); }
+                H2Event.WindowOpened(id) => { grantAll(engine, links, id, mut total); }
+                H2Event.GoAway(last, _) => {
+                    open.get().store(0);
+                    leaving = true;
+                    // Streams above `last` were not processed (RFC 9113 §6.8): they may be sent again elsewhere.
+                    var above = Vector<u32>.create();
+                    for (i in 0..links.length()) {
+                        let k: u32 = links.keyAt(i);
+                        if (k > last) {
+                            grown(above.push(k))?;
+                        }
+                    }
+                    for (k in above.view()) {
+                        failLink(links, k, NetError.Closed, true, mut total);
+                    }
+                }
+                H2Event.Request(_, _) => {} // server role only
+                H2Event.TooLarge(id) => { failLink(links, id, NetError.LimitExceeded, false, mut total); }
+            }
+        }
+        loop {
+            match (commands.tryRecv()) {
+                Some(c) => { handleCommand(engine, links, open, c, mut total)?; }
+                null => { break; }
+            }
+        }
+        await writeOut(conn, engine, limits)?;
+        if (links.length() > 0) {
+            lastActive = Timer.now();
+        }
+        if (drain.isDraining() && !leaving) {
+            open.get().store(0);
+            engineOk(engine.goAway(ErrorCodes.noError()))?;
+            await writeOut(conn, engine, limits)?;
+            leaving = true;
+        }
+        if (leaving && links.length() == 0) {
+            return Ok();
+        }
+        let now = Timer.now();
+        if (links.length() == 0 && now >= lastActive + limits.idleTimeoutMs) {
+            open.get().store(0);
+            engineOk(engine.goAway(ErrorCodes.noError()))?;
+            let written = await writeOut(conn, engine, limits);
+            return Ok(); // idle too long
+        }
+        input.compact();
+        let waitMs = if (links.length() == 0) lastActive + limits.idleTimeoutMs - now else 1000;
+        let woke = await wakeOn(conn, input, commands, if (waitMs > 1000) 1000 else waitMs)?;
+        // Both of a race's children may have finished: a read the kernel completed as it was cancelled (io_uring,
+        // CeeSafe ADR 0035 §3.4) comes back as `other`, and its bytes are already in `input`.
+        var current: Wake? = Some(woke.value);
+        var later: Wake? = woke.other;
+        var closed = false;
+        loop {
+            let w = match (current) {
+                Some(x) => x,
+                null => { break; },
+            };
+            current = later;
+            later = null;
+            match (w) {
+                Wake.Read(0) => { closed = true; } // the server closed
+                Wake.Read(n) => { input.commit(n)?; }
+                Wake.Command(c) => { handleCommand(engine, links, open, c, mut total)?; }
+                Wake.Timer => {}
+            }
+        }
+        if (closed) {
+            return Err(NetError.Closed);
+        }
+    }
+}
+
+/// One command from a stream.
+fn handleCommand(
+    engine: borrow mut H2Connection,
+    links: borrow mut HashMap<u32, H2Link>,
+    open: borrow Arc<AtomicU64>,
+    c: H2Command,
+    total: borrow mut i64,
+) -> Result<void, NetError> {
+    match (c) {
+        H2Command.Open(fields, end, headRequest, inbox) => {
+            // A handle of its own, to tell the request if the stream cannot be kept (the link holds the inbox).
+            let parts = inbox.parts.clone();
+            match (engine.openRequest(fields, end, headRequest)) {
+                Ok(id) => {
+                    let told = parts.trySend(StreamPart.Opened(id));
+                    let link = H2Link {
+                        inbox: inbox,
+                        want: 0,
+                        outstanding: 0,
+                        backlog: Vector<u8>.create(),
+                        ended: false,
+                        endSent: false,
+                        trailers: Vector<HeaderBlock>.create(),
+                    };
+                    match (links.put(id, link)) {
+                        Ok(_) => {}
+                        Err(_) => {
+                            let failed = parts.trySend(StreamPart.Failed(NetError.OutOfMemory, false));
+                            parts.close();
+                            return Err(NetError.OutOfMemory);
+                        }
+                    }
+                }
+                Err(code) => {
+                    if (code != ErrorCodes.refusedStream()) {
+                        let failed = parts.trySend(StreamPart.Failed(NetError.OutOfMemory, false));
+                        parts.close();
+                        return Err(NetError.OutOfMemory);
+                    }
+                    if (engine.streamsLeft() == 0) {
+                        open.get().store(0); // full or going away: requests look elsewhere until a stream ends
+                    }
+                    let told = parts.trySend(StreamPart.Refused);
+                }
+            }
+        }
+        H2Command.Data(id, bytes, end) => {
+            let n = truncate<i64>(bytes.length);
+            engineOk(engine.sendData(id, bytes.view(), end))?;
+            match (links.getMut(id)) {
+                Some(link) => { link.outstanding -= n; }
+                null => {}
+            }
+            total -= n;
+        }
+        H2Command.WantSend(id, n) => {
+            match (links.getMut(id)) {
+                Some(link) => { link.want = n; }
+                null => {}
+            }
+            grant(engine, links, id, total);
+        }
+        H2Command.Consumed(id, n) => {
+            engineOk(engine.consumed(id, n))?;
+            match (links.getMut(id)) {
+                Some(link) => { deliver(link)?; }
+                null => {}
+            }
+            finishIfDone(links, id, total);
+        }
+        H2Command.Reset(id, code) => {
+            engineOk(engine.resetStream(id, code))?;
+            endLink(links, id, total);
+        }
+        H2Command.Trailers(id, fields) => {
+            engineOk(engine.sendHeaders(id, fields, true))?;
+        }
+    }
+    if (engine.streamsLeft() > 0 && !engine.isGoingAway()) {
+        open.get().store(1);
+    }
+    return Ok();
+}
+
+/// Moves a stream's backlog into its inbox, and the end after it, as far as the inbox has room.
+fn deliver(link: borrow mut H2Link) -> Result<void, NetError> {
+    if (link.backlog.length > 0) {
+        var chunk = Vector<u8>.create();
+        for (b in link.backlog.view()) {
+            grown(chunk.push(b))?;
+        }
+        match (link.inbox.parts.trySend(StreamPart.Data(chunk))) {
+            Ok() => { link.backlog.clear(); }
+            Err(_) => { return Ok(); } // full: the next Consumed tries again
+        }
+    }
+    if (link.ended && !link.endSent) {
+        let trailers = match (link.trailers.pop()) {
+            Some(t) => t,
+            null => HeaderBlock.create(),
+        };
+        match (link.inbox.parts.trySend(StreamPart.End(trailers))) {
+            Ok() => { link.endSent = true; }
+            Err(StreamPart.End(back)) => { grown(link.trailers.push(back))?; }
+            Err(_) => {}
+        }
+    }
+    return Ok();
+}
+
+/// Drops `id`'s link once its end has been delivered.
+fn finishIfDone(links: borrow mut HashMap<u32, H2Link>, id: u32, total: borrow mut i64) {
+    let done = match (links.get(id)) {
+        Some(link) => link.endSent,
+        null => false,
+    };
+    if (done) {
+        endLink(links, id, total);
+    }
+}
+
+/// Tells `id`'s stream it failed (`unprocessed`: it may be sent again), and drops its link.
+fn failLink(
+    links: borrow mut HashMap<u32, H2Link>,
+    id: u32,
+    error: NetError,
+    unprocessed: bool,
+    total: borrow mut i64,
+) {
+    match (links.get(id)) {
+        Some(link) => { let told = link.inbox.parts.trySend(StreamPart.Failed(error, unprocessed)); }
+        null => {}
+    }
+    endLink(links, id, total);
+}
+
+fn endLink(links: borrow mut HashMap<u32, H2Link>, id: u32, total: borrow mut i64) {
+    match (links.remove(id)) {
+        Some(link) => {
+            total -= link.outstanding;
+            // Closed, not only dropped: the request holds its own handle, so only a close shows it the end when its
+            // last part could not be delivered (the inbox full).
+            link.inbox.parts.close();
+            link.inbox.credit.close();
+        }
+        null => {}
+    }
+}
+
+/// Credit for `id` (every waiting stream when 0), as far as the windows allow.
+fn grantAll(engine: borrow H2Connection, links: borrow mut HashMap<u32, H2Link>, id: u32, total: borrow mut i64) {
+    if (id != 0) {
+        grant(engine, links, id, total);
+        return;
+    }
+    for (i in 0..links.length()) {
+        let k: u32 = links.keyAt(i);
+        grant(engine, links, k, total);
+    }
+}
+
+/// Grants stream `id` what it asked for, up to its window and the connection's (less what is granted and not yet
+/// sent) and one frame.
+fn grant(engine: borrow H2Connection, links: borrow mut HashMap<u32, H2Link>, id: u32, total: borrow mut i64) {
+    match (links.getMut(id)) {
+        Some(link) => {
+            if (link.want == 0) {
+                return;
+            }
+            var room = engine.streamSendWindow(id) - link.outstanding;
+            let connectionRoom = engine.connectionSendWindow() - total;
+            if (connectionRoom < room) {
+                room = connectionRoom;
+            }
+            let frame = engine.peerSettings().maxFrameSize as i64;
+            if (frame < room) {
+                room = frame;
+            }
+            if ((link.want as i64) < room) {
+                room = link.want as i64;
+            }
+            if (room <= 0) {
+                return;
+            }
+            match (link.inbox.credit.trySend(truncate<u32>(room))) {
+                Ok() => {
+                    link.want = 0;
+                    link.outstanding += room;
+                    total += room;
+                }
+                Err(_) => {}
+            }
+        }
+        null => {}
+    }
+}
+
+enum Wake {
+    Read(usize),
+    Command(H2Command),
+    Timer,
+}
+
+/// One wait: bytes from the server, a stream's command, or `waitMs` passing. Both of the race's children may have
+/// finished, so both values come back (`value`, then `other`); a command taken as the timer won is kept, and the
+/// timer's wake dropped.
+async fn wakeOn(
+    conn: borrow mut Box<dyn Transport + Send>,
+    input: borrow mut OwnedBuffer,
+    commands: borrow Channel<H2Command>,
+    waitMs: u64,
+) -> Result<Raced<Wake>, NetError> {
+    return await Async.race(
+        async () => {
+            let n = await conn.read(input.spare())?;
+            return Ok(Wake.Read(n));
+        },
+        async () => {
+            let inner: Result<Raced<Wake>, NetError> = await Async.race(
+                async () => {
+                    match (await commands.recvAsync()) {
+                        Ok(Some(c)) => { return Ok(Wake.Command(c)); }
+                        Ok(null) => { return Err(NetError.Closed); }
+                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                    }
+                },
+                async () => {
+                    match (await Timer.sleep(waitMs)) {
+                        Ok() => { return Ok(Wake.Timer); }
+                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                    }
+                },
+            );
+            let won = inner?;
+            if (won.winner == 0) {
+                return Ok(won.value); // the data won: `other`, if any, is the timer's
+            }
+            return match (won.other) {
+                Some(c) => Ok(c),
+                null => Ok(won.value),
+            };
+        },
+    );
+}
+
+/// Writes the engine's output within the write timeout.
+async fn writeOut(
+    conn: borrow mut Box<dyn Transport + Send>,
+    engine: borrow mut H2Connection,
+    limits: Limits,
+) -> Result<void, NetError> {
+    let out = engine.output();
+    if (out.length == 0) {
+        return Ok();
+    }
+    let deadline = Deadline.after(limits.writeTimeoutMs);
+    await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await conn.write(out))?;
+    engine.outputWritten();
+    return Ok();
+}
+
+fn engineOk(r: Result<void, u32>) -> Result<void, NetError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(code) => {
+            if (code == ErrorCodes.streamClosed()) {
+                return Ok();
+            }
+            return Err(NetError.OutOfMemory);
+        }
+    }
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, NetError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}
+
+// ---- The request's side ----
+
+/// A request's stream on an HTTP/2 connection: what `ClientResponse` reads from.
+@noncopy
+struct H2Stream {
+    id: u32;
+    commands: Channel<H2Command>;
+    inbox: StreamInbox;
+    current: Vector<u8>;
+    at: usize;
+    ended: bool;
+    trailers: HeaderBlock;
+
+    /// Response body bytes into `into`: at least one, or 0 at the end.
+    async fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, ClientError> {
+        loop {
+            if (this.at < this.current.length) {
+                let ready = this.current.view();
+                let n = if (into.length < ready.length - this.at) into.length else ready.length - this.at;
+                for (i in 0..n) {
+                    into[i] = ready[this.at + i];
+                }
+                this.at += n;
+                await command(this.commands, H2Command.Consumed(this.id, n))?;
+                return Ok(n);
+            }
+            if (this.ended) {
+                return Ok(0);
+            }
+            match (await this.inbox.parts.recvAsync()) {
+                Ok(Some(StreamPart.Data(bytes))) => {
+                    this.current = bytes;
+                    this.at = 0;
+                }
+                Ok(Some(StreamPart.End(trailers))) => {
+                    this.ended = true;
+                    this.trailers = trailers;
+                }
+                Ok(Some(StreamPart.Failed(e, _))) => { return Err(ClientError.Net(e)); }
+                Ok(Some(_)) => {}
+                Ok(null) => { return Err(ClientError.Net(NetError.Closed)); }
+                Err(e) => { return Err(ClientError.Net(NetErrors.fromAsync(e))); }
+            }
+        }
+    }
+
+    drop {
+        if (!this.ended) {
+            let reset = this.commands.trySend(H2Command.Reset(this.id, ErrorCodes.cancel()));
+        }
+    }
+}
+
+/// Sends `c` to the connection task.
+async fn command(commands: borrow Channel<H2Command>, c: H2Command) -> Result<void, ClientError> {
+    match (await commands.sendAsync(c)) {
+        Ok() => { return Ok(); }
+        Err(SendError.Closed(_)) => { return Err(ClientError.Net(NetError.Closed)); }
+        Err(SendError.Cancelled(_)) => { return Err(ClientError.Net(NetError.Cancelled)); }
+    }
+}
+
+/// Sends a request body on stream `id` as the windows allow.
+async fn sendBody(
+    commands: borrow Channel<H2Command>,
+    inbox: borrow StreamInbox,
+    id: u32,
+    body: borrow mut dyn BodySource,
+) -> Result<void, ClientError> {
+    var chunk = [0u8; 16384];
+    loop {
+        let got = net(await body.read(mut chunk[..]))?;
+        if (got == 0) {
+            var trailers = HeaderBlock.create();
+            allocated(body.copyTrailers(mut trailers))?;
+            var sendable = HeaderBlock.create();
+            for (i in 0..trailers.count()) {
+                if (trailerSendable(trailers.name(i), trailers.value(i))) {
+                    allocated(
+                        sendable.push(
+                            trailers.name(i),
+                            trailers.value(i),
+                            HeaderBlock.sensitiveByDefault(trailers.name(i)),
+                        ),
+                    )?;
+                }
+            }
+            if (sendable.count() > 0) {
+                return await command(commands, H2Command.Trailers(id, sendable));
+            }
+            return await command(commands, H2Command.Data(id, Vector<u8>.create(), true));
+        }
+        var at: usize = 0;
+        while (at < got) {
+            await command(commands, H2Command.WantSend(id, truncate<u32>(got - at)))?;
+            let granted = match (await inbox.credit.recvAsync()) {
+                Ok(Some(g)) => g as usize,
+                Ok(null) => { return Err(ClientError.Net(NetError.Reset)); },
+                Err(e) => { return Err(ClientError.Net(NetErrors.fromAsync(e))); },
+            };
+            let n = if (granted < got - at) granted else got - at;
+            var bytes = Vector<u8>.create();
+            copyBytes(mut bytes, chunk[at..at + n])?;
+            at += n;
+            await command(commands, H2Command.Data(id, bytes, false))?;
+        }
+    }
+}
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}

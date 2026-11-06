@@ -18,17 +18,50 @@ that needs an unreleased compiler is not merged to main.
 | M5 client | 0.9.4 | U5 DNS (ADR 0048), released in 0.8.0; B15 (`dyn I + Send` async frames), fixed in 0.9.4; U15 (`HostNotFound`, 0.10.0) only for the message | done (`docs/milestones/M5.md`) |
 | M6 WebSockets | **0.10.0** | nothing new for the server (0.9.4); the client needs U16 (`Random.fill`, ADR 0060) | done (`docs/milestones/M6.md`) |
 | M7 HTTP/2 | **0.10.3** | B16 (a wake lost on kqueue past ~30 connections), fixed in 0.10.2; B17 (cancellation and the wake list quadratic in parked tasks, CeeSafe ADR 0062), fixed in 0.10.3 | gate passed, on main, released in v0.3.0 (`docs/milestones/M7.md`) |
+| M8 reverse proxy | **0.11.0** | U20 (a type that holds loans as a `borrow mut dyn I`, CeeSafe ADR 0064 §3.2) for the request-body relay; ADR 0064 §1's generic methods for `ReverseProxy.route<S>()` | in progress (`docs/milestones/M8.md`) |
 | M9 sendfile | 0.9.0 | U7 (ADR 0051) | released |
 | M10 HTTP/3 | 0.9.0 | U6 UDP (ADR 0050) | released |
 
-## Current machine (2026-11-03)
+## Current machine (2026-11-06)
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`) | **0.10.3** (release, tag `v0.10.3` = CeeSafe `94a4a92`; osx-arm64, SHA256 and signature checked) | the toolchain for main; `ceesafec test` runs the tests and both sweeps |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`), `~/.ceesafe/bin/ceesafec-0.18.2` | 0.18.2 (release, tag `v0.18.2` = CeeSafe `932bb1c`, osx-arm64; installed 2026-11-06, the two files byte-identical) | the latest release |
+| `~/.ceesafe/bin/ceesafec-0.18.1` | 0.18.1 (release, osx-arm64; `SHA256SUMS` checked, 2026-11-05) | B18 fixed |
+| `~/.ceesafe/bin/ceesafec-0.18.0` | 0.18.0 (release, osx-arm64) | B18's repro only: it does not check CeeSafe.Web |
+| `~/.ceesafe/bin/ceesafec-0.17.0` | 0.17.0 (release, osx-arm64) | the last release that builds M8 unchanged |
+| `~/.ceesafe/bin/ceesafec-0.11.0` | **0.11.0** (release, tag `v0.11.0` = CeeSafe `45dde8d`; osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, checked 2026-11-04) | the toolchain for M8; `ceesafec test` runs the tests and both sweeps |
+| `/root/cw-m8/ceesafec-0.11.0/ceesafec` on the Debian x86_64 host; `C:\cw-m8\bin\ceesafec.exe` on the Windows 11 ARM64 VM | **0.11.0** (release, linux-x64 and win-arm64) | M8's Debian and Windows runs |
+| `~/.ceesafe/bin/ceesafec-0.10.3` | 0.10.3 (release, tag `v0.10.3` = CeeSafe `94a4a92`) | main until M8 merges |
 | `/root/cw-m5/ceesafec-0.9.4/ceesafec` on the Debian x86_64 host | **0.9.4** (release, linux-x64, SHA256 checked) | M5's Debian runs |
 | `%USERPROFILE%\.ceesafe\bin\ceesafec.exe` on the Windows 11 ARM64 VM | **0.9.4** (release, win-arm64, SHA256 checked) | M4/M5's Windows runs |
 | `/root/cw-fuzz/ceesafec-0.8.0/ceesafec`, `/root/cw-tls/ceesafec-0.9.2/ceesafec` on the Debian host | 0.8.0, 0.9.2 | the HTTP and TLS fuzz campaigns only |
+
+0.11.0 (U20, CeeSafe ADR 0064) is M8's minimum: the proxy streams a request body from the client's `Exchange` to the
+upstream through `Client.send`'s `borrow mut dyn BodySource`, and its body source holds the exchange's loan. With M8
+merged it becomes main's minimum, and CI pins it. On `m8-proxy` at `754d2bd`, every package's tests pass with 0.11.0 in every mode: 43
+runs, web_tls's interpreter run skipped (`python3 tools/run_tests.py --sanitize --alloc-sweep --cancel-sweep`,
+2026-11-04, macOS arm64). No source change was needed.
+
+0.17.0 (CeeSafe ADR 0073: temporaries, two-phase `mut` arguments, block values, and the N0400 warning for a string
+that looks interpolated) only lets more code compile. On `m8-stage3` at `92f23fb`, every package, example and fuzzer
+checks with no diagnostic (N0400 fires nowhere), `fmt --check` lists no file, and every package's tests pass in every
+mode: 43 runs, web_tls's interpreter run skipped (`python3 tools/run_tests.py --sanitize --alloc-sweep
+--cancel-sweep`, 2026-11-05, macOS arm64). Nothing needs it, so M8's minimum stays 0.11.0.
+
+0.18.0 (CeeSafe ADR 0074) does not check CeeSafe.Web: `web_http`'s `Request.headers` (`-> borrow HeaderList<r>` from
+`borrow this`) is N0245, and so is everything that depends on `web_http`. The signature is sound; 0.18.0's spec had
+no way to write it (`docs/ceesafe-upstream-work.md`, B18; repro `tests/probes/deep-result-borrow-bug.cee`). CI was
+unaffected: it pins `CEESAFE_VERSION`.
+
+0.18.1 fixes B18 (CeeSafe ADR 0074 §8). CeeSafe.Web needed no change for it: at `fd5b387` every manifest checks with no
+diagnostic, `fmt --check` is clean, and `tools/run_tests.py` with the sanitizers and both sweeps passes 43 runs
+(2026-11-05, macOS arm64). Nothing needs 0.18.1, so M8's minimum stays 0.11.0.
+
+0.18.2 changes only the C backend: temporaries are kept out of the debug info (`CEE_TEMP`). With M8's stage-4 tree
+every package's tests pass in every mode (`python3 tools/run_tests.py --ceesafec ceesafec-0.18.2 --sanitize
+--alloc-sweep --cancel-sweep`: 43 runs, web_tls's interpreter run skipped), and every example and fuzzer checks
+(2026-11-06, macOS arm64). M8's minimum stays 0.11.0.
 
 0.10.3 (B16, B17, CeeSafe ADR 0062) is M7's minimum: the HTTP/2 server needs both fixes past ~30 connections and
 ~2 000 streams. With M7 merged it is main's minimum, and CI pins it.

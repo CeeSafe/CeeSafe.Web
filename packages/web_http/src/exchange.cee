@@ -69,6 +69,11 @@ public struct Exchange<region r> {
     private keep: bool;
     private done: bool;
     private upgraded: bool;
+    /// The request's trailer section: its lines as they arrive (HTTP/1.1), then its fields once the body has ended.
+    private trailerLines: Vector<u8>;
+    private trailerFields: HeaderBlock;
+    /// The response's trailer fields, sent at its end (`trailer`).
+    private responseTrailers: HeaderBlock;
 
     /// An exchange for `request`, whose body is framed by `framing`. `carry` holds the bytes received after the head;
     /// `out` the responses not yet sent; `pending` and `response` are reset here. `keepAlive` is the request's own
@@ -133,6 +138,9 @@ public struct Exchange<region r> {
             keep: keepAlive,
             done: false,
             upgraded: false,
+            trailerLines: Vector<u8>.create(),
+            trailerFields: HeaderBlock.create(),
+            responseTrailers: HeaderBlock.create(),
         };
     }
 
@@ -181,6 +189,9 @@ public struct Exchange<region r> {
             keep: false,
             done: false,
             upgraded: false,
+            trailerLines: Vector<u8>.create(),
+            trailerFields: HeaderBlock.create(),
+            responseTrailers: HeaderBlock.create(),
         };
     }
 
@@ -204,6 +215,7 @@ public struct Exchange<region r> {
             let n = await this.stream.readBody(buffer)?;
             if (n == 0) {
                 this.body = BodyState.Done;
+                grown(this.stream.copyTrailers(mut this.trailerFields))?;
             }
             return Ok(n);
         }
@@ -248,9 +260,14 @@ public struct Exchange<region r> {
                     for (i in 0..step.dataLength) {
                         buffer[i] = input[step.dataStart + i];
                     }
+                    for (i in 0..step.trailerLength) {
+                        grown(this.trailerLines.push(input[step.trailerStart + i]))?;
+                    }
                     this.consumeCarry(step.consumed)?;
                     if (step.finished) {
                         this.body = BodyState.Done;
+                        grown(this.trailerFields.pushLines(this.trailerLines.view()))?;
+                        this.trailerLines.clear();
                     }
                     if (step.dataLength > 0) {
                         return Ok(step.dataLength);
@@ -263,6 +280,38 @@ public struct Exchange<region r> {
                 BodyState.Stream => { return Ok(0); } // a stream's is read above
             }
         }
+    }
+
+    /// The request's trailer fields (RFC 9110 §6.5): empty until `read` has returned 0, and empty if the request had
+    /// none. Over HTTP/1.1 they come from a chunked body's trailer section; over HTTP/2 from the HEADERS that ended the
+    /// stream (RFC 9113 §8.1). Names are lowercase.
+    public fn trailers(borrow this) -> borrow HeaderBlock => borrow this.trailerFields;
+
+    /// Adds a trailer field to the response (RFC 9110 §6.5), sent after its content: over HTTP/2 as HEADERS ending the
+    /// stream, over HTTP/1.1 in the last chunk of a chunked response. A response with a declared length over HTTP/1.1
+    /// has nowhere to put trailers (RFC 9112 §7.1.2), so they are dropped, as for a response without content. A name
+    /// that is not a token, a value with a control byte, and the fields that frame or route a message
+    /// (`content-length`, `transfer-encoding`, `host`, `connection`, `te`, `trailer`) are `Internal`.
+    public fn trailer(borrow mut this, name: StringView, value: Slice<u8>) -> Result<void, HandlerError> {
+        let n = name.bytes();
+        if (!Ascii.isToken(n) || Ascii.equalsIgnoringCase(n, "content-length") ||
+            Ascii.equalsIgnoringCase(n, "transfer-encoding") || Ascii.equalsIgnoringCase(n, "host") ||
+            Ascii.equalsIgnoringCase(n, "connection") || Ascii.equalsIgnoringCase(n, "te") ||
+            Ascii.equalsIgnoringCase(n, "trailer")) {
+            return Err(HandlerError.Internal);
+        }
+        for (b in value) {
+            if (!Ascii.isFieldValueChar(b)) {
+                return Err(HandlerError.Internal);
+            }
+        }
+        var lower = Vector<u8>.create();
+        for (c in n) {
+            grown(lower.push(Ascii.lower(c)))?;
+        }
+        let l = lower.view();
+        grown(this.responseTrailers.push(l, value, HeaderBlock.sensitiveByDefault(l)))?;
+        return Ok();
     }
 
     /// Reads the rest of the body into `into`. `Status(413)` if it would exceed `into`'s room.
@@ -536,7 +585,8 @@ public struct Exchange<region r> {
     }
 
     /// A stream's response head (RFC 9113 §8.3.2): `:status`, the handler's fields with their names in lower case
-    /// (§8.2.1), `content-length` when `length` is known and the status allows content, and `date`. The application's
+    /// (§8.2.1), `content-length` when `length` is known and the status allows content, and `date` unless the handler set
+    /// one. The application's
     /// hook runs first when `hooks`.
     async fn streamHead(borrow mut this, length: u64?, end: bool, hooks: bool) -> Result<void, HandlerError> {
         if (hooks) {
@@ -564,7 +614,8 @@ public struct Exchange<region r> {
             for (c in line[0..colon]) {
                 grown(lower.push(if (c >= 65 && c <= 90) c + 32 else c))?;
             }
-            grown(fields.push(lower.view(), line[colon + 2..], false))?;
+            let name = lower.view();
+            grown(fields.push(name, line[colon + 2..], HeaderBlock.sensitiveByDefault(name)))?;
         }
         match (length) {
             Some(n) => {
@@ -585,10 +636,13 @@ public struct Exchange<region r> {
             }
             null => {}
         }
-        this.date.refresh();
-        match (this.date.bytes()) {
-            Some(d) => { grown(fields.push("date".bytes(), d, false))?; }
-            null => {}
+        // One `Date` (RFC 9110 §6.6.1): the handler's when it set one (a proxy relays its origin's), else ours.
+        if (!this.response.has("date")) {
+            this.date.refresh();
+            match (this.date.bytes()) {
+                Some(d) => { grown(fields.push("date".bytes(), d, false))?; }
+                null => {}
+            }
         }
         this.sent = true;
         return await this.stream.sendHead(fields, end);
@@ -614,6 +668,16 @@ public struct Exchange<region r> {
         await this.stream.sendData(this.pending.readable(), end)?;
         this.pending.clear();
         return Ok();
+    }
+
+    /// Over a stream, the response's trailers as HEADERS ending it, if `trailing`.
+    async fn streamTrailers(borrow mut this, trailing: bool) -> Result<void, HandlerError> {
+        if (!trailing) {
+            return Ok();
+        }
+        var fields = HeaderBlock.create();
+        grown(fields.pushAll(this.responseTrailers))?;
+        return await this.stream.sendHead(fields, true);
     }
 
     /// Runs the application's hook, chooses the framing, and queues the head in `out`.
@@ -747,6 +811,18 @@ public struct Exchange<region r> {
         return await this.writeBytes(bytes);
     }
 
+    /// After `switchProtocols`: ends this side's writing to the client (TCP FIN, or TLS close_notify then FIN), which
+    /// may still send; a tunnel does this when its other side has finished sending (Web ADR 0012 §3.8).
+    public async fn shutdownRaw(borrow mut this) -> Result<void, HandlerError> {
+        if (!this.upgraded) {
+            return Err(HandlerError.Internal);
+        }
+        match (await this.conn.shutdownWrite()) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(HandlerError.Io(e)); }
+        }
+    }
+
     /// Pushes a response to a GET for `path` (RFC 9113 §8.4; Web ADR 0011 §3.2): the client is promised it, and the
     /// application handles that request on its own stream as if the client had asked. False over HTTP/1.1, when the
     /// client refuses pushes, or when the connection cannot make one now.
@@ -771,38 +847,56 @@ public struct Exchange<region r> {
         }
         this.done = true;
         if (this.multiplexed) {
+            let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
+            let trailing = this.responseTrailers.count() > 0 && !bodyless;
             if (this.sent) {
-                return await this.streamPending(true);
+                await this.streamPending(!trailing)?;
+                return await this.streamTrailers(trailing);
             }
             let length = match (this.response.contentLength()) {
                 Some(n) => n,
                 null => this.pending.length() as u64,
             };
-            let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
-            if (bodyless || this.pending.length() == 0) {
+            if (bodyless || (this.pending.length() == 0 && !trailing)) {
                 this.pending.clear();
                 return await this.streamHead(Some(length), true, true);
             }
-            await this.streamHead(Some(length), false, true)?;
-            return await this.streamPending(true);
+            await this.streamHead(if (trailing) this.response.contentLength() else Some(length), false, true)?;
+            await this.streamPending(!trailing)?;
+            return await this.streamTrailers(trailing);
         }
         if (!this.sent) {
+            // Trailers need a chunked body (RFC 9112 §7.1.2), unless a length was declared, or there is no content.
+            let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
+            let trailing = this.responseTrailers.count() > 0 && !bodyless;
             let length = match (this.response.contentLength()) {
                 Some(n) => Some(n),
-                null => Some(this.pending.length() as u64),
+                null => if (trailing) null else Some(this.pending.length() as u64),
             };
             await this.sendHead(length)?;
         }
         await this.sendPending()?;
         match (this.framing) {
             ResponseFraming.Chunked => {
-                if (this.out.spareLength() < 5) {
+                // The last chunk, its trailer section (RFC 9112 §7.1.2), and the empty line.
+                var size: usize = 5;
+                for (i in 0..this.responseTrailers.count()) {
+                    size += this.responseTrailers.name(i).length + this.responseTrailers.value(i).length + 4;
+                }
+                if (this.out.spareLength() < size) {
                     await this.flushOut()?;
                 }
-                match (Encoder.lastChunk(this.out)) {
-                    Ok() => {}
-                    Err(_) => { return Err(HandlerError.Internal); }
+                if (this.out.spareLength() < size) {
+                    return Err(HandlerError.Internal); // trailers larger than the write buffer
                 }
+                grown(netGrown(this.out.append("0\r\n".bytes())))?;
+                for (i in 0..this.responseTrailers.count()) {
+                    grown(netGrown(this.out.append(this.responseTrailers.name(i))))?;
+                    grown(netGrown(this.out.append(": ".bytes())))?;
+                    grown(netGrown(this.out.append(this.responseTrailers.value(i))))?;
+                    grown(netGrown(this.out.append("\r\n".bytes())))?;
+                }
+                grown(netGrown(this.out.append("\r\n".bytes())))?;
             }
             ResponseFraming.Length(total) => {
                 if (this.written != total && !Methods.same(this.request.method(), Method.Head)) {
@@ -919,5 +1013,12 @@ fn grown(r: Result<void, AllocError>) -> Result<void, HandlerError> {
     match (r) {
         Ok() => { return Ok(); }
         Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+fn netGrown(r: Result<void, NetError>) -> Result<void, AllocError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(AllocError.OutOfMemory); }
     }
 }

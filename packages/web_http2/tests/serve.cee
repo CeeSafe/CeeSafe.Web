@@ -4,12 +4,21 @@
 import web_core;
 import web_http;
 
-/// A scripted client: it sends `input`, then waits until `closeAtMs` and ends the stream. If `drainAtMs` is not 0, the
-/// server's drain starts then (through `drain`, a handle to the connection's).
+/// A scripted client: it sends `input`, then waits until `closeAtMs` and ends the stream. From `goneAtMs` (by default
+/// `closeAtMs`) it has gone, so a write fails as it would after the peer's TCP reset; a `halfClosed` client has only
+/// shut down its sending side, and reads until `goneAtMs` (0: always). If `drainAtMs` is not 0, the server's drain starts then (through `drain`, a handle to the
+/// connection's). With `piece` above 0 the input comes `piece` bytes a read, each read first pausing 1 ms with
+/// cancellation ignored, so a read cancelled in its pause still returns its bytes: a completion-based read (io_uring,
+/// IOCP) that finished as it was cancelled (CeeSafe ADR 0035 §3.4). The close then counts from the last input byte
+/// read (`closeAfterInputMs`), since a 1 ms pause lasts about 25 ms on Windows (its clock ticks every 15.6 ms).
 struct Client {
     input: Vector<u8>;
     at: usize;
+    piece: usize;
+    closeAfterInputMs: u64;
     closeAtMs: u64;
+    halfClosed: bool;
+    goneAtMs: u64;
     drainAtMs: u64;
     drain: Drain;
     output: Vector<u8>;
@@ -22,10 +31,20 @@ impl Transport for Client {
             if (n > buffer.length) {
                 n = buffer.length;
             }
+            if (this.piece > 0) {
+                if (n > this.piece) {
+                    n = this.piece;
+                }
+                let paused: Result<void, AsyncError> = await Async.shield(100, async () => await Timer.sleep(1));
+            }
             for (i in 0..n) {
                 buffer[i] = this.input[this.at + i];
             }
             this.at += n;
+            if (this.at == this.input.length && this.closeAfterInputMs != 0) {
+                this.closeAtMs = Timer.now() + this.closeAfterInputMs;
+                this.closeAfterInputMs = 0;
+            }
             return Ok(n);
         }
         loop {
@@ -49,6 +68,10 @@ impl Transport for Client {
     }
 
     async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        let gone = if (this.halfClosed) this.goneAtMs else this.closeAtMs;
+        if (gone != 0 && Timer.now() >= gone) {
+            return Err(NetError.Reset);
+        }
         for (b in bytes) {
             match (this.output.push(b)) {
                 Ok() => {}
@@ -84,7 +107,9 @@ impl Transport for Client {
 }
 
 /// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css";
-/// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends.
+/// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends;
+/// `/trailers`: reads the body, then answers each trailer as `name=value;`; `/rtrailers`: "abc" and the trailer
+/// `x-sum: 3`.
 struct Site {}
 
 impl Application for Site {
@@ -111,6 +136,31 @@ impl Application for Site {
                 }
             }
             return await exchange.send(Status.ok(), body.view());
+        }
+        if (Ascii.equals(path.bytes(), "/dated")) {
+            exchange.header("date", "Sun, 06 Nov 1994 08:49:37 GMT".bytes())?;
+            return await exchange.send(Status.ok(), "d".bytes());
+        }
+        if (Ascii.equals(path.bytes(), "/rtrailers")) {
+            await exchange.write("abc".bytes())?;
+            return exchange.trailer("x-sum", "3".bytes());
+        }
+        if (Ascii.equals(path.bytes(), "/trailers")) {
+            var buf = [0u8; 64];
+            while (await exchange.read(mut buf[..])? > 0) {}
+            var listed = Vector<u8>.create();
+            let t = exchange.trailers();
+            for (i in 0..t.count()) {
+                for (b in t.name(i)) {
+                    listedOk(listed.push(b))?;
+                }
+                listedOk(listed.push(61))?;
+                for (b in t.value(i)) {
+                    listedOk(listed.push(b))?;
+                }
+                listedOk(listed.push(59))?;
+            }
+            return await exchange.send(Status.ok(), listed.view());
         }
         if (Ascii.equals(path.bytes(), "/push")) {
             let pushed = await exchange.push("/style.css")?;
@@ -151,10 +201,33 @@ impl Application for Site {
 
 /// Serves the scripted client's `input` with `Site`, the client leaving after `closeAfterMs`; what the server wrote.
 async fn served(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
-    await servedDraining(input, closeAfterMs, 0);
+    await servedAs(input, closeAfterMs, 0, false, 0, false, 0);
 
 /// `served`, with the server's drain started after `drainAfterMs` (0: never).
-async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterMs: u64) -> Result<Vector<u8>, TestFailure> {
+async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
+    await servedAs(input, closeAfterMs, drainAfterMs, false, 0, false, 0);
+
+/// `served`, with a client that half-closes after `closeAfterMs` and keeps reading until `goneAfterMs` (0: always).
+async fn servedHalfClosed(input: borrow Vector<u8>, closeAfterMs: u64, goneAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
+    await servedAs(input, closeAfterMs, 0, true, goneAfterMs, false, 0);
+
+/// `served`, with the server's `Date` on.
+async fn servedDated(input: borrow Vector<u8>, closeAfterMs: u64) -> Result<Vector<u8>, TestFailure> =>
+    await servedAs(input, closeAfterMs, 0, false, 0, true, 0);
+
+/// `served`, the input coming `piece` bytes a read, each read completing even when cancelled (`Client`).
+async fn servedInPieces(input: borrow Vector<u8>, closeAfterMs: u64, piece: usize) -> Result<Vector<u8>, TestFailure> =>
+    await servedAs(input, closeAfterMs, 0, false, 0, false, piece);
+
+async fn servedAs(
+    input: borrow Vector<u8>,
+    closeAfterMs: u64,
+    drainAfterMs: u64,
+    halfClosed: bool,
+    goneAfterMs: u64,
+    sendDate: bool,
+    piece: usize,
+) -> Result<Vector<u8>, TestFailure> {
     var copy = Vector<u8>.create();
     for (b in input.view()) {
         grew(copy.push(b))?;
@@ -167,7 +240,12 @@ async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterM
     var client = Client {
         input: copy,
         at: 0,
-        closeAtMs: start + closeAfterMs,
+        piece: piece,
+        closeAfterInputMs: if (piece > 0) closeAfterMs else 0u64,
+        // In pieces, open until the input has been read (then `closeAfterInputMs`).
+        closeAtMs: if (piece > 0) 0xFFFFFFFFFFFFFFFFu64 else start + closeAfterMs,
+        halfClosed: halfClosed,
+        goneAtMs: if (goneAfterMs == 0) 0u64 else start + goneAfterMs,
         drainAtMs: if (drainAfterMs == 0) 0u64 else start + drainAfterMs,
         drain: drain.share(),
         output: Vector<u8>.create(),
@@ -182,12 +260,46 @@ async fn servedDraining(input: borrow Vector<u8>, closeAfterMs: u64, drainAfterM
     };
     let context = ConnectionContext.create(1, Timer.now(), drain);
     var limits = Limits.defaults();
-    limits.sendDate = false;
+    limits.sendDate = sendDate;
     match (await serveH2(mut client, context, app, limits, "".bytes())) {
         Ok() => {}
         Err(_) => { return Err(TestFailure.create("serveH2 failed")); }
     }
     return Ok(client.output);
+}
+
+/// The values of every `date` field in the response heads in `out`, each followed by `;`.
+fn dates(out: borrow Vector<u8>) -> Result<Vector<u8>, TestFailure> {
+    var log = Vector<u8>.create();
+    var decoder = match (HpackDecoder.create(4096, 65536)) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a decoder")); },
+    };
+    let all = out.view();
+    var at: usize = 0;
+    while (at + 9 <= all.length) {
+        let h = match (Frames.parseHeader(all[at..])) {
+            Some(h) => h,
+            null => { return Err(TestFailure.create("a frame")); },
+        };
+        if (h.kind == FrameTypes.headers()) {
+            var fields = HeaderBlock.create();
+            match (decoder.decode(all[at + 9..at + 9 + h.length as usize], mut fields)) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("a response head")); }
+            }
+            for (i in 0..fields.count()) {
+                if (Ascii.equals(fields.name(i), "date")) {
+                    for (b in fields.value(i)) {
+                        grew(log.push(b))?;
+                    }
+                    append(mut log, ";")?;
+                }
+            }
+        }
+        at += 9 + h.length as usize;
+    }
+    return Ok(log);
 }
 
 /// The frames in `out`, one item each: `TYPE STREAM [fFLAGS]`, then for HEADERS `:status` and for DATA its bytes.
@@ -288,6 +400,64 @@ async fn a_body_echoed_and_two_streams_interleaved() -> Result<void, TestFailure
     return Check.isTrue(contains(log.view(), "data 1 f1 abcdef; "), "stream 1's body echoed");
 }
 
+/// A read that completed as the wait's other arm won (a stream's message; io_uring, CeeSafe ADR 0035 §3.4) keeps its
+/// bytes: `Async.race` returns them as `other`. Dropped, the connection's framing broke and the echo never came.
+@test
+async fn a_read_completed_as_it_was_cancelled_keeps_its_bytes() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let echo = blockOf(":method: POST\n:scheme: https\n:path: /echo\n:authority: example.test\n")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, echo.view())?;
+    var body = Vector<u8>.create();
+    for (i in 0..1000) {
+        grew(body.push(48 + truncate<u8>(i % 10)))?;
+    }
+    let all = body.view();
+    for (k in 0..20usize) {
+        let flags = if (k == 19) FrameFlags.endStream() else 0u8;
+        frame(mut bytes, FrameTypes.data(), flags, 1, all[k * 50..k * 50 + 50])?;
+    }
+    let out = await servedInPieces(bytes, 2000, 7)?;
+    let log = frames(out)?;
+    var want = Vector<u8>.create();
+    for (b in "data 1 f1 ".bytes()) {
+        grew(want.push(b))?;
+    }
+    for (b in body.view()) {
+        grew(want.push(b))?;
+    }
+    Check.isTrue(contains(log.view(), "headers 1 f4 200; "), "the echo's head")?;
+    return Check.isTrue(containsBytes(log.view(), want.view()), "the 1 000 bytes echoed whole");
+}
+
+/// A request's trailers (HEADERS with END_STREAM after its DATA, RFC 9113 §8.1) reach the handler once it has read
+/// the body.
+@test
+async fn request_trailers_reach_the_handler() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let post = blockOf(":method: POST\n:scheme: https\n:path: /trailers\n:authority: example.test\n")?;
+    let trailers = blockOf("x-t: 1\nx-checksum: abc\n")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders(), 1, post.view())?;
+    frame(mut bytes, FrameTypes.data(), 0, 1, "abc".bytes())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, trailers.view())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    return Check.isTrue(contains(log.view(), "data 1 f1 x-t=1;x-checksum=abc;; "), "the trailers listed");
+}
+
+/// A response's trailers end the stream as HEADERS after its DATA (RFC 9113 §8.1).
+@test
+async fn response_trailers_end_the_stream() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let get = getBlock("/rtrailers")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, get.view())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    return Check.isTrue(contains(log.view(), "headers 1 f4 200; data 1 abc; headers 1 f5 3; "), "head, DATA, trailers");
+}
+
 @test
 async fn a_push_promise() -> Result<void, TestFailure> {
     var bytes = Vector<u8>.create();
@@ -314,8 +484,9 @@ fn startsWith(hay: Slice<u8>, prefix: StringView) -> bool {
     return true;
 }
 
-fn contains(hay: Slice<u8>, needle: StringView) -> bool {
-    let n = needle.bytes();
+fn contains(hay: Slice<u8>, needle: StringView) -> bool => containsBytes(hay, needle.bytes());
+
+fn containsBytes(hay: Slice<u8>, n: Slice<u8>) -> bool {
     if (n.length > hay.length) {
         return false;
     }
@@ -332,4 +503,28 @@ fn contains(hay: Slice<u8>, needle: StringView) -> bool {
         }
     }
     return false;
+}
+
+fn listedOk(r: Result<void, AllocError>) -> Result<void, HandlerError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(HandlerError.Internal); }
+    }
+}
+
+/// RFC 9110 §6.6.1: a response has one `Date`. A handler that sets its own (a proxy relaying its origin's) keeps it,
+/// and the server adds none; without one, the server's is there (29 bytes, IMF-fixdate).
+@test
+async fn a_handler_date_is_the_only_date() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let dated = getBlock("/dated")?;
+    let plain = getBlock("/hello")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, dated.view())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 3, plain.view())?;
+    let out = await servedDated(bytes, 300)?;
+    let found = dates(out)?;
+    let v = found.view();
+    Check.isTrue(startsWith(v, "Sun, 06 Nov 1994 08:49:37 GMT;"), "the handler's date, first")?;
+    return Check.equalU64(30 + 30, v.length as u64); // two heads, one date each
 }

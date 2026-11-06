@@ -222,6 +222,139 @@ fn encoder_round_trips() -> Result<void, TestFailure> {
     return Check.equalBytes(indexed.view(), one.view());
 }
 
+/// Encodes example `e`'s header list with `enc` and checks the block and the table's size against the RFC's.
+fn encodes(enc: borrow mut HpackEncoder, e: borrow Example) -> Result<void, TestFailure> {
+    var block = Vector<u8>.create();
+    grew(enc.begin(mut block))?;
+    let text = e.expected.view();
+    var start: usize = 0;
+    for (i in 0..text.length) {
+        if (text[i] != 10) {
+            continue;
+        }
+        var cut = start + 1;
+        while (!(text[cut] == 58 && text[cut + 1] == 32)) {
+            cut += 1;
+        }
+        grew(enc.encode(text[start..cut], text[cut + 2..i], false, mut block))?;
+        start = i + 1;
+    }
+    Check.equalBytes(e.block.view(), block.view())?;
+    return Check.equalU64(e.tableSize as u64, enc.tableSize() as u64);
+}
+
+/// An encoder whose table has already been announced as `size` (the RFC's examples assume it was).
+fn encoderOf(size: u32, huffman: bool) -> Result<HpackEncoder, TestFailure> {
+    var enc = match (HpackEncoder.create(size)) {
+        Ok(e) => e,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    if (!huffman) {
+        enc = enc.withoutHuffman();
+    }
+    var first = Vector<u8>.create();
+    grew(enc.begin(mut first))?;
+    Check.equalU64(size as u64, enc.tableLimit() as u64)?;
+    return Ok(enc);
+}
+
+/// The stateful encoder gives RFC 7541 Appendix C's blocks byte for byte: C.3 and C.5 without Huffman coding, C.4 and
+/// C.6 with it; C.5 and C.6 with a 256-byte table, so entries are evicted.
+@test
+fn encoder_rfc7541_c3_to_c6() -> Result<void, TestFailure> {
+    var c3 = encoderOf(4096, false)?;
+    encodes(mut c3, exampleC_3_1()?)?;
+    encodes(mut c3, exampleC_3_2()?)?;
+    encodes(mut c3, exampleC_3_3()?)?;
+    var c4 = encoderOf(4096, true)?;
+    encodes(mut c4, exampleC_4_1()?)?;
+    encodes(mut c4, exampleC_4_2()?)?;
+    encodes(mut c4, exampleC_4_3()?)?;
+    var c5 = encoderOf(256, false)?;
+    encodes(mut c5, exampleC_5_1()?)?;
+    encodes(mut c5, exampleC_5_2()?)?;
+    encodes(mut c5, exampleC_5_3()?)?;
+    var c6 = encoderOf(256, true)?;
+    encodes(mut c6, exampleC_6_1()?)?;
+    encodes(mut c6, exampleC_6_2()?)?;
+    return encodes(mut c6, exampleC_6_3()?);
+}
+
+/// A table capped below 4 096 is announced in the first block: 256 is 001 11111 then 225 (§5.1: 256 - 31), 0x3fe101.
+@test
+fn encoder_announces_a_small_table() -> Result<void, TestFailure> {
+    var enc = match (HpackEncoder.create(256)) {
+        Ok(e) => e,
+        Err(_) => { return Check.fail("out of memory"); },
+    };
+    var block = Vector<u8>.create();
+    grew(enc.begin(mut block))?;
+    let update = hexBytes("3fe101")?;
+    Check.equalBytes(update.view(), block.view())?;
+    var again = Vector<u8>.create();
+    grew(enc.begin(mut again))?;
+    return Check.equalU64(0, again.length as u64);
+}
+
+/// The peer's SETTINGS_HEADER_TABLE_SIZE drops to 0 and rises to 100 between blocks: the next block starts with both
+/// updates, the smallest first (§4.2), and a decoder that follows it ends with the same table.
+@test
+fn encoder_signals_the_smallest_size() -> Result<void, TestFailure> {
+    var enc = encoderOf(4096, true)?;
+    var d = decoder(4096)?;
+    var block = Vector<u8>.create();
+    grew(enc.begin(mut block))?;
+    grew(enc.encode("x-one".bytes(), "1".bytes(), false, mut block))?;
+    var fields = HeaderBlock.create();
+    match (d.decode(block.view(), mut fields)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the first block"); }
+    }
+    Check.equalU64(38, enc.tableSize() as u64)?; // 5 + 1 + 32
+    Check.equalU64(38, d.tableSize() as u64)?;
+    enc.setLimit(0);
+    enc.setLimit(100);
+    block.clear();
+    grew(enc.begin(mut block))?;
+    let updates = hexBytes("203f45")?; // size 0; size 100 (31, then 69)
+    Check.equalBytes(updates.view(), block.view())?;
+    grew(enc.encode("x-one".bytes(), "1".bytes(), false, mut block))?; // evicted by the 0: a literal again
+    fields.clear();
+    match (d.decode(block.view(), mut fields)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the second block"); }
+    }
+    Check.equalU64(38, enc.tableSize() as u64)?;
+    return Check.equalU64(38, d.tableSize() as u64);
+}
+
+/// A sensitive field is never indexed (§6.2.3: 0001 prefix) and never matched in the table; a field costing more than
+/// half the table is sent without indexing (0000 prefix).
+@test
+fn encoder_keeps_sensitive_and_large_fields_out() -> Result<void, TestFailure> {
+    var enc = encoderOf(4096, false)?;
+    var block = Vector<u8>.create();
+    grew(enc.begin(mut block))?;
+    grew(enc.encode("authorization".bytes(), "secret".bytes(), true, mut block))?;
+    Check.equalU64(0x1f, block[0] as u64)?; // never indexed, name index 23 (15 + 8)
+    Check.equalU64(0, enc.tableSize() as u64)?;
+    var large = Vector<u8>.create();
+    for (i in 0..2100u32) {
+        grew(large.push(97))?;
+    }
+    block.clear();
+    grew(enc.encode("x-large".bytes(), large.view(), false, mut block))?;
+    Check.equalU64(0x00, block[0] as u64)?;
+    Check.equalU64(0, enc.tableSize() as u64)?;
+    var d = decoder(4096)?;
+    var fields = HeaderBlock.create();
+    match (d.decode(block.view(), mut fields)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the block"); }
+    }
+    return Check.equalU64(2100, fields.value(0).length as u64);
+}
+
 fn failsWith(block: StringView, limit: u32, maxList: u64) -> Result<HpackError?, TestFailure> {
     var d = match (HpackDecoder.create(limit, maxList)) {
         Ok(d) => d,

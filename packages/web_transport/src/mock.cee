@@ -25,6 +25,7 @@ public struct MockTransport {
     private hang: bool;
     private pauseMs: u64;
     private paused: bool;
+    private completing: bool;
     private out: Vector<u8>;
     private step: usize;
     private failAfter: usize;
@@ -32,6 +33,10 @@ public struct MockTransport {
     private poisoned: bool;
     private shut: bool;
     private protocol: Alpn;
+    /// Where each byte written is also sent, for a test that has handed the transport away.
+    private copyTo: Channel<u8>?;
+    private peer: SocketAddress?;
+    private local: SocketAddress?;
 
     /// A transport whose peer sends `input` and then ends its side.
     public fn create(input: Slice<u8>) -> Result<MockTransport, AllocError> {
@@ -48,6 +53,7 @@ public struct MockTransport {
             hang: false,
             pauseMs: 0,
             paused: false,
+            completing: false,
             out: Vector<u8>.create(),
             step: 0,
             failAfter: 0,
@@ -55,7 +61,26 @@ public struct MockTransport {
             poisoned: false,
             shut: false,
             protocol: Alpn.None,
+            copyTo: null,
+            peer: null,
+            local: null,
         });
+    }
+
+    /// The addresses `peerAddress` and `localAddress` report (null by default).
+    public fn withAddresses(this, peer: SocketAddress?, local: SocketAddress?) -> MockTransport {
+        var m = this;
+        m.peer = peer;
+        m.local = local;
+        return m;
+    }
+
+    /// Every byte written is also sent to `copies` (dropped if it is full), so a test can see what was written after
+    /// handing the transport to a pool.
+    public fn withCopiesTo(this, copies: borrow Channel<u8>) -> MockTransport {
+        var m = this;
+        m.copyTo = Some(copies.clone());
+        return m;
     }
 
     /// Each read returns at most `n` bytes (n ≥ 1; 0 is taken as 1).
@@ -94,6 +119,15 @@ public struct MockTransport {
         var m = this;
         m.pauseMs = ms;
         m.paused = true;
+        return m;
+    }
+
+    /// With a pause (`withPause`), a read cancelled in its pause still returns its bytes: a completion-based read
+    /// (io_uring, IOCP) that finished as it was cancelled (CeeSafe ADR 0035 §3.4). Reads at the end of a hanging input
+    /// still wait until cancelled.
+    public fn withCompletingReads(this) -> MockTransport {
+        var m = this;
+        m.completing = true;
         return m;
     }
 
@@ -179,7 +213,13 @@ public struct MockTransport {
             return Err(NetError.Reset);
         }
         match (this.out.push(b)) {
-            Ok() => { return Ok(); }
+            Ok() => {
+                match (borrow this.copyTo) {
+                    Some(c) => { let copied = c.trySend(b); }
+                    null => {}
+                }
+                return Ok();
+            }
             Err(_) => {
                 this.poisoned = true;
                 return Err(NetError.OutOfMemory);
@@ -193,7 +233,12 @@ impl Transport for MockTransport {
         if (buffer.length == 0) {
             return Err(NetError.LimitExceeded);
         }
-        await this.pause()?;
+        if (this.completing && this.paused) {
+            let ms = this.pauseMs;
+            let paused: Result<void, AsyncError> = await Async.shield(ms + 100, async () => await Timer.sleep(ms));
+        } else {
+            await this.pause()?;
+        }
         if (this.resetArmed && this.at >= this.resetAt) {
             return Err(NetError.Reset);
         }
@@ -278,10 +323,10 @@ impl Transport for MockTransport {
     fn alpn(borrow this) -> Alpn => this.protocol;
 
     @effects()
-    fn peerAddress(borrow this) -> SocketAddress? => null;
+    fn peerAddress(borrow this) -> SocketAddress? => this.peer;
 
     @effects()
-    fn localAddress(borrow this) -> SocketAddress? => null;
+    fn localAddress(borrow this) -> SocketAddress? => this.local;
 
     @effects(alloc)
     fn peerIdentity(borrow this, into: borrow mut PeerIdentity) -> bool => false;

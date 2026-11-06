@@ -1,0 +1,185 @@
+// HPACK's dynamic table across blocks (invariant 10): RFC 7541 §2.3, §4, §6.2.3, §6.3; Web ADR 0012 §3.10.
+import web_http;
+import web_http2;
+
+fn smaller(a: u32, b: u32) -> u32 => if (a < b) a else b;
+
+/// An HPACK integer (RFC 7541 §5.1) at `at` with an `n`-bit prefix: its value and where it ends; `end` 0 if cut short.
+struct Integer {
+    value: u64;
+    end: usize;
+}
+
+fn integerAt(block: Slice<u8>, at: usize, n: u32) -> Integer {
+    let mask = (1u64 << n) - 1;
+    var v = block[at] as u64 & mask;
+    var k = at + 1;
+    if (v < mask) {
+        return Integer { value: v, end: k };
+    }
+    var shift: u64 = 0;
+    loop {
+        if (k >= block.length || shift > 28) {
+            return Integer { value: 0, end: 0 };
+        }
+        let b = block[k];
+        k += 1;
+        v += (b as u64 & 127) << shift;
+        shift += 7;
+        if (b & 128 == 0) {
+            return Integer { value: v, end: k };
+        }
+    }
+}
+
+/// §4.2: the dynamic table size updates a block must open with, after the sizes `sizes[0..changes]` were set since
+/// the last block, when the table's maximum was `current`: none if nothing changed; else the smallest from the first
+/// change on, when below the final one, then the final one. Checks the block's leading updates against that.
+fn checkUpdates(block: Slice<u8>, sizes: Slice<u32>, current: u32) {
+    // Sizes equal to the table's before the first change change nothing (§6.3 signals a change).
+    var smallest: u32 = 0xFFFFFFFF;
+    var changed = false;
+    for (v in sizes) {
+        if (v != current) {
+            changed = true;
+        }
+        if (changed && v < smallest) {
+            smallest = v;
+        }
+    }
+    var want = [0u64; 2];
+    var wanted: usize = 0;
+    if (sizes.length > 0 && changed) {
+        let last = sizes[sizes.length - 1];
+        if (smallest < last) {
+            want[0] = smallest as u64;
+            wanted = 1;
+        }
+        want[wanted] = last as u64;
+        wanted += 1;
+    }
+    var got: usize = 0;
+    var at: usize = 0;
+    while (at < block.length && block[at] & 0xE0 == 0x20) {
+        let i = integerAt(block, at, 5);
+        if (i.end == 0) {
+            fail("a dynamic table size update cut short (RFC 7541 §6.3)", block);
+        }
+        if (got >= wanted || i.value != want[got]) {
+            fail("a block's table size updates are not the smallest then the final size (RFC 7541 §4.2)", block);
+        }
+        got += 1;
+        at = i.end;
+    }
+    if (got != wanted) {
+        fail("a table size change not signalled at the next block's start (RFC 7541 §4.2)", block);
+    }
+}
+
+fn tableCase(rng: borrow mut Rng, seen: borrow mut Seen) {
+    // The decoder's SETTINGS_HEADER_TABLE_SIZE, which the encoder hears as the peer's, and the encoder's own bound.
+    let limits = [0u32, 64, 256, 4096];
+    let caps = [0u32, 256, 4096, 8192];
+    let limit = limits[rng.below(4) as usize];
+    let cap = caps[rng.below(4) as usize];
+    var encoder = match (HpackEncoder.create(cap)) {
+        Ok(e) => e,
+        Err(_) => { return; },
+    };
+    if (rng.below(4) == 0) {
+        encoder = encoder.withoutHuffman();
+    }
+    encoder.setLimit(limit);
+    var asked = limit;
+    // The sizes set since the last block, as the encoder may use them (each the smaller of the peer's and its cap).
+    var sizes = [0u32; 4];
+    var changes: usize = 0;
+    if (smaller(cap, 4096) != 4096) {
+        sizes[changes] = smaller(cap, 4096); // `create` takes its cap below 4 096 at once
+        changes += 1;
+    }
+    sizes[changes] = smaller(limit, cap);
+    changes += 1;
+    var current: u32 = 4096; // RFC 9113 §6.5.2: SETTINGS_HEADER_TABLE_SIZE's initial value
+    var decoder = match (HpackDecoder.create(limit, 1 << 20)) {
+        Ok(d) => d,
+        Err(_) => { return; },
+    };
+    let names = ["x-a", "x-b", "content-type", "set-cookie", "authorization", "cache-control", "x-long", "cookie"];
+    let values = ["1", "text/html", "no-store", "abc"];
+    let blocks = 1 + rng.below(8);
+    for (b in 0..blocks) {
+        // Now and then the peer's setting changes, once or twice, before the block (§4.2: the smallest, then the last).
+        let more = if (rng.below(4) == 0) 1 + rng.below(2) else 0;
+        for (c in 0..more) {
+            asked = truncate<u32>(rng.below(limit as u64 + 1));
+            encoder.setLimit(asked);
+            sizes[changes] = smaller(asked, cap);
+            changes += 1;
+        }
+        var fields = HeaderBlock.create();
+        let count = 1 + rng.below(10);
+        for (f in 0..count) {
+            let name = names[rng.below(8) as usize];
+            var value = Vector<u8>.create();
+            if (rng.below(3) == 0) {
+                let n = rng.below(300);
+                for (i in 0..n) {
+                    put(mut value, truncate<u8>(rng.next()));
+                }
+            } else {
+                putAll(mut value, values[rng.below(4) as usize].bytes());
+            }
+            let sensitive = HeaderBlock.sensitiveByDefault(name.bytes()) || rng.below(8) == 0;
+            let p = fields.push(name.bytes(), value.view(), sensitive);
+        }
+        var block = Vector<u8>.create();
+        match (encoder.begin(mut block)) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+        for (i in 0..fields.count()) {
+            match (encoder.encode(fields.name(i), fields.value(i), fields.span(i).sensitive, mut block)) {
+                Ok() => {}
+                Err(_) => { return; }
+            }
+        }
+        let set = sizes[0..changes];
+        checkUpdates(block.view(), set, current);
+        if (changes > 0) {
+            current = sizes[changes - 1];
+        }
+        changes = 0;
+        var back = HeaderBlock.create();
+        match (decoder.decode(block.view(), mut back)) {
+            Ok() => {}
+            Err(_) => {
+                fail("a block from the encoder's dynamic table did not decode (RFC 7541 §6.3, §4)", block.view());
+            }
+        }
+        if (back.count() != fields.count()) {
+            fail("a different number of fields back through the dynamic table (RFC 7541)", block.view());
+        }
+        for (i in 0..fields.count()) {
+            if (!same(back.name(i), fields.name(i)) || !same(back.value(i), fields.value(i))) {
+                fail("a field came back changed through the dynamic table (RFC 7541 §2.3)", block.view());
+            }
+            if (back.span(i).sensitive != fields.span(i).sensitive) {
+                fail("a field's never-indexed mark was not kept (RFC 7541 §6.2.3, §7.1.3)", block.view());
+            }
+        }
+        if (encoder.tableLimit() != smaller(asked, cap)) {
+            fail(
+                "the encoder's table limit is not the smaller of the peer's and its own (Web ADR 0012 §3.10)",
+                block.view(),
+            );
+        }
+        if (encoder.tableSize() > encoder.tableLimit()) {
+            fail("the encoder's table is over its limit (RFC 7541 §4.4)", block.view());
+        }
+        if (decoder.tableSize() != encoder.tableSize()) {
+            fail("the encoder's and decoder's tables differ in size (RFC 7541 §2.3.2, §4.1)", block.view());
+        }
+        seen.tableBlocks += 1;
+    }
+}

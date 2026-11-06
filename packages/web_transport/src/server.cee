@@ -160,7 +160,7 @@ async fn worker(
             async () => await incoming.next(),
             async () => await drainStarted<PlainStream>(drain),
         );
-        let stream = match (next) {
+        var stream = match (next) {
             Ok(raced) => raced.value,
             Err(NetError.Closed) => { return Ok(); } // the source ended
             Err(NetError.Cancelled) => {
@@ -180,7 +180,31 @@ async fn worker(
             }
         };
         let id = counters.accepted.fetchAdd(1);
-        var conn = match (await acceptor.accept(stream, Deadline.after(limits.handshakeMs))) {
+        let handshake = Deadline.after(limits.handshakeMs);
+        // Behind a balancer that speaks the PROXY protocol (Web ADR 0012 §3.6, amendment 2): from a source it lists,
+        // the header first, read exactly, within the handshake's time; any other source is closed unread.
+        var said = ProxyHeader.Local;
+        if (!limits.proxyProtocolFrom.isEmpty()) {
+            var s = stream;
+            let from = match (s.peerAddress()) {
+                Some(a) => limits.proxyProtocolFrom.trusts(a),
+                null => false,
+            };
+            if (!from) {
+                let failed = counters.handshakesFailed.fetchAdd(1);
+                continue;
+            }
+            match (await readProxyHeader(mut s, handshake)) {
+                Ok(h) => { said = h; }
+                Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+                Err(_) => {
+                    let failed = counters.handshakesFailed.fetchAdd(1);
+                    continue;
+                }
+            }
+            stream = s;
+        }
+        var conn = match (await acceptor.accept(stream, handshake)) {
             Ok(c) => c,
             Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
             Err(_) => {
@@ -190,9 +214,16 @@ async fn worker(
         };
         var identity = PeerIdentity.empty();
         let verified = conn.peerIdentity(mut identity); // a TLS client certificate, copied before `conn` is lent out
-        let ctx = ConnectionContext.acceptedNow(id, drain)
-            .withAddresses(conn.peerAddress(), conn.localAddress())
-            .withPeerIdentity(identity);
+        var peer = conn.peerAddress();
+        var local = conn.localAddress();
+        match (said) {
+            ProxyHeader.Proxied(from, to) => {
+                peer = Some(from);
+                local = Some(to);
+            }
+            ProxyHeader.Local => {}
+        }
+        let ctx = ConnectionContext.acceptedNow(id, drain).withAddresses(peer, local).withPeerIdentity(identity);
         match (await handler.serve(mut conn, ctx)) {
             Ok() => {
                 let done = counters.served.fetchAdd(1);

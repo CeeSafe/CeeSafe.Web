@@ -30,7 +30,8 @@ enum Outgoing {
 /// Request body for a stream's task.
 enum BodyPart {
     Data(Vector<u8>),
-    End,
+    /// The body's end, with the request's trailer fields (empty if none).
+    End(HeaderBlock),
 }
 
 /// The connection's side of one stream.
@@ -42,6 +43,8 @@ struct Link {
     backlog: Vector<u8>;
     ended: bool;
     endSent: bool;
+    /// The trailers to send with the end (at most one block: a vector, so `deliver` can move it out with `pop`).
+    trailers: Vector<HeaderBlock>;
     want: u32;
     outstanding: i64;
     scheme: Vector<u8>;
@@ -119,6 +122,11 @@ async fn run(
     var total: i64 = 0; // credit granted and not yet used, across streams
     var lastActive = Timer.now();
     var leaving = false;
+    // The client has stopped sending (a read of 0): a half-close (RFC 9293 §3.6), or it has gone. Either way no stream
+    // can start, so GOAWAY goes out and nothing more is read. The streams in flight finish, writing their responses to
+    // a client that may still read them (Web ADR 0012 §3.10). Each idle second a PING probes it: a client that has gone
+    // answers with a TCP reset, so a later write fails, and that failure is this connection's normal end.
+    var peerDone = false;
     loop {
         // Every complete frame in the input.
         loop {
@@ -158,14 +166,21 @@ async fn run(
                     }
                 }
                 H2Event.Trailers(id) => {
+                    let taken = head;
+                    head = HeaderBlock.create();
                     match (links.getMut(id)) {
                         Some(link) => {
                             link.ended = true;
+                            match (link.trailers.push(taken)) {
+                                Ok() => {}
+                                Err(_) => { return Err(NetError.OutOfMemory); }
+                            }
                             deliver(link)?;
                         }
                         null => {}
                     }
                 }
+                H2Event.Response(_, _) => {} // client role only
                 H2Event.TooLarge(id) => {
                     var fields = HeaderBlock.create();
                     alloc(fields.push(":status".bytes(), "431".bytes(), false))?;
@@ -184,14 +199,20 @@ async fn run(
                 null => { break; }
             }
         }
-        await writeOutput(conn, engine, limits)?;
+        match (await writeOutput(conn, engine, limits)) {
+            Ok() => {}
+            Err(e) => { return Err(if (peerDone) NetError.Closed else e); }
+        }
         if (links.length() > 0) {
             lastActive = Timer.now();
         }
         // The end: the client left, or the server drains, once no stream is left.
         if (connection.isDraining() && !leaving) {
             engineOk(engine.goAway(ErrorCodes.noError()))?;
-            await writeOutput(conn, engine, limits)?;
+            match (await writeOutput(conn, engine, limits)) {
+                Ok() => {}
+                Err(e) => { return Err(if (peerDone) NetError.Closed else e); }
+            }
             leaving = true;
         }
         if (leaving && links.length() == 0) {
@@ -205,14 +226,36 @@ async fn run(
         }
         input.compact();
         let waitMs = if (links.length() == 0) lastActive + limits.idleTimeoutMs - now else 1000;
-        match (await wake(conn, input, outgoing, if (waitMs > 1000) 1000 else waitMs)) {
-            Ok(Wake.Read(0)) => { return Err(NetError.Closed); } // the client closed
-            Ok(Wake.Read(n)) => { input.commit(n)?; }
-            Ok(Wake.Message(m)) => {
-                await handle(set, connection, app, limits, engine, links, outgoing, m, mut total)?;
+        let woke = await wake(conn, input, outgoing, if (waitMs > 1000) 1000 else waitMs, !peerDone)?;
+        // Both of a race's children may have finished: a read the kernel completed as it was cancelled (io_uring,
+        // CeeSafe ADR 0035 §3.4) comes back as `other`, and its bytes are already in `input`.
+        var current: Wake? = Some(woke.value);
+        var later: Wake? = woke.other;
+        loop {
+            let w = match (current) {
+                Some(x) => x,
+                null => { break; },
+            };
+            current = later;
+            later = null;
+            match (w) {
+                Wake.Read(0) => {
+                    peerDone = true;
+                    if (!leaving) {
+                        engineOk(engine.goAway(ErrorCodes.noError()))?;
+                        leaving = true;
+                    }
+                }
+                Wake.Read(n) => { input.commit(n)?; }
+                Wake.Message(m) => {
+                    await handle(set, connection, app, limits, engine, links, outgoing, m, mut total)?;
+                }
+                Wake.Timer => {
+                    if (peerDone && links.length() > 0) {
+                        engineOk(engine.ping([0u8; 8]))?;
+                    }
+                }
             }
-            Ok(Wake.Timer) => {}
-            Err(e) => { return Err(e); }
         }
     }
 }
@@ -274,6 +317,7 @@ fn startStream(
         backlog: Vector<u8>.create(),
         ended: !hasBody,
         endSent: false,
+        trailers: Vector<HeaderBlock>.create(),
         want: 0,
         outstanding: 0,
         scheme: scheme,
@@ -440,8 +484,19 @@ fn deliver(link: borrow mut Link) -> Result<void, NetError> {
         }
     }
     if (link.ended && !link.endSent) {
-        match (link.body.trySend(BodyPart.End)) {
+        let trailers = match (link.trailers.pop()) {
+            Some(t) => t,
+            null => HeaderBlock.create(),
+        };
+        match (link.body.trySend(BodyPart.End(trailers))) {
             Ok() => { link.endSent = true; }
+            Err(BodyPart.End(back)) => {
+                // full: kept for the next try
+                match (link.trailers.push(back)) {
+                    Ok() => {}
+                    Err(_) => { return Err(NetError.OutOfMemory); }
+                }
+            }
             Err(_) => {}
         }
     }
@@ -479,40 +534,54 @@ async fn writeOutput(
     return Ok();
 }
 
-/// One wait: bytes from the client, a stream's message, or `waitMs` passing.
+/// One wait: bytes from the client (when `reading`), a stream's message, or `waitMs` passing. Both of the race's
+/// children may have finished, so both values come back (`value`, then `other`).
 async fn wake(
     conn: borrow mut dyn Transport,
     input: borrow mut OwnedBuffer,
     outgoing: borrow Channel<Outgoing>,
     waitMs: u64,
-) -> Result<Wake, NetError> {
-    let raced: Result<Raced<Wake>, NetError> = await Async.race(
+    reading: bool,
+) -> Result<Raced<Wake>, NetError> {
+    if (!reading) {
+        let w = await quietWake(outgoing, waitMs)?;
+        return Ok(Raced<Wake> { winner: 1, value: w, other: null });
+    }
+    return await Async.race(
         async () => {
             let n = await conn.read(input.spare())?;
             return Ok(Wake.Read(n));
         },
+        async () => await quietWake(outgoing, waitMs),
+    );
+}
+
+/// One wait without reading: a stream's message, or `waitMs` passing. A message taken as the timer won is kept: the
+/// timer's wake is the one dropped.
+async fn quietWake(outgoing: borrow Channel<Outgoing>, waitMs: u64) -> Result<Wake, NetError> {
+    let raced: Result<Raced<Wake>, NetError> = await Async.race(
         async () => {
-            let inner: Result<Raced<Wake>, NetError> = await Async.race(
-                async () => {
-                    match (await outgoing.recvAsync()) {
-                        Ok(Some(m)) => { return Ok(Wake.Message(m)); }
-                        Ok(null) => { return Err(NetError.Closed); }
-                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
-                    }
-                },
-                async () => {
-                    match (await Timer.sleep(waitMs)) {
-                        Ok() => { return Ok(Wake.Timer); }
-                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
-                    }
-                },
-            );
-            let won = inner?;
-            return Ok(won.value);
+            match (await outgoing.recvAsync()) {
+                Ok(Some(m)) => { return Ok(Wake.Message(m)); }
+                Ok(null) => { return Err(NetError.Closed); }
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+        },
+        async () => {
+            match (await Timer.sleep(waitMs)) {
+                Ok() => { return Ok(Wake.Timer); }
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
         },
     );
     let won = raced?;
-    return Ok(won.value);
+    if (won.winner == 0) {
+        return Ok(won.value); // the data won: `other`, if any, is the timer's
+    }
+    return match (won.other) {
+        Some(m) => Ok(m),
+        null => Ok(won.value),
+    };
 }
 
 // ---- The stream's task ----
@@ -527,6 +596,7 @@ struct StreamPort {
     current: Vector<u8>;
     at: usize;
     ended: bool;
+    trailers: HeaderBlock;
 }
 
 impl StreamSink for StreamPort {
@@ -550,7 +620,10 @@ impl StreamSink for StreamPort {
                     this.current = bytes;
                     this.at = 0;
                 }
-                Ok(Some(BodyPart.End)) => { this.ended = true; }
+                Ok(Some(BodyPart.End(trailers))) => {
+                    this.ended = true;
+                    this.trailers = trailers;
+                }
                 Ok(null) => { return Err(HandlerError.Io(NetError.Reset)); } // the stream was reset
                 Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
             }
@@ -606,6 +679,10 @@ impl StreamSink for StreamPort {
             Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
         }
     }
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> =>
+        into.pushAll(this.trailers);
 }
 
 async fn post(outgoing: borrow Channel<Outgoing>, m: Outgoing) -> Result<void, HandlerError> {
@@ -741,6 +818,7 @@ async fn serveStream(
         current: Vector<u8>.create(),
         at: 0,
         ended: false,
+        trailers: HeaderBlock.create(),
     };
     var none = NoTransport {};
     var carry = match (OwnedBuffer.create(16)) {

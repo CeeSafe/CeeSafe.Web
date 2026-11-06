@@ -125,3 +125,24 @@ fn framing_rules() -> Result<void, TestFailure> {
     }, "unknown length over 1.0: until close (no chunked in 1.0)")?;
     return Ok();
 }
+
+/// RFC 9110 §6.6.1: one `Date`. A head that has its own (a proxy relaying its origin's, in any case) keeps it, and the
+/// writer adds none.
+@test
+fn a_head_date_is_the_only_date() -> Result<void, TestFailure> {
+    var h = head()?;
+    match (h.add("Date", "Sun, 06 Nov 1994 08:49:37 GMT".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("add")); }
+    }
+    var out = buffer(512)?;
+    let ours = "Wed, 04 Nov 2026 06:00:00 GMT";
+    match (Encoder.head(h, ResponseFraming.Length(0), true, Some(ours.bytes()), mut out)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("encode")); }
+    }
+    return Check.equalBytes(
+        "HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\ncontent-length: 0\r\n\r\n".bytes(),
+        out.readable(),
+    );
+}

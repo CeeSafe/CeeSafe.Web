@@ -778,6 +778,113 @@ prints the area.
 app.get();` and then `let application: borrow dyn Application = sendable;`. That is two lines, not a workaround: no
 wrapper, no `unsafe`.
 
+## U21 — Timers on Windows keep the 15.6 ms tick   *(found 2026-11-05, M8, ceesafec 0.11.0, Windows 11 ARM64; wanted, not blocking)*
+
+**Gap:** `Timer.now()` on Windows is `GetTickCount64()` (CeeSafe `runtime/hosted/ceesafe_rt_async.c:826`), which
+advances once a system tick, about 15.6 ms. A short sleep wakes, finds the clock unmoved, and waits again.
+- Measured 2026-11-05: 180 shielded `Timer.sleep(1)` calls take 4 485 and 4 547 ms on the Windows VM (about 25 ms
+  each), and 203 ms on macOS (`clock_gettime(CLOCK_MONOTONIC)`). Built with the 0.11.0 releases.
+- Two tests assumed millisecond timers and failed in M8's Windows run: `web_http2`'s
+  `a_read_completed_as_it_was_cancelled_keeps_its_bytes` (its 2 s close came before the input was read) and
+  `web_sse`'s `heartbeats_while_quiet` under the allocation sweep (25 ms of slack). Their timing was made robust
+  (M8, Findings); nothing in the libraries depends on sub-tick timers.
+
+**Wanted:** a millisecond clock on Windows (`QueryPerformanceCounter`, or `QueryUnbiasedInterruptTimePrecise`), and
+waits that end on time (a high-resolution waitable timer, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`), so a 1 ms sleep
+lasts about 1 ms as on Linux and macOS.
+
+## B18 — Bug: a `borrow S<r>` result of `borrow this` is refused as a deep result   *(found 2026-11-05, M8, ceesafec 0.18.0; fixed in 0.18.1)*
+
+**Symptom:** with 0.18.0, nothing that depends on `web_http` checks. `web_http/src/request.cee:62`:
+
+```ceesafe
+public fn headers(borrow this) -> borrow HeaderList<r> => borrow this.fields;
+```
+
+is N0245: "the returned reference may point into what parameter 'this' refers to, but the return type names only
+regions that its referent holds; name the parameter's own region instead (e.g. '-> Slice<u8>', elided)". Checked on
+`m8-stage3` at `92f23fb`: `web_http` and every package, example and fuzzer that depends on it fail with only this
+error.
+
+**Why it is a bug:** the signature is sound, and 0.18.0 has no way to write it. Rust's `fn headers(&self) ->
+&HeaderList<'r>` is the same, and ADR 0074's "What breaks" names only "a function returning a view of its
+parameter's own storage under a pointee region". 0.18.0 follows the letter of its spec: `spec/type-system.md` §25.6
+elides a result's regions only "for a result of scoped type without written regions" (line 1777). `r` is written
+inside, so the reference's own region gets no flow name; the result names only `this`'s pointee region, and so is
+a deep result of `this` (line 1790), whose callee rule refuses `borrow this.fields`. The gap is in the spec and ADR
+0074 §2.4, not only the code. (Corrected 2026-11-05: this entry first said 0.18.0 broke its own spec.)
+
+**No way around it in 0.18.0:** the hint's elided form, `-> borrow HeaderList`, checks in `web_http`, but loses `r`.
+`web_sse`'s `lastEventId(request: borrow Request<r>) -> Slice<r, u8>?` (`request.headers().getNamed(…)`) is then
+N0245 too, since `getNamed`'s `Slice<r, u8>` is now a deep result of a reference that holds only the loan. The
+explicit `-> borrow(this) HeaderList<r>` checks too, and moves the error to the same line of `lastEventId`. Keeping
+`r` would mean changing public signatures to work around the compiler, which the project's rules forbid.
+- Measured on a scratch copy (2026-11-05): with `headers` elided and `lastEventId` returning `Slice<u8>?`, every
+  package, example and fuzzer checks on 0.18.0 with no diagnostic. B18 is the only check-time break.
+
+**Cause (read in CeeSafe at `v0.18.0` = `992e0a7`, not changed there):** two gaps, one in each half of §2.4.
+1. **Callee:** `resolveFlows` (`src/check/references.cee:482`) runs elision (`resolveReturnSources`) only when the
+   result names no region at all (`named`, about line 556). `collectFlowNames` adds nothing for a reference with no
+   written region and recurses into its pointee, so `borrow HeaderList<r>` names only `r`. Its elided outer
+   reference is never resolved to `this`, `resolved` stays empty, and the deep loop (about lines 568–597) makes
+   `this` a deep source. Before 0.18.0 nothing read the classification.
+2. **Caller:** `deepSourceEdge` (`src/nir/borrow.cee:837`) drops the outer loan only for an argument `&p` or a
+   reference parameter. A reference returned by a call (`o.inner()` in `o.inner().first()`) keeps all its loans,
+   `o`'s outer one among them, so a deep result through it is N0245 in the caller. Rust accepts the same
+   (`fn f<'r>(o: &Outer<'r>) -> &'r [u8] { o.inner().first() }`, with `inner(&self) -> &Inner<'r>`).
+
+**Why the release checks missed it:** 0.18.0 was checked against CeeSafeLibs and CeeSafeApps (35 packages; CeeSafe
+`ROADMAP.md:920`). CeeSafe.Web is not among "the three repositories" that ADR 0074 §2.4 searched. `request.cee:62` is
+the only result of this shape in the four repositories, and CeeSafe's corpus has none.
+
+**Repro:** `tests/probes/deep-result-borrow-bug.cee`. It checks and prints 1 on 0.17.0 and 0.11.0, and is N0245 on
+0.18.0. With `inner`'s result elided, or written `borrow(this)`, 0.18.0 moves the N0245 to `firstOf` (gap 2).
+- In the same probe shape, 0.18.0 refuses `borrow this -> borrow S<r>`, `borrow mut this -> borrow mut S<r>` and
+  `borrow this -> (borrow S<r>)?`. It accepts `-> borrow(this) S<r>`, `-> S<r>` by value, `-> borrow S` and
+  `-> Slice<r, u8>` from a view field. 0.17.0 accepts all of them.
+
+**Wanted:**
+- A reference result with an elided outer region (`-> borrow S<r>`, `-> borrow mut S<r>`) is tied to the
+  receiver by elision, as §25.6 says, and so is not a deep result. With several reference parameters the outer
+  region is as ambiguous as v0 elision: an owner's choice between N0245's "name the sources" and today's 0.17.0
+  behaviour.
+- A deep result through a reference returned by a call carries what that reference's referent holds.
+- A corpus case for each, beside ADR 0074's `Lexer`, and CeeSafe.Web among the repositories checked before a release.
+
+**Fixed in 0.18.1** (released 2026-11-05, tag `v0.18.1` = CeeSafe `8e171c6`; the fix is `2de9c3e`, CeeSafe ADR 0074
+§8, spec type-system.md §25.6 and lifetimes.md §7):
+- a result reference with nothing written on it takes the single scoped parameter's elided region, so
+  `-> borrow HeaderList<r>` from `borrow this` is tied to `this`, not a deep result (`resolveFlows`);
+- a call whose `borrow T` result passes through one reference parameter is followed to its argument, so
+  `request.headers().getNamed(…)` gives `Slice<r, u8>` (`throughDefinitions`, `deepSourceEdge`).
+
+The corpus gained `run-pass/deep-results-through.cee` and `check-fail/deep-results-through.cee`, and the case's negative
+forms stay errors. With the released 0.18.1 (osx-arm64, `SHA256SUMS` checked), CeeSafe.Web at `fd5b387`, unchanged,
+checks with no diagnostic in all 27 manifests, `fmt --check` is clean, the probe prints 1, and the full suite
+(sanitizers and both sweeps) passes 43 runs. It was never worked around. M8's minimum stays 0.11.0: nothing needs 0.18.1
+(`docs/toolchain.md`).
+
+## U20 — A type that holds loans cannot be a `borrow mut dyn I`   *(found 2026-11-04, M8, ceesafec 0.10.3; resolved in 0.11.0)*
+
+**Gap:** `web_client`'s `Client.send(request, body: borrow mut dyn BodySource)` takes the request body as a `dyn`.
+
+- The proxy's body source must read from the request's `Exchange`, so it is a struct with a region parameter:
+  `ExchangeBody<region r> { exchange: borrow mut(r) Exchange<r>, … }`, implementing `BodySource`.
+- Passing it is N0268: "'ExchangeBody' holds loans, so it cannot be a 'dyn BodySource': use it through a bound
+  instead" (`web_proxy/src/proxy.cee` on branch `m8-stage3`).
+- A bound is no way out in 0.10.3. `send` is a method, and methods cannot declare type parameters, so every step from
+  `send` to the write would have to become a top-level generic function.
+
+**Wanted:** CeeSafe ADR 0064 §3.2 (OD-10a): a scoped `T` behind a reference coerces to `borrow dyn I` and
+`borrow mut dyn I`, the `dyn` carrying the reference's loan.
+- Accepted 2026-11-03.
+- Implemented on CeeSafe's working tree 2026-11-04 (ADR 0064 §5.4); released in ceesafec 0.11.0 (tag `v0.11.0`, 2026-11-04).
+- ADR 0064 §1's generic methods would also give `send<B: BodySource>` as a second route.
+
+**Resolved in 0.11.0:** `web_proxy/src/proxy.cee` passes its `ExchangeBody` to `Client.send` unchanged and checks on
+0.11.0 (2026-11-04). It was never worked around in the meantime. M8's toolchain minimum is 0.11.0
+(`docs/toolchain.md`).
+
 ## B16 — Bug: a wake lost when a full kqueue change queue drains the wake pipe   *(found 2026-11-03, M7, ceesafec 0.10.1, macOS (kqueue); fixed in 0.10.2)*
 
 **Cause (found 2026-11-03, in the CeeSafe repo):**

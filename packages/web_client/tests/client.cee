@@ -310,3 +310,206 @@ fn bad_requests() -> Result<void, TestFailure> {
     };
     return Check.isTrue(framing, "framing is the client's");
 }
+
+/// What the mocks were given to write, in order.
+fn copied(copies: borrow Channel<u8>) -> Result<Vector<u8>, TestFailure> {
+    var all = Vector<u8>.create();
+    loop {
+        match (copies.tryRecv()) {
+            Some(b) => {
+                match (all.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Err(TestFailure.create("out of memory")); }
+                }
+            }
+            null => { return Ok(all); }
+        }
+    }
+}
+
+fn holds(hay: Slice<u8>, needle: StringView) -> bool {
+    let n = needle.bytes();
+    if (n.length > hay.length) {
+        return false;
+    }
+    for (i in 0..hay.length - n.length + 1) {
+        var same = true;
+        for (j in 0..n.length) {
+            if (hay[i + j] != n[j]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `setAuthority` sends its `host` instead of the URL's (Web ADR 0012 §3.5); a redirect to another origin sends that
+/// origin's own.
+@test
+async fn a_request_authority() -> Result<void, TestFailure> {
+    let copies = match (Channel<u8>.create(8192)) {
+        Ok(c) => c,
+        Err(_) => { return Check.fail("a channel"); },
+    };
+    let scripts = scriptsOf(2)?;
+    queue(scripts, script("HTTP/1.1 301 Moved\r\nlocation: http://other.test/x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")?
+        .withCopiesTo(copies))?;
+    queue(scripts, script(ok2())?.withCopiesTo(copies))?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    var get = request(Method.Get, "http://backend.test:8080/a")?;
+    match (get.setAuthority("public.example:8443".bytes())) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a valid authority"); }
+    }
+    var none = NoBody {};
+    var got = Vector<u8>.create();
+    Check.equalU64(200, await outcome(client, await client.send(get, mut none), mut got) as u64)?;
+    let sent = copied(copies)?;
+    Check.isTrue(holds(sent.view(), "GET /a HTTP/1.1\r\nhost: public.example:8443\r\n"), "the authority as host")?;
+    Check.isTrue(holds(sent.view(), "GET /x HTTP/1.1\r\nhost: other.test\r\n"), "the other origin's own host")?;
+    Check.isTrue(!holds(sent.view(), "backend.test"), "never the URL's own")?;
+    var bad = request(Method.Get, "http://backend.test/")?;
+    for (k in 0..7u32) {
+        let t = match (k) {
+            0 => "",
+            1 => "a b",
+            2 => "a/b",
+            3 => "a?b",
+            4 => "a#b",
+            5 => "u@a",
+            _ => "a\r\nx: y",
+        };
+        match (bad.setAuthority(t.bytes())) {
+            Err(ClientError.BadRequest) => {}
+            _ => { return Check.fail("a bad authority was accepted"); }
+        }
+    }
+    return Ok();
+}
+
+/// `fields` lists every response field in order, names lowercased, credentials and cookies marked never indexed.
+@test
+async fn a_response_lists_its_fields() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(1)?;
+    queue(scripts, script("HTTP/1.1 200 OK\r\nX-A: 1\r\nSet-Cookie: s=1\r\ncontent-length: 2\r\nX-A: 2\r\n\r\nok")?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    var response = match (await client.get("http://example.test/")) {
+        Ok(r) => r,
+        Err(e) => { return Check.fail(ClientErrors.describe(e)); },
+    };
+    var fields = HeaderBlock.create();
+    match (response.fields(mut fields)) {
+        Ok() => {}
+        Err(e) => { return Check.fail(ClientErrors.describe(e)); }
+    }
+    Check.equalU64(4, fields.count() as u64)?;
+    Check.equalBytes("x-a".bytes(), fields.name(0))?;
+    Check.equalBytes("1".bytes(), fields.value(0))?;
+    Check.equalBytes("set-cookie".bytes(), fields.name(1))?;
+    Check.isTrue(fields.span(1).sensitive, "set-cookie never indexed")?;
+    Check.isTrue(!fields.span(0).sensitive, "x-a indexable")?;
+    Check.equalBytes("content-length".bytes(), fields.name(2))?;
+    Check.equalBytes("x-a".bytes(), fields.name(3))?;
+    return Check.equalBytes("2".bytes(), fields.value(3));
+}
+
+/// `upgrade` writes `connection: upgrade` and `upgrade` in place of the request's own, and a 101 gives the connection
+/// with the bytes read past its head; the switched connection frees its slot, so with one connection per origin the
+/// next request still gets one.
+@test
+async fn an_upgrade_switches() -> Result<void, TestFailure> {
+    let copies = match (Channel<u8>.create(8192)) {
+        Ok(c) => c,
+        Err(_) => { return Check.fail("a channel"); },
+    };
+    let scripts = scriptsOf(2)?;
+    queue(scripts, script("HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: echo/1\r\n\r\nEARLY")?
+        .withCopiesTo(copies))?;
+    queue(scripts, script(ok2())?)?;
+    var o = quick();
+    o.maxPerOrigin = 1;
+    let client = mockClient(o, scripts, v4(1), null, null, null, false)?;
+    var get = request(Method.Get, "http://example.test/tunnel")?;
+    match (get.header("connection", "keep-alive".bytes())) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a field"); }
+    }
+    match (get.header("upgrade", "other".bytes())) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a field"); }
+    }
+    var none = NoBody {};
+    var switched = match (await client.upgrade(get, "echo/1".bytes(), mut none)) {
+        Ok(Upgraded.Switched(s)) => s,
+        Ok(Upgraded.Answered(r)) => { return Check.fail("not switched"); },
+        Err(e) => { return Check.fail(ClientErrors.describe(e)); },
+    };
+    Check.equalBytes("EARLY".bytes(), switched.early())?;
+    var fields = HeaderBlock.create();
+    match (switched.fields(mut fields)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the 101's fields"); }
+    }
+    Check.equalBytes("upgrade".bytes(), fields.name(1))?;
+    Check.equalBytes("echo/1".bytes(), fields.value(1))?;
+    match (await switched.transport().write("ping".bytes())) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a write after the switch"); }
+    }
+    let sent = copied(copies)?;
+    Check.isTrue(holds(sent.view(), "\r\nconnection: upgrade\r\nupgrade: echo/1\r\n"), "the client's own upgrade fields")?;
+    Check.isTrue(!holds(sent.view(), "keep-alive") && !holds(sent.view(), "other"), "not the request's")?;
+    Check.isTrue(holds(sent.view(), "\r\n\r\nping"), "the new protocol's bytes after the head")?;
+    var got = Vector<u8>.create();
+    Check.equalU64(200, await outcome(client, await client.get("http://example.test/next"), mut got) as u64)?;
+    var bad = request(Method.Get, "http://example.test/")?;
+    match (await client.upgrade(bad, "a b\r\n".bytes(), mut none)) {
+        Err(ClientError.BadRequest) => { return Ok(); }
+        _ => { return Check.fail("a bad protocol was sent"); }
+    }
+}
+
+/// A server that does not switch gives an ordinary response to read.
+@test
+async fn an_upgrade_refused() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(1)?;
+    queue(scripts, script("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nno")?)?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    let get = request(Method.Get, "http://example.test/")?;
+    var none = NoBody {};
+    var response = match (await client.upgrade(get, "websocket".bytes(), mut none)) {
+        Ok(Upgraded.Answered(r)) => r,
+        Ok(Upgraded.Switched(_)) => { return Check.fail("switched"); },
+        Err(e) => { return Check.fail(ClientErrors.describe(e)); },
+    };
+    var got = Vector<u8>.create();
+    match (await response.readToEnd(mut got, 64)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the body"); }
+    }
+    return Check.equalBytes("no".bytes(), got.view());
+}
+
+/// RFC 9112 §7.1.2: a body of unknown length goes chunked, and its trailers in the last chunk; a framing field among
+/// them is left out (RFC 9110 §6.5.1).
+@test
+async fn request_trailers_in_the_last_chunk() -> Result<void, TestFailure> {
+    let copies = match (Channel<u8>.create(8192)) {
+        Ok(c) => c,
+        Err(_) => { return Check.fail("a channel"); },
+    };
+    let scripts = scriptsOf(1)?;
+    queue(scripts, script(ok2())?.withCopiesTo(copies))?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    let post = request(Method.Post, "http://example.test/up")?;
+    var trailing = TrailingBody { done: false };
+    var got = Vector<u8>.create();
+    Check.equalU64(200, await outcome(client, await client.send(post, mut trailing), mut got) as u64)?;
+    let sent = copied(copies)?;
+    return Check.isTrue(holds(sent.view(), "\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-sum: 42\r\n\r\n") &&
+        !holds(sent.view(), "content-length"), "the trailers in the last chunk, and no framing field");
+}

@@ -127,6 +127,24 @@ async fn messages_from_another_task() -> Result<void, TestFailure> {
     return Check.equalBytes("T[a]T[b]T[c]".bytes(), w.frames.view());
 }
 
+/// A read that completed as the wait's other arm won (a message queued by another task; io_uring, CeeSafe ADR 0035
+/// §3.4) keeps its bytes: `Async.race` returns them as `other`. Dropped, the client's frames broke and its Close never
+/// came through.
+@test
+async fn a_read_completed_as_it_was_cancelled_keeps_its_bytes() -> Result<void, TestFailure> {
+    var input = Vector<u8>.create();
+    for (i in 0..20) {
+        clientFrame(mut input, Opcode.Text, true, "0123456789".bytes())?;
+    }
+    let close = closePayload(1000);
+    clientFrame(mut input, Opcode.Close, true, close[..])?;
+    var conn = completingPeer(input, 3, 2);
+    let code = await session(mut conn, upgradeText(), options(), Script.FromAnotherTask)?;
+    Check.equalU64(1000, code as u64)?;
+    let w = written(conn.output)?;
+    return Check.equalBytes("T[a]T[b]T[c]C1000".bytes(), w.frames.view());
+}
+
 @test
 async fn fragments_and_the_servers_close() -> Result<void, TestFailure> {
     // The server sends "fragmented" in 4-byte fragments, then closes; the client's Close ends it.

@@ -15,7 +15,7 @@ public enum ResponseFraming {
 
 /// Response encoding.
 public struct Encoder {
-    /// Writes the status line, `Date` (if `date` is given), the head's fields, the framing field and, unless
+    /// Writes the status line, `Date` (if `date` is given and the head has none), the head's fields, the framing field and, unless
     /// `keepAlive`, `Connection: close`, then the empty line. `Err(LimitExceeded)` if `out` has no room; nothing
     /// partial is left in it then.
     public fn head(
@@ -48,7 +48,8 @@ public struct Encoder {
         out.append(" ".bytes())?;
         out.append(status.reason().bytes())?;
         out.append("\r\n".bytes())?;
-        match (date) {
+        // One `Date` (RFC 9110 §6.6.1): the head's own when it has one (a proxy relays its origin's), else `date`.
+        match (if (head.has("date")) null else date) {
             Some(d) => {
                 out.append("date: ".bytes())?;
                 out.append(d)?;

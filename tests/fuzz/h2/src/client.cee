@@ -1,0 +1,810 @@
+// The client role (Web ADR 0012 §7): invariants 7-9.
+import web_core;
+import web_http;
+import web_http2;
+
+/// The requests a case opens, in order: 0 GET, 1 HEAD, 2 POST with a 3-byte body, 3 POST whose body never ends.
+struct Plan {
+    kinds: [u8; 8];
+    count: usize;
+}
+
+fn planOf(rng: borrow mut Rng) -> Plan {
+    var p = Plan { kinds: [0u8; 8], count: 1 + rng.below(6) as usize };
+    for (k in 0..p.count) {
+        p.kinds[k] = truncate<u8>(rng.below(4));
+    }
+    return p;
+}
+
+/// A request's head as the client sends it (§8.3.1).
+fn planHead(kind: u8, k: usize) -> HeaderBlock {
+    var h = HeaderBlock.create();
+    let m = h.push(":method".bytes(), (if (kind == 1) "HEAD" else if (kind >= 2) "POST" else "GET").bytes(), false);
+    let s = h.push(":scheme".bytes(), "https".bytes(), false);
+    let p = h.push(":path".bytes(), (if (k % 2 == 0) "/" else "/a/b?c=d").bytes(), false);
+    let a = h.push(":authority".bytes(), "example.test".bytes(), false);
+    if (k % 3 == 1) {
+        let c = h.push("cookie".bytes(), "session=abc".bytes(), true);
+    }
+    return h;
+}
+
+/// A client with the plan's requests opened; null if memory ran out. Its output (preface and requests) is left
+/// unwritten.
+fn planned(plan: borrow Plan, input: Slice<u8>) -> H2Connection? {
+    var c = match (H2Connection.client(H2Settings.client(16384), H2Guards.defaults(16384))) {
+        Ok(c) => c,
+        Err(_) => { return null; },
+    };
+    match (c.start(1048576)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    for (k in 0..plan.count) {
+        let kind = plan.kinds[k];
+        let head = planHead(kind, k);
+        match (c.openRequest(head, kind <= 1, kind == 1)) {
+            Ok(id) => {
+                if (id != 2 * truncate<u32>(k) + 1) {
+                    fail("the client's streams are not 1, 3, 5, ... (RFC 9113 §5.1.1)", input);
+                }
+            }
+            Err(_) => { fail("a request refused before the server spoke (RFC 9113 §6.5.2: no limit yet)", input); }
+        }
+        if (kind == 2) {
+            match (c.sendData(2 * truncate<u32>(k) + 1, "abc".bytes(), true)) {
+                Ok() => {}
+                Err(_) => { fail("3 bytes refused within a 65 535-byte window", input); }
+            }
+        }
+    }
+    return Some(c);
+}
+
+/// Invariant 7's preface half: the client's first bytes are the preface, SETTINGS with SETTINGS_ENABLE_PUSH = 0, the
+/// connection's WINDOW_UPDATE, then each request's HEADERS (and a POST's DATA), decoding to what was asked.
+fn checkSetup(plan: borrow Plan) {
+    let none = "".bytes();
+    var c = match (planned(plan, none)) {
+        Some(c) => c,
+        null => { return; },
+    };
+    let out = c.output();
+    let p = clientPreface();
+    let want = p.bytes();
+    if (out.length < want.length || !same(out[0..want.length], want)) {
+        fail("the client's output does not start with the preface (RFC 9113 §3.4)", out);
+    }
+    var at = want.length;
+    var decoder = match (HpackDecoder.create(4096, 1 << 20)) {
+        Ok(d) => d,
+        Err(_) => { return; },
+    };
+    var frames: usize = 0;
+    var pushOff = false;
+    var headers: usize = 0;
+    var fields = HeaderBlock.create();
+    while (at + 9 <= out.length) {
+        let length = (out[at] as usize << 16) | (out[at + 1] as usize << 8) | out[at + 2] as usize;
+        let kind = out[at + 3];
+        let flags = out[at + 4];
+        let stream = read32(out, at + 5) & 0x7FFFFFFF;
+        if (at + 9 + length > out.length) {
+            fail("the client's setup is not whole frames", out);
+        }
+        let payload = out[at + 9..at + 9 + length];
+        if (frames == 0) {
+            if (kind != 4 || flags != 0 || stream != 0) {
+                fail("the preface is not followed by SETTINGS (RFC 9113 §3.4)", out);
+            }
+            var s: usize = 0;
+            while (s + 6 <= payload.length) {
+                if (payload[s] == 0 && payload[s + 1] == 2) {
+                    pushOff = read32(payload, s + 2) == 0;
+                }
+                s += 6;
+            }
+            if (!pushOff) {
+                fail("the client's SETTINGS do not disable push (Web ADR 0012 §7; RFC 9113 §8.4)", out);
+            }
+        } else if (kind == 1) {
+            if (headers >= plan.count || stream != 2 * truncate<u32>(headers) + 1) {
+                fail("a request's HEADERS on the wrong stream (RFC 9113 §5.1.1)", out);
+            }
+            let kindOf = plan.kinds[headers];
+            let ends = flags & 1 != 0;
+            if (ends != (kindOf <= 1) || flags & 4 == 0) {
+                fail("a request's HEADERS with the wrong END_STREAM or no END_HEADERS", out);
+            }
+            fields.clear();
+            match (decoder.decode(payload, mut fields)) {
+                Ok() => {}
+                Err(_) => { fail("the client's request block does not decode (RFC 7541)", out); }
+            }
+            let asked = planHead(kindOf, headers);
+            if (fields.count() != asked.count()) {
+                fail("a request decodes to another number of fields", out);
+            }
+            for (i in 0..asked.count()) {
+                if (!same(fields.name(i), asked.name(i)) || !same(fields.value(i), asked.value(i)) ||
+                    fields.span(i).sensitive != asked.span(i).sensitive) {
+                    fail("a request's field came back changed (RFC 7541 §6.2.3 for never-indexed)", out);
+                }
+            }
+            headers += 1;
+        } else if (kind == 0) {
+            if (stream == 0 || stream % 2 == 0 || flags != 1 || !same(payload, "abc".bytes())) {
+                fail("a POST's DATA is not its 3 bytes with END_STREAM", out);
+            }
+        } else if (kind != 8 || stream != 0) {
+            fail("an unexpected frame in the client's setup", out);
+        }
+        frames += 1;
+        at += 9 + length;
+    }
+    if (at != out.length || headers != plan.count) {
+        fail("the client's setup is not one HEADERS a request, in whole frames", out);
+    }
+}
+
+/// A server's header block, from its own encoder (keeping the dynamic table in step across blocks).
+fn serverBlock(encoder: borrow mut HpackEncoder, fields: borrow HeaderBlock) -> Vector<u8> {
+    var b = Vector<u8>.create();
+    let g = encoder.begin(mut b);
+    for (i in 0..fields.count()) {
+        let e = encoder.encode(fields.name(i), fields.value(i), fields.span(i).sensitive, mut b);
+    }
+    return b;
+}
+
+/// HEADERS, split over CONTINUATION now and then (§6.10).
+fn headersFrames(rng: borrow mut Rng, out: borrow mut Vector<u8>, id: u32, block: Slice<u8>, end: bool) {
+    let endFlag: u8 = if (end) 1u8 else 0u8;
+    if (rng.below(4) == 0 && block.length > 2) {
+        let cut = 1 + rng.below((block.length - 1) as u64) as usize;
+        frame(out, 1, endFlag, id, block[0..cut]);
+        frame(out, 9, 4, id, block[cut..]);
+    } else {
+        frame(out, 1, endFlag | 4, id, block);
+    }
+}
+
+/// The server's side: its SETTINGS, then an answer to each request (now and then a 103 first, a reset or nothing
+/// instead), with PING, WINDOW_UPDATE, PRIORITY and a closing GOAWAY scattered in.
+/// What an undamaged server conversation must give: for each stream, whether the server answered it (and how much body)
+/// or reset it.
+struct Expect {
+    answered: [bool; 8];
+    reset: [bool; 8];
+    body: [u64; 8];
+}
+
+/// With `damaged`, now and then a fault no bit flip finds easily: a field name with a random byte (§8.2.1), a
+/// content-length that lies (§8.1.1), DATA with no head before it (§8.1), a stray frame (§5.1).
+fn serverSeed(
+    rng: borrow mut Rng,
+    plan: borrow Plan,
+    out: borrow mut Vector<u8>,
+    expect: borrow mut Expect,
+    damaged: bool,
+) {
+    var encoder = match (HpackEncoder.create(4096)) {
+        Ok(e) => e,
+        Err(_) => { return; },
+    };
+    var settings = Vector<u8>.create();
+    let raw = [0u8, 3, 0, 0, 0, 100, 0, 4, 0, 0, 255, 255, 0, 5, 0, 0, 64, 0];
+    putAll(mut settings, raw[..]);
+    frame(out, 4, 0, 0, settings.view());
+    if (rng.below(2) == 0) {
+        frame(out, 4, 1, 0, "".bytes()); // the acknowledgement of the client's SETTINGS
+    }
+    let backwards = rng.below(4) == 0;
+    for (j in 0..plan.count) {
+        let k = if (backwards) plan.count - 1 - j else j;
+        let id = 2 * truncate<u32>(k) + 1;
+        let kind = plan.kinds[k];
+        match (rng.below(10)) {
+            0 => {
+                var rst = Vector<u8>.create();
+                put32(mut rst, truncate<u32>(rng.below(14)));
+                frame(out, 3, 0, id, rst.view());
+                expect.reset[k] = true;
+                continue;
+            }
+            1 => { continue; } // no answer yet
+            _ => {}
+        }
+        if (rng.below(5) == 0) {
+            var early = HeaderBlock.create();
+            let s = early.push(":status".bytes(), "103".bytes(), false);
+            let l = early.push("link".bytes(), "</s.css>; rel=preload".bytes(), false);
+            let b = serverBlock(mut encoder, early);
+            headersFrames(rng, out, id, b.view(), false);
+        }
+        let statuses = ["200", "200", "204", "304", "404", "500"];
+        let status = statuses[rng.below(6) as usize];
+        let noContent = kind == 1 || equalsText(status.bytes(), "204") || equalsText(status.bytes(), "304");
+        let big = rng.below(16) == 0;
+        // At most 60 000 bytes, leaving the 65 535-byte window room for padding (§6.1 counts it, §6.9.1).
+        let n = if (noContent) 0 else if (big) 20000 + rng.below(40000) else rng.below(3000);
+        var spare = 65535 - n;
+        expect.answered[k] = true;
+        expect.body[k] = n;
+        let withLength = rng.below(2) == 0;
+        let lie = damaged && withLength && rng.below(8) == 0;
+        let headless = damaged && rng.below(16) == 0;
+        let withTrailers = !noContent && rng.below(4) == 0;
+        var head = HeaderBlock.create();
+        let s = head.push(":status".bytes(), status.bytes(), false);
+        if (withLength) {
+            var digits = Vector<u8>.create();
+            number(mut digits, if (kind == 1) 1234 else if (lie) n + 1 + rng.below(2) * (n + 1) else n);
+            let c = head.push("content-length".bytes(), digits.view(), false);
+        }
+        let v = head.push("server".bytes(), "fuzz".bytes(), false);
+        if (rng.below(2) == 0) {
+            let c = head.push("set-cookie".bytes(), "id=a3fWa; Secure".bytes(), true);
+        }
+        if (rng.below(2) == 0) {
+            let c = head.push("cache-control".bytes(), "no-store".bytes(), false);
+        }
+        if (damaged && rng.below(8) == 0) {
+            oddField(rng, mut head);
+        }
+        let block = serverBlock(mut encoder, head);
+        if (!headless) {
+            headersFrames(rng, out, id, block.view(), n == 0 && !withTrailers);
+        }
+        var sent: u64 = 0;
+        while (sent < n) {
+            var chunk = 1 + rng.below(16376); // room for padding within 16 384 (§4.2, §6.1)
+            if (chunk > n - sent) {
+                chunk = n - sent;
+            }
+            var body = Vector<u8>.create();
+            let pad = rng.below(8);
+            let padded = rng.below(4) == 0 && 1 + pad <= spare;
+            if (padded) {
+                spare -= 1 + pad;
+            }
+            if (padded) {
+                put(mut body, truncate<u8>(pad));
+            }
+            for (i in 0..chunk) {
+                put(mut body, truncate<u8>(97 + (sent + i) % 26));
+            }
+            if (padded) {
+                for (i in 0..pad) {
+                    put(mut body, 0);
+                }
+            }
+            sent += chunk;
+            let last = sent == n && !withTrailers;
+            frame(out, 0, (if (last) 1u8 else 0u8) | (if (padded) 8u8 else 0u8), id, body.view());
+        }
+        if (withTrailers) {
+            var t = HeaderBlock.create();
+            let c = t.push("x-checksum".bytes(), "abc".bytes(), false);
+            let b = serverBlock(mut encoder, t);
+            headersFrames(rng, out, id, b.view(), true);
+        }
+        if (damaged && rng.below(8) == 0) {
+            strayFrame(rng, plan, out);
+        }
+        match (rng.below(6)) {
+            0 => {
+                var ping = Vector<u8>.create();
+                put32(mut ping, truncate<u32>(rng.next()));
+                put32(mut ping, 9);
+                frame(out, 6, 0, 0, ping.view());
+            }
+            1 => {
+                var inc = Vector<u8>.create();
+                put32(mut inc, 1 + truncate<u32>(rng.below(1000)));
+                frame(out, 8, 0, if (rng.below(2) == 0) 0u32 else id, inc.view());
+            }
+            2 => {
+                var prio = Vector<u8>.create();
+                put32(mut prio, 0);
+                put(mut prio, 16);
+                frame(out, 2, 0, id, prio.view());
+            }
+            _ => {}
+        }
+    }
+    if (rng.below(6) == 0) {
+        var away = Vector<u8>.create();
+        put32(mut away, 2 * truncate<u32>(plan.count) - 1);
+        put32(mut away, 0);
+        frame(out, 7, 0, 0, away.view());
+    }
+}
+
+fn read32(b: Slice<u8>, at: usize) -> u32 =>
+    (b[at] as u32 << 24) | (b[at + 1] as u32 << 16) | (b[at + 2] as u32 << 8) | b[at + 3] as u32;
+
+/// A decimal `content-length` (RFC 9110 §8.6: 1*DIGIT), or null.
+fn decimalOf(v: Slice<u8>) -> u64? {
+    if (v.length == 0 || v.length > 18) {
+        return null;
+    }
+    var n: u64 = 0;
+    for (b in v) {
+        if (b < 48 || b > 57) {
+            return null;
+        }
+        n = n * 10 + (b - 48) as u64;
+    }
+    return Some(n);
+}
+
+/// What a final response's head says, checked apart from `Responses` (§8.3.2, §8.2): `ok` if well formed.
+struct Shape {
+    ok: bool;
+    status: u32;
+    hasLength: bool;
+    length: u64;
+}
+
+fn connectionSpecific(name: Slice<u8>) -> bool =>
+    equalsText(name, "connection") || equalsText(name, "keep-alive") || equalsText(name, "proxy-connection") ||
+        equalsText(name, "transfer-encoding") || equalsText(name, "upgrade");
+
+fn responseShape(head: borrow HeaderBlock) -> Shape {
+    var r = Shape { ok: false, status: 0, hasLength: false, length: 0 };
+    var regular = false;
+    var statuses: u32 = 0;
+    for (i in 0..head.count()) {
+        let name = head.name(i);
+        let value = head.value(i);
+        if (!fieldOk(name, value)) {
+            return r;
+        }
+        if (name[0] == 58) {
+            if (regular || !equalsText(name, ":status") || value.length != 3) {
+                return r; // only :status, first (§8.3, §8.3.2)
+            }
+            for (b in value) {
+                if (b < 48 || b > 57) {
+                    return r;
+                }
+            }
+            statuses += 1;
+            r.status = (value[0] - 48) as u32 * 100 + (value[1] - 48) as u32 * 10 + (value[2] - 48) as u32;
+        } else {
+            regular = true;
+            if (connectionSpecific(name)) {
+                return r; // §8.2.2
+            }
+            if (equalsText(name, "content-length")) {
+                let n = match (decimalOf(value)) {
+                    Some(n) => n,
+                    null => { return r; },
+                };
+                if (r.hasLength && r.length != n) {
+                    return r;
+                }
+                r.hasLength = true;
+                r.length = n;
+            }
+        }
+    }
+    r.ok = statuses == 1;
+    return r;
+}
+
+/// A trailer section: no pseudo-field (§8.1), and §8.2's field rules.
+fn trailersOk(head: borrow HeaderBlock) -> bool {
+    for (i in 0..head.count()) {
+        let name = head.name(i);
+        if (!fieldOk(name, head.value(i)) || name[0] == 58 || connectionSpecific(name)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// One of the client's streams, as the events tell it.
+struct Track {
+    final: bool;
+    done: bool;
+    hasLength: bool;
+    length: u64;
+    got: u64;
+}
+
+/// Whether the server's frames (walked as RFC 9113 §4.1 frames them) include a PRIORITY on `id`.
+fn prioritized(input: Slice<u8>, id: u32) -> bool {
+    var at: usize = 0;
+    while (at + 9 <= input.length) {
+        let length = (input[at] as usize << 16) | (input[at + 1] as usize << 8) | input[at + 2] as usize;
+        if (input[at + 3] == 2 && read32(input, at + 5) & 0x7FFFFFFF == id) {
+            return true;
+        }
+        at += 9 + length;
+    }
+    return false;
+}
+
+/// The plan's index of `id`, or the plan's count if the client never opened it.
+fn indexOf(id: u32, plan: borrow Plan) -> usize {
+    if (id % 2 == 0 || ((id - 1) / 2) as usize >= plan.count) {
+        return plan.count;
+    }
+    return ((id - 1) / 2) as usize;
+}
+
+/// Feeds `input` to a client with the plan's requests open, checking invariant 8; then invariant 9 on its output.
+fn runClient(
+    input: Slice<u8>,
+    plan: borrow Plan,
+    rng: borrow mut Rng,
+    whole: bool,
+    log: borrow mut Vector<u8>,
+    seen: borrow mut Seen,
+    expect: borrow Expect,
+    valid: bool,
+) {
+    let connectionWindow: u64 = 1048576;
+    var errors: u64 = 0;
+    var resets = [false; 8];
+    var engine = match (planned(plan, input)) {
+        Some(c) => c,
+        null => { return; },
+    };
+    engine.outputWritten();
+    var buffer = match (OwnedBuffer.create(input.length + 16)) {
+        Ok(b) => b,
+        Err(_) => { return; },
+    };
+    var head = HeaderBlock.create();
+    var data = Vector<u8>.create();
+    var tracks = [Track { final: false, done: false, hasLength: false, length: 0, got: 0 }; 8];
+    var total: u64 = 0;
+    var at: usize = 0;
+    var ended = false;
+    while (at < input.length && !ended) {
+        let n = if (whole) input.length - at else 1 + rng.below((input.length - at) as u64) as usize;
+        match (buffer.append(input[at..at + n])) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+        at += n;
+        loop {
+            head.clear();
+            data.clear();
+            match (engine.next(mut buffer, mut head, mut data, 0)) {
+                Ok(H2Event.NeedMore) => { break; }
+                Ok(H2Event.Request(_, _)) => { fail("a request event from a client's connection", input); }
+                Ok(H2Event.TooLarge(_)) => { fail("a 431 event from a client's connection", input); }
+                Ok(H2Event.Response(id, end)) => {
+                    let k = indexOf(id, plan);
+                    if (k == plan.count) {
+                        fail("a response on a stream the client never opened (RFC 9113 §5.1, §8.4)", input);
+                    }
+                    if (tracks[k].final || tracks[k].done) {
+                        fail("a second final response, or one after the stream ended (RFC 9113 §8.1)", input);
+                    }
+                    let shape = responseShape(head);
+                    if (!shape.ok) {
+                        fail("a response head that breaks RFC 9113 §8.2-§8.3.2", input);
+                    }
+                    if (shape.status < 200) {
+                        fail("an interim (1xx) head reported as the response (RFC 9113 §8.1)", input);
+                    }
+                    seen.responses += 1;
+                    let noContent = plan.kinds[k] == 1 || shape.status == 204 || shape.status == 304;
+                    tracks[k].final = true;
+                    tracks[k].hasLength = shape.hasLength && !noContent;
+                    tracks[k].length = shape.length;
+                    if (end) {
+                        if (tracks[k].hasLength && tracks[k].length != 0) {
+                            fail(
+                                "a response ended without the content its content-length names (RFC 9113 §8.1.1)",
+                                input,
+                            );
+                        }
+                        tracks[k].done = true;
+                    }
+                    append(log, "resp ");
+                    number(log, id as u64);
+                    append(log, if (end) " end; " else "; ");
+                }
+                Ok(H2Event.Data(id, end)) => {
+                    let k = indexOf(id, plan);
+                    if (k == plan.count) {
+                        fail("DATA on a stream the client never opened (RFC 9113 §5.1)", input);
+                    }
+                    if (!tracks[k].final || tracks[k].done) {
+                        fail("DATA before the response's head or after its end (RFC 9113 §8.1)", input);
+                    }
+                    seen.clientData += 1;
+                    tracks[k].got += data.length as u64;
+                    total += data.length as u64;
+                    if (tracks[k].got > 65535) {
+                        fail("a stream got more DATA than its window (RFC 9113 §6.9)", input);
+                    }
+                    if (total > connectionWindow) {
+                        fail("the connection got more DATA than its window (RFC 9113 §6.9)", input);
+                    }
+                    if (tracks[k].hasLength &&
+                        (tracks[k].got > tracks[k].length || (end && tracks[k].got != tracks[k].length))) {
+                        fail("DATA that does not add up to content-length (RFC 9113 §8.1.1)", input);
+                    }
+                    if (end) {
+                        tracks[k].done = true;
+                    }
+                    append(log, "data ");
+                    number(log, id as u64);
+                    append(log, " ");
+                    number(log, data.length as u64);
+                    append(log, if (end) " end; " else "; ");
+                }
+                Ok(H2Event.Trailers(id)) => {
+                    let k = indexOf(id, plan);
+                    if (k == plan.count || !tracks[k].final || tracks[k].done) {
+                        fail("trailers on a stream without a response, or after its end (RFC 9113 §8.1)", input);
+                    }
+                    if (!trailersOk(head)) {
+                        fail("a trailer section that breaks RFC 9113 §8.1-§8.2", input);
+                    }
+                    if (tracks[k].hasLength && tracks[k].got != tracks[k].length) {
+                        fail("trailers ending a body short of content-length (RFC 9113 §8.1.1)", input);
+                    }
+                    tracks[k].done = true;
+                    append(log, "trailers ");
+                    number(log, id as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.Reset(id, code)) => {
+                    let k = indexOf(id, plan);
+                    if (k == plan.count) {
+                        fail("a reset reported for a stream the client never opened", input);
+                    }
+                    tracks[k].done = true;
+                    resets[k] = true;
+                    append(log, "reset ");
+                    number(log, id as u64);
+                    append(log, " ");
+                    number(log, code as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.StreamError(id, code)) => {
+                    // Only PRIORITY, which may name any stream, makes a stream error on one never opened (§6.3, §5.3.1).
+                    // Anything else there is a connection error (§5.1).
+                    let k = indexOf(id, plan);
+                    if (k == plan.count && !prioritized(input, id)) {
+                        fail("a stream error on a stream the client never opened (a connection error, §5.1)", input);
+                    }
+                    if (k < plan.count) {
+                        tracks[k].done = true;
+                    }
+                    errors += 1;
+                    seen.clientStreamErrors += 1;
+                    append(log, "error ");
+                    number(log, id as u64);
+                    append(log, " ");
+                    number(log, code as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.WindowOpened(id)) => {
+                    if (id != 0 && indexOf(id, plan) == plan.count) {
+                        fail("a window opened on a stream the client never opened", input);
+                    }
+                    append(log, "window ");
+                    number(log, id as u64);
+                    append(log, "; ");
+                }
+                Ok(H2Event.GoAway(last, code)) => {
+                    append(log, "goaway ");
+                    number(log, last as u64);
+                    append(log, " ");
+                    number(log, code as u64);
+                    append(log, "; ");
+                }
+                Err(code) => {
+                    errors += 1;
+                    seen.clientConnectionErrors += 1;
+                    append(log, "conn ");
+                    number(log, code as u64);
+                    let g = engine.goAway(code);
+                    ended = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (valid) {
+        // An undamaged conversation: no error, every answer whole, every reset reported.
+        if (errors > 0) {
+            showLog(log.view());
+            fail("a valid server conversation gave a stream or connection error", input);
+        }
+        for (k in 0..plan.count) {
+            if (expect.answered[k] && (!tracks[k].final || !tracks[k].done || tracks[k].got != expect.body[k])) {
+                showLog(log.view());
+                fail("a valid response did not arrive whole (RFC 9113 §8.1)", input);
+            }
+            if (expect.reset[k] && !resets[k]) {
+                fail("the server's RST_STREAM was not reported", input);
+            }
+        }
+    }
+    if (!ended && buffer.readable().length == 0) {
+        // Every frame was read and none ended the connection: none was on a stream the client never opened but a
+        // PRIORITY (§5.1, idle: "any frame other than HEADERS or PRIORITY ... MUST be treated as a connection error";
+        // a HEADERS the server opens is one too).
+        var f: usize = 0;
+        while (f + 9 <= input.length) {
+            let length = (input[f] as usize << 16) | (input[f + 1] as usize << 8) | input[f + 2] as usize;
+            let kind = input[f + 3];
+            let stream = read32(input, f + 5) & 0x7FFFFFFF;
+            if (kind <= 9 && kind != 2 && stream != 0 && indexOf(stream, plan) == plan.count) {
+                fail("a frame on a stream the client never opened did not end the connection (RFC 9113 §5.1)", input);
+            }
+            f += 9 + length;
+        }
+    }
+    checkClientOutput(engine.output(), input, plan);
+    append(log, " | ");
+    putAll(log, engine.output());
+}
+
+/// Invariant 9: what the client wrote after its setup, against what the server's frames asked for (walked here as
+/// RFC 9113 §4.1 frames them, which counts at least as many as the engine accepted).
+fn checkClientOutput(out: Slice<u8>, input: Slice<u8>, plan: borrow Plan) {
+    var settingsAsked: u64 = 0;
+    var pings = Vector<u8>.create();
+    var at: usize = 0;
+    while (at + 9 <= input.length) {
+        let length = (input[at] as usize << 16) | (input[at + 1] as usize << 8) | input[at + 2] as usize;
+        if (at + 9 + length > input.length) {
+            break;
+        }
+        let kind = input[at + 3];
+        let flags = input[at + 4];
+        if (kind == 4 && flags & 1 == 0) {
+            settingsAsked += 1;
+        }
+        if (kind == 6 && flags & 1 == 0 && length == 8) {
+            putAll(mut pings, input[at + 9..at + 17]);
+        }
+        at += 9 + length;
+    }
+    var acks: u64 = 0;
+    var goaways: u32 = 0;
+    var k: usize = 0;
+    while (k + 9 <= out.length) {
+        let length = (out[k] as usize << 16) | (out[k + 1] as usize << 8) | out[k + 2] as usize;
+        let kind = out[k + 3];
+        let flags = out[k + 4];
+        let stream = read32(out, k + 5) & 0x7FFFFFFF;
+        if (length > 16384 || k + 9 + length > out.length) {
+            fail("the client's output is not whole frames of at most 16 384 (RFC 9113 §4.2)", input);
+        }
+        let payload = out[k + 9..k + 9 + length];
+        if (goaways > 0) {
+            fail("the client wrote after its GOAWAY", input);
+        }
+        if (kind == 4) {
+            if (flags != 1 || length != 0 || stream != 0) {
+                fail("the client sent SETTINGS other than an acknowledgement after its preface", input);
+            }
+            acks += 1;
+            if (acks > settingsAsked) {
+                fail("the client acknowledged SETTINGS the server never sent (RFC 9113 §6.5.3)", input);
+            }
+        } else if (kind == 6) {
+            if (flags != 1 || length != 8 || stream != 0) {
+                fail("the client sent a PING it was not asked for (RFC 9113 §6.7)", input);
+            }
+            var found = false;
+            let asked = pings.view();
+            var p: usize = 0;
+            while (p + 8 <= pings.length && !found) {
+                found = same(asked[p..p + 8], payload);
+                p += 8;
+            }
+            if (!found) {
+                fail("a PING acknowledgement echoing data no PING carried (RFC 9113 §6.7)", input);
+            }
+        } else if (kind == 8) {
+            if (length != 4 || (stream != 0 && indexOf(stream, plan) == plan.count)) {
+                fail("a WINDOW_UPDATE on a stream the client never opened", input);
+            }
+            if (read32(payload, 0) & 0x7FFFFFFF == 0) {
+                fail("a WINDOW_UPDATE of 0 (RFC 9113 §6.9)", input);
+            }
+        } else if (kind == 3) {
+            if (length != 4 || stream == 0) {
+                fail("a malformed RST_STREAM, or one on stream 0 (RFC 9113 §6.4)", input);
+            }
+            if (indexOf(stream, plan) == plan.count && !prioritized(input, stream)) {
+                fail("RST_STREAM on a stream the client never opened, not for a PRIORITY (RFC 9113 §6.4, §5.1)", input);
+            }
+        } else if (kind == 7) {
+            if (length < 8 || stream != 0) {
+                fail("a malformed GOAWAY (RFC 9113 §6.8)", input);
+            }
+            if (read32(payload, 0) & 0x7FFFFFFF != 0) {
+                fail(
+                    "a client's GOAWAY names a stream the server opened, but servers open none here (§6.8, §8.4)",
+                    input,
+                );
+            }
+            goaways += 1;
+        } else {
+            fail("the client sent a frame the driver never asked for", input);
+        }
+        k += 9 + length;
+    }
+    if (k != out.length) {
+        fail("the client's output is not whole frames", input);
+    }
+}
+
+fn clientCase(rng: borrow mut Rng, seen: borrow mut Seen) {
+    let plan = planOf(rng);
+    checkSetup(plan);
+    var input = Vector<u8>.create();
+    var expect = Expect { answered: [false; 8], reset: [false; 8], body: [0u64; 8] };
+    let valid = rng.below(8) == 0;
+    serverSeed(rng, plan, mut input, mut expect, !valid);
+    if (!valid) {
+        mutate(rng, mut input);
+    }
+    var whole = Vector<u8>.create();
+    var pieces = Vector<u8>.create();
+    runClient(input.view(), plan, rng, true, mut whole, seen, expect, valid);
+    var again = noneSeen();
+    runClient(input.view(), plan, rng, false, mut pieces, mut again, expect, valid);
+    if (!same(whole.view(), pieces.view())) {
+        fail("the client gave different events or output fed whole and in pieces", input.view());
+    }
+}
+
+/// The events so far, before a broken invariant's input.
+fn showLog(log: Slice<u8>) {
+    match (StringView.fromUtf8(log)) {
+        Some(t) => { Console.writeLine(t); }
+        null => {}
+    }
+}
+
+/// A field `x?a` whose middle byte is any octet, with a short value of any octets: well formed or not (§8.2.1).
+fn oddField(rng: borrow mut Rng, fields: borrow mut HeaderBlock) {
+    var name = Vector<u8>.create();
+    put(mut name, 120);
+    put(mut name, truncate<u8>(rng.next()));
+    put(mut name, 97);
+    var value = Vector<u8>.create();
+    let n = rng.below(4);
+    for (i in 0..n) {
+        put(mut value, truncate<u8>(rng.next()));
+    }
+    let p = fields.push(name.view(), value.view(), false);
+}
+
+/// A frame of any known type on a stream the client opened, one it did not (odd, above them, or even) or 0, with a
+/// short payload; a WINDOW_UPDATE of 0 half the time (§5.1's idle rules against §6.9's zero increment).
+fn strayFrame(rng: borrow mut Rng, plan: borrow Plan, out: borrow mut Vector<u8>) {
+    let kind = truncate<u8>(rng.below(10));
+    let stream = match (rng.below(4)) {
+        0 => 2 * truncate<u32>(rng.below(plan.count as u64)) + 1,
+        1 => 2 * truncate<u32>(plan.count + rng.below(4) as usize) + 1,
+        2 => 2 * truncate<u32>(1 + rng.below(4)),
+        _ => 0u32,
+    };
+    var payload = Vector<u8>.create();
+    if (kind == 8) {
+        put32(mut payload, if (rng.below(2) == 0) 0u32 else 1 + truncate<u32>(rng.below(100)));
+    } else {
+        let n = rng.below(10);
+        for (i in 0..n) {
+            put(mut payload, truncate<u8>(rng.next()));
+        }
+    }
+    frame(out, kind, truncate<u8>(rng.next()), stream, payload.view());
+}

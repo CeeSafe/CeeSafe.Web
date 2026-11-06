@@ -1,0 +1,442 @@
+// Who the client is, and what a proxy tells its upstream (Web ADR 0012 §3.4): trusted proxies as CIDR blocks; the
+// `Forwarded` field (RFC 7239) and `X-Forwarded-For` read right to left past trusted hops; and the fields sent on.
+// Sans-I/O: fields in, values out.
+import web_core;
+import web_transport;
+import web_http;
+
+/// One hop of a forwarding chain, as a `for=` value or an `X-Forwarded-For` element names it.
+public enum Hop {
+    /// An address (its port, if one was given; 0 otherwise).
+    Address(SocketAddress),
+    /// `unknown`, or an obfuscated identifier (`_hidden`, RFC 7239 §6.3): a hop that keeps its address to itself.
+    Hidden,
+    /// Text that is none of these, or an element without `for=`.
+    Malformed,
+}
+
+/// Which field says who the client is, when the peer is trusted.
+public enum ForwardedSource {
+    /// `Forwarded` if the request has one, else `X-Forwarded-For` (Web ADR 0012 §3.4).
+    ForwardedFirst,
+    /// `X-Forwarded-For` if the request has one, else `Forwarded`.
+    XForwardedForFirst,
+}
+
+/// Who the client is.
+public enum ClientIs {
+    /// This address.
+    Address(SocketAddress),
+    /// A hop that hid its address (`unknown`, or obfuscated).
+    Hidden,
+    /// Nobody knows: the peer's address itself is unknown (a test's transport).
+    Unknown,
+}
+
+/// The hops of a chain, left (the first proxy's client) to right (the last proxy).
+public struct Hops {
+    private list: Vector<Hop>;
+
+    /// The `for=` hops of every `Forwarded` field in `headers`, in order (RFC 7239 §4: several fields are one list).
+    /// An element without `for=`, or one that does not parse, is `Malformed`; empty elements are skipped (RFC 9110
+    /// §5.6.1.2). Commas inside a quoted string, escaped quotes included (§5.6.4), do not split. A field that ends
+    /// inside a quoted string cannot be split at all, so its last hop is `Malformed`: otherwise a client's unclosed
+    /// quote would swallow the hop a trusted proxy appended after it.
+    public fn fromForwarded(headers: borrow HeaderList) -> Result<Hops, AllocError> {
+        var list = Vector<Hop>.create();
+        for (i in 0..headers.count()) {
+            if (!Ascii.equalsIgnoringCase(headers.nameBytes(i), "forwarded")) {
+                continue;
+            }
+            let value = headers.value(i);
+            var start: usize = 0;
+            var quoted = false;
+            var k: usize = 0;
+            loop {
+                let end = k >= value.length;
+                if (!end) {
+                    let b = value[k];
+                    if (quoted && b == 92) {
+                        k += 2; // a quoted-pair
+                        continue;
+                    }
+                    if (b == 34) {
+                        quoted = !quoted;
+                    }
+                    if (quoted || b != 44) {
+                        k += 1;
+                        continue;
+                    }
+                }
+                if (end && quoted) {
+                    list.push(Hop.Malformed)?;
+                    break;
+                }
+                let element = trimWhitespace(value[start..(if (end) value.length else k)]);
+                if (element.length > 0) {
+                    list.push(forElement(element)?)?;
+                }
+                if (end) {
+                    break;
+                }
+                start = k + 1;
+                k += 1;
+            }
+        }
+        return Ok(Hops { list: list });
+    }
+
+    /// The hops of every `X-Forwarded-For` field in `headers`, in order: addresses, with or without a port (`[::1]:80`).
+    public fn fromXForwardedFor(headers: borrow HeaderList) -> Result<Hops, AllocError> {
+        var list = Vector<Hop>.create();
+        for (i in 0..headers.count()) {
+            if (!Ascii.equalsIgnoringCase(headers.nameBytes(i), "x-forwarded-for")) {
+                continue;
+            }
+            let value = headers.value(i);
+            var start: usize = 0;
+            for (k in 0..value.length + 1) {
+                if (k < value.length && value[k] != 44) {
+                    continue;
+                }
+                list.push(node(trimWhitespace(value[start..k])))?;
+                start = k + 1;
+            }
+        }
+        return Ok(Hops { list: list });
+    }
+
+    /// How many hops.
+    public fn count(borrow this) -> usize => this.list.length;
+
+    /// The `i`th hop, from the left.
+    public fn hop(borrow this, i: usize) -> Hop => this.list[i];
+}
+
+/// The `for=` hop of one `Forwarded` element (`for=…;proto=…`, RFC 7239 §4), whose quoted strings are closed:
+/// parameter names are case-insensitive, and a parameter given twice makes the element malformed (§4: "MUST NOT
+/// occur more than once").
+fn forElement(element: Slice<u8>) -> Result<Hop, AllocError> {
+    var found: Hop = Hop.Malformed;
+    var seen = false;
+    var start: usize = 0;
+    var quoted = false;
+    var k: usize = 0;
+    loop {
+        let end = k >= element.length;
+        if (!end) {
+            let b = element[k];
+            if (quoted && b == 92) {
+                k += 2;
+                continue;
+            }
+            if (b == 34) {
+                quoted = !quoted;
+            }
+            if (quoted || b != 59) {
+                k += 1;
+                continue;
+            }
+        }
+        let pair = trimWhitespace(element[start..(if (end) element.length else k)]);
+        start = k + 1;
+        k += 1;
+        var eq: usize = 0;
+        while (eq < pair.length && pair[eq] != 61) {
+            eq += 1;
+        }
+        if (eq == pair.length) {
+            if (pair.length > 0) {
+                return Ok(Hop.Malformed);
+            }
+        } else {
+            if (!Ascii.isToken(pair[0..eq])) {
+                return Ok(Hop.Malformed);
+            }
+            if (Ascii.equalsIgnoringCase(pair[0..eq], "for")) {
+                if (seen) {
+                    return Ok(Hop.Malformed);
+                }
+                seen = true;
+                found = forValue(pair[eq + 1..])?;
+            }
+        }
+        if (end) {
+            break;
+        }
+    }
+    return Ok(found);
+}
+
+/// A `for` value: a token, or a quoted string read with its quoted-pairs undone (RFC 9110 §5.6.4), as a node.
+fn forValue(value: Slice<u8>) -> Result<Hop, AllocError> {
+    if (value.length == 0 || value[0] != 34) {
+        if (value.length > 0 && value[0] == 91) {
+            return Ok(Hop.Malformed); // IPv6 must be quoted (RFC 7239 §6)
+        }
+        return Ok(node(value));
+    }
+    var text = Vector<u8>.create();
+    var k: usize = 1;
+    loop {
+        if (k >= value.length) {
+            return Ok(Hop.Malformed); // not closed
+        }
+        let b = value[k];
+        if (b == 92) {
+            if (k + 1 >= value.length) {
+                return Ok(Hop.Malformed);
+            }
+            text.push(value[k + 1])?;
+            k += 2;
+            continue;
+        }
+        if (b == 34) {
+            break;
+        }
+        text.push(b)?;
+        k += 1;
+    }
+    if (k + 1 != value.length) {
+        return Ok(Hop.Malformed); // bytes after the closing quote
+    }
+    return Ok(node(text.view()));
+}
+
+/// A node (RFC 7239 §6): an IPv4 address or `[IPv6]`, with an optional `:port`; `unknown`; or an obfuscated `_name`.
+fn node(text: Slice<u8>) -> Hop {
+    if (text.length == 0) {
+        return Hop.Malformed;
+    }
+    if (Ascii.equalsIgnoringCase(text, "unknown") || text[0] == 95) {
+        return Hop.Hidden;
+    }
+    var hostStart: usize = 0;
+    var hostEnd = text.length;
+    var port: u16 = 0;
+    if (text[0] == 91) {
+        var close: usize = 0;
+        while (close < text.length && text[close] != 93) {
+            close += 1;
+        }
+        if (close == text.length) {
+            return Hop.Malformed;
+        }
+        hostStart = 1;
+        hostEnd = close;
+        if (close + 1 < text.length) {
+            if (text[close + 1] != 58) {
+                return Hop.Malformed;
+            }
+            port = match (portOf(text[close + 2..])) {
+                Some(p) => p,
+                null => { return Hop.Malformed; },
+            };
+        }
+    } else {
+        var colons: usize = 0;
+        var last: usize = 0;
+        for (k in 0..text.length) {
+            if (text[k] == 58) {
+                colons += 1;
+                last = k;
+            }
+        }
+        if (colons == 1) {
+            hostEnd = last;
+            port = match (portOf(text[last + 1..])) {
+                Some(p) => p,
+                null => { return Hop.Malformed; },
+            };
+        }
+    }
+    if (hasZone(text[hostStart..hostEnd])) {
+        return Hop.Malformed; // RFC 7239 §6's IPv6address (RFC 3986's) has no zone
+    }
+    let hostText = match (StringView.fromUtf8(text[hostStart..hostEnd])) {
+        Some(t) => t,
+        null => { return Hop.Malformed; },
+    };
+    return match (SocketAddresses.parseIp(hostText, port)) {
+        Some(a) => Hop.Address(a),
+        null => Hop.Malformed,
+    };
+}
+
+/// A port, `0` to `65535`; an obfuscated port (`_1`) is accepted as 0.
+fn portOf(text: Slice<u8>) -> u16? {
+    if (text.length > 0 && text[0] == 95) {
+        return Some(0u16);
+    }
+    let n = Ascii.parseDecimal(text)?;
+    if (n > 65535) {
+        return null;
+    }
+    return Some(truncate<u16>(n));
+}
+
+/// Who the client is (Web ADR 0012 §3.4). A peer that is not trusted is the client, whatever its fields say. Past a
+/// trusted peer the chain is read from the right: each trusted address is skipped, and the first untrusted one is the
+/// client; a hidden hop is the client, unnamed; a malformed hop ends the walk with the last trusted address; if every
+/// hop is trusted, the left-most is the client.
+public fn clientOf(
+    peer: SocketAddress?,
+    headers: borrow HeaderList,
+    trusted: borrow TrustedProxies,
+    source: ForwardedSource,
+) -> Result<ClientIs, AllocError> {
+    let p = match (peer) {
+        Some(a) => a,
+        null => { return Ok(ClientIs.Unknown); },
+    };
+    if (!trusted.trusts(p)) {
+        return Ok(ClientIs.Address(p));
+    }
+    let forwarded = Hops.fromForwarded(headers)?;
+    let xff = Hops.fromXForwardedFor(headers)?;
+    let hops = match (source) {
+        ForwardedSource.ForwardedFirst => if (forwarded.count() > 0) forwarded else xff,
+        ForwardedSource.XForwardedForFirst => if (xff.count() > 0) xff else forwarded,
+    };
+    var last = p;
+    var i = hops.count();
+    while (i > 0) {
+        i -= 1;
+        match (hops.hop(i)) {
+            Hop.Address(a) => {
+                if (!trusted.trusts(a)) {
+                    return Ok(ClientIs.Address(a));
+                }
+                last = a;
+            }
+            Hop.Hidden => { return Ok(ClientIs.Hidden); }
+            Hop.Malformed => { return Ok(ClientIs.Address(last)); }
+        }
+    }
+    return Ok(ClientIs.Address(last));
+}
+
+/// What the proxy sends upstream about the request's origin (Web ADR 0012 §3.4): each value, or empty to send none.
+public struct ForwardingFields {
+    /// `Forwarded`: a trusted peer's chain with this hop appended, or this hop alone.
+    public forwarded: Vector<u8>;
+    /// `X-Forwarded-For`: likewise, addresses only.
+    public forwardedFor: Vector<u8>;
+    /// `X-Forwarded-Proto`: a trusted peer's, else this hop's scheme.
+    public forwardedProto: Vector<u8>;
+    /// `X-Forwarded-Host`: a trusted peer's, else the request's host.
+    public forwardedHost: Vector<u8>;
+}
+
+/// The forwarding fields for a request that came from `peer` over `scheme` (`http` or `https`) for `host`. The
+/// incoming fields are kept and extended only when `peer` is trusted; from any other peer they are replaced, never
+/// extended. `forwarded` and `xForwarded` choose which families are produced.
+public fn forwardingFields(
+    peer: SocketAddress?,
+    headers: borrow HeaderList,
+    trusted: borrow TrustedProxies,
+    scheme: StringView,
+    host: Slice<u8>,
+    forwarded: bool,
+    xForwarded: bool,
+) -> Result<ForwardingFields, AllocError> {
+    let believed = match (peer) {
+        Some(p) => trusted.trusts(p),
+        null => false,
+    };
+    var out = ForwardingFields {
+        forwarded: Vector<u8>.create(),
+        forwardedFor: Vector<u8>.create(),
+        forwardedProto: Vector<u8>.create(),
+        forwardedHost: Vector<u8>.create(),
+    };
+    if (forwarded) {
+        if (believed) {
+            joinAll(mut out.forwarded, headers, "forwarded")?;
+        }
+        if (out.forwarded.length > 0) {
+            append(mut out.forwarded, ", ".bytes())?;
+        }
+        append(mut out.forwarded, "for=".bytes())?;
+        match (peer) {
+            Some(p) => {
+                var ip = Vector<u8>.create();
+                ipText(p, mut ip)?;
+                match (p) {
+                    SocketAddress.V6(_, _, _) => {
+                        append(mut out.forwarded, "\"[".bytes())?;
+                        append(mut out.forwarded, ip.view())?;
+                        append(mut out.forwarded, "]\"".bytes())?;
+                    }
+                    _ => { append(mut out.forwarded, ip.view())?; }
+                }
+            }
+            null => { append(mut out.forwarded, "unknown".bytes())?; }
+        }
+        append(mut out.forwarded, ";proto=".bytes())?;
+        append(mut out.forwarded, scheme.bytes())?;
+        if (host.length > 0) {
+            append(mut out.forwarded, ";host=".bytes())?;
+            if (Ascii.isToken(host)) {
+                append(mut out.forwarded, host)?;
+            } else {
+                quote(mut out.forwarded, host)?;
+            }
+        }
+    }
+    if (xForwarded) {
+        if (believed) {
+            joinAll(mut out.forwardedFor, headers, "x-forwarded-for")?;
+            joinAll(mut out.forwardedProto, headers, "x-forwarded-proto")?;
+            joinAll(mut out.forwardedHost, headers, "x-forwarded-host")?;
+        }
+        match (peer) {
+            Some(p) => {
+                if (out.forwardedFor.length > 0) {
+                    append(mut out.forwardedFor, ", ".bytes())?;
+                }
+                ipText(p, mut out.forwardedFor)?;
+            }
+            null => {}
+        }
+        if (out.forwardedProto.length == 0) {
+            append(mut out.forwardedProto, scheme.bytes())?;
+        }
+        if (out.forwardedHost.length == 0) {
+            append(mut out.forwardedHost, host)?;
+        }
+    }
+    return Ok(out);
+}
+
+/// The values of every field named `name` in `headers`, joined with ", ".
+fn joinAll(out: borrow mut Vector<u8>, headers: borrow HeaderList, name: StringView) -> Result<void, AllocError> {
+    for (i in 0..headers.count()) {
+        if (!Ascii.equalsIgnoringCase(headers.nameBytes(i), name)) {
+            continue;
+        }
+        if (out.length > 0) {
+            append(out, ", ".bytes())?;
+        }
+        append(out, headers.value(i))?;
+    }
+    return Ok();
+}
+
+fn quote(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, AllocError> {
+    out.push(34)?;
+    for (b in text) {
+        if (b == 34 || b == 92) {
+            out.push(92)?;
+        }
+        out.push(b)?;
+    }
+    return out.push(34);
+}
+
+fn append(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        out.push(b)?;
+    }
+    return Ok();
+}
