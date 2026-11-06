@@ -359,9 +359,8 @@ public struct WebSocket<region r, L: RawLink> {
         var payload = [0u8; 125];
         let control = this.reader.control();
         let n = control.length;
-        for (i in 0..n) {
-            payload[i] = control[i];
-        }
+        let dest = borrow mut payload[0..n];
+        dest.copyFrom(control[0..n]);
         return await this.writeFrame(Opcode.Pong, true, payload[0..n]);
     }
 

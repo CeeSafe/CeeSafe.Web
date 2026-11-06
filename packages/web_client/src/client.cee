@@ -165,9 +165,8 @@ impl BodySource for BytesBody {
         if (n > into.length) {
             n = into.length;
         }
-        for (i in 0..n) {
-            into[i] = this.data[this.at + i];
-        }
+        let dest = borrow mut into[0..n];
+        dest.copyFrom(this.data[this.at..this.at + n]);
         this.at += n;
         return Ok(n);
     }
@@ -1215,9 +1214,8 @@ public struct ClientResponse {
                     if (n as u64 > this.left) {
                         n = truncate<usize>(this.left);
                     }
-                    for (i in 0..n) {
-                        buffer[i] = ready[i];
-                    }
+                    let dest = borrow mut buffer[0..n];
+                    dest.copyFrom(ready[0..n]);
                     consumed(mut this.carry, n)?;
                     this.left -= n as u64;
                     if (this.left == 0) {
@@ -1237,9 +1235,8 @@ public struct ClientResponse {
                             return Err(ClientError.Protocol(e));
                         },
                     };
-                    for (i in 0..step.dataLength) {
-                        buffer[i] = input[step.dataStart + i];
-                    }
+                    let dest = borrow mut buffer[0..step.dataLength];
+                    dest.copyFrom(input[step.dataStart..step.dataStart + step.dataLength]);
                     for (i in 0..step.trailerLength) {
                         pushedOk(this.trailerLines.push(input[step.trailerStart + i]))?;
                     }
@@ -1263,9 +1260,8 @@ public struct ClientResponse {
                     }
                     let ready = this.carry.readable();
                     let n = if (buffer.length < ready.length) buffer.length else ready.length;
-                    for (i in 0..n) {
-                        buffer[i] = ready[i];
-                    }
+                    let dest = borrow mut buffer[0..n];
+                    dest.copyFrom(ready[0..n]);
                     consumed(mut this.carry, n)?;
                     return Ok(n);
                 }

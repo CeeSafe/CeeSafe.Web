@@ -442,9 +442,7 @@ public fn ipText(address: SocketAddress, out: borrow mut Vector<u8>) -> Result<v
 }
 
 fn appendText(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
-    for (b in bytes) {
-        out.push(b)?;
-    }
+    out.extend(bytes)?;
     return Ok();
 }
 

@@ -55,9 +55,8 @@ impl RawLink for WebSocketConnection {
         if (!this.carry.isEmpty()) {
             let ready = this.carry.readable();
             let n = if (into.length < ready.length) into.length else ready.length;
-            for (i in 0..n) {
-                into[i] = ready[i];
-            }
+            let dest = borrow mut into[0..n];
+            dest.copyFrom(ready[0..n]);
             match (this.carry.consume(n)) {
                 Ok() => { return Ok(n); }
                 Err(_) => { return Err(HandlerError.Internal); }

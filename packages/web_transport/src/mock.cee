@@ -41,9 +41,7 @@ public struct MockTransport {
     /// A transport whose peer sends `input` and then ends its side.
     public fn create(input: Slice<u8>) -> Result<MockTransport, AllocError> {
         var v = Vector<u8>.withCapacity(input.length)?;
-        for (b in input) {
-            v.push(b)?;
-        }
+        v.extend(input)?;
         return Ok(MockTransport {
             input: v,
             at: 0,
@@ -254,9 +252,8 @@ impl Transport for MockTransport {
             return Ok(0);
         }
         let n = this.nextChunk(buffer.length);
-        for (i in 0..n) {
-            buffer[i] = this.input[this.at + i];
-        }
+        let dest = borrow mut buffer[0..n];
+        dest.copyFrom(this.input[this.at..this.at + n]);
         this.at += n;
         return Ok(n);
     }

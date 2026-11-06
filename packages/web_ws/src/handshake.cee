@@ -476,8 +476,6 @@ fn windowBits(v: Slice<u8>) -> u32 {
 }
 
 fn appendText(out: borrow mut Vector<u8>, text: StringView) -> Result<void, AllocError> {
-    for (b in text.bytes()) {
-        out.push(b)?;
-    }
+    out.extend(text.bytes())?;
     return Ok();
 }

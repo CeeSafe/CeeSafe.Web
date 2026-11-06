@@ -393,9 +393,8 @@ impl<region r> BodySource for ExchangeBody<r> {
         if (this.at < this.kept.length) {
             let ready = this.kept.view();
             let n = if (into.length < ready.length - this.at) into.length else ready.length - this.at;
-            for (i in 0..n) {
-                into[i] = ready[this.at + i];
-            }
+            let dest = borrow mut into[0..n];
+            dest.copyFrom(ready[this.at..this.at + n]);
             this.at += n;
             return Ok(n);
         }
@@ -974,8 +973,6 @@ fn grownNet(r: Result<void, AllocError>) -> Result<void, NetError> {
 }
 
 fn appendTo(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
-    for (b in bytes) {
-        out.push(b)?;
-    }
+    out.extend(bytes)?;
     return Ok();
 }
