@@ -117,6 +117,13 @@ public interface BodySource {
     /// Back to the start, to send again (a retry, a 307 or 308); false if it cannot.
     @effects()
     fn rewind(borrow mut this) -> bool;
+
+    /// Adds its trailer fields (RFC 9110 §6.5) to `into`; asked once `read` has returned 0. They go in the last chunk
+    /// of a chunked body over HTTP/1.1, or as HEADERS ending the stream over HTTP/2. A body with a known length over
+    /// HTTP/1.1 has nowhere to put them (RFC 9112 §7.1.2), so they are not asked for there, and fields that frame or
+    /// route a message are never sent.
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError>;
 }
 
 /// No body.
@@ -130,6 +137,9 @@ impl BodySource for NoBody {
 
     @effects()
     fn rewind(borrow mut this) -> bool => true;
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> => Ok();
 }
 
 /// A body held in memory: its length is known, and it can always replay.
@@ -167,6 +177,9 @@ impl BodySource for BytesBody {
         this.at = 0;
         return true;
     }
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> => Ok();
 }
 
 /// A failed attempt, and whether sending it again is safe as far as the connection goes (§3.8 rule 2).
@@ -851,17 +864,56 @@ public struct Client {
                 var size = [0u8; 24];
                 loop {
                     let got = net(await body.read(mut chunk[8..]))?;
+                    if (got == 0) {
+                        // The last chunk, its trailer section (RFC 9112 §7.1.2), and the empty line.
+                        var trailers = HeaderBlock.create();
+                        allocated(body.copyTrailers(mut trailers))?;
+                        var last = Vector<u8>.create();
+                        copyBytes(mut last, "0\r\n".bytes())?;
+                        for (i in 0..trailers.count()) {
+                            if (trailerSendable(trailers.name(i), trailers.value(i))) {
+                                copyBytes(mut last, trailers.name(i))?;
+                                copyBytes(mut last, ": ".bytes())?;
+                                copyBytes(mut last, trailers.value(i))?;
+                                copyBytes(mut last, "\r\n".bytes())?;
+                            }
+                        }
+                        copyBytes(mut last, "\r\n".bytes())?;
+                        await sendCounted(conn, last.view(), written)?;
+                        break;
+                    }
                     let start = chunkHeader(got, mut size);
                     await sendCounted(conn, size[start..], written)?;
-                    if (got == 0) {
-                        break; // "0\r\n\r\n": the last chunk and no trailers
-                    }
                     await sendCounted(conn, chunk[8..8 + got], written)?;
                     await sendCounted(conn, "\r\n".bytes(), written)?;
                 }
             }
         }
         return Ok();
+    }
+}
+
+/// Whether a request trailer may be sent: a token for a name, no control byte in its value, and not a field that frames
+/// or routes a message (RFC 9110 §6.5.1).
+fn trailerSendable(name: Slice<u8>, value: Slice<u8>) -> bool {
+    if (!Ascii.isToken(name) || Ascii.equalsIgnoringCase(name, "content-length") ||
+        Ascii.equalsIgnoringCase(name, "transfer-encoding") || Ascii.equalsIgnoringCase(name, "host") ||
+        Ascii.equalsIgnoringCase(name, "connection") || Ascii.equalsIgnoringCase(name, "te") ||
+        Ascii.equalsIgnoringCase(name, "trailer") || (name.length > 0 && name[0] == 58)) {
+        return false;
+    }
+    for (b in value) {
+        if (!Ascii.isFieldValueChar(b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn allocated(r: Result<void, AllocError>) -> Result<void, ClientError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
     }
 }
 

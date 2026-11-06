@@ -216,3 +216,37 @@ fn quick() -> ClientOptions {
     o.firstByteMs = 2000;
     return o;
 }
+
+/// A body of unknown length, "abc", with trailers: `x-sum: 42`, and a `content-length` that must never be sent as one.
+struct TrailingBody {
+    done: bool;
+}
+
+impl BodySource for TrailingBody {
+    @effects()
+    fn length(borrow this) -> u64? => null;
+
+    async fn read(borrow mut this, into: SliceMut<u8>) -> Result<usize, NetError> {
+        if (this.done) {
+            return Ok(0);
+        }
+        this.done = true;
+        let t = "abc".bytes();
+        for (i in 0..t.length) {
+            into[i] = t[i];
+        }
+        return Ok(t.length);
+    }
+
+    @effects()
+    fn rewind(borrow mut this) -> bool {
+        this.done = false;
+        return true;
+    }
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> {
+        into.push("x-sum".bytes(), "42".bytes(), false)?;
+        return into.push("content-length".bytes(), "9".bytes(), false);
+    }
+}

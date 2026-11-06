@@ -493,3 +493,23 @@ async fn an_upgrade_refused() -> Result<void, TestFailure> {
     }
     return Check.equalBytes("no".bytes(), got.view());
 }
+
+/// RFC 9112 §7.1.2: a body of unknown length goes chunked, and its trailers in the last chunk; a framing field among
+/// them is left out (RFC 9110 §6.5.1).
+@test
+async fn request_trailers_in_the_last_chunk() -> Result<void, TestFailure> {
+    let copies = match (Channel<u8>.create(8192)) {
+        Ok(c) => c,
+        Err(_) => { return Check.fail("a channel"); },
+    };
+    let scripts = scriptsOf(1)?;
+    queue(scripts, script(ok2())?.withCopiesTo(copies))?;
+    let client = mockClient(quick(), scripts, v4(1), null, null, null, false)?;
+    let post = request(Method.Post, "http://example.test/up")?;
+    var trailing = TrailingBody { done: false };
+    var got = Vector<u8>.create();
+    Check.equalU64(200, await outcome(client, await client.send(post, mut trailing), mut got) as u64)?;
+    let sent = copied(copies)?;
+    return Check.isTrue(holds(sent.view(), "\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-sum: 42\r\n\r\n") &&
+        !holds(sent.view(), "content-length"), "the trailers in the last chunk, and no framing field");
+}

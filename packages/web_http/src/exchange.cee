@@ -866,9 +866,12 @@ public struct Exchange<region r> {
             return await this.streamTrailers(trailing);
         }
         if (!this.sent) {
+            // Trailers need a chunked body (RFC 9112 §7.1.2), unless a length was declared, or there is no content.
+            let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
+            let trailing = this.responseTrailers.count() > 0 && !bodyless;
             let length = match (this.response.contentLength()) {
                 Some(n) => Some(n),
-                null => Some(this.pending.length() as u64),
+                null => if (trailing) null else Some(this.pending.length() as u64),
             };
             await this.sendHead(length)?;
         }

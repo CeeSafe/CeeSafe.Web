@@ -22,6 +22,8 @@ enum H2Command {
     Consumed(u32, usize),
     /// Reset the stream with this code (the caller gave it up).
     Reset(u32, u32),
+    /// The request's trailers, ending its stream.
+    Trailers(u32, HeaderBlock),
 }
 
 /// A stream's channels, which the request makes and the connection task keeps.
@@ -621,6 +623,9 @@ fn handleCommand(
             engineOk(engine.resetStream(id, code))?;
             endLink(links, id, total);
         }
+        H2Command.Trailers(id, fields) => {
+            engineOk(engine.sendHeaders(id, fields, true))?;
+        }
     }
     if (engine.streamsLeft() > 0 && !engine.isGoingAway()) {
         open.get().store(1);
@@ -897,6 +902,23 @@ async fn sendBody(
     loop {
         let got = net(await body.read(mut chunk[..]))?;
         if (got == 0) {
+            var trailers = HeaderBlock.create();
+            allocated(body.copyTrailers(mut trailers))?;
+            var sendable = HeaderBlock.create();
+            for (i in 0..trailers.count()) {
+                if (trailerSendable(trailers.name(i), trailers.value(i))) {
+                    allocated(
+                        sendable.push(
+                            trailers.name(i),
+                            trailers.value(i),
+                            HeaderBlock.sensitiveByDefault(trailers.name(i)),
+                        ),
+                    )?;
+                }
+            }
+            if (sendable.count() > 0) {
+                return await command(commands, H2Command.Trailers(id, sendable));
+            }
             return await command(commands, H2Command.Data(id, Vector<u8>.create(), true));
         }
         var at: usize = 0;

@@ -147,6 +147,116 @@ async fn two_requests_share_a_connection() -> Result<void, TestFailure> {
     return Check.isTrue(all.length > 24 && Ascii.equals(all[0..24], "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), "the client preface");
 }
 
+/// RFC 9113 §8.1: a request's trailers are a HEADERS frame ending its stream, after its DATA (which does not end it);
+/// a framing field among them is left out (RFC 9110 §6.5.1).
+@test
+async fn request_trailers_end_the_stream() -> Result<void, TestFailure> {
+    var server = Vector<u8>.create();
+    frameTo(mut server, FrameTypes.settings(), 0, 0, "".bytes())?;
+    let ok = block(":status: 200\n")?;
+    frameTo(mut server, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, ok.view())?;
+    let copies = match (Channel<u8>.create(65536)) {
+        Ok(c) => c,
+        Err(_) => { return Check.fail("a channel"); },
+    };
+    let scripts = scriptsOf(1)?;
+    var mock = match (MockTransport.create(server.view())) {
+        Ok(m) => m,
+        Err(_) => { return Check.fail("a mock"); },
+    };
+    queue(scripts, mock.withPause(30).withCopiesTo(copies))?;
+    scripts.close();
+    let client = h2Client(scripts)?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a drain"); },
+    };
+    var status: u16 = 0;
+    let raced: Result<Raced<bool>, NetError> = await Async.race(
+        async () => {
+            await client.run(drain)?;
+            return Ok(false);
+        },
+        async () => {
+            let post = match (ClientRequest.create(Method.Post, "http://example.test/up")) {
+                Ok(r) => r,
+                Err(_) => { return Ok(false); },
+            };
+            var trailing = TrailingBody { done: false };
+            match (await client.send(post, mut trailing)) {
+                Ok(r) => {
+                    status = r.status();
+                    return Ok(true);
+                }
+                Err(_) => { return Ok(false); }
+            }
+        },
+    );
+    match (raced) {
+        Ok(won) => { Check.isTrue(won.value && status == 200, "answered")?; }
+        Err(e) => { return Check.fail(NetErrors.describe(e)); }
+    }
+    var sent = Vector<u8>.create();
+    loop {
+        match (copies.tryRecv()) {
+            Some(b) => {
+                match (sent.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Check.fail("out of memory"); }
+                }
+            }
+            null => { break; }
+        }
+    }
+    // Stream 1's frames, its header blocks decoded in order (the client's encoder may index).
+    let all = sent.view();
+    var decoder = match (HpackDecoder.create(4096, 65536)) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a decoder"); },
+    };
+    var at: usize = 24;
+    var blocks: u32 = 0;
+    var dataEnded = false;
+    var data = Vector<u8>.create();
+    var last = HeaderBlock.create();
+    var lastEnds = false;
+    while (at + 9 <= all.length) {
+        let n = (all[at] as usize << 16) | (all[at + 1] as usize << 8) | all[at + 2] as usize;
+        let kind = all[at + 3];
+        let flags = all[at + 4];
+        let stream = all[at + 8];
+        let payload = all[at + 9..at + 9 + n];
+        at += 9 + n;
+        if (stream != 1) {
+            continue;
+        }
+        if (kind == FrameTypes.data()) {
+            for (b in payload) {
+                match (data.push(b)) {
+                    Ok() => {}
+                    Err(_) => { return Check.fail("out of memory"); }
+                }
+            }
+            dataEnded = dataEnded || (flags & FrameFlags.endStream()) != 0;
+        }
+        if (kind == FrameTypes.headers()) {
+            blocks += 1;
+            last = HeaderBlock.create();
+            match (decoder.decode(payload, mut last)) {
+                Ok() => {}
+                Err(_) => { return Check.fail("a header block the client sent"); }
+            }
+            lastEnds = (flags & FrameFlags.endStream()) != 0;
+        }
+    }
+    Check.equalBytes("abc".bytes(), data.view())?;
+    Check.isTrue(!dataEnded, "the DATA does not end the stream")?;
+    Check.isTrue(blocks == 2 && lastEnds, "a second HEADERS ends it")?;
+    Check.isTrue(last.count() == 1, "one trailer: the framing field left out")?;
+    Check.equalBytes("x-sum".bytes(), last.name(0))?;
+    return Check.equalBytes("42".bytes(), last.value(0));
+}
+
 /// Without `run`, a connection that speaks HTTP/2 is refused rather than left unread.
 @test
 async fn http2_without_run_is_refused() -> Result<void, TestFailure> {

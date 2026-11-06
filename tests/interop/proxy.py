@@ -11,7 +11,15 @@ of a Python backend that reports what reached it, so every expected value comes 
   4. h2load -n 20000 -c 10 -m 10 over h2c through the proxy to examples/server: every request succeeds;
   5. HAProxy (official Docker image) in front, sending PROXY protocol v1 and v2 (§3.4, amendment 2): the backend's
      X-Forwarded-For is the client address HAProxy saw (HAProxy also sends it as x-haproxy-src); a trusted source
-     that sends no header is dropped.
+     that sends no header is dropped;
+  6. trailers both ways: the backend's response trailers reach curl (HTTP/1.1) and nghttp (h2c), and a client's
+     request trailers reach the backend (RFC 9110 §6.5);
+  7. half-close: a client that sends its requests and then shutdown(SHUT_WR) still gets every response, over
+     HTTP/1.1 (pipelined) and h2c (three streams);
+  8. backpressure both ways (§3.5): a client that stops reading stops the backend's writes, and a backend that stops
+     reading stops the client's, each within a bounded number of bytes and with the proxy's memory bounded;
+  9. a tunnel whose peers write at once: 64 MiB each way over an upgraded connection, SHA-256 equal at both ends;
+ 10. h2load through the proxy to examples/server over an HTTP/2 (h2c) upstream (CW_UPSTREAM_H2C).
 
 Build examples/proxy and examples/server first (ceesafec build in each), then:
     python3 tests/interop/proxy.py [--skip-haproxy] [--gib N]
@@ -23,12 +31,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 PROXY = ROOT / "examples/proxy/out/proxy"
 SERVER = ROOT / "examples/server/out/server"
 BACKEND, FRONT, H2BACKEND, H2FRONT, PPFRONT, HAPROXY = 18101, 18100, 18103, 18102, 18104, 18105
+TUNNEL_BACKEND, TUNNEL_FRONT = 18107, 18108
 # examples/proxy listens on 127.0.0.1, which a bridged container reaches only through Docker Desktop's
 # host.docker.internal; on Linux HAProxy shares the host's network instead.
 LINUX = sys.platform.startswith("linux")
 BLOCK = hashlib.sha256(b"cw-m8").digest() * 2048  # 64 KiB, the download's repeating content
 
 results = []
+progress = {"down": 0, "up": 0}  # bytes the backend has written to /stream, and read from /sink
+gate = threading.Event()  # set: /sink reads on
 
 
 def check(name, cond, got):
@@ -55,6 +66,23 @@ class Backend(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
             self.connection.shutdown(socket.SHUT_RDWR)
+        elif self.path == "/trailers":
+            self.send_response(200)
+            self.send_header("transfer-encoding", "chunked")
+            self.send_header("trailer", "x-checksum")
+            self.end_headers()
+            self.wfile.write(b"5\r\nhello\r\n0\r\nx-checksum: c0ffee\r\n\r\n")
+        elif self.path.startswith("/stream/"):
+            n = int(self.path[8:])
+            progress["down"] = 0
+            self.send_response(200)
+            self.send_header("content-length", str(n))
+            self.end_headers()
+            while n > 0:
+                k = min(n, len(BLOCK))
+                self.wfile.write(BLOCK[:k])
+                progress["down"] += k
+                n -= k
         elif self.path.startswith("/bytes/"):
             n = int(self.path[7:])
             self.send_response(200)
@@ -68,14 +96,17 @@ class Backend(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if self.path == "/sink":
+            return self.sink()
         h = hashlib.sha256()
+        trailers = []
         total = 0
         if self.headers.get("transfer-encoding", "").lower() == "chunked":
             while True:
                 size = int(self.rfile.readline().split(b";")[0], 16)
                 if size == 0:
-                    while self.rfile.readline() not in (b"\r\n", b""):
-                        pass
+                    while (line := self.rfile.readline()) not in (b"\r\n", b""):
+                        trailers.append(line.decode().strip().lower())
                     break
                 left = size
                 while left:
@@ -93,7 +124,23 @@ class Backend(http.server.BaseHTTPRequestHandler):
                 h.update(chunk)
                 left -= len(chunk)
                 total += len(chunk)
+        if self.path == "/trailers":
+            return self.answer(json.dumps(trailers).encode())
         self.answer(f"{total} {h.hexdigest()}".encode())
+
+    def sink(self):
+        # Reads 1 MiB, then nothing until `gate` is set: the client's writes must stall behind it.
+        left = int(self.headers.get("content-length", "0"))
+        progress["up"] = 0
+        while left:
+            if progress["up"] >= 1 << 20:
+                gate.wait()
+            chunk = self.rfile.read(min(left, 65536))
+            if not chunk:
+                break
+            progress["up"] += len(chunk)
+            left -= len(chunk)
+        self.answer(str(progress["up"]).encode())
 
     def answer(self, body):
         self.send_response(200)
@@ -210,6 +257,188 @@ def load():
         server.kill()
 
 
+def rss_kib(p):
+    r = subprocess.run(["ps", "-o", "rss=", "-p", str(p.pid)], capture_output=True, text=True)
+    return int(r.stdout.strip() or 0)
+
+
+def trailers():
+    # curl -v does not print trailers; --raw passes the chunked framing, the last chunk's trailers with it.
+    r = curl("-v", "--raw", "-o", "-", f"http://127.0.0.1:{FRONT}/trailers")
+    check("response trailers to curl (HTTP/1.1)",
+          r.stdout == b"5\r\nhello\r\n0\r\nx-checksum: c0ffee\r\n\r\n" and b"< trailer: x-checksum" in r.stderr,
+          (r.stdout[:60], [l for l in r.stderr.decode().splitlines() if "checksum" in l]))
+    n = subprocess.run(["nghttp", "-v", f"http://127.0.0.1:{FRONT}/trailers"], capture_output=True, text=True)
+    check("response trailers to nghttp (h2c)", "x-checksum: c0ffee" in n.stdout,
+          [l.strip() for l in n.stdout.splitlines() if "checksum" in l][:2] or n.stdout[-200:])
+    with socket.create_connection(("127.0.0.1", FRONT)) as c:
+        c.sendall(b"POST /trailers HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                  b"3\r\nabc\r\n0\r\nx-request-sum: 42\r\n\r\n")
+        got = read_all(c)
+    check("request trailers to the backend", b'"x-request-sum: 42"' in got, got.split(b"\r\n\r\n")[-1][:80])
+
+
+def read_all(c):
+    out = b""
+    while chunk := c.recv(65536):
+        out += chunk
+    return out
+
+
+def h2_frame(kind, flags, stream, payload=b""):
+    return len(payload).to_bytes(3, "big") + bytes([kind, flags]) + stream.to_bytes(4, "big") + payload
+
+
+def half_close():
+    with socket.create_connection(("127.0.0.1", FRONT)) as c:
+        c.sendall(b"GET /headers HTTP/1.1\r\nhost: x\r\n\r\nGET /headers HTTP/1.1\r\nhost: x\r\n\r\n")
+        c.shutdown(socket.SHUT_WR)
+        got = read_all(c)
+    check("half-close HTTP/1.1: both pipelined responses", got.count(b"HTTP/1.1 200 OK") == 2,
+          got.count(b"HTTP/1.1 200 OK"))
+    # h2c by prior knowledge: three GETs (HPACK static indexes: :method GET 0x82, :scheme http 0x86, :path / 0x84,
+    # then /headers as a literal path, and :authority as a literal), then SHUT_WR.
+    block = b"\x82\x86\x44\x08/headers\x41\x01x"
+    out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + h2_frame(4, 0, 0)
+    for sid in (1, 3, 5):
+        out += h2_frame(1, 0x5, sid, block)  # END_STREAM | END_HEADERS
+    with socket.create_connection(("127.0.0.1", FRONT)) as c:
+        c.sendall(out)
+        c.shutdown(socket.SHUT_WR)
+        c.settimeout(10)
+        data = read_all(c)
+    ended, at = set(), 0
+    while at + 9 <= len(data):
+        n = int.from_bytes(data[at:at + 3], "big")
+        kind, flags, sid = data[at + 3], data[at + 4], int.from_bytes(data[at + 5:at + 9], "big") & 0x7FFFFFFF
+        if kind in (0, 1) and flags & 1:
+            ended.add(sid)
+        at += 9 + n
+    check("half-close h2c: three streams answered", ended == {1, 3, 5}, sorted(ended))
+
+
+def backpressure(proxy):
+    base = rss_kib(proxy)
+    total = 256 << 20
+    c = socket.create_connection(("127.0.0.1", FRONT))
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    c.sendall(f"GET /stream/{total} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n".encode())
+    got = c.recv(1 << 20)
+    time.sleep(3)
+    written, rss = progress["down"], rss_kib(proxy)
+    check("a client that stops reading stops the backend", written < 64 << 20 and rss - base < 64 << 10,
+          f"backend wrote {written >> 20} MiB of {total >> 20} while the client read {len(got) >> 10} KiB; "
+          f"proxy RSS +{(rss - base) >> 10} MiB")
+    h = hashlib.sha256(got)
+    size = len(got)
+    while chunk := c.recv(1 << 20):
+        h.update(chunk)
+        size += len(chunk)
+    c.close()
+    check("then it reads to the end", size > total and progress["down"] == total, f"{size} bytes on the wire")
+    gate.clear()
+    c = socket.create_connection(("127.0.0.1", FRONT))
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+    c.sendall(f"POST /sink HTTP/1.1\r\nhost: x\r\ncontent-length: {total}\r\nconnection: close\r\n\r\n".encode())
+    sent = [0]
+
+    def send():
+        piece = b"u" * 65536
+        try:
+            while sent[0] < total:
+                c.sendall(piece)
+                sent[0] += len(piece)
+        except OSError:
+            pass
+    t = threading.Thread(target=send, daemon=True)
+    t.start()
+    time.sleep(3)
+    stalled, rss = sent[0], rss_kib(proxy)
+    check("a backend that stops reading stops the client", stalled < 64 << 20 and rss - base < 64 << 10,
+          f"client sent {stalled >> 20} MiB of {total >> 20} while the backend read {progress['up'] >> 10} KiB; "
+          f"proxy RSS +{(rss - base) >> 10} MiB")
+    gate.set()
+    t.join(120)
+    answer = read_all(c)
+    c.close()
+    check("then the backend reads it all", answer.endswith(str(total).encode()), answer[-40:])
+
+
+TUNNEL_BYTES = 64 << 20
+
+
+def tunnel_backend(server, digests):
+    conn, _ = server.accept()
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += conn.recv(4096)
+    rest = head.split(b"\r\n\r\n", 1)[1]
+    conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n")
+    digests["backend got"] = stream_both(conn, rest)
+    conn.close()
+
+
+def stream_both(conn, already):
+    """Writes TUNNEL_BYTES of a pattern while reading TUNNEL_BYTES; the SHA-256 of what was read."""
+    def write():
+        for i in range(TUNNEL_BYTES // len(BLOCK)):
+            conn.sendall(BLOCK)
+    t = threading.Thread(target=write, daemon=True)
+    t.start()
+    h, n = hashlib.sha256(already), len(already)
+    while n < TUNNEL_BYTES:
+        chunk = conn.recv(1 << 20)
+        if not chunk:
+            break
+        h.update(chunk)
+        n += len(chunk)
+    t.join()
+    return h.hexdigest(), n
+
+
+def tunnel():
+    want = hashlib.sha256(BLOCK * (TUNNEL_BYTES // len(BLOCK))).hexdigest()
+    server = socket.create_server(("127.0.0.1", TUNNEL_BACKEND))
+    digests = {}
+    tb = threading.Thread(target=tunnel_backend, args=(server, digests), daemon=True)
+    tb.start()
+    proxy = start(PROXY, {"CW_PORT": str(TUNNEL_FRONT), "CW_BACKENDS": f"http://127.0.0.1:{TUNNEL_BACKEND}"},
+                  "proxy: listening")
+    try:
+        c = socket.create_connection(("127.0.0.1", TUNNEL_FRONT))
+        c.sendall(b"GET /t HTTP/1.1\r\nhost: x\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n")
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += c.recv(4096)
+        status, rest = head.split(b"\r\n", 1)[0], head.split(b"\r\n\r\n", 1)[1]
+        t0 = time.time()
+        client_got = stream_both(c, rest)
+        tb.join(60)
+        c.close()
+        check("tunnel, both peers writing at once", status.startswith(b"HTTP/1.1 101") and
+              client_got == (want, TUNNEL_BYTES) and digests.get("backend got") == (want, TUNNEL_BYTES),
+              f"{status.decode()}; {TUNNEL_BYTES >> 20} MiB each way in {time.time() - t0:.1f} s")
+    finally:
+        proxy.kill()
+        server.close()
+
+
+def load_h2_upstream():
+    server = start(SERVER, {"CW_PORT": str(H2BACKEND)}, "server: listening")
+    proxy = start(PROXY, {"CW_PORT": str(H2FRONT), "CW_BACKENDS": f"http://127.0.0.1:{H2BACKEND}",
+                          "CW_UPSTREAM_H2C": "1"}, "proxy: listening")
+    try:
+        r = subprocess.run(["h2load", "-n", "20000", "-c", "10", "-m", "10", f"http://127.0.0.1:{H2FRONT}/"],
+                           capture_output=True, text=True)
+        line = [l for l in r.stdout.splitlines() if l.startswith("requests:")]
+        rate = [l for l in r.stdout.splitlines() if l.startswith("finished in")]
+        check("h2load through the proxy, h2c upstream", bool(line) and "20000 succeeded" in line[0] and
+              "0 failed" in line[0], (line[0] if line else r.stdout[-300:]) + (" | " + rate[0] if rate else ""))
+    finally:
+        proxy.kill()
+        server.kill()
+
+
 def haproxy(scratch):
     upstream = "127.0.0.1" if LINUX else "host.docker.internal"
     v1, v2 = (HAPROXY, HAPROXY + 1) if LINUX else (8001, 8002)
@@ -279,11 +508,16 @@ def main():
     try:
         forwarding()
         partial()
+        trailers()
+        half_close()
+        backpressure(proxy)
         big(args.gib, scratch)
     finally:
         proxy.kill()
     limited(scratch)
     load()
+    load_h2_upstream()
+    tunnel()
     if not args.skip_haproxy:
         haproxy(scratch)
     backend.shutdown()

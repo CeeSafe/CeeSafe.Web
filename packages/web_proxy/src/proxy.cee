@@ -341,7 +341,7 @@ fn hopByHop(name: Slice<u8>) -> bool =>
     Ascii.equalsIgnoringCase(name, "connection") || Ascii.equalsIgnoringCase(name, "proxy-connection") ||
         Ascii.equalsIgnoringCase(name, "keep-alive") || Ascii.equalsIgnoringCase(name, "te") ||
         Ascii.equalsIgnoringCase(name, "transfer-encoding") || Ascii.equalsIgnoringCase(name, "upgrade") ||
-        Ascii.equalsIgnoringCase(name, "trailer") || Ascii.equalsIgnoringCase(name, "proxy-authenticate") ||
+        Ascii.equalsIgnoringCase(name, "proxy-authenticate") ||
         Ascii.equalsIgnoringCase(name, "proxy-authorization");
 
 /// Whether `name` is listed in any `Connection` field among `values` (RFC 9110 §7.6.1: those are hop-by-hop too).
@@ -435,6 +435,11 @@ impl<region r> BodySource for ExchangeBody<r> {
         this.at = 0;
         return true;
     }
+
+    /// The client's request trailers (Web ADR 0012 §3.10: relayed both ways).
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> =>
+        into.pushAll(this.exchange.trailers());
 }
 
 /// One request through the proxy.

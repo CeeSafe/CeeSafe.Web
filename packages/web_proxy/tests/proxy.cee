@@ -11,10 +11,16 @@ import web_server;
 
 struct St {}
 
-struct FixedResolver {}
+/// Every name is 10.0.0.9, unless `fails`, when no name is found.
+struct FixedResolver {
+    fails: bool;
+}
 
 impl Resolver for FixedResolver {
     async fn resolve(borrow this, host: StringView, port: u16) -> Result<Vector<SocketAddress>, NetError> {
+        if (this.fails) {
+            return Err(NetError.Io(IoError.HostNotFound));
+        }
         var v = Vector<SocketAddress>.create();
         match (v.push(SocketAddress.V4([10u8, 0, 0, 9], port))) {
             Ok() => { return Ok(v); }
@@ -23,20 +29,29 @@ impl Resolver for FixedResolver {
     }
 }
 
-/// Dials the scripted upstream connections in order; none left is `Closed`.
+/// Dials the scripted upstream connections in order; none left is refused. With `hangs`, a dial never completes.
 struct ScriptDialer {
     scripts: Channel<MockTransport>;
+    hangs: bool;
 }
 
 struct ScriptJob {
     scripts: Channel<MockTransport>;
+    hangs: bool;
 }
 
 impl DialJob for ScriptJob {
     async fn dial(borrow mut this) -> Result<PlainStream, NetError> {
+        if (this.hangs) {
+            match (await Timer.sleep(600000)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+            return Err(NetError.Closed);
+        }
         match (this.scripts.tryRecv()) {
             Some(m) => { return Ok(PlainStream.mock(m)); }
-            null => { return Err(NetError.Closed); }
+            null => { return Err(NetError.Io(IoError.ConnectionRefused)); }
         }
     }
 }
@@ -44,7 +59,7 @@ impl DialJob for ScriptJob {
 impl Dialer for ScriptDialer {
     @effects(alloc)
     fn job(borrow this, address: SocketAddress) -> Result<Box<dyn DialJob>, NetError> {
-        match (Box.create(ScriptJob { scripts: this.scripts.clone() })) {
+        match (Box.create(ScriptJob { scripts: this.scripts.clone(), hangs: this.hangs })) {
             Ok(b) => {
                 let d: Box<dyn DialJob> = b;
                 return Ok(d);
@@ -76,23 +91,69 @@ fn queued(scripts: borrow Channel<MockTransport>, m: MockTransport) -> Result<vo
 }
 
 /// A proxy to `backends` backends, all dialing `scripts`, mounted on every path for GET and POST.
-fn proxyServer(scripts: borrow Channel<MockTransport>, backends: u32) -> Result<Server<St>, TestFailure> {
-    var options = ProxyOptions.defaults();
+fn proxyServer(scripts: borrow Channel<MockTransport>, backends: u32) -> Result<Server<St>, TestFailure> =>
+    proxyServerWith(scripts, backends, ProxyOptions.defaults(), Network.Scripted);
+
+/// How the proxy reaches its backends in a test.
+enum Network {
+    Scripted,
+    NoNames,
+    DialsHang,
+    /// https backends, whose TLS handshake fails.
+    TlsFails,
+}
+
+/// A TLS connector whose handshake fails as web_tls's does when the peer leaves mid-handshake.
+struct FailingTls {}
+
+impl Connector for FailingTls {
+    async fn connect(borrow this, stream: PlainStream, host: StringView, deadline: Deadline)
+        -> Result<Box<dyn Transport + Send>, NetError> => Err(NetError.Tls(TlsReason.Handshake));
+}
+
+fn proxyServerWith(scripts: borrow Channel<MockTransport>, backends: u32, settings: ProxyOptions, network: Network)
+    -> Result<Server<St>, TestFailure> => serverFor(proxyWith(scripts, backends, settings, network)?);
+
+fn proxyWith(scripts: borrow Channel<MockTransport>, backends: u32, settings: ProxyOptions, network: Network)
+    -> Result<ReverseProxy, TestFailure> {
+    var options = settings;
     options.policy = Policy.RoundRobin;
+    let fails = match (network) {
+        Network.NoNames => true,
+        _ => false,
+    };
+    let hangs = match (network) {
+        Network.DialsHang => true,
+        _ => false,
+    };
+    let tlsFails = match (network) {
+        Network.TlsFails => true,
+        _ => false,
+    };
     var builder = ProxyBuilder.create(options);
     for (i in 0..backends) {
-        let url = if (i == 0) "http://a.test:8080/" else "http://b.test:8081/";
+        let url = if (tlsFails) "https://a.test:8443/" else if (i == 0) "http://a.test:8080/" else "http://b.test:8081/";
         match (builder.backend(url, 1)) {
             Ok() => {}
             Err(_) => { return Err(TestFailure.create("a backend")); }
         }
     }
-    let resolver: Box<dyn Resolver + Send> = boxed(Box.create(FixedResolver {}))?;
-    let dialer: Box<dyn Dialer + Send> = boxed(Box.create(ScriptDialer { scripts: scripts.clone() }))?;
-    let proxy = match (builder.buildWithNetwork(null, resolver, dialer)) {
+    let resolver: Box<dyn Resolver + Send> = boxed(Box.create(FixedResolver { fails: fails }))?;
+    let dialer: Box<dyn Dialer + Send> = boxed(Box.create(ScriptDialer { scripts: scripts.clone(), hangs: hangs }))?;
+    var tls: Box<dyn Connector + Send>? = null;
+    if (tlsFails) {
+        let failing: Box<dyn Connector + Send> = boxed(Box.create(FailingTls {}))?;
+        tls = failing;
+    }
+    let proxy = match (builder.buildWithNetwork(tls, resolver, dialer)) {
         Ok(p) => p,
         Err(_) => { return Err(TestFailure.create("the proxy")); },
     };
+    return Ok(proxy);
+}
+
+/// A server with `proxy` on every path for GET and POST.
+fn serverFor(proxy: borrow ReverseProxy) -> Result<Server<St>, TestFailure> {
     var limits = Limits.defaults();
     limits.sendDate = false;
     var server = match (Server<St>.create(St {}, limits)) {
@@ -300,4 +361,354 @@ fn alloc(r: Result<void, AllocError>) -> Result<void, TestFailure> {
         Ok() => { return Ok(); }
         Err(_) => { return Err(TestFailure.create("out of memory")); }
     }
+}
+
+/// How many scripted upstream connections were never dialed.
+fn undialed(scripts: borrow Channel<MockTransport>) -> usize {
+    var n: usize = 0;
+    loop {
+        match (scripts.tryRecv()) {
+            Some(_) => { n += 1; }
+            null => { return n; }
+        }
+    }
+}
+
+/// How often `text` occurs in `bytes`.
+fn occurrences(bytes: Slice<u8>, text: StringView) -> usize {
+    let t = text.bytes();
+    var n: usize = 0;
+    if (t.length > bytes.length) {
+        return 0;
+    }
+    for (i in 0..bytes.length - t.length + 1) {
+        var same = true;
+        for (k in 0..t.length) {
+            if (bytes[i + k] != t[k]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// `head`, then `count` bytes of `a`.
+fn padded(head: StringView, count: u32) -> Result<MockTransport, TestFailure> {
+    var v = Vector<u8>.create();
+    for (b in head.bytes()) {
+        alloc(v.push(b))?;
+    }
+    for (k in 0..count) {
+        alloc(v.push(97))?;
+    }
+    match (MockTransport.create(v.view())) {
+        Ok(m) => { return Ok(m); }
+        Err(_) => { return Err(TestFailure.create("a mock")); }
+    }
+}
+
+/// Plan §7's exit, RFC 9112 §6.1: a request with both Content-Length and Transfer-Encoding is refused with 400 before
+/// any backend is dialed, so its ambiguous framing never reaches an upstream.
+@test
+async fn a_request_with_both_lengths_is_400_and_never_sent() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    let copies = channel<u8>(65536)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")?.withCopiesTo(copies))?;
+    let server = proxyServer(scripts, 1)?;
+    let out = await served(server, "POST /x HTTP/1.1\r\nhost: example.com\r\ncontent-length: 3\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 400 "), "400")?;
+    Check.isTrue(drained(copies)?.length == 0, "nothing went upstream")?;
+    return Check.isTrue(undialed(scripts) == 1, "no backend was dialed");
+}
+
+/// Plan §7's exit, §3.7, RFC 9112 §6.3: an upstream head with both lengths, two different lengths, or a malformed
+/// status line is a 502, and that connection is discarded: the next request dials a new one (had it been kept, the
+/// bytes behind the bad head would answer it).
+@test
+async fn ambiguous_or_malformed_upstream_heads_are_502() -> Result<void, TestFailure> {
+    let heads = [
+        "HTTP/1.1 200 OK\r\ncontent-length: 4\r\ntransfer-encoding: chunked\r\n\r\n4\r\nbad!\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 4\r\ncontent-length: 5\r\n\r\nbad!",
+        "HTTP/1.1 2OO OK\r\ncontent-length: 4\r\n\r\nbad!",
+    ];
+    for (head in heads) {
+        let scripts = channel<MockTransport>(2)?;
+        queued(scripts, mock(head)?)?;
+        queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nnext")?)?;
+        let server = proxyServer(scripts, 1)?;
+        let out = await served(server, "POST /x HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\n\r\nzPOST /y HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\n\r\nz")?;
+        let expected = "HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nnext";
+        Check.equalBytes(expected.bytes(), out.view())?;
+    }
+    return Ok();
+}
+
+/// Plan §7's exit, RFC 9112 §7.1: an upstream that ends inside a chunk, after the head went out, is not relayed as
+/// complete: the client's chunked body never gets its last chunk, and a request behind it is not answered.
+@test
+async fn an_upstream_that_ends_mid_chunk_is_not_complete() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    queued(scripts, padded("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n186a0\r\n", 40000)?)?;
+    let server = proxyServer(scripts, 1)?;
+    let out = await served(server, "GET /x HTTP/1.1\r\nhost: example.com\r\n\r\nGET /y HTTP/1.1\r\nhost: example.com\r\n\r\n")?;
+    let view = out.view();
+    Check.isTrue(startsWith(view, "HTTP/1.1 200 OK\r\n"), "the head was relayed")?;
+    Check.isTrue(has(view, "\r\ntransfer-encoding: chunked\r\n"), "chunked to the client")?;
+    Check.isTrue(occurrences(view, "\r\n0\r\n\r\n") == 0, "no last chunk")?;
+    return Check.isTrue(occurrences(view, "HTTP/1.1 ") == 1, "no second response");
+}
+
+/// §3.7: once the head has gone out, a failure is not retried, even with another backend free.
+@test
+async fn no_retry_after_the_head() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    queued(scripts, padded("HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n", 40000)?)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nsecond")?)?;
+    let server = proxyServer(scripts, 2)?;
+    let out = await served(server, "GET /x HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n")?;
+    Check.isFalse(has(out.view(), "second"), "not answered by the other backend")?;
+    return Check.isTrue(undialed(scripts) == 1, "the other backend was not dialed");
+}
+
+/// §3.7: retries are capped by the budget, `retryMinimum` plus `retryPercent` of the requests. With a minimum of one
+/// and no percentage, the first failed GET is retried and the second is a 502.
+@test
+async fn the_retry_budget_caps_retries() -> Result<void, TestFailure> {
+    var options = ProxyOptions.defaults();
+    options.retryMinimum = 1;
+    options.retryPercent = 0;
+    let scripts = channel<MockTransport>(4)?;
+    queued(scripts, mock("")?)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nfirst")?)?;
+    queued(scripts, mock("")?)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecond")?)?;
+    let server = proxyServerWith(scripts, 2, options, Network.Scripted)?;
+    let out = await served(server, "GET /x HTTP/1.1\r\nhost: example.com\r\n\r\nGET /y HTTP/1.1\r\nhost: example.com\r\n\r\n")?;
+    let view = out.view();
+    Check.isTrue(startsWith(view, "HTTP/1.1 200 OK\r\n"), "the first was retried")?;
+    Check.isTrue(has(view, "\r\n\r\nfirstHTTP/1.1 502 Bad Gateway\r\n"), "the second was not")?;
+    return Check.isTrue(undialed(scripts) == 1, "the budget's end left a backend undialed");
+}
+
+/// Runs `proxy`'s active checks until `checks` requests for the check path have reached `copies` (then 10 ms more, for
+/// the last answer), or for `ms` milliseconds if `checks` is 0.
+async fn checkedFor(proxy: borrow ReverseProxy, copies: borrow Channel<u8>, checks: usize, ms: u64)
+    -> Result<void, TestFailure> {
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let r: Result<Raced<bool>, NetError> = await Async.race(
+        async () => {
+            await proxy.run(drain)?;
+            return Ok(true);
+        },
+        async () => {
+            var sent = Vector<u8>.create();
+            var waited: u64 = 0;
+            while (waited < ms) {
+                match (await Timer.sleep(2)) {
+                    Ok() => {}
+                    Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                }
+                waited += 2;
+                loop {
+                    match (copies.tryRecv()) {
+                        Some(b) => {
+                            match (sent.push(b)) {
+                                Ok() => {}
+                                Err(_) => { return Err(NetError.OutOfMemory); }
+                            }
+                        }
+                        null => { break; }
+                    }
+                }
+                if (checks > 0 && occurrences(sent.view(), "GET /health ") >= checks) {
+                    match (await Timer.sleep(10)) {
+                        Ok() => {}
+                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                    }
+                    return Ok(true);
+                }
+            }
+            return Ok(checks == 0);
+        },
+    );
+    match (r) {
+        Ok(raced) => {
+            return Check.isTrue(raced.winner == 1 && raced.value, "the checks ran as expected");
+        }
+        Err(_) => { return Err(TestFailure.create("the checks failed")); }
+    }
+}
+
+/// §3.6, §3.7: active checks against a backend that fails them (`unhealthyAfter`, 3) mark it unhealthy, and with
+/// panic mode off a request then gets 503 without a dial; after `healthyAfter` (2) passing checks it is used again.
+/// (Passive ejection alone never empties the set: at most half the backends are ejected at once.)
+@test
+async fn active_checks_and_503_with_no_usable_backend() -> Result<void, TestFailure> {
+    var options = ProxyOptions.defaults();
+    options.health.panicMode = false;
+    options.checkPath = Vector<u8>.create();
+    for (b in "/health".bytes()) {
+        alloc(options.checkPath.push(b))?;
+    }
+    options.checkIntervalMs = 20;
+    options.checkTimeoutMs = 1000;
+    let scripts = channel<MockTransport>(4)?;
+    let copies = channel<u8>(65536)?;
+    let proxy = proxyWith(scripts, 1, options, Network.Scripted)?;
+    await checkedFor(proxy, copies, 0, 150)?; // nothing to dial: every check is refused
+    let server = serverFor(proxy)?; // shares the proxy's state
+    let out = await served(server, "GET /x HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 503 "), "503 while unhealthy")?;
+    for (k in 0..2u32) {
+        queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")?.withCopiesTo(copies))?;
+    }
+    await checkedFor(proxy, copies, 2, 2000)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")?)?;
+    let again = await served(server, "GET /x HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n")?;
+    return Check.isTrue(startsWith(again.view(), "HTTP/1.1 200 OK\r\n"), "used again once healthy");
+}
+
+/// §3.7: a refused connection and a name that does not resolve are each a 502.
+@test
+async fn refused_and_unresolved_backends_are_502() -> Result<void, TestFailure> {
+    let none = channel<MockTransport>(1)?;
+    let refused = proxyServer(none, 1)?;
+    let out = await served(refused, "POST /x HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\nconnection: close\r\n\r\nz")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 502 "), "refused: 502")?;
+    let scripts = channel<MockTransport>(1)?;
+    queued(scripts, mock("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")?)?;
+    let unresolved = proxyServerWith(scripts, 1, ProxyOptions.defaults(), Network.NoNames)?;
+    let again = await served(unresolved, "POST /x HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\nconnection: close\r\n\r\nz")?;
+    Check.isTrue(startsWith(again.view(), "HTTP/1.1 502 "), "no such name: 502")?;
+    return Check.isTrue(undialed(scripts) == 1, "nothing was dialed");
+}
+
+/// §3.7: a TLS handshake that fails is a 502.
+@test
+async fn a_failed_tls_handshake_is_502() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    queued(scripts, mock("")?)?;
+    let server = proxyServerWith(scripts, 1, ProxyOptions.defaults(), Network.TlsFails)?;
+    let out = await served(server, "POST /x HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\nconnection: close\r\n\r\nz")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 502 "), "a failed handshake: 502")?;
+    return Check.isTrue(undialed(scripts) == 0, "the backend was dialed");
+}
+
+/// §3.7: a connection not made within `connectMs`, or a head not begun within `firstByteMs`, is a 504.
+@test
+async fn upstream_timeouts_are_504() -> Result<void, TestFailure> {
+    var options = ProxyOptions.defaults();
+    options.client.connectMs = 50;
+    let none = channel<MockTransport>(1)?;
+    let connecting = proxyServerWith(none, 1, options, Network.DialsHang)?;
+    let out = await served(connecting, "POST /x HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\nconnection: close\r\n\r\nz")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 504 "), "connectMs: 504")?;
+    var waiting = ProxyOptions.defaults();
+    waiting.client.firstByteMs = 50;
+    let scripts = channel<MockTransport>(1)?;
+    queued(scripts, mock("")?.withHang())?;
+    let silent = proxyServerWith(scripts, 1, waiting, Network.Scripted)?;
+    let again = await served(silent, "POST /x HTTP/1.1\r\nhost: example.com\r\ncontent-length: 1\r\nconnection: close\r\n\r\nz")?;
+    return Check.isTrue(startsWith(again.view(), "HTTP/1.1 504 "), "firstByteMs: 504");
+}
+
+/// §3.8: a tunnel whose two peers write at once. The client's bytes follow its Upgrade request, and the upstream's
+/// follow its 101, so both are there before either is read: each reaches the other side whole, and the tunnel ends when
+/// both sides have.
+@test
+async fn a_tunnel_whose_peers_write_at_once() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    let copies = channel<u8>(65536)?;
+    queued(scripts, mock("HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nfrom the upstream")?.withChunk(7).withCopiesTo(copies))?;
+    let server = proxyServer(scripts, 1)?;
+    let out = await served(server, "GET /ws HTTP/1.1\r\nhost: example.com\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\nfrom the client")?;
+    let sent = drained(copies)?;
+    Check.isTrue(startsWith(sent.view(), "GET /ws HTTP/1.1\r\n"), "the upgrade went upstream")?;
+    Check.isTrue(has(sent.view(), "\r\n\r\nfrom the client"), "the client's bytes, after the request")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 101 "), "the switch")?;
+    return Check.isTrue(has(out.view(), "\r\n\r\nfrom the upstream"), "the upstream's bytes, after the 101");
+}
+
+/// §3.8: a drain during a tunnel. The tunnel is not idle, so it does not end by itself; the server's grace period
+/// cancels it (`forced`), and the drain finishes long before `tunnelIdleMs` (5 min).
+@test
+async fn a_drain_during_a_tunnel() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    queued(scripts, mock("HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n")?.withHang())?;
+    let server = proxyServer(scripts, 1)?;
+    let service = match (serviceOf(server)) {
+        Ok(s) => s,
+        Err(_) => { return Check.fail("a service"); },
+    };
+    let toClient = channel<u8>(65536)?;
+    let incoming = match (MockIncoming.create(2)) {
+        Ok(i) => i,
+        Err(_) => { return Check.fail("a source"); },
+    };
+    let client = mock("GET /ws HTTP/1.1\r\nhost: example.com\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n")?;
+    match (incoming.push(client.withHang().withCopiesTo(toClient))) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a connection"); }
+    }
+    var limits = ConnectionLimits.defaults();
+    limits.workers = 2;
+    limits.graceMs = 100;
+    limits.closeLingerMs = 50;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a drain"); },
+    };
+    var forced = false;
+    let started = Timer.now();
+    let ran: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            let report = await ConnectionServer.run(incoming, PlainAcceptor {}, service, limits, drain)?;
+            forced = report.forced;
+            return Ok();
+        });
+        s.spawn(async () => {
+            match (await Timer.sleep(50)) {
+                Ok() => {}
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+            drain.start();
+            return Ok();
+        });
+    });
+    let took = Timer.now() - started;
+    match (ran) {
+        Ok() => {}
+        Err(_) => { return Check.fail("the server failed"); }
+    }
+    let answered = drained(toClient)?;
+    Check.isTrue(startsWith(answered.view(), "HTTP/1.1 101 "), "the tunnel was open")?;
+    Check.isTrue(forced, "the grace period ended it")?;
+    return Check.isTrue(took < 3000, "the drain finished");
+}
+
+/// §3.10, RFC 9110 §6.5: trailers are relayed both ways. A chunked request's trailers reach the upstream in its last
+/// chunk; the upstream's response trailers reach the client in the last chunk of a chunked response, even when the
+/// whole body arrived before the handler ended (a declared length would have nowhere to put them).
+@test
+async fn trailers_are_relayed_both_ways() -> Result<void, TestFailure> {
+    let scripts = channel<MockTransport>(2)?;
+    let copies = channel<u8>(65536)?;
+    let upstream = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntrailer: x-checksum\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: c0ffee\r\n\r\n";
+    queued(scripts, mock(upstream)?.withCopiesTo(copies))?;
+    let server = proxyServer(scripts, 1)?;
+    let out = await served(server, "POST /t HTTP/1.1\r\nhost: example.com\r\ntransfer-encoding: chunked\r\nte: trailers\r\nconnection: close\r\n\r\n3\r\nabc\r\n0\r\nx-request-sum: 42\r\n\r\n")?;
+    let sent = drained(copies)?;
+    Check.isTrue(has(sent.view(), "\r\ntransfer-encoding: chunked\r\n"), "chunked upstream")?;
+    Check.isTrue(has(sent.view(), "\r\n3\r\nabc\r\n0\r\nx-request-sum: 42\r\n\r\n"), "the request's trailers upstream")?;
+    Check.isTrue(startsWith(out.view(), "HTTP/1.1 200 OK\r\n"), "the status")?;
+    Check.isTrue(has(out.view(), "\r\ntransfer-encoding: chunked\r\n"), "chunked to the client")?;
+    Check.isTrue(has(out.view(), "\r\ntrailer: x-checksum\r\n"), "the trailer declaration is end-to-end")?;
+    return Check.isTrue(has(out.view(), "\r\n5\r\nhello\r\n0\r\nx-checksum: c0ffee\r\n\r\n"), "the response's trailers");
 }

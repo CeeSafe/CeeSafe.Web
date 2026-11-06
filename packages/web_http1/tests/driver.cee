@@ -159,6 +159,16 @@ async fn response_trailers_in_the_last_chunk() -> Result<void, TestFailure> {
     );
 }
 
+/// A response never flushed, with trailers, is chunked too (RFC 9112 §7.1.2): a declared length would leave the
+/// trailers nowhere to go. Without trailers it gets its length; HEAD gets neither body nor trailers.
+@test
+async fn whole_response_trailers_need_chunks() -> Result<void, TestFailure> {
+    let s = await run("GET /whole-trailers HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ntransfer-encoding: chunked\r\n\r\n5\r\nwhole\r\n0\r\nx-sum: 5\r\n\r\n", s.output)?;
+    let h = await run("HEAD /whole-trailers HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    return same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 5\r\n\r\n", h.output);
+}
+
 @test
 async fn expect_100_continue() -> Result<void, TestFailure> {
     let read = await run("POST /e HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", 4096,

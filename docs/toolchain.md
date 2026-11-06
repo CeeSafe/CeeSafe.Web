@@ -22,11 +22,12 @@ that needs an unreleased compiler is not merged to main.
 | M9 sendfile | 0.9.0 | U7 (ADR 0051) | released |
 | M10 HTTP/3 | 0.9.0 | U6 UDP (ADR 0050) | released |
 
-## Current machine (2026-11-04)
+## Current machine (2026-11-06)
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`), `~/.ceesafe/bin/ceesafec-0.18.1` | 0.18.1 (release, osx-arm64; `SHA256SUMS` checked, 2026-11-05) | the latest release, with B18 fixed |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`), `~/.ceesafe/bin/ceesafec-0.18.2` | 0.18.2 (release, tag `v0.18.2` = CeeSafe `932bb1c`, osx-arm64; installed 2026-11-06, the two files byte-identical) | the latest release |
+| `~/.ceesafe/bin/ceesafec-0.18.1` | 0.18.1 (release, osx-arm64; `SHA256SUMS` checked, 2026-11-05) | B18 fixed |
 | `~/.ceesafe/bin/ceesafec-0.18.0` | 0.18.0 (release, osx-arm64) | B18's repro only: it does not check CeeSafe.Web |
 | `~/.ceesafe/bin/ceesafec-0.17.0` | 0.17.0 (release, osx-arm64) | the last release that builds M8 unchanged |
 | `~/.ceesafe/bin/ceesafec-0.11.0` | **0.11.0** (release, tag `v0.11.0` = CeeSafe `45dde8d`; osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, checked 2026-11-04) | the toolchain for M8; `ceesafec test` runs the tests and both sweeps |
@@ -56,6 +57,11 @@ unaffected: it pins `CEESAFE_VERSION`.
 0.18.1 fixes B18 (CeeSafe ADR 0074 §8). CeeSafe.Web needed no change for it: at `fd5b387` every manifest checks with no
 diagnostic, `fmt --check` is clean, and `tools/run_tests.py` with the sanitizers and both sweeps passes 43 runs
 (2026-11-05, macOS arm64). Nothing needs 0.18.1, so M8's minimum stays 0.11.0.
+
+0.18.2 changes only the C backend: temporaries are kept out of the debug info (`CEE_TEMP`). With M8's stage-4 tree
+every package's tests pass in every mode (`python3 tools/run_tests.py --ceesafec ceesafec-0.18.2 --sanitize
+--alloc-sweep --cancel-sweep`: 43 runs, web_tls's interpreter run skipped), and every example and fuzzer checks
+(2026-11-06, macOS arm64). M8's minimum stays 0.11.0.
 
 0.10.3 (B16, B17, CeeSafe ADR 0062) is M7's minimum: the HTTP/2 server needs both fixes past ~30 connections and
 ~2 000 streams. With M7 merged it is main's minimum, and CI pins it.

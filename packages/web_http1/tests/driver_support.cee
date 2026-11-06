@@ -85,7 +85,7 @@ impl Transport for Script {
 
 /// Routes on the path:
 /// - `/stream`: writes "part1", flushes, writes "part2" (a streamed, chunked response); `/stream-trailers` the same,
-///   with the trailer `x-sum: 10`;
+///   with the trailer `x-sum: 10`; `/whole-trailers`: writes "whole" without flushing, with the trailer `x-sum: 5`;
 /// - `/ignore`: answers "ok" without reading the body;
 /// - `/fail`: fails with 404;
 /// - `/big`: 20000 bytes of `x`, length not declared; `/bigknown`: the same, declared;
@@ -111,6 +111,10 @@ impl Application for App {
             await exchange.flush()?;
             await exchange.write("part2".bytes())?;
             return exchange.trailer("x-sum", "10".bytes());
+        }
+        if (Ascii.equals(p, "/whole-trailers")) {
+            await exchange.write("whole".bytes())?;
+            return exchange.trailer("x-sum", "5".bytes());
         }
         if (Ascii.equals(p, "/stream")) {
             await exchange.write("part1".bytes())?;

@@ -355,3 +355,46 @@ async fn the_worker_reads_proxy_headers() -> Result<void, TestFailure> {
     Check.equalU64(19, handler.exact.load())?;
     return Check.equalU64(19, handler.named.load());
 }
+
+/// Web ADR 0012 §3.4: a trusted source whose header stops short, or that sends nothing, is closed when the handshake
+/// deadline passes, unserved; a slow one does not hold its worker past it.
+@test
+async fn a_short_or_late_proxy_header_is_closed_at_the_deadline() -> Result<void, TestFailure> {
+    let incoming = match (MockIncoming.create(4)) {
+        Ok(i) => i,
+        Err(_) => { return Check.fail("a source"); },
+    };
+    match (incoming.push(source("PROXY TCP4 203.0.113.7 10.0", "10.0.0.5", 64)?.withHang())) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a push"); }
+    }
+    match (incoming.push(source("", "10.0.0.6", 64)?.withHang())) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a push"); }
+    }
+    incoming.close();
+    var limits = ConnectionLimits.defaults();
+    limits.workers = 2;
+    limits.handshakeMs = 100;
+    limits.closeLingerMs = 20;
+    match (limits.proxyProtocolFrom.add("10.0.0.0/8")) {
+        Ok(true) => {}
+        _ => { return Check.fail("a block"); }
+    }
+    let handler = HeaderHandler { exact: AtomicU64.create(0), named: AtomicU64.create(0) };
+    let acceptor = PlainAcceptor {};
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Check.fail("a drain"); },
+    };
+    let started = Timer.now();
+    let report = match (await ConnectionServer.run(incoming, acceptor, handler, limits, drain)) {
+        Ok(r) => r,
+        Err(e) => { return Check.fail(NetErrors.describe(e)); },
+    };
+    let took = Timer.now() - started;
+    Check.equalU64(2, report.accepted)?;
+    Check.equalU64(0, report.served)?;
+    Check.equalU64(2, report.handshakesFailed)?;
+    return Check.isTrue(took >= 90 && took < 3000, "closed at the deadline");
+}
