@@ -301,7 +301,8 @@ Three details of §3.3 changed in the building; the design is otherwise as writt
 
 1. **The file is `borrow mut File`, not `borrow File`.** In 0.19.1, `File.readAt` takes `borrow this`, but
    `AsyncFiles.readAt` and `AsyncFiles.length` take `borrow mut File` (lib/std `async.cee:978`, `:986`; why is
-   CeeSafe's to say, and a `borrow File` version would be an upstream request, not needed now). TLS and HTTP/2 read the file that way, so `Transport.sendFile` and
+   CeeSafe's to say, and a `borrow File` version would be an upstream request, not needed now). TLS and HTTP/2
+   read the file that way, so `Transport.sendFile` and
    `Exchange.sendFile` take `borrow mut File`. A plain stream passes it on to lib/std's `sendFileAll`, which takes
    `borrow File`. The cost: one open `File` cannot be sent on two streams at once; each request opens its own, as a
    static-file handler does anyway.
@@ -310,9 +311,12 @@ Three details of §3.3 changed in the building; the design is otherwise as writt
    connection, so the file goes in slices of 1 MiB, each under its own deadline (`Transports.sendFileWithin`): a
    client must take 1 MiB per `writeTimeoutMs` (30 s by default). A chunked response sends each slice as its own
    chunk, not the whole file as one.
-3. **The copying transports share one helper.** Interfaces have no default methods, so `Transports.copyFile` (16 KiB
-   positioned reads, each written) is what `TlsTransport`, `MockTransport` and the test doubles call. TLS's piece
-   is a stack buffer in the task's frame, not a pooled one: the pool was not needed once stage 2's copies were gone.
+3. **The copying transports share one helper.** Interfaces have no default methods, so `Transports.copyFile`
+   (positioned reads, each written) is what `TlsTransport`, `MockTransport` and the test doubles call; HTTP/2's
+   `streamFile` reads the same way. The piece is 256 KiB, one heap buffer per send (`Transports.fileBuffer`), not a
+   pooled one. Each `AsyncFiles.readAt` is a round trip to a worker thread (lib/std `async.cee:978`), and with
+   16 KiB pieces sending a file over TLS or HTTP/2 was up to 3.9x slower than streaming it from memory; 256 KiB made it
+   1.5x–4.3x faster than 16 KiB, at up to 256 KiB per send in flight (M9.md, stage 3).
 
 A failed send marks the exchange done and not to be kept, so a handler that ignores the error still never completes
 the response: no last chunk over HTTP/1.1, no END_STREAM over HTTP/2 (tests `*_when_the_handler_ignores_it` in

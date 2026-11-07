@@ -60,9 +60,21 @@ public interface Transport {
 
 /// Helpers over any transport.
 public struct Transports {
-    /// The size of `copyFile`'s pieces: one TLS record's plaintext (RFC 8446 §5.1), and HTTP/2's default frame
-    /// (RFC 9113 §4.2).
-    public fn filePiece() -> usize => 16384;
+    /// The most `copyFile` reads at once. Each read is a round trip to a worker thread (CeeSafe ADR 0075 §2.1), so
+    /// the piece is large; the transport splits it into records or frames.
+    public fn filePiece() -> usize => 262144;
+
+    /// A zeroed buffer for `copyFile`'s pieces: `filePiece()` bytes, or `length` if less.
+    @effects(alloc)
+    public fn fileBuffer(length: u64) -> Result<Vector<u8>, NetError> {
+        let piece = Transports.filePiece();
+        let size: usize = if (length < piece as u64) truncate<usize>(length) else piece;
+        var buffer = Vector<u8>.create();
+        match (buffer.resize(size, 0)) {
+            Ok() => { return Ok(buffer); }
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
 
     /// Sends `length` bytes of `file` from `offset` through `t.write`, in pieces of at most `filePiece()` bytes read with
     /// `AsyncFiles.readAt` on a worker thread (CeeSafe ADR 0075 §2.1): `sendFile` for a transport that cannot hand a
@@ -73,11 +85,12 @@ public struct Transports {
         offset: u64,
         length: u64,
     ) -> Result<void, NetError> {
-        var piece = [0u8; 16384];
+        var piece = Transports.fileBuffer(length)?;
+        let size = piece.length;
         var sent: u64 = 0;
         while (sent < length) {
             let left = length - sent;
-            let want: usize = if (left < 16384) truncate<usize>(left) else 16384;
+            let want: usize = if (left < size as u64) truncate<usize>(left) else size;
             let n = match (await AsyncFiles.readAt(file, mut piece[0..want], offset + sent)) {
                 Ok(n) => n,
                 Err(e) => { return Err(NetErrors.fromAsync(e)); },

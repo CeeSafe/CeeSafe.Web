@@ -598,11 +598,15 @@ public struct Exchange<region r> {
         offset: u64,
         length: u64,
     ) -> Result<void, HandlerError> {
-        var piece = [0u8; 16384];
+        var piece = match (Transports.fileBuffer(length)) {
+            Ok(b) => b,
+            Err(e) => { return Err(HandlerError.Io(e)); },
+        };
+        let size = piece.length;
         var sent: u64 = 0;
         while (sent < length) {
             let left = length - sent;
-            let want: usize = if (left < 16384) truncate<usize>(left) else 16384;
+            let want: usize = if (left < size as u64) truncate<usize>(left) else size;
             let n = match (await AsyncFiles.readAt(file, mut piece[0..want], offset + sent)) {
                 Ok(n) => n,
                 Err(e) => { return Err(HandlerError.Io(NetErrors.fromAsync(e))); },
