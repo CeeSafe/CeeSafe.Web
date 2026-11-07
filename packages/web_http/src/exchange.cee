@@ -499,6 +499,123 @@ public struct Exchange<region r> {
         return Ok();
     }
 
+    /// Writes `length` bytes of `file` from `offset` as body, after what was written before (Web ADR 0013 §3.3): the head
+    /// first if it was not sent, and the declared length checked, as `write`. Over HTTP/1.1 the transport sends the
+    /// file itself (a plain stream: `sendfile`, nothing copied); over HTTP/2 it goes as DATA in pieces of 16 KiB. It
+    /// goes in slices of 1 MiB, each within the write timeout, so a client must take 1 MiB per `writeTimeoutMs`; a
+    /// chunked response sends each slice as a chunk. A file that ends before `length` fails with `Io(Io(InvalidInput))`
+    /// and the response is never completed: the HTTP/1.1 connection closes without the last chunk, and an HTTP/2
+    /// stream is reset, so a client sees a transfer cut short, never a short success.
+    public async fn sendFile(
+        borrow mut this,
+        file: borrow mut File,
+        offset: u64,
+        length: u64,
+    ) -> Result<void, HandlerError> {
+        if (this.done) {
+            return Err(HandlerError.Internal);
+        }
+        if (length == 0) {
+            return Ok();
+        }
+        match (await this.sendFileBody(file, offset, length)) {
+            Ok() => { return Ok(); }
+            Err(e) => {
+                this.keep = false;
+                this.done = true; // never completed: no last chunk, no END_STREAM
+                return Err(e);
+            }
+        }
+    }
+
+    async fn sendFileBody(
+        borrow mut this,
+        file: borrow mut File,
+        offset: u64,
+        length: u64,
+    ) -> Result<void, HandlerError> {
+        // What was written before goes first, with the head.
+        await this.sendPending()?;
+        let counted = this.written + length;
+        let declared = match (this.response.contentLength()) {
+            Some(n) => n,
+            null => counted,
+        };
+        if (counted > declared) {
+            return Err(HandlerError.Internal); // more than declared: the framing would be wrong
+        }
+        this.written = counted;
+        let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
+        if (bodyless) {
+            return Ok(); // HEAD, 204, 304: counted, not sent (RFC 9110 §9.3.2)
+        }
+        if (this.multiplexed) {
+            return await this.streamFile(file, offset, length);
+        }
+        let chunked = match (this.framing) {
+            ResponseFraming.Chunked => true,
+            ResponseFraming.NoContent => { return Ok(); },
+            _ => false,
+        };
+        var sent: u64 = 0;
+        while (sent < length) {
+            let slice: u64 = if (length - sent < 1048576) length - sent else 1048576;
+            if (chunked) {
+                if (this.out.spareLength() < 18) {
+                    await this.flushOut()?;
+                }
+                match (Encoder.chunkHeader(truncate<usize>(slice), this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            await this.flushOut()?;
+            match (await Transports.sendFileWithin(
+                this.conn,
+                file,
+                offset + sent,
+                slice,
+                Deadline.after(this.limits.writeTimeoutMs),
+            )) {
+                Ok() => {}
+                Err(e) => { return Err(HandlerError.Io(e)); }
+            }
+            if (chunked) {
+                match (Encoder.chunkEnd(this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            sent += slice;
+        }
+        return Ok();
+    }
+
+    /// Over a stream: positioned reads of 16 KiB on a worker thread (CeeSafe ADR 0075 §2.1), each sent as DATA.
+    async fn streamFile(
+        borrow mut this,
+        file: borrow mut File,
+        offset: u64,
+        length: u64,
+    ) -> Result<void, HandlerError> {
+        var piece = [0u8; 16384];
+        var sent: u64 = 0;
+        while (sent < length) {
+            let left = length - sent;
+            let want: usize = if (left < 16384) truncate<usize>(left) else 16384;
+            let n = match (await AsyncFiles.readAt(file, mut piece[0..want], offset + sent)) {
+                Ok(n) => n,
+                Err(e) => { return Err(HandlerError.Io(NetErrors.fromAsync(e))); },
+            };
+            if (n == 0) {
+                return Err(HandlerError.Io(NetError.Io(IoError.InvalidInput))); // the file ended before `length`
+            }
+            await this.stream.sendData(piece[0..n], false)?;
+            sent += n as u64;
+        }
+        return Ok();
+    }
+
     /// Sends everything written so far now: the head, and the body as it stands (a streaming response). The rest
     /// of the response follows chunked unless a length was declared.
     public async fn flush(borrow mut this) -> Result<void, HandlerError> {

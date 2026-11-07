@@ -294,3 +294,26 @@ Tests, with oracles outside the code:
    systems with coarse timestamps make that likelier; the README says so.
 6. **io_uring as the Linux default?** Recommended: **measure, and send the numbers to CeeSafe as a
    recommendation**. CeeSafe.Web does not override the runtime's default.
+
+## 7. Amendment 1 (2026-11-07, M9 stage 3: `sendFile` as built)
+
+Three details of §3.3 changed in the building; the design is otherwise as written.
+
+1. **The file is `borrow mut File`, not `borrow File`.** In 0.19.1, `File.readAt` takes `borrow this`, but
+   `AsyncFiles.readAt` and `AsyncFiles.length` take `borrow mut File` (lib/std `async.cee:978`, `:986`; why is
+   CeeSafe's to say, and a `borrow File` version would be an upstream request, not needed now). TLS and HTTP/2 read the file that way, so `Transport.sendFile` and
+   `Exchange.sendFile` take `borrow mut File`. A plain stream passes it on to lib/std's `sendFileAll`, which takes
+   `borrow File`. The cost: one open `File` cannot be sent on two streams at once; each request opens its own, as a
+   static-file handler does anyway.
+2. **1 MiB slices, each within the write timeout.** M1's write timeout bounds each write (`writeTimeoutMs`). One
+   deadline over a 1 GiB file would end slow but honest downloads, and none would leave a stalled client holding the
+   connection, so the file goes in slices of 1 MiB, each under its own deadline (`Transports.sendFileWithin`): a
+   client must take 1 MiB per `writeTimeoutMs` (30 s by default). A chunked response sends each slice as its own
+   chunk, not the whole file as one.
+3. **The copying transports share one helper.** Interfaces have no default methods, so `Transports.copyFile` (16 KiB
+   positioned reads, each written) is what `TlsTransport`, `MockTransport` and the test doubles call. TLS's piece
+   is a stack buffer in the task's frame, not a pooled one: the pool was not needed once stage 2's copies were gone.
+
+A failed send marks the exchange done and not to be kept, so a handler that ignores the error still never completes
+the response: no last chunk over HTTP/1.1, no END_STREAM over HTTP/2 (tests `*_when_the_handler_ignores_it` in
+`packages/web_server/tests/sendfile.cee`).

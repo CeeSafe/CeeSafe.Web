@@ -31,6 +31,13 @@ public interface Transport {
     /// Ends this side's writing (TCP FIN; TLS close_notify, then FIN). Reading still works.
     async fn shutdownWrite(borrow mut this) -> Result<void, NetError>;
 
+    /// Sends `length` bytes of `file` from `offset`, without moving its position: all of them, or an error (Web ADR
+    /// 0013 §3.3). A file that ends first is `Err(Io(InvalidInput))`, its bytes before the end sent. A plain stream
+    /// hands the file to the kernel (`sendfile`, `TransmitFile`); a transport that cannot, copies
+    /// (`Transports.copyFile`). Poisoning is as for `write`. The loan is unique because a positioned read on a worker
+    /// thread (`AsyncFiles.readAt`) needs one.
+    async fn sendFile(borrow mut this, file: borrow mut File, offset: u64, length: u64) -> Result<void, NetError>;
+
     /// The peer's address (CeeSafe ADR 0044), read when the connection was made; null for a transport without one,
     /// such as a mock, or when the kernel no longer knew it.
     @effects()
@@ -53,6 +60,37 @@ public interface Transport {
 
 /// Helpers over any transport.
 public struct Transports {
+    /// The size of `copyFile`'s pieces: one TLS record's plaintext (RFC 8446 §5.1), and HTTP/2's default frame
+    /// (RFC 9113 §4.2).
+    public fn filePiece() -> usize => 16384;
+
+    /// Sends `length` bytes of `file` from `offset` through `t.write`, in pieces of at most `filePiece()` bytes read with
+    /// `AsyncFiles.readAt` on a worker thread (CeeSafe ADR 0075 §2.1): `sendFile` for a transport that cannot hand a
+    /// file to the kernel. A file that ends first is `Err(Io(InvalidInput))`, as lib/std's `sendFileAll` reports it.
+    public async fn copyFile(
+        t: borrow mut dyn Transport,
+        file: borrow mut File,
+        offset: u64,
+        length: u64,
+    ) -> Result<void, NetError> {
+        var piece = [0u8; 16384];
+        var sent: u64 = 0;
+        while (sent < length) {
+            let left = length - sent;
+            let want: usize = if (left < 16384) truncate<usize>(left) else 16384;
+            let n = match (await AsyncFiles.readAt(file, mut piece[0..want], offset + sent)) {
+                Ok(n) => n,
+                Err(e) => { return Err(NetErrors.fromAsync(e)); },
+            };
+            if (n == 0) {
+                return Err(NetError.Io(IoError.InvalidInput)); // the file ended before `length`
+            }
+            await t.write(piece[0..n])?;
+            sent += n as u64;
+        }
+        return Ok();
+    }
+
     /// Writes every byte of `parts` (lib/std's `IoParts`, ADR 0045 §3.1), looping over `writeVectored`'s partial
     /// steps: each step sends what is left, `parts.after(sent)`.
     public async fn writeAllVectored(t: borrow mut dyn Transport, parts: borrow IoParts) -> Result<void, NetError> {
@@ -121,6 +159,25 @@ public struct Transports {
             return Err(NetError.TimedOut);
         }
         return await Async.deadline(deadline.instant(), NetError.TimedOut, async () => await t.write(bytes));
+    }
+
+    /// Sends `length` bytes of `file` from `offset` as `sendFile`, bounded by `deadline`: `Err(TimedOut)` once it passes,
+    /// and the transport is then poisoned (§3.4). A caller sending a large file gives each slice its own deadline.
+    public async fn sendFileWithin(
+        t: borrow mut dyn Transport,
+        file: borrow mut File,
+        offset: u64,
+        length: u64,
+        deadline: Deadline,
+    ) -> Result<void, NetError> {
+        if (deadline.isNever()) {
+            return await t.sendFile(file, offset, length);
+        }
+        if (deadline.isExpired()) {
+            return Err(NetError.TimedOut);
+        }
+        return await Async.deadline(deadline.instant(), NetError.TimedOut, async () =>
+            await t.sendFile(file, offset, length));
     }
 
     /// Closes gracefully: ends writing, then reads (into `scratch`, discarding) until the peer ends its side or

@@ -35,6 +35,7 @@ public struct MockTransport {
     private protocol: Alpn;
     /// Where each byte written is also sent, for a test that has handed the transport away.
     private copyTo: Channel<u8>?;
+    private fileSends: usize;
     private peer: SocketAddress?;
     private local: SocketAddress?;
 
@@ -60,6 +61,7 @@ public struct MockTransport {
             shut: false,
             protocol: Alpn.None,
             copyTo: null,
+            fileSends: 0,
             peer: null,
             local: null,
         });
@@ -154,6 +156,9 @@ public struct MockTransport {
 
     /// Everything written so far.
     public fn written(borrow this) -> Slice<u8> => this.out.view();
+
+    /// How many times `sendFile` was called: a test sees which path a driver took (Web ADR 0013 §5).
+    public fn sendFileCalls(borrow this) -> usize => this.fileSends;
 
     /// How many input bytes have been read.
     public fn consumed(borrow this) -> usize => this.at;
@@ -273,6 +278,12 @@ impl Transport for MockTransport {
             this.record(b)?;
         }
         return Ok();
+    }
+
+    /// Copies through `write` (`Transports.copyFile`), counting the call.
+    async fn sendFile(borrow mut this, file: borrow mut File, offset: u64, length: u64) -> Result<void, NetError> {
+        this.fileSends += 1;
+        return await Transports.copyFile(this, file, offset, length);
     }
 
     async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {

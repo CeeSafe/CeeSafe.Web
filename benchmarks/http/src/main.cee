@@ -8,6 +8,7 @@
 //   GET  /stream   1 MiB, written 16 KiB at a time with no declared length
 //   POST /echo     the request body back (at most 1 MiB)
 //   POST /stop     starts the drain
+//   GET  /file     the file named by CW_FILE, with `Exchange.sendFile` (Web ADR 0013 §3.3); 404 without CW_FILE
 import web_core;
 import web_transport;
 import web_http;
@@ -74,6 +75,39 @@ impl Handler<App> for Echo {
     }
 }
 
+/// The file at `path` (opened for each request, its length read then), sent with `sendFile`.
+struct FileRoute {
+    path: String?;
+}
+
+impl Handler<App> for FileRoute {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        match (borrow this.path) {
+            Some(p) => { return await sendPath(p.view(), exchange); }
+            null => { return await exchange.send(Status.notFound(), "".bytes()); }
+        }
+    }
+}
+
+async fn sendPath(path: StringView, exchange: borrow mut Exchange) -> Result<void, HandlerError> {
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(_) => { return await exchange.send(Status.notFound(), "".bytes()); },
+    };
+    let length = match (await AsyncFiles.length(mut file)) {
+        Ok(n) => n,
+        Err(_) => { return Err(HandlerError.Internal); },
+    };
+    exchange.setStatus(Status.ok());
+    exchange.setContentLength(length);
+    return await exchange.sendFile(mut file, 0, length);
+}
+
 struct Stop {}
 
 impl Handler<App> for Stop {
@@ -127,6 +161,19 @@ fn application() -> Result<Server<App>, RouteError> {
     server.router().get("/stream", handler(Box.create(Stream { piece: filled(16384)? }))?)?;
     server.router().post("/echo", handler(Box.create(Echo {}))?)?;
     server.router().post("/stop", handler(Box.create(Stop {}))?)?;
+    var served: String? = null;
+    match (Environment.variable("CW_FILE")) {
+        Some(p) => {
+            var s = String.create();
+            match (s.append(p)) {
+                Ok() => {}
+                Err(_) => { return Err(RouteError.OutOfMemory); }
+            }
+            served = Some(s);
+        }
+        null => {}
+    }
+    server.router().get("/file", handler(Box.create(FileRoute { path: served }))?)?;
     return Ok(server);
 }
 

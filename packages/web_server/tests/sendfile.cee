@@ -1,0 +1,317 @@
+// `Exchange.sendFile` (Web ADR 0013 §3.3) through `HttpService` on mock connections, with a real file in a temporary
+// directory. The expected bytes come from RFC 9112 (a length-framed body is the bytes; a chunk is its size in hex, CRLF,
+// the bytes, CRLF; the last chunk `0` CRLF CRLF, §7.1) and RFC 9113 (DATA frames, END_STREAM, RST_STREAM, §6.1, §6.4),
+// and the file's contents from `pattern`, not from the code under test. The mock counts `sendFile` calls, so a test
+// sees that HTTP/1.1 hands the file to the transport.
+import web_core;
+import web_transport;
+import web_http;
+import web_http2;
+
+/// Byte `i` of every test file: a repeating alphabet.
+fn pattern(i: usize) -> u8 => 97 + truncate<u8>(i % 26);
+
+/// A file of `size` pattern bytes, `body` in a new temporary directory.
+struct TestFile {
+    dir: String;
+    path: String;
+
+    fn create(size: usize) -> Result<TestFile, TestFailure> {
+        let dir = match (Directory.temporary()) {
+            Ok(d) => d,
+            Err(_) => { return Err(TestFailure.create("a temporary directory")); },
+        };
+        var path = String.create();
+        alloc(path.append(dir.view()))?;
+        alloc(path.append("/body"))?;
+        var file = match (File.create(path.view())) {
+            Ok(f) => f,
+            Err(_) => { return Err(TestFailure.create("the file")); },
+        };
+        var block = [0u8; 4096];
+        var at: usize = 0;
+        while (at < size) {
+            let n = if (size - at < 4096) size - at else 4096;
+            for (i in 0..n) {
+                block[i] = pattern(at + i);
+            }
+            match (file.write(block[0..n])) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("writing the file")); }
+            }
+            at += n;
+        }
+        return Ok(TestFile { dir: dir, path: path });
+    }
+
+    fn remove(borrow this) {
+        let f = File.remove(this.path.view());
+        let d = Directory.remove(this.dir.view());
+    }
+}
+
+/// `TestFile.create` on a worker thread: a test is async, and must not block its thread.
+async fn madeFile(size: usize) -> Result<TestFile, TestFailure> => await Async.blocking(() => TestFile.create(size));
+
+/// `TestFile.remove` on a worker thread.
+async fn removed(file: borrow mut TestFile) {
+    await Async.blocking(() => file.remove());
+}
+
+/// Sends the file at `path`: `length` bytes from 0 (the file's own length if null), declared as the content length
+/// when `declare`, after `prefix` written the ordinary way.
+struct FileBody {
+    path: String;
+    length: u64?;
+    declare: bool;
+    prefix: bool;
+    /// Returns Ok whatever `sendFile` returned, as a careless handler would.
+    swallow: bool;
+}
+
+impl Handler<St> for FileBody {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var file = match (await AsyncFiles.open(this.path.view())) {
+            Ok(f) => f,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        let size = match (this.length) {
+            Some(n) => n,
+            null => match (await AsyncFiles.length(mut file)) {
+                Ok(n) => n,
+                Err(_) => { return Err(HandlerError.Internal); },
+            },
+        };
+        exchange.setStatus(Status.ok());
+        let extra: u64 = if (this.prefix) 1 else 0;
+        if (this.declare) {
+            exchange.setContentLength(size + extra);
+        }
+        if (this.prefix) {
+            await exchange.write("<".bytes())?;
+        }
+        let sent = await exchange.sendFile(mut file, 0, size);
+        if (this.swallow) {
+            return Ok();
+        }
+        return sent;
+    }
+}
+
+/// What a connection wrote, and how many times `sendFile` was called on it.
+struct Served {
+    out: Vector<u8>;
+    calls: usize;
+}
+
+/// Serves `request` on one mock connection whose `/f` route is `handler`. An HTTP/2 connection ends when it has been
+/// idle for 200 ms.
+async fn servedFile(request: Slice<u8>, handler: FileBody, h2: bool) -> Result<Served, TestFailure> {
+    var limits = quiet();
+    limits.idleTimeoutMs = 200;
+    var s = routed(Server<St>.create(state()?, limits))?;
+    let h: Box<dyn Handler<St> + Send> = alloc(Box.create(handler))?;
+    added(s.router().get("/f", h))?;
+    let service = net(serviceOf(s))?;
+    let drain = net(Drain.create())?;
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    var c = alloc(MockTransport.create(request))?;
+    if (h2) {
+        c = c.withHang();
+    }
+    netDone(await service.serve(mut c, ctx))?;
+    var out = Vector<u8>.create();
+    alloc(out.extend(c.written()))?;
+    return Ok(Served { out: out, calls: c.sendFileCalls() });
+}
+
+fn handlerFor(file: borrow TestFile, length: u64?, declare: bool, prefix: bool) -> Result<FileBody, TestFailure> =>
+    handlerOf(file, length, declare, prefix, false);
+
+fn handlerOf(
+    file: borrow TestFile,
+    length: u64?,
+    declare: bool,
+    prefix: bool,
+    swallow: bool,
+) -> Result<FileBody, TestFailure> {
+    var path = String.create();
+    alloc(path.append(file.path.view()))?;
+    return Ok(FileBody { path: path, length: length, declare: declare, prefix: prefix, swallow: swallow });
+}
+
+/// `head`, then `size` pattern bytes from `from`.
+fn expected(head: StringView, from: usize, size: usize) -> Result<Vector<u8>, TestFailure> {
+    var v = Vector<u8>.create();
+    alloc(v.extend(head.bytes()))?;
+    for (i in 0..size) {
+        alloc(v.push(pattern(from + i)))?;
+    }
+    return Ok(v);
+}
+
+@test
+async fn http1_hands_the_file_to_the_transport() -> Result<void, TestFailure> {
+    var file = await madeFile(100000)?;
+    let r = await servedFile("GET /f HTTP/1.1\r\nhost: a\r\n\r\n".bytes(), handlerFor(borrow file, null, true, false)?, false);
+    await removed(mut file);
+    let s = r?;
+    let want = expected("HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n", 0, 100000)?;
+    Check.equalBytes(want.view(), s.out.view())?;
+    return Check.equalU64(1, s.calls as u64);
+}
+
+@test
+async fn http1_chunked_sends_a_chunk_per_mebibyte() -> Result<void, TestFailure> {
+    // "<" written first, then 1 MiB + 10 bytes of file: three chunks, the file's two from two `sendFile` calls.
+    let size: usize = 1048586;
+    var file = await madeFile(size)?;
+    let r = await servedFile("GET /f HTTP/1.1\r\nhost: a\r\n\r\n".bytes(), handlerFor(borrow file, null, false, true)?, false);
+    await removed(mut file);
+    let s = r?;
+    var want = expected("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\n<\r\n100000\r\n", 0, 1048576)?;
+    alloc(want.extend("\r\na\r\n".bytes()))?;
+    for (i in 0..10usize) {
+        alloc(want.push(pattern(1048576 + i)))?;
+    }
+    alloc(want.extend("\r\n0\r\n\r\n".bytes()))?;
+    Check.equalBytes(want.view(), s.out.view())?;
+    return Check.equalU64(2, s.calls as u64);
+}
+
+@test
+async fn http1_a_short_file_is_never_complete() -> Result<void, TestFailure> {
+    // 1 000 bytes promised and declared, 600 in the file: the 600 go, then the connection ends (RFC 9112 §6.3: the
+    // client sees fewer bytes than content-length, an incomplete message).
+    var file = await madeFile(600)?;
+    let r = await servedFile("GET /f HTTP/1.1\r\nhost: a\r\n\r\nGET /f HTTP/1.1\r\nhost: a\r\n\r\n".bytes(), handlerFor(borrow file, Some(1000), true, false)?, false);
+    await removed(mut file);
+    let s = r?;
+    let want = expected("HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n", 0, 600)?;
+    return Check.equalBytes(want.view(), s.out.view()); // and not the second request's answer
+}
+
+@test
+async fn http1_chunked_a_short_file_has_no_last_chunk() -> Result<void, TestFailure> {
+    var file = await madeFile(600)?;
+    let r = await servedFile("GET /f HTTP/1.1\r\nhost: a\r\n\r\n".bytes(), handlerFor(borrow file, Some(1000), false, false)?, false);
+    await removed(mut file);
+    let s = r?;
+    // The chunk's size line promised 1 000 (0x3e8); 600 bytes follow, and nothing after them.
+    let want = expected("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3e8\r\n", 0, 600)?;
+    return Check.equalBytes(want.view(), s.out.view());
+}
+
+@test
+async fn http1_head_sends_the_length_and_no_body() -> Result<void, TestFailure> {
+    var file = await madeFile(5000)?;
+    let r = await servedFile("HEAD /f HTTP/1.1\r\nhost: a\r\n\r\n".bytes(), handlerFor(borrow file, null, true, false)?, false);
+    await removed(mut file);
+    let s = r?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 5000\r\n\r\n".bytes(), s.out.view())?;
+    return Check.equalU64(0, s.calls as u64);
+}
+
+/// The preface, an empty SETTINGS and `GET /f` on stream 1 (RFC 7541's static table: 2 `:method GET`, 7 `:scheme
+/// https`; `:path` index 4 and `:authority` 1 as literals with incremental indexing).
+fn h2Get() -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    alloc(out.extend("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".bytes()))?;
+    let settings = [0u8, 0, 0, 4, 0, 0, 0, 0, 0];
+    alloc(out.extend(settings[..]))?;
+    let headers = [0u8, 0, 9, 1, 5, 0, 0, 0, 1];
+    alloc(out.extend(headers[..]))?;
+    let block = [0x82u8, 0x87, 0x44, 2, 0x2F, 0x66, 0x41, 1, 0x61];
+    alloc(out.extend(block[..]))?;
+    return Ok(out);
+}
+
+/// Stream 1's DATA payloads in order, whether one ended the stream, and whether it was reset.
+struct H2Body {
+    data: Vector<u8>;
+    ended: bool;
+    reset: bool;
+}
+
+fn h2Body(out: Slice<u8>) -> Result<H2Body, TestFailure> {
+    var b = H2Body { data: Vector<u8>.create(), ended: false, reset: false };
+    var at: usize = 0;
+    while (at + 9 <= out.length) {
+        let length = (out[at] as usize << 16) | (out[at + 1] as usize << 8) | out[at + 2] as usize;
+        let kind = out[at + 3];
+        let flags = out[at + 4];
+        let stream = (out[at + 5] as u32 << 24) | (out[at + 6] as u32 << 16) | (out[at + 7] as u32 << 8) | out[at + 8] as u32;
+        if (at + 9 + length > out.length) {
+            return Err(TestFailure.create("a frame cut short"));
+        }
+        if (stream == 1 && kind == 0) {
+            alloc(b.data.extend(out[at + 9..at + 9 + length]))?;
+            if ((flags & 1) == 1) {
+                b.ended = true;
+            }
+        }
+        if (stream == 1 && kind == 3) {
+            b.reset = true;
+        }
+        at += 9 + length;
+    }
+    return Ok(b);
+}
+
+@test
+async fn h2_sends_the_file_as_data() -> Result<void, TestFailure> {
+    // 40 000 bytes: within the default 65 535-byte windows (RFC 9113 §6.9.2), in frames of at most 16 384 (§4.2).
+    var file = await madeFile(40000)?;
+    let request = h2Get()?;
+    let r = await servedFile(request.view(), handlerFor(borrow file, null, true, false)?, true);
+    await removed(mut file);
+    let s = r?;
+    let b = h2Body(s.out.view())?;
+    let want = expected("", 0, 40000)?;
+    Check.equalBytes(want.view(), b.data.view())?;
+    Check.isTrue(b.ended, "END_STREAM")?;
+    return Check.isFalse(b.reset, "no RST_STREAM");
+}
+
+@test
+async fn h2_a_short_file_resets_the_stream() -> Result<void, TestFailure> {
+    var file = await madeFile(600)?;
+    let request = h2Get()?;
+    let r = await servedFile(request.view(), handlerFor(borrow file, Some(1000), true, false)?, true);
+    await removed(mut file);
+    let s = r?;
+    let b = h2Body(s.out.view())?;
+    Check.isFalse(b.ended, "never END_STREAM")?;
+    return Check.isTrue(b.reset, "RST_STREAM on stream 1");
+}
+
+@test
+async fn http1_a_short_file_stays_incomplete_when_the_handler_ignores_it() -> Result<void, TestFailure> {
+    // The handler returns Ok after the failed send: still no last chunk, and the connection still ends.
+    var file = await madeFile(600)?;
+    let r = await servedFile(
+        "GET /f HTTP/1.1\r\nhost: a\r\n\r\nGET /f HTTP/1.1\r\nhost: a\r\n\r\n".bytes(),
+        handlerOf(borrow file, Some(1000), false, false, true)?,
+        false,
+    );
+    await removed(mut file);
+    let s = r?;
+    let want = expected("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3e8\r\n", 0, 600)?;
+    return Check.equalBytes(want.view(), s.out.view());
+}
+
+@test
+async fn h2_a_short_file_never_ends_the_stream_when_the_handler_ignores_it() -> Result<void, TestFailure> {
+    var file = await madeFile(600)?;
+    let request = h2Get()?;
+    let r = await servedFile(request.view(), handlerOf(borrow file, Some(1000), true, false, true)?, true);
+    await removed(mut file);
+    let s = r?;
+    let b = h2Body(s.out.view())?;
+    return Check.isFalse(b.ended, "never END_STREAM");
+}

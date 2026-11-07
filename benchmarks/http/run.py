@@ -2,7 +2,7 @@
 """M9's request-rate benchmark (Web ADR 0013 §3.1), against benchmarks/http's server.
 
 usage: python3 benchmarks/http/run.py [--duration 10] [--conns 1,10,100] [--modes h1,h2c,tls-h1,tls-h2]
-                                      [--routes small,4k,64k,stream,echo] [--json out.json] [--nginx]
+                                      [--routes small,4k,64k,stream,echo,file] [--json out.json] [--nginx]
 
 For each mode (HTTP/1.1 and h2c in clear, HTTP/1.1 and h2 over TLS), route and connection count, h2load runs for
 `duration` seconds after a one-second warm-up, one request at a time on each connection (`-m 1`, so HTTP/2 is not
@@ -15,6 +15,9 @@ script's own, from the raw samples. Reported:
 The server is built first (`ceesafec build`, with the ceesafec on PATH unless --ceesafec). TLS uses a self-signed
 P-256 certificate made with `openssl` in a temporary directory.
 
+`/file` is a 1 MiB file sent with `Exchange.sendFile` (Web ADR 0013 §3.3; the server's CW_FILE), the same bytes as
+`/stream`, which the handler writes from memory.
+
 `--nginx` runs the same routes against nginx (on PATH), one worker per core, `sendfile on`, the bodies as files
 (`/stream` as a 1 MiB file, `/echo` left out): a reference, not a target. Allocations do not apply to it.
 """
@@ -25,8 +28,14 @@ SERVER = HERE / "out" / "bench_http"
 PORT = 18190
 # The allocation runs: (warm-up, counted) requests per route; the large bodies need fewer.
 COUNTS = {"small": (2000, 20000), "4k": (2000, 20000), "64k": (500, 5000), "stream": (100, 1000),
-          "echo": (2000, 20000)}
-ROUTES = {"small": "/small", "4k": "/4k", "64k": "/64k", "stream": "/stream", "echo": "/echo"}
+          "echo": (2000, 20000), "file": (100, 1000)}
+ROUTES = {"small": "/small", "4k": "/4k", "64k": "/64k", "stream": "/stream", "echo": "/echo", "file": "/file"}
+
+
+def mebibyte(path):
+    """The 1 MiB file `/file` serves: the alphabet `/stream` repeats."""
+    path.write_bytes(bytes(97 + i % 26 for i in range(1048576)))
+    return path
 
 
 def build(ceesafec):
@@ -56,7 +65,7 @@ def wait_port(port, seconds=10):
 
 class Server:
     def __init__(self, tls, scratch, alloc=False):
-        env = dict(os.environ, CW_PORT=str(PORT), CW_WORKERS="256")
+        env = dict(os.environ, CW_PORT=str(PORT), CW_WORKERS="256", CW_FILE=str(scratch / "file"))
         if alloc:
             env["CEESAFE_ALLOC_REPORT"] = "1"
         if tls:
@@ -186,7 +195,7 @@ def main():
     ap.add_argument("--duration", type=int, default=10)
     ap.add_argument("--conns", default="1,10,100")
     ap.add_argument("--modes", default="h1,h2c,tls-h1,tls-h2")
-    ap.add_argument("--routes", default="small,4k,64k,stream,echo")
+    ap.add_argument("--routes", default="small,4k,64k,stream,echo,file")
     ap.add_argument("--ceesafec", default="ceesafec")
     ap.add_argument("--json")
     ap.add_argument("--nginx", action="store_true")
@@ -198,6 +207,7 @@ def main():
     tls = certificate(scratch)
     body = scratch / "body"
     body.write_bytes(b"x" * 4096)
+    mebibyte(scratch / "file")
     results = []
     try:
         if args.nginx:
@@ -234,7 +244,7 @@ def run_nginx(args, modes, routes, conns, scratch, results):
     root = scratch / "root"
     root.mkdir()
     (root / "small").write_bytes(b"hello, world\n")
-    for name, size in (("4k", 4096), ("64k", 65536), ("stream", 1048576)):
+    for name, size in (("4k", 4096), ("64k", 65536), ("stream", 1048576), ("file", 1048576)):
         (root / name).write_bytes(bytes(97 + i % 26 for i in range(size)))
     conf = nginx_config(scratch, root)
     p = subprocess.Popen(["nginx", "-c", str(conf), "-p", str(scratch)], stdout=subprocess.DEVNULL,

@@ -282,6 +282,15 @@ impl Transport for TlsTransport {
         return Ok(total);
     }
 
+    /// Positioned reads of one record's plaintext (16 KiB) on a worker thread, each encrypted and written
+    /// (`Transports.copyFile`, Web ADR 0013 §3.3): the kernel cannot encrypt, so the bytes pass through.
+    async fn sendFile(borrow mut this, file: borrow mut File, offset: u64, length: u64) -> Result<void, NetError> {
+        if (this.poisoned) {
+            return Err(NetError.Closed);
+        }
+        return await Transports.copyFile(this, file, offset, length);
+    }
+
     /// Sends close_notify, then ends the stream's writing.
     /// Safety: `conn` is this transport's live context.
     async fn shutdownWrite(borrow mut this) -> Result<void, NetError> {
