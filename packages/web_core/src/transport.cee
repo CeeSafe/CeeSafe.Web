@@ -34,8 +34,9 @@ public interface Transport {
     /// Sends `length` bytes of `file` from `offset`, without moving its position: all of them, or an error (Web ADR
     /// 0013 §3.3). A file that ends first is `Err(Io(InvalidInput))`, its bytes before the end sent. A plain stream
     /// hands the file to the kernel (`sendfile`, `TransmitFile`); a transport that cannot, copies
-    /// (`Transports.copyFile`). Poisoning is as for `write`. The loan is unique because a positioned read on a worker
-    /// thread (`AsyncFiles.readAt`) needs one.
+    /// (`Transports.copyFile`). Any failure poisons the transport, a short file too: some of the bytes may have gone,
+    /// as with a failed `write`. The loan is unique because a positioned read on a worker thread (`AsyncFiles.readAt`)
+    /// needs one.
     async fn sendFile(borrow mut this, file: borrow mut File, offset: u64, length: u64) -> Result<void, NetError>;
 
     /// The peer's address (CeeSafe ADR 0044), read when the connection was made; null for a transport without one,

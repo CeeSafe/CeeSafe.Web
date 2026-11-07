@@ -1,0 +1,198 @@
+// `TlsTransport.sendFile` (Web ADR 0013 §3.3) over loopback: TLS cannot hand a file to the kernel, so it reads and
+// encrypts it (`Transports.copyFile`), and a client verifying the server as in tls.cee decrypts it. The file is
+// `written` bytes of `pattern`, then extended by `setLength` so the rest reads as zeros: a send from past 4 GiB must
+// return zeros, where an offset cut to 32 bits would return the pattern, which has none. After a short file the
+// transport is poisoned: a write and the shutdown are `Closed`, so no close_notify follows the partial bytes. (The
+// client cannot see the difference: a stream ending without close_notify reads as 0, Web ADR 0002 amendment 1 item
+// 4, and HTTP's framing finds the body short.) Expected bytes come from `pattern` and the file's layout, not from the
+// code under test.
+import web_core;
+import web_transport;
+
+/// Byte `p` of the written part of every test file: a repeating alphabet, never 0.
+fn pattern(p: u64) -> u8 => 97 + truncate<u8>(p % 26);
+
+/// 4 GiB: offsets past it need more than 32 bits.
+fn fourGiB() -> u64 => 4294967296;
+
+/// True if `got` is the file's bytes from `offset`: the pattern below `written`, zeros above.
+fn isFileFrom(got: Slice<u8>, offset: u64, written: u64) -> bool {
+    for (i in 0..got.length) {
+        let p = offset + i as u64;
+        let want: u8 = if (p < written) pattern(p) else 0;
+        if (got[i] != want) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn io<T>(r: Result<T, AsyncError>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create(what)); }
+    }
+}
+
+/// A file in a new temporary directory: `written` pattern bytes, then `length` in all.
+struct TestFile {
+    dir: String;
+    path: String;
+}
+
+async fn madeFile(written: usize, length: u64) -> Result<TestFile, TestFailure> {
+    let dir = match (await Async.blocking(() => Directory.temporary())) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a temporary directory")); },
+    };
+    var path = String.create();
+    match (path.append(dir.view())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+    match (path.append("/body")) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+    var file = io(await AsyncFiles.create(path.view()), "creating the file")?;
+    var block = [0u8; 4096];
+    var at: usize = 0;
+    while (at < written) {
+        let n = if (written - at < 4096) written - at else 4096;
+        for (i in 0..n) {
+            block[i] = pattern((at + i) as u64);
+        }
+        io(await AsyncFiles.write(mut file, block[0..n]), "writing the file")?;
+        at += n;
+    }
+    io(await AsyncFiles.setLength(mut file, length), "extending the file")?;
+    return Ok(TestFile { dir: dir, path: path });
+}
+
+async fn removed(file: borrow TestFile) {
+    let f = await Async.blocking(() => File.remove(file.path.view()));
+    let d = await Async.blocking(() => Directory.remove(file.dir.view()));
+}
+
+fn isInvalidInput(e: NetError?) -> bool => match (e) {
+    Some(NetError.Io(IoError.InvalidInput)) => true,
+    _ => false,
+};
+
+fn isClosed(e: NetError?) -> bool => match (e) {
+    Some(NetError.Closed) => true,
+    _ => false,
+};
+
+/// What a send did: the bytes the client decrypted, how its reading ended (null: a read of 0, the server's
+/// close_notify), `sendFile`'s error, and a write's and a shutdown's after a failed `sendFile`.
+struct Sent {
+    got: Vector<u8>;
+    ended: NetError?;
+    error: NetError?;
+    after: NetError?;
+    shutdown: NetError?;
+}
+
+/// Sends `length` bytes of the file at `path` from `offset` over TLS, then closes with close_notify if it can.
+async fn sentOverTls(path: StringView, offset: u64, length: u64) -> Result<Sent, TestFailure> {
+    var serverConfig = setupOk(TlsConfig.server(chainOf(Cert.Server).bytes(), keyOf(Cert.Server).bytes()))?;
+    var clientConfig = setupOk(TlsConfig.client())?;
+    setupDone(clientConfig.trustPem(trustOf(Trust.Ca).bytes()))?;
+    let listener = net(Listener.bind("127.0.0.1", 0))?;
+    let port = net(listener.port())?;
+    var got = Vector<u8>.create();
+    var ended: NetError? = null;
+    var error: NetError? = null;
+    var after: NetError? = null;
+    var shutdown: NetError? = null;
+    let r: Result<void, NetError> = await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            let stream = await listener.accept()?;
+            var t = await TlsTransport.accept(stream, serverConfig, Deadline.after(5000))?;
+            var file = match (await AsyncFiles.open(path)) {
+                Ok(f) => f,
+                Err(e) => { return Err(NetErrors.fromAsync(e)); },
+            };
+            match (await t.sendFile(mut file, offset, length)) {
+                Ok() => {}
+                Err(e) => {
+                    error = Some(e);
+                    match (await t.write("x".bytes())) {
+                        Ok() => {}
+                        Err(w) => { after = Some(w); }
+                    }
+                }
+            }
+            match (await t.shutdownWrite()) {
+                Ok() => {}
+                Err(e) => { shutdown = Some(e); }
+            }
+            return Ok();
+        });
+        s.spawn(async () => {
+            let tcp = PlainStream.tcp(await TcpTransport.connect("127.0.0.1", port)?);
+            var t = await TlsTransport.connect(tcp, clientConfig, nameOf(Host.Localhost), Deadline.after(5000))?;
+            var buf = [0u8; 65536];
+            loop {
+                match (await bounded(mut t, mut buf[..])) {
+                    Ok(0) => { return Ok(); }
+                    Ok(n) => {
+                        match (got.extend(buf[0..n])) {
+                            Ok() => {}
+                            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+                        }
+                    }
+                    Err(e) => {
+                        ended = Some(e);
+                        return Ok();
+                    }
+                }
+            }
+        });
+    });
+    match (r) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    return Ok(Sent { got: got, ended: ended, error: error, after: after, shutdown: shutdown });
+}
+
+/// Sends from a file of `written` pattern bytes and `length` in all.
+async fn sendOf(written: usize, length: u64, offset: u64, count: u64) -> Result<Sent, TestFailure> {
+    let file = await madeFile(written, length)?;
+    let r = await sentOverTls(file.path.view(), offset, count);
+    await removed(file);
+    return r;
+}
+
+@test
+async fn tls_sends_a_range_of_a_file() -> Result<void, TestFailure> {
+    // 600 000 bytes from offset 1 000: more than two of copyFile's 256 KiB pieces, and not aligned to any.
+    let s = await sendOf(601000, 601000, 1000, 600000)?;
+    Check.isTrue(s.error == null && s.shutdown == null, "no error")?;
+    Check.isTrue(s.ended == null, "the client read the close_notify as the end")?;
+    Check.equalU64(600000, s.got.length as u64)?;
+    Check.isTrue(isFileFrom(s.got.view(), 1000, 601000), "the file's bytes from offset 1000")?;
+    return Ok();
+}
+
+@test
+async fn tls_sends_from_past_4_gib() -> Result<void, TestFailure> {
+    let s = await sendOf(65536, fourGiB() + 400000, fourGiB() + 5, 300000)?;
+    Check.isTrue(s.error == null && s.shutdown == null, "no error")?;
+    Check.equalU64(300000, s.got.length as u64)?;
+    Check.isTrue(isFileFrom(s.got.view(), fourGiB() + 5, 65536), "zeros: the offset kept its high bits")?;
+    return Ok();
+}
+
+@test
+async fn tls_a_short_file_poisons_the_transport() -> Result<void, TestFailure> {
+    let s = await sendOf(1000, 1000, 0, 5000)?;
+    Check.isTrue(isInvalidInput(s.error), "Io(InvalidInput)")?;
+    Check.isTrue(isClosed(s.after), "a write after it is Closed")?;
+    Check.isTrue(isClosed(s.shutdown), "so is the shutdown: no close_notify")?;
+    Check.equalU64(1000, s.got.length as u64)?;
+    Check.isTrue(isFileFrom(s.got.view(), 0, 1000), "the file's 1000 bytes, nothing after")?;
+    return Ok();
+}

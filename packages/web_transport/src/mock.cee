@@ -282,8 +282,17 @@ impl Transport for MockTransport {
 
     /// Copies through `write` (`Transports.copyFile`), counting the call.
     async fn sendFile(borrow mut this, file: borrow mut File, offset: u64, length: u64) -> Result<void, NetError> {
+        if (this.poisoned || this.shut) {
+            return Err(NetError.Closed);
+        }
         this.fileSends += 1;
-        return await Transports.copyFile(this, file, offset, length);
+        match (await Transports.copyFile(this, file, offset, length)) {
+            Ok() => { return Ok(); }
+            Err(e) => {
+                this.poisoned = true; // as TcpTransport: some of the bytes may have gone
+                return Err(e);
+            }
+        }
     }
 
     async fn writeVectored(borrow mut this, parts: borrow IoParts) -> Result<usize, NetError> {

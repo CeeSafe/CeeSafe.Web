@@ -297,7 +297,7 @@ Tests, with oracles outside the code:
 
 ## 7. Amendment 1 (2026-11-07, M9 stage 3: `sendFile` as built)
 
-Three details of §3.3 changed in the building; the design is otherwise as written.
+Five details of §3.3 and §5 changed in the building; the design is otherwise as written.
 
 1. **The file is `borrow mut File`, not `borrow File`.** In 0.19.1, `File.readAt` takes `borrow this`, but
    `AsyncFiles.readAt` and `AsyncFiles.length` take `borrow mut File` (lib/std `async.cee:978`, `:986`; why is
@@ -317,6 +317,12 @@ Three details of §3.3 changed in the building; the design is otherwise as writt
    pooled one. Each `AsyncFiles.readAt` is a round trip to a worker thread (lib/std `async.cee:978`), and with
    16 KiB pieces sending a file over TLS or HTTP/2 was up to 3.9x slower than streaming it from memory; 256 KiB made it
    1.5x–4.3x faster than 16 KiB, at up to 256 KiB per send in flight (M9.md, stage 3).
+
+4. **Any failed `sendFile` poisons the transport**, a short file included: some of its bytes may have gone, as with a
+   failed write. Over TLS this also means no close_notify after them (tests in `packages/web_transport/tests/` and
+   `packages/web_tls/tests/sendfile.cee`).
+5. **§5's trace of the kernel's call** was made with a library preloaded in front of libc's `sendfile` on Linux and
+   macOS, not strace or dtruss: the Linux host had no strace (M9.md, stage 3).
 
 A failed send marks the exchange done and not to be kept, so a handler that ignores the error still never completes
 the response: no last chunk over HTTP/1.1, no END_STREAM over HTTP/2 (tests `*_when_the_handler_ignores_it` in

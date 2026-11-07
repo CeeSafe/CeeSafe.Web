@@ -288,7 +288,13 @@ impl Transport for TlsTransport {
         if (this.poisoned) {
             return Err(NetError.Closed);
         }
-        return await Transports.copyFile(this, file, offset, length);
+        match (await Transports.copyFile(this, file, offset, length)) {
+            Ok() => { return Ok(); }
+            Err(e) => {
+                this.poisoned = true; // some of the bytes may have gone, so no close_notify after them
+                return Err(e);
+            }
+        }
     }
 
     /// Sends close_notify, then ends the stream's writing.
