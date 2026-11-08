@@ -1,0 +1,85 @@
+// B19 probe (docs/ceesafe-upstream-work.md): on Linux, `AsyncTcpStream.sendFileAll` to a peer that has reset the
+// connection raises SIGPIPE, which ends the process (exit status 141), under epoll and under io_uring
+// (CEESAFE_REACTOR_URING=1). The runtime calls `sendfile(2)`, which has no MSG_NOSIGNAL, and nothing blocks or ignores
+// SIGPIPE; macOS is spared by the sockets' SO_NOSIGPIPE. Each round: the server writes 64 KiB; the client reads one
+// byte and closes with the rest unread, so its kernel answers with a reset; the server's read reports the reset
+// (Linux then answers further sends with EPIPE); the server's `sendFileAll` must then fail with an error, not a signal.
+// Expected: "rounds 20, failed sends 20" and exit status 0. Native build only (the interpreter has no sendfile).
+// 0.19.1 on Debian 12 (Linux 6.1): nothing printed, exit status 141, under both reactors.
+
+async fn client(port: u16) -> Result<void, AsyncError> {
+    let conn = await AsyncTcpStream.connect("127.0.0.1", port)?;
+    var buf = [0u8; 1];
+    let n = await conn.read(mut buf[..])?;
+    return Ok();
+}
+
+async fn round(
+    listener: borrow AsyncTcpListener,
+    port: u16,
+    path: StringView,
+    failed: borrow Arc<AtomicU64>,
+) -> Result<void, AsyncError> {
+    return await Async.tasks(4, AsyncError.Cancelled, async (set) => {
+        let started = set.trySpawn(async move () => await client(port));
+        let conn = await listener.accept()?;
+        let file = match (await AsyncFiles.open(path)) {
+            Ok(f) => f,
+            Err(_) => { return Err(AsyncError.Cancelled); },
+        };
+        var block = [120u8; 65536];
+        await conn.write(block[..])?;
+        // Until the reset: the client sends nothing, so a read ends only with it (or with an end of stream).
+        var buf = [0u8; 16];
+        var reading = true;
+        while (reading) {
+            match (await conn.read(mut buf[..])) {
+                Ok(0) => { reading = false; }
+                Ok(_) => {}
+                Err(_) => { reading = false; }
+            }
+        }
+        match (await conn.sendFileAll(file, 0, 67108864)) {
+            Ok() => {}
+            Err(_) => { let before = failed.get().fetchAdd(1); }
+        }
+        return Ok();
+    });
+}
+
+async fn trial(path: StringView) -> Result<u64, AsyncError> {
+    let listener = match (AsyncTcpListener.bind("127.0.0.1", 0)) {
+        Ok(l) => l,
+        Err(_) => { return Err(AsyncError.Cancelled); },
+    };
+    let port = match (listener.port()) {
+        Ok(p) => p,
+        Err(_) => { return Err(AsyncError.Cancelled); },
+    };
+    let failed = Arc<AtomicU64>.create(AtomicU64.create(0))!;
+    for (i in 0..20) {
+        await round(listener, port, path, failed)?;
+    }
+    return Ok(failed.get().load());
+}
+
+fn main() {
+    let path = "sendfile-sigpipe-bug.body";
+    match (File.create(path)) {
+        Ok(f) => {
+            match (f.setLength(67108864)) {
+                Ok() => {}
+                Err(_) => { Console.writeLine("could not size the file"); return; }
+            }
+        }
+        Err(_) => { Console.writeLine("could not create the file"); return; }
+    }
+    match (Async.run(trial(path))) {
+        Ok(failures) => {
+            Console.write("rounds 20, failed sends ");
+            Console.writeLine(failures);
+        }
+        Err(_) => { Console.writeLine("error"); }
+    }
+    let removed = File.remove(path);
+}

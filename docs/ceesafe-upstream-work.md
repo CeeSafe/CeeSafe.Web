@@ -2,8 +2,22 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.19.1", "Status at 0.10.1", "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.21.0", "Status at 0.19.1", "Status at 0.10.1", "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.21.0 (released 2026-11-06, tag `v0.21.0` = CeeSafe `e6b9214`)
+
+Checked from CeeSafe.Web on 2026-11-08 against CeeSafe's source at the tag, not yet by building this repo with it.
+
+| Item | Status | Checked by |
+|---|---|---|
+| **U22** an open file's modification time and kind | **still open**. CeeSafe ADR 0077 §5 adds `File.modified(path)`, which reads the *path* (`stat`, `_stat64` on Windows: `runtime/hosted/ceesafe_rt_io.c:1616`, `:1620`), and the interpreter answers `Unsupported`. U22 asks for the open file (`fstat`), so that the time describes the file that is sent, not one renamed into its place between the two calls (Web ADR 0013 §3.4). There is still no `kind` on an open file, and no open that refuses a FIFO or device without blocking | the spec, `type-system.md` §26.3 (`File.modified(path)`); `lib/std/host.cee:266` |
+
+| **B19** on Linux, `sendFile` to a reset connection raises SIGPIPE and ends the process | **open**, found 2026-11-08; reproduced on 0.19.1 and 0.21.0 | `tests/probes/sendfile-sigpipe-bug.cee`; the B19 section below |
+
+`web_static` (M9 stage 4) still waits for U22: a path-based time and kind, read before or after the open, would be the
+check-then-use race that Web ADR 0013 §3.4 rules out. B19 blocks v0.4: on Linux, any client that resets a connection
+while `Exchange.sendFile` is sending (plain TCP) ends the server.
 
 ## Status at 0.19.1 (released 2026-11-06, tag `v0.19.1` = CeeSafe `619145e`)
 
@@ -828,6 +842,55 @@ public fn kind(borrow this) -> Result<PathKind, IoError>;
 
 **Effect on CeeSafe.Web until then:** M9's stages 1 to 3 go first: the profile, buffers and vectored writes, and
 `sendFile`. `web_static` waits for U22.
+
+## B19 — Bug: on Linux, `sendFile` to a reset connection raises SIGPIPE   *(found 2026-11-08, M9 stage 5, ceesafec 0.19.1; still in 0.21.0)*
+
+**Symptom:** on Linux, a CeeSafe.Web server sending a file over plain TCP (`Exchange.sendFile` → `TcpTransport` →
+lib/std's `AsyncTcpStream.sendFileAll`) dies with exit status 141 (SIGPIPE) when the client resets the connection
+in the middle of the body. One such client ends the whole server, every connection with it.
+
+**Found:** `benchmarks/http/run.py --routes file1g` on the Debian host (hanan; Debian 12.14, Linux 6.1.0-44, x86-64),
+ceesafec 0.19.1, 2026-11-08: h2load closes its connections in the middle of a 1 GiB response when its time is up, and
+the server was gone before the script's stop request (`ConnectionRefusedError`; exit status 141 when run by hand).
+- **Narrowed by hand,** with a Python client that reads part of a response, then closes with the rest unread, so
+  its kernel sends a reset:
+  - `/file` (1 GiB, `sendfile`): the server died on the first such client (exit 141);
+  - `/stream` (1 MiB written from memory, `sendmsg` with `MSG_NOSIGNAL`): 20 clients, the server lived (exit 0);
+  - `/file` over TLS (read and encrypt, `send` with `MSG_NOSIGNAL`): 20 clients, the server lived (exit 0).
+- **A preloaded library logging `sendfile`, `sendmsg` and `writev`** (scratch, not committed) showed one `sendfile`
+  on the connection sending 749 568 of 1 048 576 bytes. The process died inside the next `sendfile`, which never
+  returned.
+- **macOS is not affected:** its sockets get `SO_NOSIGPIPE` (`runtime/hosted/ceesafe_rt_io.c:964`, `:1055`,
+  `:1197` at `v0.21.0`).
+
+**Probe:** `tests/probes/sendfile-sigpipe-bug.cee`, lib/std only. The server writes 64 KiB; the client reads one
+byte, then closes; the server reads until the reset, then calls `sendFileAll`. Expected: "rounds 20, failed sends 20",
+exit 0. On Debian it prints nothing and exits 141 under epoll and under io_uring (`CEESAFE_REACTOR_URING=1`): 0.19.1,
+3 runs of each; 0.21.0, 1 run of each. macOS arm64 (0.19.1) prints the expected line and exits 0.
+- **The read is what makes it certain.** Without it (the probe's first version, `sendFileAll` straight after the
+  client closes), 60 runs on Debian failed the send with an error and exited 0. The kernel reports the reset once,
+  as ECONNRESET, to whichever call comes first. A later send on that socket gets EPIPE, and an EPIPE send raises
+  SIGPIPE unless the call says `MSG_NOSIGNAL`. In the server, a read is always pending on an HTTP/1.1 connection,
+  so the read takes the reset and `sendfile` gets EPIPE.
+
+**Cause (read in CeeSafe at `v0.21.0` = `e6b9214`):** the Linux readiness step calls
+`sendfile(socket, file, &at, count)` (`runtime/hosted/ceesafe_rt_async.c:4157`); io_uring uses the same step
+(`:4251`). `sendfile(2)` has no flags argument, so it has no `MSG_NOSIGNAL`. Every other send in the runtime passes
+`MSG_NOSIGNAL` (`ceesafe_rt_io.c:218`, `:1264`; `ceesafe_rt_async.c:3215`, `:3584`, `:3632`). Nothing in the runtime
+ignores or blocks SIGPIPE (no `signal`, `sigaction` or `pthread_sigmask` for it in `runtime/`).
+
+**Wanted:** a `sendFile` to a socket whose peer is gone fails with an `IoError` (EPIPE as
+`ConnectionReset` or `Closed`, whichever lib/std already uses for a send's EPIPE), never a signal, on every reactor.
+How is CeeSafe's choice. Some options:
+- ignore SIGPIPE once at startup, as nginx and Go do;
+- block it on the I/O threads and clear a pending one with `sigtimedwait` after an EPIPE;
+- `splice` through a pipe, which takes `SPLICE_F_*` flags but has no no-signal flag either, so it does not help by
+  itself.
+
+**Effect on CeeSafe.Web until then:** it is not worked around. A process-wide `signal(SIGPIPE, SIG_IGN)` would need
+`unsafe` or C, which the rules forbid. Stage 5's file routes (`file`, `file1g`) cannot be measured on Linux with
+h2load, which resets connections when its time is up. v0.4 does not ship with this open: it is a remote denial of
+service for any Linux server that sends files.
 
 ## B18 — Bug: a `borrow S<r>` result of `borrow this` is refused as a deep result   *(found 2026-11-05, M8, ceesafec 0.18.0; fixed in 0.18.1)*
 

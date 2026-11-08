@@ -16,7 +16,11 @@ The server is built first (`ceesafec build`, with the ceesafec on PATH unless --
 P-256 certificate made with `openssl` in a temporary directory.
 
 `/file` is a 1 MiB file sent with `Exchange.sendFile` (Web ADR 0013 §3.3; the server's CW_FILE), the same bytes as
-`/stream`, which the handler writes from memory.
+`/stream`, which the handler writes from memory. The route `file1g` is the same `/file` with CW_FILE a 1 GiB file
+(ADR 0013 §3.6); it is not in the default routes, and its rows add `mib_per_s` (bytes of whole responses a second).
+
+The reactor is the runtime's choice: CeeSafe's default, or io_uring when CEESAFE_REACTOR_URING=1 is in the
+environment, which the server inherits. Each row records which (`reactor`).
 
 `--nginx` runs the same routes against nginx (on PATH), one worker per core, `sendfile on`, the bodies as files
 (`/stream` as a 1 MiB file, `/echo` left out): a reference, not a target. Allocations do not apply to it.
@@ -28,8 +32,25 @@ SERVER = HERE / "out" / "bench_http"
 PORT = 18190
 # The allocation runs: (warm-up, counted) requests per route; the large bodies need fewer.
 COUNTS = {"small": (2000, 20000), "4k": (2000, 20000), "64k": (500, 5000), "stream": (100, 1000),
-          "echo": (2000, 20000), "file": (100, 1000)}
-ROUTES = {"small": "/small", "4k": "/4k", "64k": "/64k", "stream": "/stream", "echo": "/echo", "file": "/file"}
+          "echo": (2000, 20000), "file": (100, 1000), "file1g": (2, 10)}
+ROUTES = {"small": "/small", "4k": "/4k", "64k": "/64k", "stream": "/stream", "echo": "/echo", "file": "/file",
+          "file1g": "/file"}
+GIBIBYTE = 1 << 30
+REACTOR = "io_uring" if os.environ.get("CEESAFE_REACTOR_URING") == "1" else "default"
+
+
+def served(scratch, route):
+    """The file CW_FILE names for `route`."""
+    return scratch / ("file1g" if route == "file1g" else "file")
+
+
+def gibibyte(path):
+    """The 1 GiB file `file1g` serves: the 1 MiB alphabet file 1024 times, written a mebibyte at a time."""
+    piece = bytes(97 + i % 26 for i in range(1048576))
+    with open(path, "wb") as f:
+        for _ in range(GIBIBYTE // len(piece)):
+            f.write(piece)
+    return path
 
 
 def mebibyte(path):
@@ -64,8 +85,8 @@ def wait_port(port, seconds=10):
 
 
 class Server:
-    def __init__(self, tls, scratch, alloc=False):
-        env = dict(os.environ, CW_PORT=str(PORT), CW_WORKERS="256", CW_FILE=str(scratch / "file"))
+    def __init__(self, tls, scratch, alloc=False, route=None):
+        env = dict(os.environ, CW_PORT=str(PORT), CW_WORKERS="256", CW_FILE=str(served(scratch, route)))
         if alloc:
             env["CEESAFE_ALLOC_REPORT"] = "1"
         if tls:
@@ -149,7 +170,7 @@ def allocations(mode, route, tls, scratch, body):
     warm, count = COUNTS[route]
     counts = []
     for n in (warm, warm + count):
-        s = Server(tls, scratch, alloc=True)
+        s = Server(tls, scratch, alloc=True, route=route)
         args = ["h2load", "-n", str(n), "-c", "10", "-m", "1", *(["--h1"] if mode.endswith("h1") else [])]
         if body:
             args += ["-d", str(body)]
@@ -208,6 +229,8 @@ def main():
     body = scratch / "body"
     body.write_bytes(b"x" * 4096)
     mebibyte(scratch / "file")
+    if "file1g" in routes:
+        gibibyte(scratch / "file1g")
     results = []
     try:
         if args.nginx:
@@ -218,20 +241,23 @@ def main():
                 for route in routes:
                     posted = body if route == "echo" else None
                     for c in conns:
-                        s = Server(tls if mode.startswith("tls") else None, scratch)
+                        s = Server(tls if mode.startswith("tls") else None, scratch, route=route)
                         peak = Peak(s.p.pid)
                         peak.start()
                         r = h2load(mode, ROUTES[route], c, args.duration, scratch, posted)
                         peak.done = True
                         s.stop(base_url(mode))
-                        r.update(server="ceesafe.web", mode=mode, route=route, conns=c, peak_rss_kib=peak.peak)
+                        r.update(server="ceesafe.web", mode=mode, route=route, conns=c, peak_rss_kib=peak.peak,
+                                 reactor=REACTOR)
+                        if route == "file1g":
+                            r["mib_per_s"] = round(r["succeeded"] * GIBIBYTE / args.duration / 1048576)
                         results.append(r)
                         print(row(r), flush=True)
                     if not args.no_alloc:
                         a = allocations(mode, route, tls if mode.startswith("tls") else None, scratch,
                                         posted)
                         results.append({"server": "ceesafe.web", "mode": mode, "route": route,
-                                        "allocations_per_request": a})
+                                        "reactor": REACTOR, "allocations_per_request": a})
                         print(f"| {mode} | {route} | allocations per request | {a} |", flush=True)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -246,6 +272,8 @@ def run_nginx(args, modes, routes, conns, scratch, results):
     (root / "small").write_bytes(b"hello, world\n")
     for name, size in (("4k", 4096), ("64k", 65536), ("stream", 1048576), ("file", 1048576)):
         (root / name).write_bytes(bytes(97 + i % 26 for i in range(size)))
+    if "file1g" in routes:
+        gibibyte(root / "file1g")
     conf = nginx_config(scratch, root)
     p = subprocess.Popen(["nginx", "-c", str(conf), "-p", str(scratch)], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
@@ -259,8 +287,11 @@ def run_nginx(args, modes, routes, conns, scratch, results):
                 if route == "echo":
                     continue
                 for c in conns:
-                    r = h2load(mode, ROUTES[route], c, args.duration, scratch, None)
+                    path = "/file1g" if route == "file1g" else ROUTES[route]
+                    r = h2load(mode, path, c, args.duration, scratch, None)
                     r.update(server="nginx", mode=mode, route=route, conns=c)
+                    if route == "file1g":
+                        r["mib_per_s"] = round(r["succeeded"] * GIBIBYTE / args.duration / 1048576)
                     results.append(r)
                     print(row(r), flush=True)
     finally:
@@ -270,8 +301,9 @@ def run_nginx(args, modes, routes, conns, scratch, results):
 
 
 def row(r):
-    return (f"| {r['server']} | {r['mode']} | {r['route']} | {r['conns']} | {r['requests_per_s']} | {r['p50_us']} | "
-            f"{r['p99_us']} | {r['p999_us']} | {r.get('peak_rss_kib', '')} | {r['failed']} |")
+    return (f"| {r['server']} | {r.get('reactor', '')} | {r['mode']} | {r['route']} | {r['conns']} | "
+            f"{r['requests_per_s']} | {r.get('mib_per_s', '')} | {r['p50_us']} | {r['p99_us']} | {r['p999_us']} | "
+            f"{r.get('peak_rss_kib', '')} | {r['failed']} |")
 
 
 if __name__ == "__main__":
