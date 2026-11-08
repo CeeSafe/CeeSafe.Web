@@ -19,7 +19,7 @@ that needs an unreleased compiler is not merged to main.
 | M6 WebSockets | **0.10.0** | nothing new for the server (0.9.4); the client needs U16 (`Random.fill`, ADR 0060) | done (`docs/milestones/M6.md`) |
 | M7 HTTP/2 | **0.10.3** | B16 (a wake lost on kqueue past ~30 connections), fixed in 0.10.2; B17 (cancellation and the wake list quadratic in parked tasks, CeeSafe ADR 0062), fixed in 0.10.3 | gate passed, on main, released in v0.3.0 (`docs/milestones/M7.md`) |
 | M8 reverse proxy | **0.11.0** | U20 (a type that holds loans as a `borrow mut dyn I`, CeeSafe ADR 0064 §3.2) for the request-body relay; ADR 0064 §1's generic methods for `ReverseProxy.route<S>()` | gate passed, on main (#3, 2026-11-06); released with M9 as v0.4 (`docs/milestones/M8.md`) |
-| M9 low-level I/O | **0.19.1** | `Vector.resize` (ADR 0071, 0.15.0) for `OwnedBuffer.create`; U7 sendfile (ADR 0051); `readAt`/`length` (ADR 0075) for TLS and HTTP/2 file bodies; U22 for `web_static` | in progress (Web ADR 0013) |
+| M9 low-level I/O | **0.22.0** | `Vector.resize` (ADR 0071, 0.15.0) for `OwnedBuffer.create`; U7 sendfile (ADR 0051); `readAt`/`length` (ADR 0075) for TLS and HTTP/2 file bodies; B19 (`sendFile` to a reset connection raised SIGPIPE on Linux) and U22 (`File.openRegular`, `f.modified()`, `f.kind()`) for `web_static`, both CeeSafe ADR 0078 | in progress (Web ADR 0013) |
 | M10 HTTP/3 | 0.9.0 | U6 UDP (ADR 0050) | released |
 
 ## Current machine (2026-11-06)
@@ -27,12 +27,14 @@ that needs an unreleased compiler is not merged to main.
 | Binary | Version | Use |
 |---|---|---|
 | `~/.ceesafe/bin/ceesafec` (on `PATH`) | 0.20.0 (release, osx-arm64; found 2026-11-06) | checks every manifest; not yet tested |
+| `~/.ceesafe/bin/ceesafec-0.22.0` | **0.22.0** (release, tag `v0.22.0` = CeeSafe `f225f7a`, osx-arm64; the archive matches the release's `SHA256SUMS`, signature checked, 2026-11-08) | M9's minimum: B19 and U22 (CeeSafe ADR 0078) |
 | `~/.ceesafe/bin/ceesafec-0.19.1` | 0.19.1 (release, tag `v0.19.1` = CeeSafe `619145e`, osx-arm64) | `File.readAt`, `length` (CeeSafe ADR 0075), for M9 stage 3 |
 | `~/.ceesafe/bin/ceesafec-0.18.2` | 0.18.2 (release, tag `v0.18.2` = CeeSafe `932bb1c`, osx-arm64) | C backend only |
 | `~/.ceesafe/bin/ceesafec-0.18.1` | 0.18.1 (release, osx-arm64; `SHA256SUMS` checked, 2026-11-05) | B18 fixed |
 | `~/.ceesafe/bin/ceesafec-0.18.0` | 0.18.0 (release, osx-arm64) | B18's repro only: it does not check CeeSafe.Web |
 | `~/.ceesafe/bin/ceesafec-0.17.0` | 0.17.0 (release, osx-arm64) | the last release that builds M8 unchanged |
 | `~/.ceesafe/bin/ceesafec-0.11.0` | **0.11.0** (release, tag `v0.11.0` = CeeSafe `45dde8d`; osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, checked 2026-11-04) | the toolchain for M8; `ceesafec test` runs the tests and both sweeps |
+| `/root/cw-m9/ceesafec-0.22.0/ceesafec` on the Debian x86_64 host (hanan) | **0.22.0** (release, linux-x64; the archive matches the release's `SHA256SUMS`, 2026-11-08) | M9 from 0.22.0 |
 | `/root/cw-m9/ceesafec-0.19.1/ceesafec` and `/root/cw-m9/ceesafec-0.21.0/ceesafec` on the Debian x86_64 host (hanan) | 0.19.1 and 0.21.0 (releases, linux-x64; archives checked against each release's `SHA256SUMS`, 2026-11-08) | M9 stage 5's runs (0.19.1); B19's probe (both) |
 | `/root/cw-m8/ceesafec-0.11.0/ceesafec` on the Debian x86_64 host; `C:\cw-m8\bin\ceesafec.exe` on the Windows 11 ARM64 VM | **0.11.0** (release, linux-x64 and win-arm64) | M8's Debian and Windows runs |
 | `~/.ceesafe/bin/ceesafec-0.10.3` | 0.10.3 (release, tag `v0.10.3` = CeeSafe `94a4a92`) | M7 and v0.3.x; main's minimum until M8 merged |
@@ -74,6 +76,17 @@ still N0205), U21, and U22 (an open file's modification time and kind), which `w
 is 0.19.1 from stage 2 (the owner's choice, 2026-11-06): `OwnedBuffer.create` fills with `Vector.resize`, and
 stage 3 uses `readAt`. CI pins v0.19.1 on `m9-io`. 0.20.0 checks every manifest (27, the benchmark included) with no
 diagnostic; its tests have not been run.
+
+0.22.0 (CeeSafe ADR 0078, written from this project's B19 and U22) is M9's minimum from 2026-11-08 (the owner's
+choice). On Linux, `sendFile` to a reset connection is an error, not SIGPIPE, and an open file's time and kind and
+`File.openRegular` are there for `web_static`. CI pins v0.22.0. Run 2026-11-08 on macOS arm64, M9's tree at `1bcf1fc`
+plus these documents:
+- every manifest (28) checks with no diagnostic, `fmt --check` is clean, and `tools/check_layers.py` passes;
+- `python3 tools/run_tests.py --ceesafec ceesafec-0.22.0 --sanitize --alloc-sweep --cancel-sweep`: 42 runs passed, 1
+  skipped (web_tls in the interpreter) and 1 failed, web_ws in the interpreter. Its `sha1_rfc3174_vectors` (the 1M-byte
+  vector) passed its 120 s limit while the machine's load average was about 42 from the suite's parallel builds.
+- Re-run alone, `ceesafec-0.22.0 test --interp --timeout 120` in web_ws passed 26 of 26.
+- That test takes 63.6 s on 0.22.0 and 63.6 s on 0.19.1, so the interpreter did not get slower.
 
 0.10.3 (B16, B17, CeeSafe ADR 0062) is M7's minimum: the HTTP/2 server needs both fixes past ~30 connections and
 ~2 000 streams. With M7 merged it is main's minimum, and CI pins it.

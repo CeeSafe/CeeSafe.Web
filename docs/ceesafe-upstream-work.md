@@ -2,8 +2,18 @@
 
 **For:** a separate session working in `~/dev/CeeSafe` (main at `5fa4316`, ceesafec 0.6.0-dev).
 **From:** `~/dev/CeeSafe.Web/docs/implementation-plan.md` §5 (accepted 2026-11-02).
-**Status:** see "Status at 0.21.0", "Status at 0.19.1", "Status at 0.10.1", "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
+**Status:** see "Status at 0.22.0", "Status at 0.21.0", "Status at 0.19.1", "Status at 0.10.1", "Status at 0.10.0", "Status at 0.9.4", "Status at 0.9.2", "Status at 0.9.1", "Status at 0.9.0", "Status at 0.8.0" and "Status at 0.7.0" below. File references in the item sections were checked against `5fa4316`;
 re-check them before editing.
+
+## Status at 0.22.0 (released 2026-11-08, tag `v0.22.0` = CeeSafe `f225f7a`)
+
+CeeSafe ADR 0078, written and released from this project's request (the owner: "Fix B19 and U22 in CeeSafe", then
+"Go ahead and release CeeSafe"). M9's minimum is 0.22.0 from 2026-11-08 (`docs/toolchain.md`).
+
+| Item | Status | Checked by |
+|---|---|---|
+| **B19** `sendFile` to a reset connection raised SIGPIPE on Linux | **fixed**: each Linux `sendfile` blocks SIGPIPE on its thread and takes one it raised, after a failed call or with a partial count (the second way in: `sendfile` returns the pieces before the reset and raises the signal for the next). The process's disposition of SIGPIPE is unchanged | `tests/probes/sendfile-sigpipe-bug.cee` passes with 0.22.0 on hanan; CeeSafe's corpus `async-send-file-reset` (0.21.0 exits 141 on Linux) passes with the released linux-x64 binary under epoll and io_uring; benchmarks/http built with the release candidate survived 80 clients dropping mid-file and h2load's resets, then served 1 GiB whole, both reactors (2026-11-08) |
+| **U22** an open file's modification time and kind | **released**: `f.modified()` and `f.kind()` from the open file (`fstat`); `File.openRegular(path)` opens only a regular file without waiting on a FIFO (`IsDirectory` for a directory, `InvalidInput` otherwise); `AsyncFiles.openRegular`, `AsyncFiles.modified`, `AsyncFiles.kind` (`borrow mut File`, as `AsyncFiles.length`). The interpreter answers `Unsupported` for `modified`, and takes `kind` and `openRegular`'s check from the path | CeeSafe's corpus `file-open-regular` on macOS, Debian and Windows 11 ARM64, natively and interpreted; the spec, `type-system.md` §26.3 |
 
 ## Status at 0.21.0 (released 2026-11-06, tag `v0.21.0` = CeeSafe `e6b9214`)
 
@@ -15,9 +25,7 @@ Checked from CeeSafe.Web on 2026-11-08 against CeeSafe's source at the tag, not 
 
 | **B19** on Linux, `sendFile` to a reset connection raises SIGPIPE and ends the process | **open**, found 2026-11-08; reproduced on 0.19.1 and 0.21.0 | `tests/probes/sendfile-sigpipe-bug.cee`; the B19 section below |
 
-`web_static` (M9 stage 4) still waits for U22: a path-based time and kind, read before or after the open, would be the
-check-then-use race that Web ADR 0013 §3.4 rules out. B19 blocks v0.4: on Linux, any client that resets a connection
-while `Exchange.sendFile` is sending (plain TCP) ends the server.
+Both are fixed in 0.22.0 (above).
 
 ## Status at 0.19.1 (released 2026-11-06, tag `v0.19.1` = CeeSafe `619145e`)
 
@@ -820,7 +828,7 @@ advances once a system tick, about 15.6 ms. A short sleep wakes, finds the clock
 waits that end on time (a high-resolution waitable timer, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`), so a 1 ms sleep
 lasts about 1 ms as on Linux and macOS.
 
-## U22 — An open file's modification time and kind   *(found 2026-11-06 designing M9, Web ADR 0013 §3.4; accepted by the owner; needed for M9's stage 4)*
+## U22 — An open file's modification time and kind   *(found 2026-11-06 designing M9, Web ADR 0013 §3.4; accepted by the owner; needed for M9's stage 4; released in 0.22.0, CeeSafe ADR 0078)*
 
 **Gap:** a static-file handler (`web_static`, Web ADR 0013 §3.5) answers with validators and refuses what is not a
 regular file. CeeSafe 0.19.1 gives an open file's length and a positioned read (ADR 0075). It does not give:
@@ -843,7 +851,7 @@ public fn kind(borrow this) -> Result<PathKind, IoError>;
 **Effect on CeeSafe.Web until then:** M9's stages 1 to 3 go first: the profile, buffers and vectored writes, and
 `sendFile`. `web_static` waits for U22.
 
-## B19 — Bug: on Linux, `sendFile` to a reset connection raises SIGPIPE   *(found 2026-11-08, M9 stage 5, ceesafec 0.19.1; still in 0.21.0)*
+## B19 — Bug: on Linux, `sendFile` to a reset connection raises SIGPIPE   *(found 2026-11-08, M9 stage 5, ceesafec 0.19.1; still in 0.21.0; fixed in 0.22.0, CeeSafe ADR 0078)*
 
 **Symptom:** on Linux, a CeeSafe.Web server sending a file over plain TCP (`Exchange.sendFile` → `TcpTransport` →
 lib/std's `AsyncTcpStream.sendFileAll`) dies with exit status 141 (SIGPIPE) when the client resets the connection
