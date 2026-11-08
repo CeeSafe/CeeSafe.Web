@@ -1,2 +1,14 @@
-// web_http3: HTTP/3 and QPACK over ngtcp2/nghttp3 (QUIC over lib/std UDP).
-// Milestone M10 (docs/implementation-plan.md). Empty until then.
+// web_http3: HTTP/3 and QPACK over nghttp3, on web_quic (Web ADR 0014 §3.6), through its shim (c/h3_shim.c). The shim
+// does no I/O and keeps no pointer, so each call is declared without effects.
+
+extern "C" {
+    @effects()
+    fn h3_nghttp3_version() -> u32;
+}
+
+/// The library `web_http3` runs on.
+public struct Http3Library {
+    /// nghttp3's version, as `0xMMmmpp` (1.19.0 is `0x011300`).
+    /// Safety: the call takes no arguments and returns a number; nghttp3's static version record is read in C only.
+    public fn nghttp3Version() -> u32 => unsafe { h3_nghttp3_version() };
+}

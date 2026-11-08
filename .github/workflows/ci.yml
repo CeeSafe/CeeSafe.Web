@@ -9,7 +9,7 @@ on:
   pull_request:
 
 env:
-  CEESAFE_VERSION: v0.22.0 # M9's minimum (docs/toolchain.md)
+  CEESAFE_VERSION: v0.22.0 # M9's and M10's minimum (docs/toolchain.md)
 
 jobs:
   test:
@@ -21,14 +21,18 @@ jobs:
         include:
           - os: macos-15 # macos-14 is no longer offered (2026-11-06)
             sanitize: true
-          # The sweeps run on 24.04 (OpenSSL 3.0.13): 22.04's OpenSSL 3.0.2 leaks its own global state when an
-          # allocation fails, which LeakSanitizer reports (Web ADR 0002 amendment 5.8). 22.04 still runs every test
-          # below, with io_uring.
-          - os: ubuntu-24.04
+          # Linux runs on 26.04 (OpenSSL 3.5.5), which web_quic and web_http3 need (Web ADR 0014 §3.3, the owner's
+          # answer 5): its sweeps, and every test with io_uring. 24.04 (OpenSSL 3.0.13) keeps web_tls's 3.0 minimum
+          # tested, sweeps included, without the two QUIC packages. (22.04's OpenSSL 3.0.2 leaked its own global state
+          # when an allocation failed, Web ADR 0002 amendment 5.8, so the 3.0 sweeps were already on 24.04.)
+          - os: ubuntu-26.04
             sanitize: true
-          - os: ubuntu-22.04
+          - os: ubuntu-26.04
             reactor: uring
             env_name: CEESAFE_REACTOR_URING
+          - os: ubuntu-24.04
+            sanitize: true
+            exclude: web_quic,web_http3
           - os: windows-2022
           - os: windows-2022
             reactor: wsapoll
@@ -94,17 +98,18 @@ jobs:
         run: |
           set -e
           for p in packages/*/; do
+            case ",${{ matrix.exclude }}," in *",$(basename "$p"),"*) echo "skip $p (OpenSSL 3.0)"; continue ;; esac
             (cd "$p" && ceesafec fetch --offline && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
           done
 
       - name: Tests (ceesafec test, native and interpreter, leak check)
         shell: bash
-        run: python3 tools/run_tests.py --timeout 600 # SHA-1's million-byte vector, interpreted on a slow runner
+        run: python3 tools/run_tests.py --timeout 600 --exclude "${{ matrix.exclude }}" # SHA-1's 1M-byte vector, interpreted
 
       - name: Tests with ASan and UBSan, allocation-failure and cancellation sweeps
         if: matrix.sanitize
         shell: bash
-        run: python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep
+        run: python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep --exclude "${{ matrix.exclude }}"
 
       - name: Example builds
         shell: bash
@@ -125,8 +130,8 @@ jobs:
           for f in *.cee; do echo "== $f"; ceesafec check "$f" && ceesafec run --interp "$f" || true; done
 
   ceesafe-main:
-    # Early warning against CeeSafe's main branch (docs/toolchain.md): never required.
-    runs-on: ubuntu-22.04
+    # Early warning against CeeSafe's main branch (docs/toolchain.md): never required. On 26.04 for OpenSSL 3.5.
+    runs-on: ubuntu-26.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

@@ -22,7 +22,8 @@ ALLOWED = {
     "web_sse": {"web_core", "web_http"},
     "web_ws": {"web_core", "web_http"},
     "web_http2": {"web_core", "web_http"},
-    "web_http3": {"web_core", "web_http", "web_tls"},
+    "web_quic": {"web_core", "web_tls"},  # ADR 0004 amendment 4 (Web ADR 0014 §3.1)
+    "web_http3": {"web_core", "web_http", "web_quic"},  # ADR 0004 amendment 4
     "web_client": {"web_core", "web_transport", "web_http", "web_http1", "web_http2", "web_ws"},  # ADR 0004 am. 2
     "web_server": {"web_core", "web_transport", "web_http", "web_http1", "web_http2", "web_sse", "web_ws"},
     "web_proxy": {"web_core", "web_transport", "web_http", "web_client", "web_server"},

@@ -1,0 +1,6 @@
+// The vendored nghttp3 links and answers (Web ADR 0014 §4, stage 1). Expected value: its release number (1.19.0,
+// third_party/README.md).
+
+@test
+fn nghttp3_is_the_vendored_release() -> Result<void, TestFailure> =>
+    Check.equalU64(0x011300, Http3Library.nghttp3Version() as u64);

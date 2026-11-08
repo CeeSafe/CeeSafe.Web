@@ -1,0 +1,28 @@
+[package]
+name = "web_quic"
+version = "0.4.0"
+kind = "library"
+# QUIC over ngtcp2 1.26.0 with its OpenSSL backend (Web ADR 0014). OpenSSL >= 3.5, checked by the shim (§3.3). The C
+# is the shim and the vendored library, through the wrappers tools/vendor_quic.py writes (§3.2).
+c = ["c/quic_shim.c", "c/vendor/lib_ngtcp2_acktr.c", "c/vendor/lib_ngtcp2_addr.c", "c/vendor/lib_ngtcp2_balloc.c", "c/vendor/lib_ngtcp2_bbr.c", "c/vendor/lib_ngtcp2_buf.c", "c/vendor/lib_ngtcp2_callbacks.c", "c/vendor/lib_ngtcp2_cc.c", "c/vendor/lib_ngtcp2_cid.c", "c/vendor/lib_ngtcp2_conn.c", "c/vendor/lib_ngtcp2_conn_info.c", "c/vendor/lib_ngtcp2_conv.c", "c/vendor/lib_ngtcp2_crypto.c", "c/vendor/lib_ngtcp2_dcidtr.c", "c/vendor/lib_ngtcp2_err.c", "c/vendor/lib_ngtcp2_fmt.c", "c/vendor/lib_ngtcp2_frame_chain.c", "c/vendor/lib_ngtcp2_gaptr.c", "c/vendor/lib_ngtcp2_idtr.c", "c/vendor/lib_ngtcp2_ksl.c", "c/vendor/lib_ngtcp2_log.c", "c/vendor/lib_ngtcp2_map.c", "c/vendor/lib_ngtcp2_mem.c", "c/vendor/lib_ngtcp2_objalloc.c", "c/vendor/lib_ngtcp2_opl.c", "c/vendor/lib_ngtcp2_path.c", "c/vendor/lib_ngtcp2_pcg.c", "c/vendor/lib_ngtcp2_pkt.c", "c/vendor/lib_ngtcp2_pmtud.c", "c/vendor/lib_ngtcp2_ppe.c", "c/vendor/lib_ngtcp2_pq.c", "c/vendor/lib_ngtcp2_pv.c", "c/vendor/lib_ngtcp2_qlog.c", "c/vendor/lib_ngtcp2_range.c", "c/vendor/lib_ngtcp2_ratelim.c", "c/vendor/lib_ngtcp2_ringbuf.c", "c/vendor/lib_ngtcp2_rob.c", "c/vendor/lib_ngtcp2_rst.c", "c/vendor/lib_ngtcp2_rtb.c", "c/vendor/lib_ngtcp2_settings.c", "c/vendor/lib_ngtcp2_str.c", "c/vendor/lib_ngtcp2_strm.c", "c/vendor/lib_ngtcp2_transport_params.c", "c/vendor/lib_ngtcp2_unreachable.c", "c/vendor/lib_ngtcp2_vec.c", "c/vendor/lib_ngtcp2_version.c", "c/vendor/lib_ngtcp2_wf.c", "c/vendor/crypto_shared.c", "c/vendor/crypto_ossl_ossl.c"]
+# The include path upstream gives the crypto sources (crypto/ossl/CMakeLists.txt): lib/ and crypto/ besides the headers.
+include-dirs = ["../../third_party/ngtcp2-1.26.0/config", "../../third_party/ngtcp2-1.26.0/lib/includes", "../../third_party/ngtcp2-1.26.0/crypto/includes", "../../third_party/ngtcp2-1.26.0/lib", "../../third_party/ngtcp2-1.26.0/crypto"]
+
+[target.linux]
+links = ["ssl", "crypto"]
+
+[target.macos]
+# Homebrew's openssl@3 (3.5 or later), not the system's LibreSSL.
+links = ["ssl", "crypto"]
+lib-dirs = ["/opt/homebrew/opt/openssl@3/lib"]
+include-dirs = ["/opt/homebrew/opt/openssl@3/include"]
+
+[target.windows]
+# As web_tls's: OPENSSL_DIR is the install, OPENSSL_LIB_DIR its MSVC import libraries for this machine.
+links = ["libssl", "libcrypto"]
+lib-dirs = ["$OPENSSL_LIB_DIR"]
+include-dirs = ["$OPENSSL_DIR/include"]
+
+[dependencies]
+web_core = { path = "../web_core" }
+web_tls = { path = "../web_tls" }
