@@ -55,9 +55,11 @@ public struct StatusCode {
         408 => "Request Timeout",
         409 => "Conflict",
         411 => "Length Required",
+        412 => "Precondition Failed",
         413 => "Content Too Large",
         414 => "URI Too Long",
         415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
         417 => "Expectation Failed",
         426 => "Upgrade Required",
         429 => "Too Many Requests",
@@ -85,6 +87,8 @@ public struct Status {
     public fn created() -> StatusCode => StatusCode { value: 201 };
     /// 204 No Content.
     public fn noContent() -> StatusCode => StatusCode { value: 204 };
+    /// 206 Partial Content (RFC 9110 §15.3.7).
+    public fn partialContent() -> StatusCode => StatusCode { value: 206 };
     /// 304 Not Modified.
     public fn notModified() -> StatusCode => StatusCode { value: 304 };
     /// 400 Bad Request.
@@ -97,10 +101,14 @@ public struct Status {
     public fn requestTimeout() -> StatusCode => StatusCode { value: 408 };
     /// 411 Length Required.
     public fn lengthRequired() -> StatusCode => StatusCode { value: 411 };
+    /// 412 Precondition Failed (RFC 9110 §15.5.13).
+    public fn preconditionFailed() -> StatusCode => StatusCode { value: 412 };
     /// 413 Content Too Large.
     public fn contentTooLarge() -> StatusCode => StatusCode { value: 413 };
     /// 414 URI Too Long.
     public fn uriTooLong() -> StatusCode => StatusCode { value: 414 };
+    /// 416 Range Not Satisfiable (RFC 9110 §15.5.17).
+    public fn rangeNotSatisfiable() -> StatusCode => StatusCode { value: 416 };
     /// 417 Expectation Failed.
     public fn expectationFailed() -> StatusCode => StatusCode { value: 417 };
     /// 431 Request Header Fields Too Large.

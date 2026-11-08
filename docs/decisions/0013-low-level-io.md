@@ -340,3 +340,38 @@ the response: no last chunk over HTTP/1.1, no END_STREAM over HTTP/2 (tests `*_w
    B19 is not worked around here, since that would take `unsafe` or C. v0.4 waits for its fix, since otherwise any
    client could end a Linux server that sends files.
 
+
+3. **The file routes were measured on 0.22.0, with B19 fixed** (M9.md, stage 5, "The file routes"). The 1 MiB file:
+   io_uring at 0.94–1.01x epoll in clear, 0.87–0.94x over TLS. The 1 GiB file on one connection: the same under
+   both, except tls-h1 at 0.83x. More than one connection of 1 GiB needs runs longer than 10 s, not made. The
+   recommendation stands: keep epoll the default.
+
+## 9. Amendment 3 (2026-11-08, M9 stage 4: `web_static` as built)
+
+§3.5 is built in `packages/web_static`, on ceesafec 0.22.0, where CeeSafe ADR 0078 gives U22. These details differ
+from §3.5 or add to it:
+
+1. **`:` is refused on every system, not only on Windows.** lib/std cannot tell which system it runs on, and a `:`
+   in a file name is rare on POSIX. The README says so.
+2. **The package also depends on `web_transport`, for its tests** (`MockTransport` under `web_server`'s
+   `HttpService`). Manifests have no test-only dependencies, and `web_server` depends on it already, so nothing new is
+   reachable (Web ADR 0004 amendment 3).
+3. **Mounting.** `StaticFiles<S>` is a `Handler<S>` for any application state, as `ReverseProxy.route<S>()` is (CeeSafe
+   ADR 0064). On a route ending in `*path` the wildcard is looked up; on any other route, the whole request path.
+4. **Errors from the open:**
+   - a missing path, `NotDirectory` (`a.txt/b`), `PermissionDenied` and `InvalidInput` (not a regular file) are 404;
+   - `IsDirectory` is the index, or 404;
+   - anything else is 500.
+5. **Where the RFCs leave a choice:**
+   - **HEAD ignores `Range`** (RFC 9110 §14.2 defines range handling for GET only).
+   - **Other methods get 405 with `Allow: GET, HEAD`.**
+   - **The 304 carries** `ETag`, `Last-Modified` and the configured `Cache-Control` (RFC 9110 §15.4.5).
+   - **`If-Range` with a date** matches only `Last-Modified`'s exact second.
+6. **`web_http` gains:**
+   - `HttpDate.parse`, for RFC 9110 §5.6.7's three date forms; RFC 850's two-digit year is read against the current
+     time;
+   - `Status.partialContent()`, `preconditionFailed()` and `rangeNotSatisfiable()`, with the reasons for 412 and 416.
+7. **In the interpreter,** `f.modified()` is `Unsupported`. There the handler answers without validators and applies
+   no conditionals.
+
+Tests: `packages/web_static/tests/` (units and served), and `web_http`'s `http_date_*` (M9.md, stage 4).

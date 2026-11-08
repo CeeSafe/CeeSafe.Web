@@ -1,0 +1,173 @@
+// Validators and conditional requests (RFC 9110 §8.8, §13), as Web ADR 0013 §3.5 gives them for a file. The `ETag` is
+// strong, from the size and the modification time in nanoseconds, the same idea as nginx's. `Last-Modified` is the
+// time, to the second. Preconditions are evaluated in RFC 9110 §13.2.2's order.
+import web_http;
+
+/// A file's validators: its strong `ETag` and its modification time.
+public struct Validators {
+    /// `"<size in hex>-<modification time in nanoseconds since 1970, in hex>"`, quotes included.
+    public etag: [u8; 36];
+    public etagLength: usize;
+    /// Seconds since 1970, for `Last-Modified` and the date preconditions. A time before 1970 is 0.
+    public modifiedSeconds: u64;
+
+    /// The validators of a file of `size` bytes modified at `modified`.
+    public fn of(size: u64, modified: UnixTime) -> Validators {
+        let seconds: u64 = if (modified.seconds < 0) 0 else truncate<u64>(modified.seconds);
+        let nanos: u64 = if (modified.seconds < 0) 0 else seconds * 1000000000 + modified.nanoseconds as u64;
+        var tag = [0u8; 36];
+        var n: usize = 0;
+        tag[n] = 34;
+        n += 1;
+        n = appendHex(mut tag, n, size);
+        tag[n] = 45;
+        n += 1;
+        n = appendHex(mut tag, n, nanos);
+        tag[n] = 34;
+        n += 1;
+        return Validators { etag: tag, etagLength: n, modifiedSeconds: seconds };
+    }
+
+    /// The `ETag` value.
+    public fn etagBytes(borrow this) -> Slice<u8> => this.etag[0..this.etagLength];
+}
+
+/// `v` in lower-case hex, without leading zeros, at `at` in `out`; the new length.
+fn appendHex(out: borrow mut [u8; 36], at: usize, v: u64) -> usize {
+    let digits = "0123456789abcdef".bytes();
+    var shift: u32 = 60;
+    var started = false;
+    var n = at;
+    loop {
+        let d = truncate<usize>((v >> shift) & 15);
+        if (d != 0 || started || shift == 0) {
+            out[n] = digits[d];
+            n += 1;
+            started = true;
+        }
+        if (shift == 0) {
+            break;
+        }
+        shift -= 4;
+    }
+    return n;
+}
+
+/// What the preconditions decide, before any `Range` is looked at.
+public enum Precondition {
+    /// Go on: send the file, or the part `Range` asks for.
+    Proceed,
+    /// 304 Not Modified (GET and HEAD).
+    NotModified,
+    /// 412 Precondition Failed.
+    Failed,
+}
+
+public struct Conditionals {
+    /// RFC 9110 §13.2.2's steps 1 to 4 for a GET or HEAD of a file with `validators`, given the request's fields:
+    /// 1. `If-Match` that does not match (strong comparison; `*` matches any file) is 412.
+    /// 2. Without `If-Match`, `If-Unmodified-Since` with a valid date before the file's time is 412.
+    /// 3. `If-None-Match` that matches (weak comparison; `*` matches) is 304.
+    /// 4. Without `If-None-Match`, `If-Modified-Since` with a valid date at or after the file's time is 304.
+    /// A date field with an invalid date is ignored (RFC 9110 §13.1.3, §13.1.4). `nowSeconds` is for RFC 850's
+    /// two-digit years.
+    public fn evaluate(headers: borrow HeaderList, validators: borrow Validators, nowSeconds: u64) -> Precondition {
+        let tag = validators.etagBytes();
+        if (present(headers, "if-match")) {
+            if (!listMatches(headers, "if-match", tag, true)) {
+                return Precondition.Failed;
+            }
+        } else {
+            match (dateOf(headers, "if-unmodified-since", nowSeconds)) {
+                Some(t) => {
+                    if (validators.modifiedSeconds > t) {
+                        return Precondition.Failed;
+                    }
+                }
+                null => {}
+            }
+        }
+        if (present(headers, "if-none-match")) {
+            if (listMatches(headers, "if-none-match", tag, false)) {
+                return Precondition.NotModified;
+            }
+        } else {
+            match (dateOf(headers, "if-modified-since", nowSeconds)) {
+                Some(t) => {
+                    if (validators.modifiedSeconds <= t) {
+                        return Precondition.NotModified;
+                    }
+                }
+                null => {}
+            }
+        }
+        return Precondition.Proceed;
+    }
+
+    /// RFC 9110 §13.1.5: whether a `Range` may be used. With no `If-Range`, it may. With one, only if it is an
+    /// entity-tag that strongly matches the file's, or an HTTP date exactly the file's `Last-Modified`. A weak
+    /// entity-tag never matches.
+    public fn rangeAllowed(headers: borrow HeaderList, validators: borrow Validators, nowSeconds: u64) -> bool {
+        let value = match (headers.getNamed("if-range")) {
+            Some(v) => trimmed(v),
+            null => { return true; },
+        };
+        if (value.length > 0 && (value[0] == 34 || value[0] == 87)) {
+            return value.length >= 2 && value[0] == 34 && equal(value, validators.etagBytes());
+        }
+        return match (HttpDate.parse(value, nowSeconds)) {
+            Some(t) => t == validators.modifiedSeconds,
+            null => false,
+        };
+    }
+}
+
+/// Whether the request has a field named `name` (lower case).
+fn present(headers: borrow HeaderList, name: StringView) -> bool => headers.getNamed(name).isSome();
+
+/// The date of the first field named `name`, if it is a valid HTTP date.
+fn dateOf(headers: borrow HeaderList, name: StringView, nowSeconds: u64) -> u64? {
+    let value = headers.getNamed(name)?;
+    return HttpDate.parse(trimmed(value), nowSeconds);
+}
+
+/// Whether any field named `name` lists `*` or an entity-tag matching `tag` (RFC 9110 §8.8.3.2): strongly (neither
+/// weak, the same opaque tag) when `strong`, else weakly (the same opaque tag, either weak).
+fn listMatches(headers: borrow HeaderList, name: StringView, tag: Slice<u8>, strong: bool) -> bool {
+    for (i in 0..headers.count()) {
+        if (!Ascii.equalsIgnoringCase(headers.nameBytes(i), name)) {
+            continue;
+        }
+        let v = headers.value(i);
+        var start: usize = 0;
+        for (k in 0..v.length + 1) {
+            if (k == v.length || v[k] == 44) {
+                let element = trimmed(v[start..k]);
+                if (element.length == 1 && element[0] == 42) {
+                    return true;
+                }
+                let weak = element.length >= 2 && element[0] == 87 && element[1] == 47;
+                let opaque = if (weak) element[2..] else element;
+                if (opaque.length >= 2 && opaque[0] == 34 && opaque[opaque.length - 1] == 34 && equal(opaque, tag)) {
+                    if (!strong || !weak) {
+                        return true;
+                    }
+                }
+                start = k + 1;
+            }
+        }
+    }
+    return false;
+}
+
+fn equal(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}

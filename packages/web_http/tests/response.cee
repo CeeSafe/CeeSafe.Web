@@ -133,3 +133,55 @@ fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
     }
     return true;
 }
+
+// HttpDate.parse (RFC 9110 §5.6.7): the three forms of RFC 9110's own example, and dates whose Unix seconds are
+// Python's calendar.timegm. `now` is 2026-11-08 12:00:00 (1794139200), for RFC 850's two-digit years.
+
+fn dateParsed(text: StringView) -> u64? => HttpDate.parse(text.bytes(), 1794139200);
+
+fn dateIs(text: StringView, want: u64) -> Result<void, TestFailure> {
+    match (dateParsed(text)) {
+        Some(t) => { return Check.isTrue(t == want, text); }
+        null => { return Check.fail("an HTTP date was refused"); }
+    }
+}
+
+fn dateRefused(text: StringView) -> Result<void, TestFailure> => Check.isTrue(dateParsed(text).isNull(), text);
+
+@test
+fn http_date_three_forms() -> Result<void, TestFailure> {
+    dateIs("Sun, 06 Nov 1994 08:49:37 GMT", 784111777)?;
+    dateIs("Sunday, 06-Nov-94 08:49:37 GMT", 784111777)?;
+    dateIs("Sun Nov  6 08:49:37 1994", 784111777)?;
+    dateIs("Thu, 01 Jan 1970 00:00:00 GMT", 0)?;
+    dateIs("Tue, 29 Feb 2000 23:59:59 GMT", 951868799)?;
+    dateIs("Tue, 19 Jan 2038 03:14:08 GMT", 2147483648)?;
+    dateIs("Mon, 01 Mar 2100 00:00:00 GMT", 4107542400)?;
+    dateIs("Fri Dec 31 23:59:59 1999", 946684799)?;
+    // RFC 850's year, with now in 2026: a year more than 50 years ahead is the century before. 69, 70 and 76 are
+    // 2069, 2070 and 2076 (at most 50 years ahead); 77 would be 2077, 51 years ahead, so it is 1977.
+    dateIs("Saturday, 01-Jun-69 00:00:00 GMT", 3137270400)?;
+    dateIs("Sunday, 01-Jun-70 00:00:00 GMT", 3168806400)?;
+    dateIs("Monday, 01-Jun-76 00:00:00 GMT", 3358195200)?;
+    dateIs("Wednesday, 01-Jun-77 00:00:00 GMT", 233971200)?;
+    // A leap second is taken as the second before it.
+    dateIs("Thu, 31 Dec 1998 23:59:60 GMT", 915148799)?;
+    return Ok();
+}
+
+@test
+fn http_date_refusals() -> Result<void, TestFailure> {
+    dateRefused("")?;
+    dateRefused("Sun, 06 Nov 1994 08:49:37 UTC")?; // only GMT
+    dateRefused("sun, 06 Nov 1994 08:49:37 GMT")?; // names are case-sensitive
+    dateRefused("Sun, 06 Nov 1994 8:49:37 GMT")?;  // two-digit hour
+    dateRefused("Sun, 31 Nov 1994 08:49:37 GMT")?; // November has 30 days
+    dateRefused("Thu, 29 Feb 2001 00:00:00 GMT")?; // not a leap year
+    dateRefused("Mon, 29 Feb 2100 00:00:00 GMT")?; // 2100 is not a leap year
+    dateRefused("Sun, 06 Nov 1994 24:00:00 GMT")?;
+    dateRefused("Wed, 31 Dec 1969 23:59:59 GMT")?; // before 1970
+    dateRefused("Someday, 06-Nov-94 08:49:37 GMT")?;
+    dateRefused("Sun Nov 6 08:49:37 1994")?; // asctime pads the day to two places
+    dateRefused("Sun, 06 Nov 1994 08:49:37 GMT ")?;
+    return Ok();
+}

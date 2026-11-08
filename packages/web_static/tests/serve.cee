@@ -1,0 +1,207 @@
+// StaticFiles (Web ADR 0013 §3.5) through HttpService on a mock HTTP/1.1 connection, over a root of real files. The
+// expected statuses and fields are RFC 9110's (§8.8 validators, §13.1 and §13.2.2 preconditions, §14 ranges, §15.3.7
+// 206, §15.4.5 304, §15.5.13 412, §15.5.17 416). The bodies are the files' bytes (`pattern`). The ETag and
+// Last-Modified are built from `File.modified(path)` (support.cee), which the handler does not use.
+import web_core;
+import web_http;
+import web_server;
+
+fn get(path: StringView, fields: StringView) -> Result<String, TestFailure> {
+    var r = String.create();
+    alloc(r.append("GET "))?;
+    alloc(r.append(path))?;
+    alloc(r.append(" HTTP/1.1\r\nhost: x\r\nconnection: close\r\n"))?;
+    alloc(r.append(fields))?;
+    alloc(r.append("\r\n"))?;
+    return Ok(r);
+}
+
+fn equalField(r: borrow Response, name: StringView, want: Slice<u8>) -> Result<void, TestFailure> {
+    match (r.field(name)) {
+        Some(v) => { return Check.equalBytes(want, v.view()); }
+        null => { return Check.fail(name); }
+    }
+}
+
+fn noField(r: borrow Response, name: StringView) -> Result<void, TestFailure> =>
+    Check.isTrue(r.field(name).isNull(), name);
+
+fn isPattern(body: Slice<u8>, from: usize) -> bool {
+    for (i in 0..body.length) {
+        if (body[i] != pattern(from + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+@test
+async fn whole_file_with_validators() -> Result<void, TestFailure> {
+    var root = await madeRoot()?;
+    let r = await served(root, StaticOptions.defaults(), get("/s/body.txt", "")?.view())?;
+    let want = await Async.blocking(() => root.expected("body.txt", 10000))?;
+    await removedRoot(mut root);
+    Check.equalU64(200, r.status as u64)?;
+    equalField(r, "content-length", "10000".bytes())?;
+    equalField(r, "content-type", "text/plain; charset=utf-8".bytes())?;
+    equalField(r, "accept-ranges", "bytes".bytes())?;
+    noField(r, "x-content-type-options")?;
+    match (want) {
+        Some(w) => {
+            equalField(r, "etag", w.etag.view())?;
+            equalField(r, "last-modified", w.modified.view())?;
+        }
+        null => {
+            noField(r, "etag")?; // the interpreter cannot read a file's time
+        }
+    }
+    Check.equalU64(10000, r.body.length as u64)?;
+    return Check.isTrue(isPattern(r.body.view(), 0), "the file's bytes");
+}
+
+@test
+async fn head_has_the_fields_and_no_body() -> Result<void, TestFailure> {
+    var root = await madeRoot()?;
+    let request = "HEAD /s/body.txt HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
+    let r = await served(root, StaticOptions.defaults(), request)?;
+    // A Range on HEAD is ignored (RFC 9110 §14.2: HEAD defines no range handling): 200, the whole length.
+    let ranged = "HEAD /s/body.txt HTTP/1.1\r\nhost: x\r\nconnection: close\r\nrange: bytes=0-9\r\n\r\n";
+    let rr = await served(root, StaticOptions.defaults(), ranged)?;
+    await removedRoot(mut root);
+    Check.equalU64(200, r.status as u64)?;
+    equalField(r, "content-length", "10000".bytes())?;
+    equalField(r, "content-type", "text/plain; charset=utf-8".bytes())?;
+    Check.equalU64(0, r.body.length as u64)?;
+    Check.equalU64(200, rr.status as u64)?;
+    equalField(rr, "content-length", "10000".bytes())?;
+    noField(rr, "content-range")?;
+    return Check.equalU64(0, rr.body.length as u64);
+}
+
+@test
+async fn if_none_match_is_304() -> Result<void, TestFailure> {
+    var root = await madeRoot()?;
+    let want = await Async.blocking(() => root.expected("body.txt", 10000))?;
+    let w = match (want) {
+        Some(w) => w,
+        null => {
+            await removedRoot(mut root);
+            return Ok(); // no validators in the interpreter
+        },
+    };
+    var fields = String.create();
+    alloc(fields.append("if-none-match: "))?;
+    alloc(fields.append(StringView.fromUtf8(w.etag.view())!))?;
+    alloc(fields.append("\r\n"))?;
+    let r = await served(root, StaticOptions.defaults(), get("/s/body.txt", fields.view())?.view())?;
+    // And If-Modified-Since at the file's own time.
+    var since = String.create();
+    alloc(since.append("if-modified-since: "))?;
+    alloc(since.append(StringView.fromUtf8(w.modified.view())!))?;
+    alloc(since.append("\r\n"))?;
+    let m = await served(root, StaticOptions.defaults(), get("/s/body.txt", since.view())?.view())?;
+    await removedRoot(mut root);
+    Check.equalU64(304, r.status as u64)?;
+    equalField(r, "etag", w.etag.view())?;
+    Check.equalU64(0, r.body.length as u64)?;
+    Check.equalU64(304, m.status as u64)?;
+    return Check.equalU64(0, m.body.length as u64);
+}
+
+@test
+async fn if_match_failing_is_412() -> Result<void, TestFailure> {
+    var root = await madeRoot()?;
+    let want = await Async.blocking(() => root.expected("body.txt", 10000))?;
+    let r = await served(root, StaticOptions.defaults(), get("/s/body.txt", "if-match: \"other\"\r\n")?.view())?;
+    await removedRoot(mut root);
+    let expected: u64 = if (want.isSome()) 412 else 200;
+    return Check.equalU64(expected, r.status as u64);
+}
+
+@test
+async fn ranges() -> Result<void, TestFailure> {
+    var root = await madeRoot()?;
+    let suffix = await served(root, StaticOptions.defaults(), get("/s/body.txt", "range: bytes=-500\r\n")?.view())?;
+    let mid = await served(root, StaticOptions.defaults(), get("/s/body.txt", "range: bytes=100-199\r\n")?.view())?;
+    let past = await served(root, StaticOptions.defaults(), get("/s/body.txt", "range: bytes=20000-\r\n")?.view())?;
+    let many = await served(root, StaticOptions.defaults(), get("/s/body.txt", "range: bytes=0-1,5-6\r\n")?.view())?;
+    let stale = await served(
+        root,
+        StaticOptions.defaults(),
+        get("/s/body.txt", "range: bytes=0-9\r\nif-range: \"stale\"\r\n")?.view(),
+    )?;
+    await removedRoot(mut root);
+    // The final 500 bytes (RFC 9110 §14.1.2).
+    Check.equalU64(206, suffix.status as u64)?;
+    equalField(suffix, "content-range", "bytes 9500-9999/10000".bytes())?;
+    equalField(suffix, "content-length", "500".bytes())?;
+    Check.equalU64(500, suffix.body.length as u64)?;
+    Check.isTrue(isPattern(suffix.body.view(), 9500), "bytes 9500 to 9999")?;
+    Check.equalU64(206, mid.status as u64)?;
+    equalField(mid, "content-range", "bytes 100-199/10000".bytes())?;
+    Check.isTrue(isPattern(mid.body.view(), 100), "bytes 100 to 199")?;
+    // Past the end: 416 with the size.
+    Check.equalU64(416, past.status as u64)?;
+    equalField(past, "content-range", "bytes */10000".bytes())?;
+    // Several ranges are ignored: the whole file.
+    Check.equalU64(200, many.status as u64)?;
+    Check.equalU64(10000, many.body.length as u64)?;
+    // An If-Range that does not match: the whole file.
+    Check.equalU64(200, stale.status as u64)?;
+    return Check.equalU64(10000, stale.body.length as u64);
+}
+
+@test
+async fn directories_and_index() -> Result<void, TestFailure> {
+    var root = await madeRoot()?;
+    let home = await served(root, StaticOptions.defaults(), get("/s/", "")?.view())?;
+    let docs = await served(root, StaticOptions.defaults(), get("/s/docs", "")?.view())?;
+    let docsSlash = await served(root, StaticOptions.defaults(), get("/s/docs/", "")?.view())?;
+    let sub = await served(root, StaticOptions.defaults(), get("/s/sub/", "")?.view())?;
+    var off = StaticOptions.defaults();
+    off.index = false;
+    let noIndex = await served(root, off, get("/s/docs/", "")?.view())?;
+    await removedRoot(mut root);
+    Check.equalU64(200, home.status as u64)?;
+    equalField(home, "content-type", "text/html; charset=utf-8".bytes())?;
+    Check.equalBytes("<p>home</p>".bytes(), home.body.view())?;
+    Check.equalU64(200, docs.status as u64)?;
+    Check.equalBytes("<p>docs</p>".bytes(), docs.body.view())?;
+    Check.equalU64(200, docsSlash.status as u64)?;
+    Check.equalU64(404, sub.status as u64)?;           // a directory without an index: no listing
+    return Check.equalU64(404, noIndex.status as u64); // index off
+}
+
+@test
+async fn refused_and_missing_are_404() -> Result<void, TestFailure> {
+    var root = await madeRoot()?;
+    let up = await served(root, StaticOptions.defaults(), get("/s/../body.txt", "")?.view())?;
+    let encoded = await served(root, StaticOptions.defaults(), get("/s/%2e%2e/body.txt", "")?.view())?;
+    let missing = await served(root, StaticOptions.defaults(), get("/s/nothing.txt", "")?.view())?;
+    let notDir = await served(root, StaticOptions.defaults(), get("/s/body.txt/x", "")?.view())?;
+    let fifo = await served(root, StaticOptions.defaults(), get("/s/fifo", "")?.view())?;
+    let hadFifo = root.fifo;
+    await removedRoot(mut root);
+    Check.equalU64(404, up.status as u64)?;
+    Check.equalU64(404, encoded.status as u64)?;
+    Check.equalU64(404, missing.status as u64)?;
+    Check.equalU64(404, notDir.status as u64)?;
+    // A FIFO with no writer: refused at once, never waited on (the test's timeout would end a wait).
+    if (hadFifo) {
+        Check.equalU64(404, fifo.status as u64)?;
+    }
+    return Ok();
+}
+
+@test
+async fn unknown_types_are_octet_stream_and_nosniff() -> Result<void, TestFailure> {
+    var root = await madeRoot()?;
+    let r = await served(root, StaticOptions.defaults(), get("/s/data.bin", "")?.view())?;
+    var cached = StaticOptions.defaults();
+    alloc(cached.cacheControl.extend("public, max-age=60".bytes()))?;
+    let c = await served(root, cached, get("/s/body.txt", "")?.view())?;
+    await removedRoot(mut root);
+    equalField(r, "content-type", "application/octet-stream".bytes())?;
+    equalField(r, "x-content-type-options", "nosniff".bytes())?;
+    return equalField(c, "cache-control", "public, max-age=60".bytes());
+}

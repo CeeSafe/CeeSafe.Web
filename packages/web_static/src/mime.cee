@@ -1,0 +1,214 @@
+// `Content-Type` from a file's extension (Web ADR 0013 §3.5): a small table taken from nginx's `mime.types` and
+// IANA's media types registry. Text types get `; charset=utf-8`. Anything else is `application/octet-stream`, with
+// `X-Content-Type-Options: nosniff`.
+
+public struct MediaTypes {
+    /// The fallback for an unknown extension (sent with `X-Content-Type-Options: nosniff`).
+    public fn fallback() -> StringView => "application/octet-stream";
+
+    /// The media type for the file named `name` (its last segment, or a whole path), by the extension after its last
+    /// `.`, compared ignoring case; empty if the table has none, for which the caller sends `fallback()`.
+    public fn forName(name: Slice<u8>) -> StringView {
+        var dot = name.length;
+        var k = name.length;
+        while (k > 0) {
+            k -= 1;
+            if (name[k] == 47) {
+                break;
+            }
+            if (name[k] == 46) {
+                dot = k;
+                break;
+            }
+        }
+        if (dot == name.length || dot + 1 == name.length || name.length - dot - 1 > 12) {
+            return "";
+        }
+        var ext = [0u8; 12];
+        let e = name[dot + 1..];
+        for (i in 0..e.length) {
+            let b = e[i];
+            ext[i] = if (b >= 65 && b <= 90) b + 32 else b;
+        }
+        return typeText(lookup(ext[0..e.length]));
+    }
+}
+
+/// The table's entry for an extension (lower case): 1 and up, or 0 if there is none.
+fn lookup(x: Slice<u8>) -> u32 {
+    if (is(x, "html") || is(x, "htm")) {
+        return 1;
+    }
+    if (is(x, "css")) {
+        return 2;
+    }
+    if (is(x, "js") || is(x, "mjs")) {
+        return 3;
+    }
+    if (is(x, "json") || is(x, "map")) {
+        return 4;
+    }
+    if (is(x, "txt")) {
+        return 5;
+    }
+    if (is(x, "csv")) {
+        return 6;
+    }
+    if (is(x, "md")) {
+        return 7;
+    }
+    if (is(x, "xml")) {
+        return 8;
+    }
+    if (is(x, "svg")) {
+        return 9;
+    }
+    if (is(x, "webmanifest")) {
+        return 10;
+    }
+    if (is(x, "ics")) {
+        return 11;
+    }
+    if (is(x, "rss")) {
+        return 12;
+    }
+    if (is(x, "atom")) {
+        return 13;
+    }
+    if (is(x, "png")) {
+        return 14;
+    }
+    if (is(x, "jpg") || is(x, "jpeg")) {
+        return 15;
+    }
+    if (is(x, "gif")) {
+        return 16;
+    }
+    if (is(x, "webp")) {
+        return 17;
+    }
+    if (is(x, "avif")) {
+        return 18;
+    }
+    if (is(x, "ico")) {
+        return 19;
+    }
+    if (is(x, "bmp")) {
+        return 20;
+    }
+    if (is(x, "tif") || is(x, "tiff")) {
+        return 21;
+    }
+    if (is(x, "woff")) {
+        return 22;
+    }
+    if (is(x, "woff2")) {
+        return 23;
+    }
+    if (is(x, "ttf")) {
+        return 24;
+    }
+    if (is(x, "otf")) {
+        return 25;
+    }
+    if (is(x, "mp3")) {
+        return 26;
+    }
+    if (is(x, "ogg") || is(x, "oga")) {
+        return 27;
+    }
+    if (is(x, "wav")) {
+        return 28;
+    }
+    if (is(x, "flac")) {
+        return 29;
+    }
+    if (is(x, "mp4") || is(x, "m4v")) {
+        return 30;
+    }
+    if (is(x, "webm")) {
+        return 31;
+    }
+    if (is(x, "ogv")) {
+        return 32;
+    }
+    if (is(x, "mov")) {
+        return 33;
+    }
+    if (is(x, "pdf")) {
+        return 34;
+    }
+    if (is(x, "wasm")) {
+        return 35;
+    }
+    if (is(x, "zip")) {
+        return 36;
+    }
+    if (is(x, "gz")) {
+        return 37;
+    }
+    if (is(x, "tar")) {
+        return 38;
+    }
+    if (is(x, "7z")) {
+        return 39;
+    }
+    return 0;
+}
+
+/// The media type of a table entry, empty for 0.
+fn typeText(entry: u32) -> StringView => match (entry) {
+    1 => "text/html; charset=utf-8",
+    2 => "text/css; charset=utf-8",
+    3 => "text/javascript; charset=utf-8",
+    4 => "application/json; charset=utf-8",
+    5 => "text/plain; charset=utf-8",
+    6 => "text/csv; charset=utf-8",
+    7 => "text/markdown; charset=utf-8",
+    8 => "text/xml; charset=utf-8",
+    9 => "image/svg+xml; charset=utf-8",
+    10 => "application/manifest+json; charset=utf-8",
+    11 => "text/calendar; charset=utf-8",
+    12 => "application/rss+xml; charset=utf-8",
+    13 => "application/atom+xml; charset=utf-8",
+    14 => "image/png",
+    15 => "image/jpeg",
+    16 => "image/gif",
+    17 => "image/webp",
+    18 => "image/avif",
+    19 => "image/vnd.microsoft.icon",
+    20 => "image/bmp",
+    21 => "image/tiff",
+    22 => "font/woff",
+    23 => "font/woff2",
+    24 => "font/ttf",
+    25 => "font/otf",
+    26 => "audio/mpeg",
+    27 => "audio/ogg",
+    28 => "audio/wav",
+    29 => "audio/flac",
+    30 => "video/mp4",
+    31 => "video/webm",
+    32 => "video/ogg",
+    33 => "video/quicktime",
+    34 => "application/pdf",
+    35 => "application/wasm",
+    36 => "application/zip",
+    37 => "application/gzip",
+    38 => "application/x-tar",
+    39 => "application/x-7z-compressed",
+    _ => "",
+};
+
+fn is(x: Slice<u8>, ext: StringView) -> bool {
+    let e = ext.bytes();
+    if (x.length != e.length) {
+        return false;
+    }
+    for (i in 0..x.length) {
+        if (x[i] != e[i]) {
+            return false;
+        }
+    }
+    return true;
+}

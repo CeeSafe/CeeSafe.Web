@@ -48,7 +48,178 @@ public struct HttpDate {
         out[27] = 77;
         out[28] = 84;
     }
+
+    /// The Unix seconds of an HTTP date in any of RFC 9110 §5.6.7's three forms, or null if it is none of them or is
+    /// before 1970:
+    /// - IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`;
+    /// - RFC 850, `Sunday, 06-Nov-94 08:49:37 GMT`, whose two-digit year is the one in the century that is not more than
+    ///   50 years after `nowSeconds` (RFC 9110 §5.6.7);
+    /// - asctime, `Sun Nov  6 08:49:37 1994`.
+    /// The weekday must be a day's name, and is not checked against the date. A second of 60 (a leap second) is taken
+    /// as 59.
+    public fn parse(text: Slice<u8>, nowSeconds: u64) -> u64? {
+        if (text.length == 29 && text[3] == 44) {
+            return fixdate(text);
+        }
+        if (text.length == 24 && text[3] == 32) {
+            return asctime(text);
+        }
+        return rfc850(text, nowSeconds);
+    }
 }
+
+/// `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn fixdate(t: Slice<u8>) -> u64? {
+    if (!shortDay(t[0..3]) || t[4] != 32 || t[7] != 32 || t[11] != 32 || t[16] != 32 || t[25] != 32 ||
+        !same(t[26..29], "GMT")) {
+        return null;
+    }
+    let day = digits(t[5..7])?;
+    let month = monthOf(t[8..11])?;
+    let year = digits(t[12..16])?;
+    return civil(year, month, day, t[17..25]);
+}
+
+/// `Sun Nov  6 08:49:37 1994`: the day is padded with a space.
+fn asctime(t: Slice<u8>) -> u64? {
+    if (!shortDay(t[0..3]) || t[7] != 32 || t[10] != 32 || t[19] != 32) {
+        return null;
+    }
+    let month = monthOf(t[4..7])?;
+    let day = if (t[8] == 32) digits(t[9..10])? else digits(t[8..10])?;
+    let year = digits(t[20..24])?;
+    return civil(year, month, day, t[11..19]);
+}
+
+/// `Sunday, 06-Nov-94 08:49:37 GMT`.
+fn rfc850(t: Slice<u8>, nowSeconds: u64) -> u64? {
+    var comma: usize = 0;
+    while (comma < t.length && t[comma] != 44) {
+        comma += 1;
+    }
+    if (comma >= t.length || !longDay(t[0..comma])) {
+        return null;
+    }
+    let r = t[comma + 1..];
+    if (r.length != 23 || r[0] != 32 || r[3] != 45 || r[7] != 45 || r[10] != 32 || r[19] != 32 ||
+        !same(r[20..23], "GMT")) {
+        return null;
+    }
+    let day = digits(r[1..3])?;
+    let month = monthOf(r[4..7])?;
+    let yy = digits(r[8..10])?;
+    // The year in the century of now, or the one before if that is more than 50 years ahead (RFC 9110 §5.6.7).
+    let nowYear = yearOf(nowSeconds);
+    var year = (nowYear / 100) * 100 + yy;
+    if (year > nowYear + 50) {
+        year -= 100;
+    }
+    return civil(year, month, day, r[11..19]);
+}
+
+/// The Unix seconds of a civil date and `hh:mm:ss`, or null if it is not a date at or after 1970-01-01.
+fn civil(year: u64, month: u64, day: u64, clock: Slice<u8>) -> u64? {
+    if (clock[2] != 58 || clock[5] != 58) {
+        return null;
+    }
+    let hour = digits(clock[0..2])?;
+    let minute = digits(clock[3..5])?;
+    var second = digits(clock[6..8])?;
+    if (second == 60) {
+        second = 59;
+    }
+    if (year < 1970 || month < 1 || month > 12 || day < 1 || day > monthDays(year, month) || hour > 23 ||
+        minute > 59 || second > 59) {
+        return null;
+    }
+    // Howard Hinnant's days_from_civil, for years >= 1970 (all values unsigned).
+    let y = if (month <= 2) year - 1 else year;
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = if (month > 2) month - 3 else month + 9;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    return Some(days * 86400 + hour * 3600 + minute * 60 + second);
+}
+
+/// The civil year of a Unix time.
+fn yearOf(unixSeconds: u64) -> u64 {
+    let z = unixSeconds / 86400 + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if (mp < 10) mp + 3 else mp - 9;
+    return yoe + era * 400 + (if (month <= 2) 1u64 else 0u64);
+}
+
+fn monthDays(year: u64, month: u64) -> u64 {
+    if (month == 2) {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        return if (leap) 29 else 28;
+    }
+    return if (month == 4 || month == 6 || month == 9 || month == 11) 30 else 31;
+}
+
+/// The value of one or more ASCII digits, or null.
+fn digits(s: Slice<u8>) -> u64? {
+    if (s.length == 0) {
+        return null;
+    }
+    var v: u64 = 0;
+    for (b in s) {
+        if (b < 48 || b > 57) {
+            return null;
+        }
+        v = v * 10 + (b - 48) as u64;
+    }
+    return Some(v);
+}
+
+/// Whether `s` is exactly `text` (case-sensitive, as RFC 9110 §5.6.7's grammar is).
+fn same(s: Slice<u8>, text: StringView) -> bool {
+    let t = text.bytes();
+    if (s.length != t.length) {
+        return false;
+    }
+    for (i in 0..s.length) {
+        if (s[i] != t[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// January is 1.
+fn monthOf(s: Slice<u8>) -> u64? {
+    let months = "JanFebMarAprMayJunJulAugSepOctNovDec".bytes();
+    var m: usize = 0;
+    while (m < 12) {
+        if (s[0] == months[m * 3] && s[1] == months[m * 3 + 1] && s[2] == months[m * 3 + 2]) {
+            return Some((m + 1) as u64);
+        }
+        m += 1;
+    }
+    return null;
+}
+
+fn shortDay(s: Slice<u8>) -> bool {
+    let names = "SunMonTueWedThuFriSat".bytes();
+    var d: usize = 0;
+    while (d < 7) {
+        if (s[0] == names[d * 3] && s[1] == names[d * 3 + 1] && s[2] == names[d * 3 + 2]) {
+            return true;
+        }
+        d += 1;
+    }
+    return false;
+}
+
+fn longDay(s: Slice<u8>) -> bool =>
+    same(s, "Sunday") || same(s, "Monday") || same(s, "Tuesday") || same(s, "Wednesday") || same(s, "Thursday") ||
+        same(s, "Friday") || same(s, "Saturday");
 
 fn twoDigits(out: borrow mut [u8; 29], at: usize, v: u64) {
     out[at] = truncate<u8>(48 + (v / 10) % 10);

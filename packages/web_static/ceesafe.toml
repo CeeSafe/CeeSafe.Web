@@ -1,0 +1,10 @@
+[package]
+name = "web_static"
+version = "0.3.1"
+kind = "library"
+
+[dependencies]
+web_core = { path = "../web_core" }
+web_transport = { path = "../web_transport" }
+web_http = { path = "../web_http" }
+web_server = { path = "../web_server" }
