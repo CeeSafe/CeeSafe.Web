@@ -11,6 +11,7 @@ public enum RangeAsk {
     Unsatisfiable,
 }
 
+/// One `bytes` range of a file, from a `Range` field (RFC 9110 §14).
 public struct Ranges {
     /// What `value` asks of a file of `size` bytes. The forms are `bytes=a-b`, `bytes=a-` and `bytes=-n` (RFC 9110
     /// §14.1.2). The unit is case-insensitive, and white space around the range is allowed. A last position past the

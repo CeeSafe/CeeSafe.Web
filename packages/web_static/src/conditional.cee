@@ -63,6 +63,7 @@ public enum Precondition {
     Failed,
 }
 
+/// RFC 9110 §13.2.2's preconditions and §13.1.5's `If-Range`, for a file's `Validators`.
 public struct Conditionals {
     /// RFC 9110 §13.2.2's steps 1 to 4 for a GET or HEAD of a file with `validators`, given the request's fields:
     /// 1. `If-Match` that does not match (strong comparison; `*` matches any file) is 412.

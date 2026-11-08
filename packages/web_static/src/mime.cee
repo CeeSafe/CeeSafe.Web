@@ -2,6 +2,7 @@
 // IANA's media types registry. Text types get `; charset=utf-8`. Anything else is `application/octet-stream`, with
 // `X-Content-Type-Options: nosniff`.
 
+/// The `Content-Type` of a file, from its extension.
 public struct MediaTypes {
     /// The fallback for an unknown extension (sent with `X-Content-Type-Options: nosniff`).
     public fn fallback() -> StringView => "application/octet-stream";

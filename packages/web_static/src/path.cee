@@ -18,6 +18,7 @@ public enum PathRefusal {
     OutOfMemory,
 }
 
+/// The lexical rules for a request path under the root (Web ADR 0013 §3.5).
 public struct StaticPaths {
     /// The longest decoded path accepted, in bytes.
     public fn maxLength() -> usize => 1024;
