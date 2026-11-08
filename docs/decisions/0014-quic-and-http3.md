@@ -1,6 +1,14 @@
 # Web ADR 0014 — HTTP/3 and QUIC: ngtcp2 and nghttp3 behind a sans-I/O shim
 
-**Status:** proposed 2026-11-09 (M10), for the owner's answers in §7.
+**Status:** accepted 2026-11-09 (M10). The owner accepted each recommendation in §7:
+- OpenSSL ≥ 3.5 only for `web_quic`, with `web_tls` kept at ≥ 3.0;
+- ngtcp2's OpenSSL backend, pinned to 1.26.0, with its one rule in the shim;
+- a C shim that queues the libraries' events, not callbacks into CeeSafe;
+- two packages, `web_quic` and `web_http3`;
+- CI's Linux jobs on `ubuntu-26.04` with one `ubuntu-24.04` job without the QUIC packages, and OpenSSL 3.5 LTS built
+  into a prefix on hanan;
+- 0-RTT off by default, safe methods only, and 425 for the rest;
+- no HTTP/3 in `web_client` in M10.
 **Scope:** implementation plan §7 M10. It covers:
 - OpenSSL 3.5, and where it is required;
 - ngtcp2 and nghttp3, vendored, with ngtcp2's OpenSSL crypto backend;
@@ -271,7 +279,7 @@ Each stage is committed and checked.
 - **netem** loss of 5 % and 10 %, and reordering, on loopback (Linux): transfers complete, and SHA-256 matches.
 - **Flood guards:** each guard's test, as M7's.
 
-## 7. Questions for the owner
+## 7. Questions for the owner (answered 2026-11-09: each as recommended)
 
 1. **OpenSSL ≥ 3.5 only for `web_quic`, with `web_tls` kept at ≥ 3.0?** Recommended: **yes**, so HTTP/1.1 and HTTP/2
    over TLS keep working on Debian 12 and Ubuntu 24.04. The alternative is the plan's literal reading: raise every
