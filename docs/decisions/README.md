@@ -19,6 +19,7 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0011](0011-http2.md) | HTTP/2: HPACK, frames, streams as tasks, flow control, push, the flood guards | Accepted 2026-11-03 | M7 |
 | [0012](0012-reverse-proxy.md) | The reverse proxy, and what M7 left open | Accepted 2026-11-03 | M8 |
 | [0013](0013-low-level-io.md) | Low-level I/O: profiling, buffers, vectored writes, sending files, static files | Accepted 2026-11-06 | M9 |
+| [0014](0014-quic-and-http3.md) | HTTP/3 and QUIC: ngtcp2 and nghttp3 behind a sans-I/O shim | Proposed 2026-11-09 | M10 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 
