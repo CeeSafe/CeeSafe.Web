@@ -33,6 +33,7 @@ that needs an unreleased compiler is not merged to main.
 | `~/.ceesafe/bin/ceesafec-0.18.0` | 0.18.0 (release, osx-arm64) | B18's repro only: it does not check CeeSafe.Web |
 | `~/.ceesafe/bin/ceesafec-0.17.0` | 0.17.0 (release, osx-arm64) | the last release that builds M8 unchanged |
 | `~/.ceesafe/bin/ceesafec-0.11.0` | **0.11.0** (release, tag `v0.11.0` = CeeSafe `45dde8d`; osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, checked 2026-11-04) | the toolchain for M8; `ceesafec test` runs the tests and both sweeps |
+| `/root/cw-m9/ceesafec-0.19.1/ceesafec` and `/root/cw-m9/ceesafec-0.21.0/ceesafec` on the Debian x86_64 host (hanan) | 0.19.1 and 0.21.0 (releases, linux-x64; archives checked against each release's `SHA256SUMS`, 2026-11-08) | M9 stage 5's runs (0.19.1); B19's probe (both) |
 | `/root/cw-m8/ceesafec-0.11.0/ceesafec` on the Debian x86_64 host; `C:\cw-m8\bin\ceesafec.exe` on the Windows 11 ARM64 VM | **0.11.0** (release, linux-x64 and win-arm64) | M8's Debian and Windows runs |
 | `~/.ceesafe/bin/ceesafec-0.10.3` | 0.10.3 (release, tag `v0.10.3` = CeeSafe `94a4a92`) | M7 and v0.3.x; main's minimum until M8 merged |
 | `/root/cw-m5/ceesafec-0.9.4/ceesafec` on the Debian x86_64 host | **0.9.4** (release, linux-x64, SHA256 checked) | M5's Debian runs |

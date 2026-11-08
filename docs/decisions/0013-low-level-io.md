@@ -327,3 +327,16 @@ Five details of §3.3 and §5 changed in the building; the design is otherwise a
 A failed send marks the exchange done and not to be kept, so a handler that ignores the error still never completes
 the response: no last chunk over HTTP/1.1, no END_STREAM over HTTP/2 (tests `*_when_the_handler_ignores_it` in
 `packages/web_server/tests/sendfile.cee`).
+
+## 8. Amendment 2 (2026-11-08, M9 stage 5: measured)
+
+1. **§3.6's numbers are in, without the file routes.** On the Debian host (M9.md, stage 5), io_uring served 0.94x
+   epoll's requests a second (geometric mean, 60 cells, two runs of each in A B A B order). It was 21–24 % slower
+   for large bodies on one connection, and better beyond noise in no cell. Allocations and peak RSS were the same.
+   The recommendation sent to CeeSafe: keep epoll the default.
+2. **The file routes (`file`, and `file1g`, the 1 GiB file §3.6 asks for) wait for CeeSafe bug B19.** On Linux,
+   `sendfile` to a reset connection raises SIGPIPE and ends the process. h2load resets its connections when its time
+   is up, so no file run finishes (`docs/ceesafe-upstream-work.md` B19). §3.3's `sendFile` is otherwise as built.
+   B19 is not worked around here, since that would take `unsafe` or C. v0.4 waits for its fix, since otherwise any
+   client could end a Linux server that sends files.
+
