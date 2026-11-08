@@ -151,9 +151,7 @@ public struct Balancer {
     /// Adds a backend named `name` (its URL) with `weight` (at least 1); its index is the count before.
     public fn add(borrow mut this, name: Slice<u8>, weight: u32) -> Result<usize, AllocError> {
         var copy = Vector<u8>.create();
-        for (b in name) {
-            copy.push(b)?;
-        }
+        copy.extend(name)?;
         this.backends.push(BackendState {
             name: copy,
             weight: if (weight == 0) 1u32 else weight,
@@ -396,13 +394,9 @@ fn isAvoided(i: usize, avoid: usize?) -> bool => match (avoid) {
 
 /// The hash input: the key, a separator that cannot be in a URL, the backend's name and its replica number.
 fn fill(out: borrow mut Vector<u8>, key: Slice<u8>, name: Slice<u8>, replica: u32) -> Result<void, AllocError> {
-    for (b in key) {
-        out.push(b)?;
-    }
+    out.extend(key)?;
     out.push(0)?;
-    for (b in name) {
-        out.push(b)?;
-    }
+    out.extend(name)?;
     out.push(0)?;
     out.push(truncate<u8>(replica))?;
     return out.push(truncate<u8>(replica >> 8));

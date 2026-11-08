@@ -102,6 +102,21 @@ impl Transport for TcpTransport {
         }
     }
 
+    /// lib/std's `sendFileAll` (CeeSafe ADR 0051): `sendfile` or `TransmitFile`, nothing copied, or its bounded copy
+    /// where the kernel refuses. Poisons on failure, as `write`.
+    async fn sendFile(borrow mut this, file: borrow mut File, offset: u64, length: u64) -> Result<void, NetError> {
+        if (this.poisoned || this.shut) {
+            return Err(NetError.Closed);
+        }
+        match (await this.stream.sendFileAll(file, offset, length)) {
+            Ok() => { return Ok(); }
+            Err(e) => {
+                this.poisoned = true;
+                return Err(NetErrors.fromAsync(e));
+            }
+        }
+    }
+
     async fn shutdownWrite(borrow mut this) -> Result<void, NetError> {
         if (this.poisoned) {
             return Err(NetError.Closed);

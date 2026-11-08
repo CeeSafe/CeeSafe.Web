@@ -48,6 +48,13 @@ impl Transport for PlainStream {
         }
     }
 
+    async fn sendFile(borrow mut this, file: borrow mut File, offset: u64, length: u64) -> Result<void, NetError> {
+        match (borrow mut this.plain) {
+            Plain.Tcp(t) => { return await t.sendFile(file, offset, length); }
+            Plain.Mock(m) => { return await m.sendFile(file, offset, length); }
+        }
+    }
+
     async fn shutdownWrite(borrow mut this) -> Result<void, NetError> {
         match (borrow mut this.plain) {
             Plain.Tcp(t) => { return await t.shutdownWrite(); }

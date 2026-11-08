@@ -57,6 +57,8 @@ public struct Exchange<region r> {
 
     private body: BodyState;
     private left: u64;
+    /// A multiplexed request's declared length less what has been read, or null without a declaration.
+    private streamLeft: u64?;
     private decoder: ChunkDecoder;
     private rate: MinRate;
     private continuePending: bool;
@@ -127,6 +129,7 @@ public struct Exchange<region r> {
             date: date,
             body: state,
             left: length,
+            streamLeft: null,
             decoder: decoder,
             rate: rate,
             continuePending: expectContinue && hasBody,
@@ -164,6 +167,11 @@ public struct Exchange<region r> {
         pending.clear();
         response.reset();
         let decoder = ChunkDecoder.create(limits);
+        // The engine has checked a declared length against the DATA (RFC 9113 §8.1.1).
+        let declared = match (request.headers().get(HeaderName.ContentLength)) {
+            Some(v) => Ascii.parseDecimal(v),
+            null => null,
+        };
         return Exchange {
             conn: conn,
             stream: stream,
@@ -178,6 +186,7 @@ public struct Exchange<region r> {
             date: date,
             body: if (hasBody) BodyState.Stream else BodyState.Done,
             left: 0,
+            streamLeft: if (hasBody) declared else null,
             decoder: decoder,
             rate: MinRate.off(),
             continuePending: false,
@@ -213,6 +222,13 @@ public struct Exchange<region r> {
         }
         if (this.multiplexed) {
             let n = await this.stream.readBody(buffer)?;
+            match (this.streamLeft) {
+                Some(left) => {
+                    let got = n as u64;
+                    this.streamLeft = Some(if (got < left) left - got else 0u64);
+                }
+                null => {}
+            }
             if (n == 0) {
                 this.body = BodyState.Done;
                 grown(this.stream.copyTrailers(mut this.trailerFields))?;
@@ -237,9 +253,8 @@ public struct Exchange<region r> {
                     if (n as u64 > this.left) {
                         n = truncate<usize>(this.left);
                     }
-                    for (i in 0..n) {
-                        buffer[i] = available[i];
-                    }
+                    let to = borrow mut buffer[0..n];
+                    to.copyFrom(available[0..n]);
                     this.consumeCarry(n)?;
                     this.left -= n as u64;
                     if (this.left == 0) {
@@ -257,9 +272,8 @@ public struct Exchange<region r> {
                             return Err(HandlerError.Status(ProtocolErrors.status(e)));
                         },
                     };
-                    for (i in 0..step.dataLength) {
-                        buffer[i] = input[step.dataStart + i];
-                    }
+                    let to = borrow mut buffer[0..step.dataLength];
+                    to.copyFrom(input[step.dataStart..step.dataStart + step.dataLength]);
                     for (i in 0..step.trailerLength) {
                         grown(this.trailerLines.push(input[step.trailerStart + i]))?;
                     }
@@ -380,12 +394,13 @@ public struct Exchange<region r> {
         }
     }
 
-    /// The body bytes not yet read, if the body has a length; 0 once it is read; null for a chunked body.
+    /// The body bytes not yet read, if the body has a length (over HTTP/2, a declared `content-length`); 0 once it is
+    /// read; null for a chunked body or an HTTP/2 body without a declared length.
     public fn remaining(borrow this) -> u64? => match (this.body) {
         BodyState.Done => Some(0u64),
         BodyState.Length => Some(this.left),
         BodyState.Chunked => null,
-        BodyState.Stream => null,
+        BodyState.Stream => this.streamLeft,
     };
 
     /// Reads more of the connection into `carry`, bounded by the minimum-rate deadline.
@@ -480,6 +495,127 @@ public struct Exchange<region r> {
                 Err(_) => { return Err(HandlerError.Internal); }
             }
             at += n;
+        }
+        return Ok();
+    }
+
+    /// Writes `length` bytes of `file` from `offset` as body, after what was written before (Web ADR 0013 §3.3): the head
+    /// first if it was not sent, and the declared length checked, as `write`. Over HTTP/1.1 the transport sends the
+    /// file itself (a plain stream: `sendfile`, nothing copied); over HTTP/2 it goes as DATA in pieces of 16 KiB. It
+    /// goes in slices of 1 MiB, each within the write timeout, so a client must take 1 MiB per `writeTimeoutMs`; a
+    /// chunked response sends each slice as a chunk. A file that ends before `length` fails with `Io(Io(InvalidInput))`
+    /// and the response is never completed: the HTTP/1.1 connection closes without the last chunk, and an HTTP/2
+    /// stream is reset, so a client sees a transfer cut short, never a short success.
+    public async fn sendFile(
+        borrow mut this,
+        file: borrow mut File,
+        offset: u64,
+        length: u64,
+    ) -> Result<void, HandlerError> {
+        if (this.done) {
+            return Err(HandlerError.Internal);
+        }
+        if (length == 0) {
+            return Ok();
+        }
+        match (await this.sendFileBody(file, offset, length)) {
+            Ok() => { return Ok(); }
+            Err(e) => {
+                this.keep = false;
+                this.done = true; // never completed: no last chunk, no END_STREAM
+                return Err(e);
+            }
+        }
+    }
+
+    async fn sendFileBody(
+        borrow mut this,
+        file: borrow mut File,
+        offset: u64,
+        length: u64,
+    ) -> Result<void, HandlerError> {
+        // What was written before goes first, with the head.
+        await this.sendPending()?;
+        let counted = this.written + length;
+        let declared = match (this.response.contentLength()) {
+            Some(n) => n,
+            null => counted,
+        };
+        if (counted > declared) {
+            return Err(HandlerError.Internal); // more than declared: the framing would be wrong
+        }
+        this.written = counted;
+        let bodyless = Methods.same(this.request.method(), Method.Head) || !this.response.status().allowsContent();
+        if (bodyless) {
+            return Ok(); // HEAD, 204, 304: counted, not sent (RFC 9110 §9.3.2)
+        }
+        if (this.multiplexed) {
+            return await this.streamFile(file, offset, length);
+        }
+        let chunked = match (this.framing) {
+            ResponseFraming.Chunked => true,
+            ResponseFraming.NoContent => { return Ok(); },
+            _ => false,
+        };
+        var sent: u64 = 0;
+        while (sent < length) {
+            let slice: u64 = if (length - sent < 1048576) length - sent else 1048576;
+            if (chunked) {
+                if (this.out.spareLength() < 18) {
+                    await this.flushOut()?;
+                }
+                match (Encoder.chunkHeader(truncate<usize>(slice), this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            await this.flushOut()?;
+            match (await Transports.sendFileWithin(
+                this.conn,
+                file,
+                offset + sent,
+                slice,
+                Deadline.after(this.limits.writeTimeoutMs),
+            )) {
+                Ok() => {}
+                Err(e) => { return Err(HandlerError.Io(e)); }
+            }
+            if (chunked) {
+                match (Encoder.chunkEnd(this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            sent += slice;
+        }
+        return Ok();
+    }
+
+    /// Over a stream: positioned reads of 16 KiB on a worker thread (CeeSafe ADR 0075 §2.1), each sent as DATA.
+    async fn streamFile(
+        borrow mut this,
+        file: borrow mut File,
+        offset: u64,
+        length: u64,
+    ) -> Result<void, HandlerError> {
+        var piece = match (Transports.fileBuffer(length)) {
+            Ok(b) => b,
+            Err(e) => { return Err(HandlerError.Io(e)); },
+        };
+        let size = piece.length;
+        var sent: u64 = 0;
+        while (sent < length) {
+            let left = length - sent;
+            let want: usize = if (left < size as u64) truncate<usize>(left) else size;
+            let n = match (await AsyncFiles.readAt(file, mut piece[0..want], offset + sent)) {
+                Ok(n) => n,
+                Err(e) => { return Err(HandlerError.Io(NetErrors.fromAsync(e))); },
+            };
+            if (n == 0) {
+                return Err(HandlerError.Io(NetError.Io(IoError.InvalidInput))); // the file ended before `length`
+            }
+            await this.stream.sendData(piece[0..n], false)?;
+            sent += n as u64;
         }
         return Ok();
     }
@@ -787,9 +923,8 @@ public struct Exchange<region r> {
         if (!this.carry.isEmpty()) {
             let held = this.carry.readable();
             let n = if (held.length < buffer.length) held.length else buffer.length;
-            for (i in 0..n) {
-                buffer[i] = held[i];
-            }
+            let to = borrow mut buffer[0..n];
+            to.copyFrom(held[0..n]);
             match (this.carry.consume(n)) {
                 Ok() => {}
                 Err(_) => { return Err(HandlerError.Internal); }

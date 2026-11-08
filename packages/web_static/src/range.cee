@@ -1,0 +1,120 @@
+// The `Range` field (RFC 9110 §14.1, §14.2), as Web ADR 0013 §3.5 answers it: one range of `bytes`, or the whole file.
+// Several ranges, another unit or a malformed field are ignored (§6.4: no `multipart/byteranges`).
+
+/// What a `Range` field asks of a file of a given size.
+public enum RangeAsk {
+    /// Ignore it and send the whole file (200).
+    Whole,
+    /// Send bytes `first` to `last`, both included (206).
+    Part(u64, u64),
+    /// Nothing of the file is in the range (416, `Content-Range: bytes */size`).
+    Unsatisfiable,
+}
+
+/// One `bytes` range of a file, from a `Range` field (RFC 9110 §14).
+public struct Ranges {
+    /// What `value` asks of a file of `size` bytes. The forms are `bytes=a-b`, `bytes=a-` and `bytes=-n` (RFC 9110
+    /// §14.1.2). The unit is case-insensitive, and white space around the range is allowed. A last position past the
+    /// end is clipped, and a suffix longer than the file is the whole file. A first position at or past the end, or
+    /// a suffix of 0, is unsatisfiable. A list of several ranges, another unit, `a-b` with `b < a`, or anything else
+    /// malformed is `Whole`.
+    public fn ask(value: Slice<u8>, size: u64) -> RangeAsk {
+        let v = trimmed(value);
+        if (v.length < 6 || !unitIsBytes(v[0..5]) || v[5] != 61) {
+            return RangeAsk.Whole;
+        }
+        let spec = trimmed(v[6..]);
+        for (b in spec) {
+            if (b == 44) {
+                return RangeAsk.Whole; // several ranges (or an empty element of a list): ignored
+            }
+        }
+        var dash: usize = 0;
+        while (dash < spec.length && spec[dash] != 45) {
+            dash += 1;
+        }
+        if (dash == spec.length) {
+            return RangeAsk.Whole;
+        }
+        let firstText = spec[0..dash];
+        let lastText = spec[dash + 1..];
+        if (firstText.length == 0) {
+            // A suffix: the last `n` bytes.
+            let n = match (number(lastText)) {
+                Some(x) => x,
+                null => { return RangeAsk.Whole; },
+            };
+            if (n == 0 || size == 0) {
+                return RangeAsk.Unsatisfiable;
+            }
+            let first = if (n >= size) 0 else size - n;
+            return RangeAsk.Part(first, size - 1);
+        }
+        let first = match (number(firstText)) {
+            Some(x) => x,
+            null => { return RangeAsk.Whole; },
+        };
+        var last: u64 = 0;
+        if (lastText.length == 0) {
+            last = 0xFFFFFFFFFFFFFFFF;
+        } else {
+            last = match (number(lastText)) {
+                Some(x) => x,
+                null => { return RangeAsk.Whole; },
+            };
+            if (last < first) {
+                return RangeAsk.Whole; // invalid (RFC 9110 §14.1.1): ignored
+            }
+        }
+        if (first >= size) {
+            return RangeAsk.Unsatisfiable;
+        }
+        return RangeAsk.Part(first, if (last >= size) size - 1 else last);
+    }
+}
+
+/// A run of ASCII digits, saturating at the largest u64 (a position past any file), or null.
+fn number(s: Slice<u8>) -> u64? {
+    if (s.length == 0) {
+        return null;
+    }
+    var v: u64 = 0;
+    for (b in s) {
+        if (b < 48 || b > 57) {
+            return null;
+        }
+        let d = (b - 48) as u64;
+        if (v > (0xFFFFFFFFFFFFFFFF - d) / 10) {
+            v = 0xFFFFFFFFFFFFFFFF;
+        } else {
+            v = v * 10 + d;
+        }
+    }
+    return Some(v);
+}
+
+/// `bytes`, in any case.
+fn unitIsBytes(s: Slice<u8>) -> bool {
+    let want = "bytes".bytes();
+    for (i in 0..5) {
+        let b = s[i];
+        let lower = if (b >= 65 && b <= 90) b + 32 else b;
+        if (lower != want[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// `s` without leading or trailing spaces and tabs.
+fn trimmed(s: Slice<u8>) -> Slice<u8> {
+    var a: usize = 0;
+    var b = s.length;
+    while (a < b && (s[a] == 32 || s[a] == 9)) {
+        a += 1;
+    }
+    while (b > a && (s[b - 1] == 32 || s[b - 1] == 9)) {
+        b -= 1;
+    }
+    return s[a..b];
+}

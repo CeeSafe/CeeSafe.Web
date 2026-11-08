@@ -1,0 +1,246 @@
+// Helpers for web_static's tests: a test state, a root of files in a temporary directory, one request served on a
+// mock connection, and the response it wrote, split into status, fields and body (RFC 9112 §4, §6: a length-framed
+// body is the bytes after the head).
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+
+struct St {}
+
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+fn io<T>(r: Result<T, IoError>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create(what)); }
+    }
+}
+
+/// Byte `i` of the test's text file: a repeating alphabet.
+fn pattern(i: usize) -> u8 => 97 + truncate<u8>(i % 26);
+
+/// `dir` + `/` + `name`.
+fn joined(dir: StringView, name: StringView) -> Result<String, TestFailure> {
+    var s = String.create();
+    alloc(s.append(dir))?;
+    alloc(s.append("/"))?;
+    alloc(s.append(name))?;
+    return Ok(s);
+}
+
+fn writeFile(path: StringView, bytes: Slice<u8>) -> Result<void, TestFailure> {
+    var f = io(File.create(path), "creating a file")?;
+    io(f.write(bytes), "writing a file")?;
+    return Ok();
+}
+
+/// A root in a new temporary directory:
+/// - `body.txt`, 10000 pattern bytes;
+/// - `index.html`;
+/// - `data.bin`, an extension the table does not have;
+/// - `sub/`, a directory with no index;
+/// - `docs/index.html`;
+/// - `fifo`, a FIFO with no writer, where `mkfifo` exists.
+struct Root {
+    dir: String;
+    fifo: bool;
+
+    fn create() -> Result<Root, TestFailure> {
+        let dir = io(Directory.temporary(), "a temporary directory")?;
+        var body = [0u8; 10000];
+        for (i in 0..10000) {
+            body[i] = pattern(i);
+        }
+        let b = joined(dir.view(), "body.txt")?;
+        writeFile(b.view(), body[..])?;
+        let i = joined(dir.view(), "index.html")?;
+        writeFile(i.view(), "<p>home</p>".bytes())?;
+        let d = joined(dir.view(), "data.bin")?;
+        let binary = [1u8, 2u8];
+        writeFile(d.view(), binary[..])?;
+        let sub = joined(dir.view(), "sub")?;
+        io(Directory.create(sub.view()), "a directory")?;
+        let docs = joined(dir.view(), "docs")?;
+        io(Directory.create(docs.view()), "a directory")?;
+        let di = joined(dir.view(), "docs/index.html")?;
+        writeFile(di.view(), "<p>docs</p>".bytes())?;
+        let f = joined(dir.view(), "fifo")?;
+        var arguments = Vector<StringView>.create();
+        alloc(arguments.push(f.view()))?;
+        let made = match (Process.capture("mkfifo", arguments, null)) {
+            Ok(out) => out.status == 0,
+            Err(_) => false,
+        };
+        return Ok(Root { dir: dir, fifo: made });
+    }
+
+    fn remove(borrow this) {
+        let names = ["body.txt", "index.html", "data.bin", "docs/index.html", "fifo"];
+        for (n in names) {
+            match (joined(this.dir.view(), n)) {
+                Ok(p) => { let _ = File.remove(p.view()); }
+                Err(_) => {}
+            }
+        }
+        for (n in ["sub", "docs"]) {
+            match (joined(this.dir.view(), n)) {
+                Ok(p) => { let _ = Directory.remove(p.view()); }
+                Err(_) => {}
+            }
+        }
+        let _ = Directory.remove(this.dir.view());
+    }
+
+    /// The file's expected `ETag` and `Last-Modified`, from `File.modified(path)` (a `stat` of the path, which the
+    /// handler does not use), or null where the system cannot tell (the interpreter).
+    fn expected(borrow this, name: StringView, size: u64) -> Result<Expected?, TestFailure> {
+        let p = joined(this.dir.view(), name)?;
+        let t = match (File.modified(p.view())) {
+            Ok(t) => t,
+            Err(IoError.Unsupported) => { return Ok(null); },
+            Err(_) => { return Err(TestFailure.create("the file's time")); },
+        };
+        // The ETag: `"<size hex>-<nanoseconds hex>"` (Web ADR 0013 §3.5), written here independently.
+        var tag = Vector<u8>.create();
+        alloc(tag.push(34))?;
+        alloc(hex(mut tag, size))?;
+        alloc(tag.push(45))?;
+        alloc(hex(mut tag, truncate<u64>(t.seconds) * 1000000000 + t.nanoseconds as u64))?;
+        alloc(tag.push(34))?;
+        var date = [0u8; 29];
+        HttpDate.format(truncate<u64>(t.seconds), mut date);
+        var modified = Vector<u8>.create();
+        alloc(modified.extend(date[..]))?;
+        return Ok(Some(Expected { etag: tag, modified: modified }));
+    }
+}
+
+struct Expected {
+    etag: Vector<u8>;
+    modified: Vector<u8>;
+}
+
+fn hex(out: borrow mut Vector<u8>, v: u64) -> Result<void, AllocError> {
+    let digits = "0123456789abcdef".bytes();
+    var buffer = [0u8; 16];
+    var n: usize = 0;
+    var x = v;
+    loop {
+        buffer[n] = digits[truncate<usize>(x % 16)];
+        n += 1;
+        x /= 16;
+        if (x == 0) {
+            break;
+        }
+    }
+    while (n > 0) {
+        n -= 1;
+        out.push(buffer[n])?;
+    }
+    return Ok();
+}
+
+async fn madeRoot() -> Result<Root, TestFailure> => await Async.blocking(() => Root.create());
+
+async fn removedRoot(root: borrow mut Root) {
+    await Async.blocking(() => root.remove());
+}
+
+/// A response: its status, its head's bytes, and its body.
+struct Response {
+    status: u16;
+    head: Vector<u8>;
+    body: Vector<u8>;
+
+    /// A copy of the value of the field `name` (lower case), compared ignoring case, or null.
+    fn field(borrow this, name: StringView) -> Vector<u8>? {
+        let h = this.head.view();
+        let n = name.bytes();
+        var start: usize = 0;
+        for (k in 0..h.length) {
+            if (h[k] == 10) {
+                let line = h[start..k];
+                if (line.length > n.length + 1 && line[n.length] == 58 && Ascii.equalsIgnoringCase(
+                    line[0..n.length],
+                    name,
+                )) {
+                    var v = n.length + 1;
+                    while (v < line.length && line[v] == 32) {
+                        v += 1;
+                    }
+                    var e = line.length;
+                    if (e > v && line[e - 1] == 13) {
+                        e -= 1;
+                    }
+                    var copy = Vector<u8>.create();
+                    match (copy.extend(line[v..e])) {
+                        Ok() => { return Some(copy); }
+                        Err(_) => { return null; }
+                    }
+                }
+                start = k + 1;
+            }
+        }
+        return null;
+    }
+}
+
+/// Splits what a connection wrote into one response.
+fn responseOf(out: Slice<u8>) -> Result<Response, TestFailure> {
+    var end: usize = 0;
+    while (end + 3 < out.length &&
+        !(out[end] == 13 && out[end + 1] == 10 && out[end + 2] == 13 && out[end + 3] == 10)) {
+        end += 1;
+    }
+    if (end + 3 >= out.length || out.length < 12) {
+        return Err(TestFailure.create("no response head"));
+    }
+    let status = (out[9] - 48) as u16 * 100 + (out[10] - 48) as u16 * 10 + (out[11] - 48) as u16;
+    var head = Vector<u8>.create();
+    alloc(head.extend(out[0..end + 2]))?;
+    var body = Vector<u8>.create();
+    alloc(body.extend(out[end + 4..]))?;
+    return Ok(Response { status: status, head: head, body: body });
+}
+
+/// HTTP limits without `Date`.
+fn quiet() -> Limits {
+    var l = Limits.defaults();
+    l.sendDate = false;
+    return l;
+}
+
+/// Serves `request` on one mock connection, with `handler` at `/s/*path`, and returns the response.
+async fn served(root: borrow Root, options: StaticOptions, request: StringView) -> Result<Response, TestFailure> {
+    var s = match (Server<St>.create(St {}, quiet())) {
+        Ok(v) => v,
+        Err(_) => { return Err(TestFailure.create("a server")); },
+    };
+    let files = alloc(StaticFiles<St>.create(root.dir.view(), options))?;
+    let h: Box<dyn Handler<St> + Send> = alloc(Box.create(files))?;
+    match (s.router().get("/s/*path", h)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("a route")); }
+    }
+    let service = match (serviceOf(s)) {
+        Ok(v) => v,
+        Err(_) => { return Err(TestFailure.create("a service")); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    var c = alloc(MockTransport.create(request.bytes()))?;
+    match (await service.serve(mut c, ctx)) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    return responseOf(c.written());
+}

@@ -26,12 +26,13 @@ ALLOWED = {
     "web_client": {"web_core", "web_transport", "web_http", "web_http1", "web_http2", "web_ws"},  # ADR 0004 am. 2
     "web_server": {"web_core", "web_transport", "web_http", "web_http1", "web_http2", "web_sse", "web_ws"},
     "web_proxy": {"web_core", "web_transport", "web_http", "web_client", "web_server"},
+    "web_static": {"web_core", "web_transport", "web_http", "web_server"},  # ADR 0004 amendment 3 (ADR 0013 §3.5)
 }
 
 # Packages that must never be depended on by these (a lower layer importing a higher one would be caught by
 # ALLOWED already; this names the property the layering exists for).
 NO_TLS = {"web_core", "web_transport", "web_http", "web_http1", "web_http2", "web_sse", "web_ws", "web_client",
-          "web_server", "web_proxy"}
+          "web_server", "web_proxy", "web_static"}
 
 
 def read_manifest(path: pathlib.Path):

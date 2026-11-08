@@ -87,6 +87,7 @@ a `web_http.ProtocolError` with one status (or a connection close) per reason. E
 | `web_client` | `web_core`, `web_transport`, `web_http`, `web_http1`, `web_http2`, `web_ws` (amendment 2) |
 | `web_server` | `web_core`, `web_transport`, `web_http`, `web_http1`, `web_http2`, `web_sse`, `web_ws` |
 | `web_proxy` | `web_core`, `web_transport`, `web_http`, `web_client`, `web_server` |
+| `web_static` | `web_core`, `web_transport`, `web_http`, `web_server` (amendment 3) |
 
 The table encodes two properties:
 
@@ -139,3 +140,12 @@ The WebSocket client (Web ADR 0010 §3.6) dials and writes the upgrade request a
 `web_ws` depends on neither `web_client` nor `web_transport`, so there is no cycle; `tools/check_layers.py` has the
 edge.
 
+## 9. Amendment 3 (2026-11-08, M9 stage 4): `web_static`
+
+Web ADR 0013 §3.5 adds `web_static`, a handler for the files under a root. It is its own package, so that a server
+without static files depends on no file code (ADR 0013 §6, answer 2).
+- **Its code** needs `web_core`, `web_http` and `web_server`.
+- **Its tests** drive the handler through `web_server`'s `HttpService` over `web_transport`'s `MockTransport`, and
+  manifests have no test-only dependencies, so it also depends on `web_transport`.
+- **Nothing new is reachable:** `web_server` depends on `web_transport` already. `web_static` stays below `web_tls`
+  (in `NO_TLS`), and `tools/check_layers.py` has the row.

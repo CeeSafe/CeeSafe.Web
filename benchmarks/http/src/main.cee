@@ -1,0 +1,286 @@
+// M9's request-rate benchmark server (Web ADR 0013 §3.1), driven by benchmarks/http/run.py. Listens on
+// 127.0.0.1:CW_PORT (default 8090), over HTTP/1.1 and h2c, or over TLS with ALPN h2 and http/1.1 when CW_CERT and
+// CW_KEY name a PEM chain and key. CW_WORKERS (default 256) bounds the connections served at once.
+//
+//   GET  /small    13 bytes
+//   GET  /4k       4 KiB
+//   GET  /64k      64 KiB
+//   GET  /stream   1 MiB, written 16 KiB at a time with no declared length
+//   POST /echo     the request body back (at most 1 MiB)
+//   POST /stop     starts the drain
+//   GET  /file     the file named by CW_FILE, with `Exchange.sendFile` (Web ADR 0013 §3.3); 404 without CW_FILE
+import web_core;
+import web_transport;
+import web_http;
+import web_server;
+import web_tls;
+
+struct App {}
+
+/// A body made once, sent whole.
+struct Fixed {
+    body: Vector<u8>;
+}
+
+impl Handler<App> for Fixed {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> =>
+        await exchange.send(Status.ok(), this.body.view());
+}
+
+/// 1 MiB in 16 KiB writes, without a declared length.
+struct Stream {
+    piece: Vector<u8>;
+}
+
+impl Handler<App> for Stream {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        exchange.setStatus(Status.ok());
+        for (i in 0..64) {
+            await exchange.write(this.piece.view())?;
+        }
+        return Ok();
+    }
+}
+
+struct Echo {}
+
+impl Handler<App> for Echo {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        // The declared length, so the buffer is not the cost being measured; 1 MiB without one.
+        let size = match (exchange.remaining()) {
+            Some(n) => if (n > 0 && n <= 1048576) n as usize else 1048576,
+            null => 1048576,
+        };
+        var body = match (OwnedBuffer.create(size)) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        await exchange.readToEnd(mut body)?;
+        return await exchange.send(Status.ok(), body.readable());
+    }
+}
+
+/// The file at `path` (opened for each request, its length read then), sent with `sendFile`.
+struct FileRoute {
+    path: String?;
+}
+
+impl Handler<App> for FileRoute {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        match (borrow this.path) {
+            Some(p) => { return await sendPath(p.view(), exchange); }
+            null => { return await exchange.send(Status.notFound(), "".bytes()); }
+        }
+    }
+}
+
+async fn sendPath(path: StringView, exchange: borrow mut Exchange) -> Result<void, HandlerError> {
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(_) => { return await exchange.send(Status.notFound(), "".bytes()); },
+    };
+    let length = match (await AsyncFiles.length(mut file)) {
+        Ok(n) => n,
+        Err(_) => { return Err(HandlerError.Internal); },
+    };
+    exchange.setStatus(Status.ok());
+    exchange.setContentLength(length);
+    return await exchange.sendFile(mut file, 0, length);
+}
+
+struct Stop {}
+
+impl Handler<App> for Stop {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        ctx.connection().drain().start();
+        return await exchange.send(Status.ok(), "stopping".bytes());
+    }
+}
+
+fn handler<H: Handler<App> + Send>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App> + Send>, RouteError> {
+    match (b) {
+        Ok(h) => {
+            let d: Box<dyn Handler<App> + Send> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+/// `count` bytes of a repeating alphabet, or `OutOfMemory`.
+fn filled(count: usize) -> Result<Vector<u8>, RouteError> {
+    var v = Vector<u8>.create();
+    for (i in 0..count) {
+        match (v.push(97 + truncate<u8>(i % 26))) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+    }
+    return Ok(v);
+}
+
+fn application() -> Result<Server<App>, RouteError> {
+    var limits = Limits.defaults();
+    limits.maxBodyBytes = 1048576;
+    var server = Server<App>.create(App {}, limits)?;
+    var small = Vector<u8>.create();
+    for (b in "hello, world\n".bytes()) {
+        match (small.push(b)) {
+            Ok() => {}
+            Err(_) => { return Err(RouteError.OutOfMemory); }
+        }
+    }
+    server.router().get("/small", handler(Box.create(Fixed { body: small }))?)?;
+    server.router().get("/4k", handler(Box.create(Fixed { body: filled(4096)? }))?)?;
+    server.router().get("/64k", handler(Box.create(Fixed { body: filled(65536)? }))?)?;
+    server.router().get("/stream", handler(Box.create(Stream { piece: filled(16384)? }))?)?;
+    server.router().post("/echo", handler(Box.create(Echo {}))?)?;
+    server.router().post("/stop", handler(Box.create(Stop {}))?)?;
+    var served: String? = null;
+    match (Environment.variable("CW_FILE")) {
+        Some(p) => {
+            var s = String.create();
+            match (s.append(p)) {
+                Ok() => {}
+                Err(_) => { return Err(RouteError.OutOfMemory); }
+            }
+            served = Some(s);
+        }
+        null => {}
+    }
+    server.router().get("/file", handler(Box.create(FileRoute { path: served }))?)?;
+    return Ok(server);
+}
+
+/// The whole file at the path in environment variable `name`, into `out`; false if the variable is not set.
+async fn readFile(name: StringView, out: borrow mut Vector<u8>) -> Result<bool, NetError> {
+    let path = match (Environment.variable(name)) {
+        Some(p) => p,
+        null => { return Ok(false); },
+    };
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(e) => { return Err(NetErrors.fromAsync(e)); },
+    };
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (await AsyncFiles.read(mut file, mut chunk[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(NetErrors.fromAsync(e)); },
+        };
+        if (n == 0) {
+            return Ok(true);
+        }
+        for (i in 0..n) {
+            match (out.push(chunk[i])) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+    }
+}
+
+fn setting(name: StringView, otherwise: u64) -> u64 {
+    let text = match (Environment.variable(name)) {
+        Some(t) => t,
+        null => { return otherwise; },
+    };
+    return match (Ascii.parseDecimal(text.bytes())) {
+        Some(v) => v,
+        null => otherwise,
+    };
+}
+
+async fn say(text: StringView) -> Result<void, NetError> {
+    match (await AsyncConsole.writeLine(text)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+async fn serve(server: Server<App>) -> Result<ServerReport?, NetError> {
+    let p = setting("CW_PORT", 8090);
+    let port = if (p > 0 && p < 65536) truncate<u16>(p) else 8090;
+    let options = ListenOptions { backlog: 0, reuseAddress: true, reusePort: false, v6Only: false };
+    let listener = Listener.bindWith(SocketAddresses.v4Loopback(port), options)?;
+    let drain = Drain.create()?;
+    var limits = ConnectionLimits.defaults();
+    limits.graceMs = 1000;
+    limits.workers = truncate<u32>(setting("CW_WORKERS", 256));
+    var chain = Vector<u8>.create();
+    var key = Vector<u8>.create();
+    let tls = await readFile("CW_CERT", mut chain)?;
+    if (!tls) {
+        await say("bench: listening")?;
+        let report = await server.run(listener, PlainAcceptor {}, limits, drain)?;
+        return Ok(Some(report));
+    }
+    if (!await readFile("CW_KEY", mut key)?) {
+        await say("bench: CW_CERT without CW_KEY")?;
+        return Ok(null);
+    }
+    var config = match (TlsConfig.server(chain.view(), key.view())) {
+        Ok(c) => c,
+        Err(_) => {
+            await say("bench: the certificate or key could not be used")?;
+            return Ok(null);
+        },
+    };
+    var protocols = [Alpn.Http2, Alpn.Http11];
+    match (config.setAlpn(protocols[..])) {
+        Ok() => {}
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); }
+    }
+    let acceptor = match (TlsAcceptor.create(config)) {
+        Ok(a) => a,
+        Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
+    };
+    await say("bench: listening")?;
+    let report = await server.run(listener, acceptor, limits, drain)?;
+    return Ok(Some(report));
+}
+
+fn main() {
+    let server = match (application()) {
+        Ok(s) => s,
+        Err(_) => {
+            Console.writeLine("bench: could not build the routes");
+            return;
+        },
+    };
+    match (Async.run(serve(server))) {
+        Ok(null) => {}
+        Ok(Some(report)) => {
+            Console.writeLine("bench: accepted, served, failed");
+            Console.writeLine(report.accepted);
+            Console.writeLine(report.served);
+            Console.writeLine(report.failed);
+        }
+        Err(e) => { Console.writeLine(NetErrors.describe(e)); }
+    }
+}

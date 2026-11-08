@@ -1,0 +1,94 @@
+// The request path's rules (Web ADR 0013 §3.5): what part of a request's path names a file under the root. The check
+// is lexical. Nothing here touches the file system, so a path that passes can still name a symbolic link under the
+// root that points outside it (§6.3, the README).
+
+/// Why a request path names no file. Every one is answered 404, never 400, so probing learns nothing.
+public enum PathRefusal {
+    /// A `%` not followed by two hex digits.
+    BadEscape,
+    /// A zero byte, a backslash or a `:` (a Windows drive or stream, refused on every system).
+    ForbiddenByte,
+    /// A segment that is `.` or `..`.
+    DotSegment,
+    /// An empty segment that is not the last (`a//b`).
+    EmptySegment,
+    /// Longer than the limit.
+    TooLong,
+    /// No memory for the decoded path.
+    OutOfMemory,
+}
+
+/// The lexical rules for a request path under the root (Web ADR 0013 §3.5).
+public struct StaticPaths {
+    /// The longest decoded path accepted, in bytes.
+    public fn maxLength() -> usize => 1024;
+
+    /// The relative path, in `out`, that `requestPath` names under the root. A leading `/` is dropped. The path is
+    /// percent-decoded once, then refused if it has a zero byte, a backslash, a `:`, a `.` or `..` segment, or an
+    /// empty segment other than the last. An empty result is the root itself. A trailing `/` is kept, so the caller
+    /// can tell a directory's form.
+    public fn relative(requestPath: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, PathRefusal> {
+        out.clear();
+        var i: usize = if (requestPath.length > 0 && requestPath[0] == 47) 1 else 0;
+        while (i < requestPath.length) {
+            var b = requestPath[i];
+            if (b == 37) {
+                if (i + 2 >= requestPath.length) {
+                    return Err(PathRefusal.BadEscape);
+                }
+                let high = hexValue(requestPath[i + 1]);
+                let low = hexValue(requestPath[i + 2]);
+                if (high > 15 || low > 15) {
+                    return Err(PathRefusal.BadEscape);
+                }
+                b = high * 16 + low;
+                i += 3;
+            } else {
+                i += 1;
+            }
+            if (b == 0 || b == 92 || b == 58) {
+                return Err(PathRefusal.ForbiddenByte);
+            }
+            if (out.length >= StaticPaths.maxLength()) {
+                return Err(PathRefusal.TooLong);
+            }
+            match (out.push(b)) {
+                Ok() => {}
+                Err(_) => { return Err(PathRefusal.OutOfMemory); }
+            }
+        }
+        // The segments, after decoding: an encoded `/` (`%2F`) separates as a written one does, so it cannot hide a
+        // `..` segment.
+        let p = out.view();
+        var start: usize = 0;
+        for (k in 0..p.length + 1) {
+            if (k == p.length || p[k] == 47) {
+                let segment = p[start..k];
+                let last = k == p.length;
+                if (segment.length == 0 && !last && p.length > 0) {
+                    return Err(PathRefusal.EmptySegment);
+                }
+                if ((segment.length == 1 && segment[0] == 46) ||
+                    (segment.length == 2 && segment[0] == 46 && segment[1] == 46)) {
+                    return Err(PathRefusal.DotSegment);
+                }
+                start = k + 1;
+            }
+        }
+        return Ok();
+    }
+}
+
+/// A hex digit's value, or 16 if `b` is not one.
+fn hexValue(b: u8) -> u8 {
+    if (b >= 48 && b <= 57) {
+        return b - 48;
+    }
+    if (b >= 97 && b <= 102) {
+        return b - 87;
+    }
+    if (b >= 65 && b <= 70) {
+        return b - 55;
+    }
+    return 16;
+}

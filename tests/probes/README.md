@@ -38,6 +38,7 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | `ws-session-region.cee` | prints `2`, `3`, `1`, `closed` | a `Session<region r>` holding the exchange races a read against a queue and a timer through a top-level function (N0241 forbids arms over fields of one `this`) | 0010 |
 | `ws-link-generic.cee` | prints `3070`, natively too | one session type over two links: a scoped one (`impl<region r> Link for Borrowed<r>`, usable through a bound, not as `dyn`, CeeSafe ADR 0054 §3.2) and an owned one; the session holds `borrow mut(r) L` and races `L`'s read in a generic top-level function | 0010 amendment 2 |
 | `h2-stream-tasks.cee` | prints `11`, then `1`, natively too | a connection's streams as task-set children (CeeSafe ADR 0053) sharing the application through `Arc<Box<dyn App + Send>>`; one stream's reset cancels only its handler (a race against its reset channel) | 0011 |
+| `sendfile-sigpipe-bug.cee` | prints `rounds 20, failed sends 20`, exit 0; native build only (Linux 0.19.1 and 0.21.0: nothing printed, exit 141, epoll and io_uring; fixed in 0.22.0; macOS as expected) | CeeSafe bug B19: `sendFileAll` after a reset raises SIGPIPE on Linux | 0013 |
 
 ## Runs
 
@@ -52,5 +53,7 @@ for f in *.cee; do ceesafec check "$f" && ceesafec run --interp "$f"; done
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.8.0 (release) | `async-deadline-void-bug` prints `ok` (interpreter, and natively with `-Werror`): B6 fixed |
 | 2026-11-02 | `~/.ceesafe/bin/ceesafec` 0.9.2 (release) | B9–B12 probes fixed: each prints its expected value, interpreted and native. New: `sse-race-exchange` as expected; `scope-droppable-error-bug` reproduces B13 (interpreter prints `3`, native build fails with 3 C errors) |
 | 2026-11-03 | `~/.ceesafe/bin/ceesafec` 0.9.4 (release) | B13, B14 and B15 probes fixed: each prints its expected value, interpreted and native |
+| 2026-11-08 | 0.19.1 and 0.21.0 (releases, linux-x64, SHA256 checked) on Debian 12 (Linux 6.1, x86-64); 0.19.1 on macOS arm64 | `sendfile-sigpipe-bug` reproduces B19 on Linux (exit 141, epoll and io_uring); macOS prints the expected line |
+| 2026-11-08 | 0.22.0 (release, linux-x64, SHA256 checked) on Debian 12 (Linux 6.1, x86-64) | `sendfile-sigpipe-bug` prints `rounds 20, failed sends 20` and exits 0 under epoll and io_uring: B19 fixed (CeeSafe ADR 0078) |
 
 `impl-generic-fail.cee` does not parse, so `ceesafec fmt --check` reports it; the other probes are formatted.

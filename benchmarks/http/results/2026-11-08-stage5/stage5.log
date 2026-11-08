@@ -1,0 +1,286 @@
+== start 2026-11-08 05:34:59 +0300 load 1.28 1.34 1.15
+== epoll 1 05:34:59 load 1.28 1.34 1.15
+| ceesafe.web | default | h1 | small | 1 | 25319 |  | 29 | 62 | 195 | 5384 | 0 |
+| ceesafe.web | default | h1 | small | 10 | 71789 |  | 126 | 251 | 553 | 6224 | 0 |
+| ceesafe.web | default | h1 | small | 100 | 73769 |  | 1269 | 2609 | 9940 | 12300 | 0 |
+| h1 | small | allocations per request | 0.0 |
+| ceesafe.web | default | h1 | 4k | 1 | 25557 |  | 30 | 76 | 98 | 5384 | 0 |
+| ceesafe.web | default | h1 | 4k | 10 | 69261 |  | 140 | 271 | 753 | 6224 | 0 |
+| ceesafe.web | default | h1 | 4k | 100 | 70544 |  | 1360 | 2962 | 9805 | 12296 | 0 |
+| h1 | 4k | allocations per request | 0.0 |
+| ceesafe.web | default | h1 | 64k | 1 | 13205 |  | 69 | 103 | 266 | 5436 | 0 |
+| ceesafe.web | default | h1 | 64k | 10 | 16672 |  | 414 | 3156 | 8155 | 6228 | 0 |
+| ceesafe.web | default | h1 | 64k | 100 | 16946 |  | 3286 | 39973 | 635544 | 12300 | 0 |
+| h1 | 64k | allocations per request | 0.0 |
+| ceesafe.web | default | h1 | stream | 1 | 1159 |  | 822 | 1143 | 7645 | 5420 | 0 |
+| ceesafe.web | default | h1 | stream | 10 | 1145 |  | 8444 | 18560 | 32882 | 6228 | 0 |
+| ceesafe.web | default | h1 | stream | 100 | 1104 |  | 87077 | 270283 | 317069 | 12304 | 0 |
+| h1 | stream | allocations per request | 0.0 |
+| ceesafe.web | default | h1 | echo | 1 | 20772 |  | 36 | 89 | 239 | 5436 | 0 |
+| ceesafe.web | default | h1 | echo | 10 | 57027 |  | 175 | 328 | 3979 | 6176 | 0 |
+| ceesafe.web | default | h1 | echo | 100 | 62047 |  | 1658 | 3446 | 10966 | 12304 | 0 |
+| h1 | echo | allocations per request | 1.0 |
+| ceesafe.web | default | h2c | small | 1 | 14123 |  | 62 | 88 | 224 | 5692 | 0 |
+| ceesafe.web | default | h2c | small | 10 | 24406 |  | 353 | 604 | 3800 | 6696 | 0 |
+| ceesafe.web | default | h2c | small | 100 | 28318 |  | 3065 | 9450 | 24476 | 15980 | 0 |
+| h2c | small | allocations per request | 33.0 |
+| ceesafe.web | default | h2c | 4k | 1 | 13572 |  | 65 | 94 | 278 | 5704 | 0 |
+| ceesafe.web | default | h2c | 4k | 10 | 28822 |  | 308 | 518 | 1235 | 6784 | 0 |
+| ceesafe.web | default | h2c | 4k | 100 | 26578 |  | 3356 | 7380 | 20737 | 16148 | 0 |
+| h2c | 4k | allocations per request | 34.0 |
+| ceesafe.web | default | h2c | 64k | 1 | 7021 |  | 127 | 214 | 506 | 5700 | 0 |
+| ceesafe.web | default | h2c | 64k | 10 | 10951 |  | 844 | 1663 | 8260 | 7236 | 0 |
+| ceesafe.web | default | h2c | 64k | 100 | 10806 |  | 8395 | 19346 | 51904 | 21256 | 0 |
+| h2c | 64k | allocations per request | 37.0 |
+| ceesafe.web | default | h2c | stream | 1 | 744 |  | 1278 | 1696 | 7630 | 5692 | 0 |
+| ceesafe.web | default | h2c | stream | 10 | 980 |  | 9781 | 19007 | 61630 | 7200 | 0 |
+| ceesafe.web | default | h2c | stream | 100 | 1001 |  | 92664 | 194031 | 216127 | 21168 | 0 |
+| h2c | stream | allocations per request | 94.02 |
+| ceesafe.web | default | h2c | echo | 1 | 12535 |  | 70 | 98 | 169 | 5700 | 0 |
+| ceesafe.web | default | h2c | echo | 10 | 25055 |  | 351 | 628 | 5589 | 6908 | 0 |
+| ceesafe.web | default | h2c | echo | 100 | 25125 |  | 3507 | 8549 | 22854 | 17428 | 0 |
+| h2c | echo | allocations per request | 37.0 |
+| ceesafe.web | default | tls-h1 | small | 1 | 20444 |  | 39 | 81 | 167 | 9472 | 0 |
+| ceesafe.web | default | tls-h1 | small | 10 | 51964 |  | 173 | 345 | 1526 | 10520 | 0 |
+| ceesafe.web | default | tls-h1 | small | 100 | 54347 |  | 1742 | 3524 | 9783 | 21876 | 0 |
+| tls-h1 | small | allocations per request | 7.0 |
+| ceesafe.web | default | tls-h1 | 4k | 1 | 16929 |  | 44 | 118 | 189 | 9476 | 0 |
+| ceesafe.web | default | tls-h1 | 4k | 10 | 46684 |  | 201 | 377 | 4184 | 10528 | 0 |
+| ceesafe.web | default | tls-h1 | 4k | 100 | 48149 |  | 1935 | 7615 | 15218 | 22156 | 0 |
+| tls-h1 | 4k | allocations per request | 7.0 |
+| ceesafe.web | default | tls-h1 | 64k | 1 | 6712 |  | 139 | 203 | 654 | 9488 | 0 |
+| ceesafe.web | default | tls-h1 | 64k | 10 | 8546 |  | 822 | 3872 | 7561 | 10784 | 0 |
+| ceesafe.web | default | tls-h1 | 64k | 100 | 8916 |  | 5256 | 39254 | 95025 | 24260 | 0 |
+| tls-h1 | 64k | allocations per request | 23.0 |
+| ceesafe.web | default | tls-h1 | stream | 1 | 505 |  | 1799 | 6751 | 10976 | 9476 | 0 |
+| ceesafe.web | default | tls-h1 | stream | 10 | 563 |  | 16879 | 37089 | 48400 | 10784 | 0 |
+| ceesafe.web | default | tls-h1 | stream | 100 | 578 |  | 149357 | 370067 | 418544 | 24524 | 0 |
+| tls-h1 | stream | allocations per request | 775.0 |
+| ceesafe.web | default | tls-h1 | echo | 1 | 14182 |  | 59 | 136 | 166 | 9468 | 0 |
+| ceesafe.web | default | tls-h1 | echo | 10 | 41012 |  | 240 | 428 | 2124 | 10688 | 0 |
+| ceesafe.web | default | tls-h1 | echo | 100 | 42818 |  | 2260 | 7468 | 16519 | 22636 | 0 |
+| tls-h1 | echo | allocations per request | 8.0 |
+| ceesafe.web | default | tls-h2 | small | 1 | 11198 |  | 73 | 129 | 809 | 9500 | 0 |
+| ceesafe.web | default | tls-h2 | small | 10 | 24232 |  | 369 | 573 | 2756 | 10984 | 0 |
+| ceesafe.web | default | tls-h2 | small | 100 | 20534 |  | 4356 | 8955 | 27573 | 24912 | 0 |
+| tls-h2 | small | allocations per request | 42.0 |
+| ceesafe.web | default | tls-h2 | 4k | 1 | 10475 |  | 85 | 116 | 318 | 9512 | 0 |
+| ceesafe.web | default | tls-h2 | 4k | 10 | 20194 |  | 424 | 756 | 5814 | 11160 | 0 |
+| ceesafe.web | default | tls-h2 | 4k | 100 | 23480 |  | 3684 | 11694 | 28113 | 25688 | 0 |
+| tls-h2 | 4k | allocations per request | 42.0 |
+| ceesafe.web | default | tls-h2 | 64k | 1 | 4171 |  | 216 | 315 | 1166 | 9484 | 0 |
+| ceesafe.web | default | tls-h2 | 64k | 10 | 5773 |  | 1681 | 2505 | 10008 | 11988 | 0 |
+| ceesafe.web | default | tls-h2 | 64k | 100 | 5664 |  | 16872 | 33615 | 55584 | 35076 | 0 |
+| tls-h2 | 64k | allocations per request | 71.0 |
+| ceesafe.web | default | tls-h2 | stream | 1 | 403 |  | 2387 | 4346 | 9611 | 9476 | 0 |
+| ceesafe.web | default | tls-h2 | stream | 10 | 469 |  | 20298 | 36667 | 57362 | 11836 | 0 |
+| ceesafe.web | default | tls-h2 | stream | 100 | 440 |  | 219571 | 341978 | 345211 | 34668 | 0 |
+| tls-h2 | stream | allocations per request | 518.04 |
+| ceesafe.web | default | tls-h2 | echo | 1 | 9471 |  | 95 | 134 | 226 | 9472 | 0 |
+| ceesafe.web | default | tls-h2 | echo | 10 | 20772 |  | 437 | 727 | 3191 | 11316 | 0 |
+| ceesafe.web | default | tls-h2 | echo | 100 | 19753 |  | 4425 | 10735 | 29871 | 27308 | 0 |
+| tls-h2 | echo | allocations per request | 45.01 |
+== io_uring 1 05:46:42 load 3.40 2.82 2.05
+| ceesafe.web | io_uring | h1 | small | 1 | 24487 |  | 36 | 53 | 194 | 5444 | 0 |
+| ceesafe.web | io_uring | h1 | small | 10 | 71038 |  | 130 | 247 | 362 | 6504 | 0 |
+| ceesafe.web | io_uring | h1 | small | 100 | 68404 |  | 1416 | 2248 | 11220 | 12544 | 0 |
+| h1 | small | allocations per request | 0.0 |
+| ceesafe.web | io_uring | h1 | 4k | 1 | 23391 |  | 38 | 57 | 99 | 5432 | 0 |
+| ceesafe.web | io_uring | h1 | 4k | 10 | 66141 |  | 141 | 269 | 521 | 6504 | 0 |
+| ceesafe.web | io_uring | h1 | 4k | 100 | 65739 |  | 1392 | 3568 | 12732 | 12580 | 0 |
+| h1 | 4k | allocations per request | 0.0 |
+| ceesafe.web | io_uring | h1 | 64k | 1 | 10266 |  | 89 | 139 | 365 | 5380 | 0 |
+| ceesafe.web | io_uring | h1 | 64k | 10 | 15221 |  | 620 | 1126 | 6553 | 6508 | 0 |
+| ceesafe.web | io_uring | h1 | 64k | 100 | 16313 |  | 5901 | 11474 | 22034 | 12516 | 0 |
+| h1 | 64k | allocations per request | 0.0 |
+| ceesafe.web | io_uring | h1 | stream | 1 | 890 |  | 1088 | 1468 | 7052 | 5444 | 0 |
+| ceesafe.web | io_uring | h1 | stream | 10 | 1014 |  | 9286 | 20574 | 36093 | 6508 | 0 |
+| ceesafe.web | io_uring | h1 | stream | 100 | 1030 |  | 91540 | 140892 | 159147 | 12576 | 0 |
+| h1 | stream | allocations per request | 0.0 |
+| ceesafe.web | io_uring | h1 | echo | 1 | 20597 |  | 42 | 66 | 213 | 5428 | 0 |
+| ceesafe.web | io_uring | h1 | echo | 10 | 58036 |  | 163 | 287 | 503 | 6508 | 0 |
+| ceesafe.web | io_uring | h1 | echo | 100 | 62926 |  | 1509 | 2987 | 9372 | 12576 | 0 |
+| h1 | echo | allocations per request | 1.0 |
+| ceesafe.web | io_uring | h2c | small | 1 | 12739 |  | 68 | 98 | 310 | 5968 | 0 |
+| ceesafe.web | io_uring | h2c | small | 10 | 23043 |  | 382 | 724 | 6155 | 7068 | 0 |
+| ceesafe.web | io_uring | h2c | small | 100 | 27688 |  | 3257 | 7594 | 19127 | 16524 | 0 |
+| h2c | small | allocations per request | 33.0 |
+| ceesafe.web | io_uring | h2c | 4k | 1 | 12534 |  | 70 | 91 | 194 | 5960 | 0 |
+| ceesafe.web | io_uring | h2c | 4k | 10 | 26819 |  | 336 | 575 | 3956 | 7060 | 0 |
+| ceesafe.web | io_uring | h2c | 4k | 100 | 27070 |  | 3259 | 11060 | 22781 | 16960 | 0 |
+| h2c | 4k | allocations per request | 34.0 |
+| ceesafe.web | io_uring | h2c | 64k | 1 | 6605 |  | 134 | 209 | 1097 | 5980 | 0 |
+| ceesafe.web | io_uring | h2c | 64k | 10 | 11275 |  | 831 | 1477 | 7488 | 7620 | 0 |
+| ceesafe.web | io_uring | h2c | 64k | 100 | 10716 |  | 8317 | 21857 | 34923 | 21444 | 0 |
+| h2c | 64k | allocations per request | 37.0 |
+| ceesafe.web | io_uring | h2c | stream | 1 | 721 |  | 1301 | 2373 | 8779 | 5976 | 0 |
+| ceesafe.web | io_uring | h2c | stream | 10 | 988 |  | 9644 | 19020 | 42277 | 7396 | 0 |
+| ceesafe.web | io_uring | h2c | stream | 100 | 1000 |  | 96049 | 205632 | 206193 | 21388 | 0 |
+| h2c | stream | allocations per request | 94.02 |
+| ceesafe.web | io_uring | h2c | echo | 1 | 11594 |  | 77 | 98 | 179 | 5976 | 0 |
+| ceesafe.web | io_uring | h2c | echo | 10 | 21569 |  | 399 | 803 | 7340 | 7272 | 0 |
+| ceesafe.web | io_uring | h2c | echo | 100 | 25485 |  | 3480 | 8155 | 24269 | 17840 | 0 |
+| h2c | echo | allocations per request | 37.0 |
+| ceesafe.web | io_uring | tls-h1 | small | 1 | 17778 |  | 44 | 93 | 195 | 9744 | 0 |
+| ceesafe.web | io_uring | tls-h1 | small | 10 | 51914 |  | 184 | 331 | 570 | 10804 | 0 |
+| ceesafe.web | io_uring | tls-h1 | small | 100 | 50269 |  | 1838 | 6607 | 14832 | 22156 | 0 |
+| tls-h1 | small | allocations per request | 7.0 |
+| ceesafe.web | io_uring | tls-h1 | 4k | 1 | 17007 |  | 53 | 95 | 178 | 9912 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 4k | 10 | 45182 |  | 199 | 381 | 4128 | 10808 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 4k | 100 | 49539 |  | 1970 | 3156 | 10955 | 22152 | 0 |
+| tls-h1 | 4k | allocations per request | 7.0 |
+| ceesafe.web | io_uring | tls-h1 | 64k | 1 | 5208 |  | 176 | 267 | 933 | 9756 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 64k | 10 | 6959 |  | 1343 | 3460 | 9758 | 11068 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 64k | 100 | 8119 |  | 11569 | 27030 | 48342 | 24264 | 0 |
+| tls-h1 | 64k | allocations per request | 23.0 |
+| ceesafe.web | io_uring | tls-h1 | stream | 1 | 396 |  | 2334 | 5135 | 13925 | 9744 | 0 |
+| ceesafe.web | io_uring | tls-h1 | stream | 10 | 532 |  | 18189 | 28930 | 44645 | 11068 | 0 |
+| ceesafe.web | io_uring | tls-h1 | stream | 100 | 460 |  | 211929 | 294736 | 296056 | 24028 | 0 |
+| tls-h1 | stream | allocations per request | 775.0 |
+| ceesafe.web | io_uring | tls-h1 | echo | 1 | 15237 |  | 60 | 88 | 191 | 9740 | 0 |
+| ceesafe.web | io_uring | tls-h1 | echo | 10 | 38411 |  | 239 | 452 | 4693 | 10952 | 0 |
+| ceesafe.web | io_uring | tls-h1 | echo | 100 | 42517 |  | 2173 | 5189 | 15929 | 22940 | 0 |
+| tls-h1 | echo | allocations per request | 8.0 |
+| ceesafe.web | io_uring | tls-h2 | small | 1 | 10272 |  | 85 | 123 | 649 | 9060 | 0 |
+| ceesafe.web | io_uring | tls-h2 | small | 10 | 23194 |  | 392 | 612 | 3515 | 11268 | 0 |
+| ceesafe.web | io_uring | tls-h2 | small | 100 | 23116 |  | 3821 | 10343 | 26618 | 25956 | 0 |
+| tls-h2 | small | allocations per request | 42.0 |
+| ceesafe.web | io_uring | tls-h2 | 4k | 1 | 10185 |  | 83 | 139 | 462 | 9788 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 4k | 10 | 19392 |  | 458 | 877 | 4979 | 11416 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 4k | 100 | 21088 |  | 4216 | 12040 | 29904 | 25936 | 0 |
+| tls-h2 | 4k | allocations per request | 42.0 |
+| ceesafe.web | io_uring | tls-h2 | 64k | 1 | 3622 |  | 256 | 334 | 825 | 9740 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 64k | 10 | 5532 |  | 1697 | 3041 | 10575 | 12220 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 64k | 100 | 5342 |  | 16913 | 42539 | 74651 | 35096 | 0 |
+| tls-h2 | 64k | allocations per request | 71.0 |
+| ceesafe.web | io_uring | tls-h2 | stream | 1 | 335 |  | 2809 | 5482 | 12038 | 9748 | 0 |
+| ceesafe.web | io_uring | tls-h2 | stream | 10 | 440 |  | 22010 | 33523 | 53128 | 12252 | 0 |
+| ceesafe.web | io_uring | tls-h2 | stream | 100 | 404 |  | 235741 | 366315 | 383511 | 35000 | 0 |
+| tls-h2 | stream | allocations per request | 518.06 |
+| ceesafe.web | io_uring | tls-h2 | echo | 1 | 8836 |  | 100 | 138 | 405 | 9748 | 0 |
+| ceesafe.web | io_uring | tls-h2 | echo | 10 | 18442 |  | 474 | 991 | 7229 | 11588 | 0 |
+| ceesafe.web | io_uring | tls-h2 | echo | 100 | 19076 |  | 4552 | 12583 | 35989 | 27332 | 0 |
+| tls-h2 | echo | allocations per request | 45.01 |
+== epoll 2 05:58:25 load 2.31 2.80 2.49
+| ceesafe.web | default | h1 | small | 1 | 28791 |  | 29 | 49 | 173 | 5444 | 0 |
+| ceesafe.web | default | h1 | small | 10 | 72106 |  | 126 | 234 | 623 | 6220 | 0 |
+| ceesafe.web | default | h1 | small | 100 | 72338 |  | 1271 | 3285 | 10756 | 12300 | 0 |
+| ceesafe.web | default | h1 | 4k | 1 | 27184 |  | 30 | 60 | 89 | 5440 | 0 |
+| ceesafe.web | default | h1 | 4k | 10 | 68846 |  | 139 | 255 | 540 | 6224 | 0 |
+| ceesafe.web | default | h1 | 4k | 100 | 68603 |  | 1367 | 4012 | 12711 | 12300 | 0 |
+| ceesafe.web | default | h1 | 64k | 1 | 13032 |  | 69 | 108 | 240 | 5432 | 0 |
+| ceesafe.web | default | h1 | 64k | 10 | 16756 |  | 410 | 2984 | 7305 | 6224 | 0 |
+| ceesafe.web | default | h1 | 64k | 100 | 16982 |  | 2728 | 17050 | 735199 | 12304 | 0 |
+| ceesafe.web | default | h1 | stream | 1 | 1150 |  | 827 | 1367 | 6981 | 5432 | 0 |
+| ceesafe.web | default | h1 | stream | 10 | 1142 |  | 8438 | 18972 | 35247 | 6224 | 0 |
+| ceesafe.web | default | h1 | stream | 100 | 1118 |  | 85621 | 235438 | 308360 | 12296 | 0 |
+| ceesafe.web | default | h1 | echo | 1 | 22085 |  | 35 | 73 | 102 | 5380 | 0 |
+| ceesafe.web | default | h1 | echo | 10 | 59404 |  | 171 | 295 | 966 | 6232 | 0 |
+| ceesafe.web | default | h1 | echo | 100 | 60940 |  | 1652 | 6071 | 12429 | 12296 | 0 |
+| ceesafe.web | default | h2c | small | 1 | 14186 |  | 62 | 86 | 139 | 5672 | 0 |
+| ceesafe.web | default | h2c | small | 10 | 29741 |  | 301 | 511 | 1069 | 6692 | 0 |
+| ceesafe.web | default | h2c | small | 100 | 29990 |  | 2896 | 8271 | 21556 | 16000 | 0 |
+| ceesafe.web | default | h2c | 4k | 1 | 13694 |  | 64 | 102 | 277 | 5700 | 0 |
+| ceesafe.web | default | h2c | 4k | 10 | 27188 |  | 324 | 557 | 2995 | 6784 | 0 |
+| ceesafe.web | default | h2c | 4k | 100 | 28647 |  | 3152 | 6266 | 15512 | 16372 | 0 |
+| ceesafe.web | default | h2c | 64k | 1 | 7020 |  | 127 | 197 | 530 | 5704 | 0 |
+| ceesafe.web | default | h2c | 64k | 10 | 11082 |  | 833 | 1495 | 7408 | 7252 | 0 |
+| ceesafe.web | default | h2c | 64k | 100 | 10464 |  | 8653 | 22069 | 54763 | 21268 | 0 |
+| ceesafe.web | default | h2c | stream | 1 | 717 |  | 1295 | 2719 | 9209 | 5700 | 0 |
+| ceesafe.web | default | h2c | stream | 10 | 978 |  | 9617 | 21758 | 37596 | 7196 | 0 |
+| ceesafe.web | default | h2c | stream | 100 | 1039 |  | 92765 | 178605 | 199932 | 21164 | 0 |
+| ceesafe.web | default | h2c | echo | 1 | 12104 |  | 72 | 98 | 212 | 5692 | 0 |
+| ceesafe.web | default | h2c | echo | 10 | 24797 |  | 356 | 638 | 4644 | 6896 | 0 |
+| ceesafe.web | default | h2c | echo | 100 | 23566 |  | 3799 | 9059 | 22156 | 17872 | 0 |
+| ceesafe.web | default | tls-h1 | small | 1 | 19544 |  | 39 | 80 | 191 | 8992 | 0 |
+| ceesafe.web | default | tls-h1 | small | 10 | 52702 |  | 170 | 345 | 1448 | 10524 | 0 |
+| ceesafe.web | default | tls-h1 | small | 100 | 53330 |  | 1747 | 3680 | 12244 | 21876 | 0 |
+| ceesafe.web | default | tls-h1 | 4k | 1 | 16551 |  | 44 | 123 | 261 | 9480 | 0 |
+| ceesafe.web | default | tls-h1 | 4k | 10 | 47486 |  | 198 | 380 | 1662 | 10524 | 0 |
+| ceesafe.web | default | tls-h1 | 4k | 100 | 50068 |  | 1949 | 4267 | 12385 | 22000 | 0 |
+| ceesafe.web | default | tls-h1 | 64k | 1 | 6445 |  | 141 | 259 | 1394 | 9492 | 0 |
+| ceesafe.web | default | tls-h1 | 64k | 10 | 8785 |  | 1038 | 3343 | 8659 | 10820 | 0 |
+| ceesafe.web | default | tls-h1 | 64k | 100 | 9282 |  | 4991 | 36110 | 58861 | 23988 | 0 |
+| ceesafe.web | default | tls-h1 | stream | 1 | 532 |  | 1790 | 3083 | 9555 | 9472 | 0 |
+| ceesafe.web | default | tls-h1 | stream | 10 | 548 |  | 16865 | 43455 | 56928 | 10784 | 0 |
+| ceesafe.web | default | tls-h1 | stream | 100 | 568 |  | 154197 | 364589 | 370554 | 24264 | 0 |
+| ceesafe.web | default | tls-h1 | echo | 1 | 15825 |  | 49 | 133 | 172 | 9480 | 0 |
+| ceesafe.web | default | tls-h1 | echo | 10 | 40188 |  | 241 | 431 | 3811 | 10528 | 0 |
+| ceesafe.web | default | tls-h1 | echo | 100 | 43000 |  | 2249 | 7223 | 15316 | 22808 | 0 |
+| ceesafe.web | default | tls-h2 | small | 1 | 11299 |  | 78 | 115 | 218 | 9496 | 0 |
+| ceesafe.web | default | tls-h2 | small | 10 | 21848 |  | 399 | 680 | 4797 | 10984 | 0 |
+| ceesafe.web | default | tls-h2 | small | 100 | 18973 |  | 4576 | 12645 | 25015 | 24780 | 0 |
+| ceesafe.web | default | tls-h2 | 4k | 1 | 9999 |  | 84 | 144 | 332 | 9472 | 0 |
+| ceesafe.web | default | tls-h2 | 4k | 10 | 22444 |  | 397 | 672 | 4343 | 11060 | 0 |
+| ceesafe.web | default | tls-h2 | 4k | 100 | 24331 |  | 3710 | 6893 | 19017 | 25460 | 0 |
+| ceesafe.web | default | tls-h2 | 64k | 1 | 4048 |  | 219 | 363 | 2145 | 9468 | 0 |
+| ceesafe.web | default | tls-h2 | 64k | 10 | 5462 |  | 1706 | 5495 | 11675 | 11960 | 0 |
+| ceesafe.web | default | tls-h2 | 64k | 100 | 5694 |  | 16752 | 32050 | 64031 | 34888 | 0 |
+| ceesafe.web | default | tls-h2 | stream | 1 | 397 |  | 2391 | 3964 | 11976 | 9472 | 0 |
+| ceesafe.web | default | tls-h2 | stream | 10 | 469 |  | 20277 | 36511 | 49064 | 11964 | 0 |
+| ceesafe.web | default | tls-h2 | stream | 100 | 451 |  | 209867 | 358030 | 358493 | 34876 | 0 |
+| ceesafe.web | default | tls-h2 | echo | 1 | 9382 |  | 95 | 132 | 520 | 9512 | 0 |
+| ceesafe.web | default | tls-h2 | echo | 10 | 20119 |  | 439 | 858 | 6743 | 11432 | 0 |
+| ceesafe.web | default | tls-h2 | echo | 100 | 19554 |  | 4467 | 11478 | 35152 | 27016 | 0 |
+== io_uring 2 06:09:49 load 2.42 2.63 2.58
+| ceesafe.web | io_uring | h1 | small | 1 | 25633 |  | 36 | 52 | 79 | 5436 | 0 |
+| ceesafe.web | io_uring | h1 | small | 10 | 68092 |  | 132 | 243 | 1162 | 6496 | 0 |
+| ceesafe.web | io_uring | h1 | small | 100 | 69692 |  | 1405 | 1998 | 9391 | 12576 | 0 |
+| ceesafe.web | io_uring | h1 | 4k | 1 | 24374 |  | 38 | 49 | 88 | 5440 | 0 |
+| ceesafe.web | io_uring | h1 | 4k | 10 | 65728 |  | 141 | 267 | 764 | 6500 | 0 |
+| ceesafe.web | io_uring | h1 | 4k | 100 | 67616 |  | 1392 | 3198 | 11039 | 12580 | 0 |
+| ceesafe.web | io_uring | h1 | 64k | 1 | 10446 |  | 89 | 128 | 310 | 5440 | 0 |
+| ceesafe.web | io_uring | h1 | 64k | 10 | 15042 |  | 618 | 1154 | 6812 | 6552 | 0 |
+| ceesafe.web | io_uring | h1 | 64k | 100 | 15806 |  | 5940 | 14941 | 31239 | 12580 | 0 |
+| ceesafe.web | io_uring | h1 | stream | 1 | 865 |  | 1075 | 2540 | 7996 | 5328 | 0 |
+| ceesafe.web | io_uring | h1 | stream | 10 | 1047 |  | 9234 | 18046 | 36122 | 6500 | 0 |
+| ceesafe.web | io_uring | h1 | stream | 100 | 1060 |  | 89482 | 145980 | 173959 | 12576 | 0 |
+| ceesafe.web | io_uring | h1 | echo | 1 | 20838 |  | 42 | 64 | 159 | 5444 | 0 |
+| ceesafe.web | io_uring | h1 | echo | 10 | 55271 |  | 163 | 368 | 3690 | 6428 | 0 |
+| ceesafe.web | io_uring | h1 | echo | 100 | 62534 |  | 1513 | 2932 | 10356 | 12568 | 0 |
+| ceesafe.web | io_uring | h2c | small | 1 | 12778 |  | 68 | 90 | 203 | 5964 | 0 |
+| ceesafe.web | io_uring | h2c | small | 10 | 27064 |  | 326 | 564 | 3980 | 7080 | 0 |
+| ceesafe.web | io_uring | h2c | small | 100 | 30461 |  | 2903 | 7150 | 17603 | 16712 | 0 |
+| ceesafe.web | io_uring | h2c | 4k | 1 | 12495 |  | 70 | 104 | 545 | 5948 | 0 |
+| ceesafe.web | io_uring | h2c | 4k | 10 | 25832 |  | 340 | 681 | 4464 | 7064 | 0 |
+| ceesafe.web | io_uring | h2c | 4k | 100 | 28148 |  | 3202 | 7885 | 22271 | 16684 | 0 |
+| ceesafe.web | io_uring | h2c | 64k | 1 | 6821 |  | 132 | 185 | 495 | 6008 | 0 |
+| ceesafe.web | io_uring | h2c | 64k | 10 | 11185 |  | 844 | 1234 | 6130 | 7548 | 0 |
+| ceesafe.web | io_uring | h2c | 64k | 100 | 11075 |  | 8170 | 21764 | 38566 | 21400 | 0 |
+| ceesafe.web | io_uring | h2c | stream | 1 | 707 |  | 1306 | 2639 | 11067 | 5976 | 0 |
+| ceesafe.web | io_uring | h2c | stream | 10 | 988 |  | 9633 | 20138 | 33917 | 7296 | 0 |
+| ceesafe.web | io_uring | h2c | stream | 100 | 1040 |  | 91254 | 153829 | 234684 | 21360 | 0 |
+| ceesafe.web | io_uring | h2c | echo | 1 | 11367 |  | 77 | 115 | 399 | 5976 | 0 |
+| ceesafe.web | io_uring | h2c | echo | 10 | 23941 |  | 374 | 723 | 4490 | 7204 | 0 |
+| ceesafe.web | io_uring | h2c | echo | 100 | 26338 |  | 3462 | 6261 | 17427 | 17984 | 0 |
+| ceesafe.web | io_uring | tls-h1 | small | 1 | 18422 |  | 42 | 82 | 462 | 9744 | 0 |
+| ceesafe.web | io_uring | tls-h1 | small | 10 | 51273 |  | 185 | 335 | 654 | 10840 | 0 |
+| ceesafe.web | io_uring | tls-h1 | small | 100 | 51673 |  | 1874 | 3350 | 11791 | 22416 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 4k | 1 | 15568 |  | 54 | 128 | 138 | 8932 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 4k | 10 | 45644 |  | 201 | 382 | 2114 | 10964 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 4k | 100 | 48155 |  | 1962 | 4095 | 14140 | 22156 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 64k | 1 | 4981 |  | 181 | 312 | 2280 | 9756 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 64k | 10 | 7121 |  | 1345 | 2213 | 9168 | 11068 | 0 |
+| ceesafe.web | io_uring | tls-h1 | 64k | 100 | 8434 |  | 11176 | 26626 | 45362 | 24472 | 0 |
+| ceesafe.web | io_uring | tls-h1 | stream | 1 | 415 |  | 2303 | 4342 | 11438 | 9744 | 0 |
+| ceesafe.web | io_uring | tls-h1 | stream | 10 | 502 |  | 19108 | 34916 | 44429 | 11068 | 0 |
+| ceesafe.web | io_uring | tls-h1 | stream | 100 | 498 |  | 194810 | 276025 | 278351 | 24008 | 0 |
+| ceesafe.web | io_uring | tls-h1 | echo | 1 | 13777 |  | 61 | 125 | 351 | 9756 | 0 |
+| ceesafe.web | io_uring | tls-h1 | echo | 10 | 39441 |  | 235 | 443 | 3816 | 10812 | 0 |
+| ceesafe.web | io_uring | tls-h1 | echo | 100 | 43078 |  | 2177 | 4247 | 12512 | 22936 | 0 |
+| ceesafe.web | io_uring | tls-h2 | small | 1 | 10299 |  | 85 | 119 | 582 | 9000 | 0 |
+| ceesafe.web | io_uring | tls-h2 | small | 10 | 22592 |  | 401 | 611 | 4351 | 11224 | 0 |
+| ceesafe.web | io_uring | tls-h2 | small | 100 | 22293 |  | 3842 | 12146 | 28897 | 25952 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 4k | 1 | 9895 |  | 90 | 118 | 186 | 9748 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 4k | 10 | 20163 |  | 455 | 706 | 1264 | 11320 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 4k | 100 | 20666 |  | 4222 | 12472 | 26662 | 26256 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 64k | 1 | 3553 |  | 254 | 409 | 2254 | 9744 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 64k | 10 | 5406 |  | 1762 | 2598 | 9686 | 12288 | 0 |
+| ceesafe.web | io_uring | tls-h2 | 64k | 100 | 5280 |  | 17078 | 43569 | 66655 | 35068 | 0 |
+| ceesafe.web | io_uring | tls-h2 | stream | 1 | 340 |  | 2752 | 6440 | 14117 | 9892 | 0 |
+| ceesafe.web | io_uring | tls-h2 | stream | 10 | 440 |  | 21882 | 36166 | 52966 | 12072 | 0 |
+| ceesafe.web | io_uring | tls-h2 | stream | 100 | 421 |  | 224277 | 327459 | 342278 | 35148 | 0 |
+| ceesafe.web | io_uring | tls-h2 | echo | 1 | 8838 |  | 102 | 145 | 345 | 9748 | 0 |
+| ceesafe.web | io_uring | tls-h2 | echo | 10 | 18462 |  | 477 | 953 | 6356 | 11524 | 0 |
+| ceesafe.web | io_uring | tls-h2 | echo | 100 | 18906 |  | 4685 | 11459 | 23716 | 27580 | 0 |
+== done 2026-11-08 06:21:11 +0300 load 3.57 2.86 2.67

@@ -443,9 +443,7 @@ async fn serveConnection(
                     match (links.getMut(id)) {
                         Some(link) => {
                             known = true;
-                            for (b in data.view()) {
-                                grown(link.backlog.push(b))?;
-                            }
+                            grown(link.backlog.extend(data.view()))?;
                             if (end) {
                                 link.ended = true;
                             }
@@ -637,9 +635,7 @@ fn handleCommand(
 fn deliver(link: borrow mut H2Link) -> Result<void, NetError> {
     if (link.backlog.length > 0) {
         var chunk = Vector<u8>.create();
-        for (b in link.backlog.view()) {
-            grown(chunk.push(b))?;
-        }
+        grown(chunk.extend(link.backlog.view()))?;
         match (link.inbox.parts.trySend(StreamPart.Data(chunk))) {
             Ok() => { link.backlog.clear(); }
             Err(_) => { return Ok(); } // full: the next Consumed tries again
@@ -848,9 +844,8 @@ struct H2Stream {
             if (this.at < this.current.length) {
                 let ready = this.current.view();
                 let n = if (into.length < ready.length - this.at) into.length else ready.length - this.at;
-                for (i in 0..n) {
-                    into[i] = ready[this.at + i];
-                }
+                let dest = borrow mut into[0..n];
+                dest.copyFrom(ready[this.at..this.at + n]);
                 this.at += n;
                 await command(this.commands, H2Command.Consumed(this.id, n))?;
                 return Ok(n);

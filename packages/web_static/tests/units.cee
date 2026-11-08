@@ -1,0 +1,253 @@
+// web_static's parts that do no I/O. Expected values come from outside the code under test: the path rules from Web ADR
+// 0013 §3.5; the ranges from RFC 9110 §14.1.2's examples, on its 10000-byte representation; the entity-tag comparisons
+// from RFC 9110 §8.8.3.2's table; the ETag's hex from Python's hex(); and the dates from Python's calendar.timegm.
+import web_http;
+
+// ---- Paths ----
+
+fn relativeOf(path: StringView) -> Result<Vector<u8>, PathRefusal> {
+    var out = Vector<u8>.create();
+    StaticPaths.relative(path.bytes(), mut out)?;
+    return Ok(out);
+}
+
+fn pathIs(path: StringView, want: StringView) -> Result<void, TestFailure> {
+    match (relativeOf(path)) {
+        Ok(v) => { return Check.equalBytes(want.bytes(), v.view()); }
+        Err(_) => { return Check.fail(path); }
+    }
+}
+
+fn pathRefused(path: StringView) -> Result<void, TestFailure> {
+    match (relativeOf(path)) {
+        Ok(_) => { return Check.fail(path); }
+        Err(_) => { return Ok(); }
+    }
+}
+
+@test
+fn paths_accepted() -> Result<void, TestFailure> {
+    pathIs("/", "")?;
+    pathIs("", "")?;
+    pathIs("/index.html", "index.html")?;
+    pathIs("css/site.css", "css/site.css")?; // a route's `*path` has no leading `/`
+    pathIs("/docs/", "docs/")?;              // a trailing `/` is kept
+    pathIs("/a%20b.txt", "a b.txt")?;        // decoded once
+    pathIs("/%2541", "%41")?;                // only once: `%25` is `%`
+    pathIs("/.well-known/x", ".well-known/x")?;
+    pathIs("/a..b/c.", "a..b/c.")?; // dots inside a segment are not dot segments
+    return Ok();
+}
+
+@test
+fn paths_refused() -> Result<void, TestFailure> {
+    pathRefused("/../etc/passwd")?;
+    pathRefused("/a/../b")?;
+    pathRefused("/a/./b")?;
+    pathRefused("/a/..")?;
+    pathRefused("/.")?;
+    pathRefused("/%2e%2e/secret")?; // `..` encoded
+    pathRefused("/a%2f..%2fb")?;    // an encoded `/` separates, so `..` is a segment
+    pathRefused("/a%00b")?;         // a zero byte
+    pathRefused("/a%5cb")?;         // a backslash
+    pathRefused("/a\\b")?;
+    pathRefused("/C:/Windows")?; // a drive letter
+    pathRefused("/file:stream")?;
+    pathRefused("/a//b")?; // an empty segment
+    pathRefused("//a")?;
+    pathRefused("/a%2")?; // a bad escape
+    pathRefused("/a%zz")?;
+    return Ok();
+}
+
+// ---- Ranges ----
+
+fn rangeIs(value: StringView, size: u64, first: u64, last: u64) -> Result<void, TestFailure> {
+    match (Ranges.ask(value.bytes(), size)) {
+        RangeAsk.Part(a, b) => { return Check.isTrue(a == first && b == last, value); }
+        _ => { return Check.fail(value); }
+    }
+}
+
+fn rangeWhole(value: StringView, size: u64) -> Result<void, TestFailure> {
+    match (Ranges.ask(value.bytes(), size)) {
+        RangeAsk.Whole => { return Ok(); }
+        _ => { return Check.fail(value); }
+    }
+}
+
+fn rangeUnsatisfiable(value: StringView, size: u64) -> Result<void, TestFailure> {
+    match (Ranges.ask(value.bytes(), size)) {
+        RangeAsk.Unsatisfiable => { return Ok(); }
+        _ => { return Check.fail(value); }
+    }
+}
+
+@test
+fn ranges_rfc9110_examples() -> Result<void, TestFailure> {
+    // RFC 9110 §14.1.2, a representation of 10000 bytes.
+    rangeIs("bytes=0-499", 10000, 0, 499)?;     // the first 500 bytes
+    rangeIs("bytes=500-999", 10000, 500, 999)?; // the second 500 bytes
+    rangeIs("bytes=-500", 10000, 9500, 9999)?;  // the final 500 bytes
+    rangeIs("bytes=9500-", 10000, 9500, 9999)?;
+    rangeIs("bytes=0-", 10000, 0, 9999)?;
+    rangeWhole("bytes=0-0,-1", 10000)?; // several ranges: ignored (Web ADR 0013 §6.4)
+    rangeWhole("bytes= 0-999, 4500-5499, -1000", 10000)?;
+    return Ok();
+}
+
+@test
+fn ranges_edges() -> Result<void, TestFailure> {
+    rangeIs("bytes=9000-20000", 10000, 9000, 9999)?; // a last position past the end is clipped
+    rangeIs("bytes=-20000", 10000, 0, 9999)?;        // a suffix longer than the file is the file
+    rangeIs("BYTES=1-2", 10000, 1, 2)?;              // the unit ignores case
+    rangeIs(" bytes=1-2 ", 10000, 1, 2)?;
+    rangeIs("bytes=0-99999999999999999999999", 10, 0, 9)?; // past u64: saturates, then clipped
+    rangeUnsatisfiable("bytes=10000-", 10000)?;            // the first position at the end
+    rangeUnsatisfiable("bytes=20000-30000", 10000)?;
+    rangeUnsatisfiable("bytes=-0", 10000)?; // a suffix of 0
+    rangeUnsatisfiable("bytes=0-", 0)?;     // nothing of an empty file
+    rangeWhole("bytes=5-1", 10000)?;        // last before first: invalid, ignored
+    rangeWhole("items=0-1", 10000)?;        // another unit
+    rangeWhole("bytes=", 10000)?;
+    rangeWhole("bytes=-", 10000)?;
+    rangeWhole("bytes=a-b", 10000)?;
+    rangeWhole("bytes=1 - 2", 10000)?; // no white space inside a range
+    rangeWhole("bytes0-1", 10000)?;
+    return Ok();
+}
+
+// ---- Validators ----
+
+@test
+fn etag_form() -> Result<void, TestFailure> {
+    // Python: hex(10000) = 0x2710; hex(1794139200 * 10**9 + 123456789) = 0x18e61018c4f64d15.
+    let v = Validators.of(10000, UnixTime { seconds: 1794139200, nanoseconds: 123456789 });
+    Check.equalBytes("\"2710-18e61018c4f64d15\"".bytes(), v.etagBytes())?;
+    Check.equalU64(1794139200, v.modifiedSeconds)?;
+    let zero = Validators.of(0, UnixTime { seconds: 0, nanoseconds: 5 });
+    Check.equalBytes("\"0-5\"".bytes(), zero.etagBytes())?;
+    let before = Validators.of(1, UnixTime { seconds: -10, nanoseconds: 0 });
+    Check.equalBytes("\"1-0\"".bytes(), before.etagBytes())?; // a time before 1970 is 0
+    return Ok();
+}
+
+/// The fields of `head`, `name: value` lines separated by `\n`.
+fn fieldsOf(head: StringView) -> HeaderList {
+    let b = head.bytes();
+    var list = HeaderList.create(b);
+    var start: usize = 0;
+    for (k in 0..b.length + 1) {
+        if (k == b.length || b[k] == 10) {
+            var colon = start;
+            while (colon < k && b[colon] != 58) {
+                colon += 1;
+            }
+            if (colon < k) {
+                var v = colon + 1;
+                while (v < k && b[v] == 32) {
+                    v += 1;
+                }
+                let _ = list.push(start, colon, v, k, 64);
+            }
+            start = k + 1;
+        }
+    }
+    return list;
+}
+
+/// A file of 10000 bytes modified at 2026-11-08 12:00:00.5 (Python: calendar.timegm gives 1794139200). Its ETag is
+/// `"2710-18e61018db67e500"` (Python: hex(1794139200500000000)).
+fn testValidators() -> Validators => Validators.of(10000, UnixTime { seconds: 1794139200, nanoseconds: 500000000 });
+
+fn decided(head: StringView) -> Precondition {
+    let fields = fieldsOf(head);
+    let v = testValidators();
+    return Conditionals.evaluate(fields, v, 1794139200);
+}
+
+fn proceeds(head: StringView) -> Result<void, TestFailure> => match (decided(head)) {
+    Precondition.Proceed => Ok(),
+    _ => Check.fail(head),
+};
+
+fn notModified(head: StringView) -> Result<void, TestFailure> => match (decided(head)) {
+    Precondition.NotModified => Ok(),
+    _ => Check.fail(head),
+};
+
+fn failed(head: StringView) -> Result<void, TestFailure> => match (decided(head)) {
+    Precondition.Failed => Ok(),
+    _ => Check.fail(head),
+};
+
+@test
+fn etag_value_from_python() -> Result<void, TestFailure> {
+    let v = testValidators();
+    return Check.equalBytes("\"2710-18e61018db67e500\"".bytes(), v.etagBytes());
+}
+
+@test
+fn preconditions_rfc9110_order() -> Result<void, TestFailure> {
+    proceeds("")?;
+    // If-None-Match: a weak comparison (RFC 9110 §8.8.3.2: W/"1" and "1" match weakly).
+    notModified("if-none-match: \"2710-18e61018db67e500\"")?;
+    notModified("if-none-match: W/\"2710-18e61018db67e500\"")?;
+    notModified("if-none-match: \"other\", \"2710-18e61018db67e500\"")?;
+    notModified("if-none-match: \"other\"\nif-none-match: \"2710-18e61018db67e500\"")?; // across fields
+    notModified("if-none-match: *")?;
+    proceeds("if-none-match: \"other\"")?;
+    // If-Match: a strong comparison; a weak tag never matches strongly.
+    proceeds("if-match: \"2710-18e61018db67e500\"")?;
+    proceeds("if-match: *")?;
+    failed("if-match: W/\"2710-18e61018db67e500\"")?;
+    failed("if-match: \"other\"")?;
+    // If-Modified-Since: the file's time is 12:00:00 to the second.
+    notModified("if-modified-since: Sun, 08 Nov 2026 12:00:00 GMT")?;
+    notModified("if-modified-since: Mon, 09 Nov 2026 00:00:00 GMT")?;
+    proceeds("if-modified-since: Sun, 08 Nov 2026 11:59:59 GMT")?;
+    proceeds("if-modified-since: yesterday")?; // not a date: ignored
+    // If-None-Match wins over If-Modified-Since (step 3 before step 4).
+    proceeds("if-none-match: \"other\"\nif-modified-since: Mon, 09 Nov 2026 00:00:00 GMT")?;
+    // If-Unmodified-Since, only without If-Match.
+    failed("if-unmodified-since: Sun, 08 Nov 2026 11:59:59 GMT")?;
+    proceeds("if-unmodified-since: Sun, 08 Nov 2026 12:00:00 GMT")?;
+    proceeds("if-match: *\nif-unmodified-since: Sun, 08 Nov 2026 11:59:59 GMT")?;
+    // A failed If-Match is 412 even when If-None-Match would be 304 (step 1 first).
+    failed("if-match: \"other\"\nif-none-match: *")?;
+    return Ok();
+}
+
+fn rangeAllowedBy(head: StringView) -> bool {
+    let fields = fieldsOf(head);
+    let v = testValidators();
+    return Conditionals.rangeAllowed(fields, v, 1794139200);
+}
+
+@test
+fn if_range() -> Result<void, TestFailure> {
+    Check.isTrue(rangeAllowedBy(""), "no If-Range")?;
+    Check.isTrue(rangeAllowedBy("if-range: \"2710-18e61018db67e500\""), "the strong tag")?;
+    Check.isFalse(rangeAllowedBy("if-range: W/\"2710-18e61018db67e500\""), "a weak tag")?;
+    Check.isFalse(rangeAllowedBy("if-range: \"other\""), "another tag")?;
+    Check.isTrue(rangeAllowedBy("if-range: Sun, 08 Nov 2026 12:00:00 GMT"), "the exact date")?;
+    Check.isFalse(rangeAllowedBy("if-range: Mon, 09 Nov 2026 00:00:00 GMT"), "a later date")?;
+    Check.isFalse(rangeAllowedBy("if-range: nonsense"), "neither")?;
+    return Ok();
+}
+
+// ---- Media types ----
+
+@test
+fn media_types() -> Result<void, TestFailure> {
+    Check.equalText("text/html; charset=utf-8", MediaTypes.forName("/srv/www/index.html".bytes()))?;
+    Check.equalText("text/css; charset=utf-8", MediaTypes.forName("a/SITE.CSS".bytes()))?;
+    Check.equalText("image/png", MediaTypes.forName("logo.png".bytes()))?;
+    Check.equalText("font/woff2", MediaTypes.forName("f.woff2".bytes()))?;
+    Check.equalText("application/manifest+json; charset=utf-8", MediaTypes.forName("app.webmanifest".bytes()))?;
+    Check.equalText("", MediaTypes.forName("README".bytes()))?;
+    Check.equalText("", MediaTypes.forName("archive.unknown".bytes()))?;
+    Check.equalText("", MediaTypes.forName("dir.d/file".bytes()))?; // the dot is in a directory's name
+    Check.equalText("", MediaTypes.forName("trailing.".bytes()))?;
+    return Ok();
+}

@@ -68,6 +68,9 @@ impl Transport for Script {
         }
     }
 
+    async fn sendFile(borrow mut this, file: borrow mut File, offset: u64, length: u64) -> Result<void, NetError> =>
+        await Transports.copyFile(this, file, offset, length);
+
     async fn shutdownWrite(borrow mut this) -> Result<void, NetError> => Ok();
 
     @effects()

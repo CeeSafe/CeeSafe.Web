@@ -1,0 +1,248 @@
+// `StaticFiles` (Web ADR 0013 §3.5): a handler for GET and HEAD that serves the regular files under a root.
+//
+// - **The path:** the route's `*path` wildcard if it has one, else the whole request path. It is decoded once and
+//   checked lexically (`StaticPaths.relative`); a refused path is 404.
+// - **What is served:** the file is opened with `File.openRegular`, so a FIFO never holds the worker, and a device or
+//   socket is 404. A directory is served as its `index.html` when `options.index` is set (the default), else 404.
+// - **Validators:** read from the open file (`f.modified()`, `length`), not its path (CeeSafe ADR 0078 §3).
+// - **Body:** `Exchange.sendFile`, so a plain HTTP/1.1 connection copies nothing.
+import web_core;
+import web_http;
+import web_server;
+
+/// How a `StaticFiles` answers.
+public struct StaticOptions {
+    /// Serve a directory as its `index.html`.
+    public index: bool;
+    /// A `Cache-Control` value for every 200, 206 and 304, or empty for none.
+    public cacheControl: Vector<u8>;
+
+    /// `index` on, no `Cache-Control`.
+    public fn defaults() -> StaticOptions => StaticOptions { index: true, cacheControl: Vector<u8>.create() };
+}
+
+/// The files under a root, as a handler for any application state `S`. Mount it on a route that ends in `*path`
+/// (`router.get("/assets/*path", …)`), or on a single path, whose whole request path is then looked up.
+public struct StaticFiles<S> {
+    root: String;
+    options: StaticOptions;
+
+    /// Serves the files under `root`, a directory path without a trailing `/` (one is dropped).
+    public fn create(root: StringView, options: StaticOptions) -> Result<StaticFiles<S>, AllocError> {
+        var r = String.create();
+        r.append(root)?;
+        let b = r.view().bytes();
+        var keep = b.length;
+        while (keep > 1 && b[keep - 1] == 47) {
+            keep -= 1;
+        }
+        var trimmed = String.create();
+        match (StringView.fromUtf8(b[0..keep])) {
+            Some(t) => { trimmed.append(t)?; }
+            null => { trimmed.append(r.view())?; }
+        }
+        return Ok(StaticFiles<S> { root: trimmed, options: options });
+    }
+}
+
+impl<S: Send> Handler<S> for StaticFiles<S> {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let method = request.method();
+        let head = Methods.same(method, Method.Head);
+        if (!head && !Methods.same(method, Method.Get)) {
+            exchange.header("allow", "GET, HEAD".bytes())?;
+            return await exchange.send(Status.methodNotAllowed(), "".bytes());
+        }
+        let raw = match (ctx.param("path")) {
+            Some(p) => p.bytes(),
+            null => request.path().bytes(),
+        };
+        var relative = Vector<u8>.create();
+        match (StaticPaths.relative(raw, mut relative)) {
+            Ok() => {}
+            Err(PathRefusal.OutOfMemory) => { return Err(HandlerError.Internal); }
+            Err(_) => { return await notFound(exchange); }
+        }
+        var path = Vector<u8>.create();
+        allocated(path.extend(this.root.view().bytes()))?;
+        allocated(path.push(47))?;
+        allocated(path.extend(relative.view()))?;
+        var file = match (await opened(path.view())) {
+            Opened.File(f) => f,
+            Opened.Directory => {
+                if (!this.options.index) {
+                    return await notFound(exchange);
+                }
+                if (path.length > 0 && path.view()[path.length - 1] != 47) {
+                    allocated(path.push(47))?;
+                }
+                allocated(path.extend("index.html".bytes()))?;
+                match (await opened(path.view())) {
+                    Opened.File(f) => f,
+                    Opened.Failed => { return Err(HandlerError.Internal); },
+                    _ => { return await notFound(exchange); },
+                }
+            },
+            Opened.Missing => { return await notFound(exchange); },
+            Opened.Failed => { return Err(HandlerError.Internal); },
+        };
+        let size = match (await AsyncFiles.length(mut file)) {
+            Ok(n) => n,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        // The interpreter cannot read a file's time (`Unsupported`): then there are no validators and no
+        // conditionals, and Range is used without If-Range.
+        let validators: Validators? = match (await AsyncFiles.modified(mut file)) {
+            Ok(t) => Some(Validators.of(size, t)),
+            Err(AsyncError.Io(IoError.Unsupported)) => null,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        let now: u64 = if (Clock.now().seconds < 0) 0 else truncate<u64>(Clock.now().seconds);
+        let headers = request.headers();
+        match (validators) {
+            Some(v) => {
+                match (Conditionals.evaluate(headers, v, now)) {
+                    Precondition.Proceed => {}
+                    Precondition.NotModified => {
+                        exchange.setStatus(Status.notModified());
+                        validatorFields(exchange, v)?;
+                        cacheField(exchange, this.options)?;
+                        return Ok();
+                    }
+                    Precondition.Failed => {
+                        return await exchange.send(Status.preconditionFailed(), "".bytes());
+                    }
+                }
+            }
+            null => {}
+        }
+        // Range applies to GET only (RFC 9110 §14.2: HEAD defines no range handling).
+        var ask = RangeAsk.Whole;
+        if (!head) {
+            match (headers.getNamed("range")) {
+                Some(value) => {
+                    let allowed = match (validators) {
+                        Some(v) => Conditionals.rangeAllowed(headers, v, now),
+                        null => headers.getNamed("if-range").isNull(),
+                    };
+                    if (allowed) {
+                        ask = Ranges.ask(value, size);
+                    }
+                }
+                null => {}
+            }
+        }
+        let media = MediaTypes.forName(path.view());
+        exchange.header("content-type", if (media.length == 0) MediaTypes.fallback().bytes() else media.bytes())?;
+        if (media.length == 0) {
+            exchange.header("x-content-type-options", "nosniff".bytes())?;
+        }
+        exchange.header("accept-ranges", "bytes".bytes())?;
+        match (validators) {
+            Some(v) => { validatorFields(exchange, v)?; }
+            null => {}
+        }
+        cacheField(exchange, this.options)?;
+        match (ask) {
+            RangeAsk.Part(first, last) => {
+                var range = Vector<u8>.create();
+                allocated(range.extend("bytes ".bytes()))?;
+                allocated(appendDecimal(mut range, first))?;
+                allocated(range.push(45))?;
+                allocated(appendDecimal(mut range, last))?;
+                allocated(range.push(47))?;
+                allocated(appendDecimal(mut range, size))?;
+                exchange.header("content-range", range.view())?;
+                exchange.setStatus(Status.partialContent());
+                exchange.setContentLength(last - first + 1);
+                return await exchange.sendFile(mut file, first, last - first + 1);
+            }
+            RangeAsk.Unsatisfiable => {
+                var range = Vector<u8>.create();
+                allocated(range.extend("bytes */".bytes()))?;
+                allocated(appendDecimal(mut range, size))?;
+                exchange.header("content-range", range.view())?;
+                return await exchange.send(Status.rangeNotSatisfiable(), "".bytes());
+            }
+            RangeAsk.Whole => {
+                exchange.setStatus(Status.ok());
+                exchange.setContentLength(size);
+                return await exchange.sendFile(mut file, 0, size);
+            }
+        }
+    }
+}
+
+/// What opening a path found.
+enum Opened {
+    File(File),
+    Directory,
+    /// Nothing to serve: missing, not a regular file, not reachable, or not readable. All are 404.
+    Missing,
+    /// Another failure (no memory, an I/O error): 500.
+    Failed,
+}
+
+async fn opened(path: Slice<u8>) -> Opened {
+    let text = match (StringView.fromUtf8(path)) {
+        Some(t) => t,
+        null => { return Opened.Missing; }, // not UTF-8: no file of CeeSafe's can have that name
+    };
+    return match (await AsyncFiles.openRegular(text)) {
+        Ok(f) => Opened.File(f),
+        Err(AsyncError.Io(IoError.IsDirectory)) => Opened.Directory,
+        Err(AsyncError.Io(IoError.NotFound)) => Opened.Missing,
+        Err(AsyncError.Io(IoError.InvalidInput)) => Opened.Missing,
+        Err(AsyncError.Io(IoError.NotDirectory)) => Opened.Missing,
+        Err(AsyncError.Io(IoError.PermissionDenied)) => Opened.Missing,
+        Err(_) => Opened.Failed,
+    };
+}
+
+async fn notFound(exchange: borrow mut Exchange) -> Result<void, HandlerError> =>
+    await exchange.send(Status.notFound(), "".bytes());
+
+/// `ETag` and `Last-Modified`.
+fn validatorFields(exchange: borrow mut Exchange, v: borrow Validators) -> Result<void, HandlerError> {
+    exchange.header("etag", v.etagBytes())?;
+    var date = [0u8; 29];
+    HttpDate.format(v.modifiedSeconds, mut date);
+    exchange.header("last-modified", date[..])?;
+    return Ok();
+}
+
+fn cacheField(exchange: borrow mut Exchange, options: borrow StaticOptions) -> Result<void, HandlerError> {
+    if (options.cacheControl.length > 0) {
+        exchange.header("cache-control", options.cacheControl.view())?;
+    }
+    return Ok();
+}
+
+fn appendDecimal(out: borrow mut Vector<u8>, v: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var n: usize = 0;
+    var x = v;
+    loop {
+        digits[n] = truncate<u8>(48 + x % 10);
+        n += 1;
+        x /= 10;
+        if (x == 0) {
+            break;
+        }
+    }
+    while (n > 0) {
+        n -= 1;
+        out.push(digits[n])?;
+    }
+    return Ok();
+}
+
+fn allocated<T>(r: Result<T, AllocError>) -> Result<T, HandlerError> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(HandlerError.Internal),
+};
