@@ -4,7 +4,9 @@
 // - a small file;
 // - a 3 MiB one, more than a stream holds unacknowledged (1 MiB), so the server must wait for acknowledgements and
 //   StreamWritable.
-// A missing file gets an empty answer. The server is cancelled when the client finishes (Async.race).
+// A missing file gets an empty answer, and so does a refused path: `/sub/../small.txt` names a file that exists, so
+// it would not be empty if the guard let `..` through. The server is cancelled when the client finishes
+// (Async.race).
 import web_core;
 import web_tls;
 
@@ -70,16 +72,17 @@ fn isPattern(bytes: Slice<u8>) -> bool {
     return true;
 }
 
-/// What the client received on each of its three streams.
+/// What the client received on each of its four streams.
 struct Fetched {
     small: Vector<u8>;
     large: Vector<u8>;
     missing: Vector<u8>;
+    refused: Vector<u8>;
     ends: u32;
 }
 
-/// The client: connects to `server`, asks for /small.txt, /large.bin and /missing on three streams, and reads until
-/// all three have ended.
+/// The client: connects to `server`, asks for /small.txt, /large.bin, /missing and /sub/../small.txt on four
+/// streams, and reads until all four have ended.
 async fn fetch(tls: borrow QuicTls, server: SocketAddress) -> Result<Fetched, TestFailure> {
     let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
     let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
@@ -99,11 +102,17 @@ async fn fetch(tls: borrow QuicTls, server: SocketAddress) -> Result<Fetched, Te
     if (buffer.resize(quicEventBufferSize(), 0).isErr() || out.resize(quicDatagramSize(), 0).isErr()) {
         return Err(TestFailure.create("out of memory"));
     }
-    var got = Fetched { small: Vector<u8>.create(), large: Vector<u8>.create(), missing: Vector<u8>.create(), ends: 0 };
+    var got = Fetched {
+        small: Vector<u8>.create(),
+        large: Vector<u8>.create(),
+        missing: Vector<u8>.create(),
+        refused: Vector<u8>.create(),
+        ends: 0,
+    };
     var asked = false;
-    var streams = [-1i64, -1, -1];
+    var streams = [-1i64, -1, -1, -1];
     let deadline = Clock.monotonicNanos() + 20000000000; // 20 s: the transfers take well under one
-    while (got.ends < 3) {
+    while (got.ends < 4) {
         if (Clock.monotonicNanos() > deadline) {
             return Err(TestFailure.create("the transfers did not finish in 20 s"));
         }
@@ -118,7 +127,8 @@ async fn fetch(tls: borrow QuicTls, server: SocketAddress) -> Result<Fetched, Te
                     let into =
                         if (stream ==
                             streams[0]) borrow mut got.small else if (stream ==
-                            streams[1]) borrow mut got.large else borrow mut got.missing;
+                            streams[1]) borrow mut got.large else if (stream ==
+                            streams[2]) borrow mut got.missing else borrow mut got.refused;
                     if (into.extend(buffer.view()[0..n]).isErr()) {
                         return Err(TestFailure.create("out of memory"));
                     }
@@ -130,8 +140,8 @@ async fn fetch(tls: borrow QuicTls, server: SocketAddress) -> Result<Fetched, Te
             }
         }
         if (!asked && conn.handshakeDone()) {
-            let paths = ["GET /small.txt\r\n", "GET /large.bin\r\n", "GET /missing\r\n"];
-            for (k in 0..3) {
+            let paths = ["GET /small.txt\r\n", "GET /large.bin\r\n", "GET /missing\r\n", "GET /sub/../small.txt\r\n"];
+            for (k in 0..4) {
                 let s = ok(conn.openStream(), "a stream")?;
                 streams[k] = s;
                 let _ = ok(conn.writeStream(s, paths[k].bytes(), true), "a request")?;
@@ -270,5 +280,6 @@ async fn hq_interop_transfer_over_udp() -> Result<void, TestFailure> {
     Check.equalU64(3 * 1048576, fetched.large.length as u64)?;
     Check.isTrue(isPattern(fetched.large.view()), "the large file's bytes")?;
     Check.equalU64(0, fetched.missing.length as u64)?;
+    Check.equalU64(0, fetched.refused.length as u64)?;
     return Ok();
 }

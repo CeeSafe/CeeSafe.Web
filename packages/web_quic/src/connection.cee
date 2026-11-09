@@ -376,12 +376,25 @@ public struct QuicConnection {
     /// Safety: as `nextTimeout`.
     public fn handshakeDone(borrow this) -> bool => unsafe { qs_handshake_done(this.raw) } == 1;
 
-    /// The application protocol the handshake chose (`Alpn.Http3` for `h3`).
+    /// The application protocol the handshake chose (`Alpn.Http3` for `h3`, `Alpn.HqInterop` for `hq-interop`).
     /// Safety: the shim writes at most 16 bytes into a local array.
     public fn alpn(borrow this) -> Alpn {
         var name = [0u8; 16];
         let n = unsafe { qs_alpn(this.raw, borrow mut name[0] as *mut u8, 16) };
-        return if (n == 2 && name[0] == 104 && name[1] == 51) Alpn.Http3 else if (n == 0) Alpn.None else Alpn.Other;
+        if (n == 0) {
+            return Alpn.None;
+        }
+        if (n > name.length) {
+            return Alpn.Other;
+        }
+        let got = name[0..n];
+        if (bytesAre(got, "h3".bytes())) {
+            return Alpn.Http3;
+        }
+        if (bytesAre(got, "hq-interop".bytes())) {
+            return Alpn.HqInterop;
+        }
+        return Alpn.Other;
     }
 
     /// Opens a bidirectional stream: its ID.
@@ -474,4 +487,17 @@ struct QuicErrors {
         }
         return Err(QuicErrors.of(code));
     }
+}
+
+/// Whether `a` and `b` hold the same bytes.
+fn bytesAre(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
 }

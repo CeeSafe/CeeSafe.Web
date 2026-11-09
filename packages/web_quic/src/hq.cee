@@ -25,6 +25,8 @@ public struct HqFiles {
 struct HqRequest {
     stream: i64;
     line: Vector<u8>;
+    /// The whole request line has arrived and been answered: the file, or an empty answer.
+    started: bool;
     file: File?;
     offset: u64;
     size: u64;
@@ -63,7 +65,7 @@ impl QuicApplication for HqFiles {
                             Err(_) => { return Err(QuicError.NoMemory); }
                         }
                     }
-                    if (fin && r.file.isNull() && !r.finSent) {
+                    if (fin && !r.started) {
                         await this.start(r);
                     }
                 }
@@ -87,16 +89,20 @@ impl QuicApplication for HqFiles {
 impl HqFiles {
     /// Opens the requested file; a refused or missing one is an empty answer.
     async fn start(borrow this, r: borrow mut HqRequest) {
+        r.started = true;
+        r.offset = 0;
+        r.size = 0;
         let path = match (requestPath(r.line.view())) {
             Some(p) => p,
             null => {
-                r.size = 0;
+                r.line.clear();
                 return;
             },
         };
         var full = String.create();
         let ok = full.append(this.root.view()).isOk() && full.append(path).isOk();
         if (!ok) {
+            r.line.clear();
             return;
         }
         match (await AsyncFiles.openRegular(full.view())) {
@@ -108,13 +114,9 @@ impl HqFiles {
                 };
                 r.file = Some(file);
             }
-            Err(_) => { r.size = 0; }
+            Err(_) => { r.size = 0; } // nothing to send: the FIN goes alone (pump)
         }
-        r.offset = 0;
         r.line.clear();
-        if (r.file.isNull()) {
-            r.offset = 0; // nothing to send: the FIN goes alone (pump)
-        }
     }
 }
 
@@ -127,7 +129,7 @@ async fn pump(
     let all = requests.viewMut();
     for (i in 0..all.length) {
         let r = borrow mut all[i];
-        if (r.finSent || r.blocked || (r.file.isNull() && r.line.length > 0)) {
+        if (r.finSent || r.blocked || !r.started) {
             continue; // done, waiting for room, or its request line is still arriving
         }
         loop {
@@ -176,6 +178,7 @@ fn requestFor(requests: borrow mut Vector<HqRequest>, stream: i64) -> Result<usi
     let r = HqRequest {
         stream: stream,
         line: Vector<u8>.create(),
+        started: false,
         file: null,
         offset: 0,
         size: 0,

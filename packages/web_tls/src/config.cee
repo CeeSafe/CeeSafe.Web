@@ -77,7 +77,8 @@ public struct TlsConfig {
             let name = match (p) {
                 Alpn.Http11 => "http/1.1",
                 Alpn.Http2 => "h2",
-                Alpn.Http3 => "h3", // a QUIC listener's configuration (Web ADR 0014 §3.1)
+                Alpn.Http3 => "h3",             // a QUIC listener's configuration (Web ADR 0014 §3.1)
+                Alpn.HqInterop => "hq-interop", // QUIC interop testing (Web ADR 0014 amendment 3)
                 _ => "",
             };
             if (name.length == 0) {

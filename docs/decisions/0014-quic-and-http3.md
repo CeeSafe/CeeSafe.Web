@@ -376,3 +376,31 @@ This amendment replaces amendment 1's items 4, 5 and 6.
    - The path guard: it must start with `/`, and may not hold `..`, `\`, `:`, a space or a zero byte. A refused or
      missing file gets an empty answer.
    - Files are read in 64 KiB pieces, and a piece the stream does not take waits for `StreamWritable`.
+
+## 10. Amendment 3 (2026-11-09, M10 stage 2: interop with ngtcp2's client)
+
+1. **`Alpn.HqInterop`** (`hq-interop`):
+   - **Why:** an hq-interop client offers only that protocol, so a server offering only `h3` fails its handshake.
+     quic-interop-runner's transport cases need it too (stage 5).
+   - **Where:** `web_core`'s `Alpn` gains it last, so the earlier variants keep their tags; `web_tls`'s `setAlpn`
+     writes it, and `QuicConnection.alpn` recognises it.
+   - It is for interop testing over QUIC; nothing over TCP offers it.
+2. **The external client** is ngtcp2 1.26.0's example client (`examples/client.cc`), with the OpenSSL backend and the
+   hq-interop codec.
+   - It is built from the release tarball, the one `tools/vendor_quic.py` checks, since the vendored tree holds only
+     the library. It is a test tool: never committed, never linked into a package.
+   - **Built by hand:** upstream's Makefile pairs the hq codec only with wolfSSL (`wsslhqclient`). The OpenSSL client
+     is the same sources, with `-DWITH_EXAMPLE_HQ_PROTO_CODEC` and `hq_client_proto_codec.cc` in place of the HTTP/3
+     codec (M10.md has the commands).
+   - **C++23:** the examples need it. Debian 12's g++ 12 fails their configure check, so the interop runs on macOS for
+     now; on Linux it comes with quic-interop-runner's images (stage 5).
+   - It does not verify the server's certificate, so the handshake's certificate checks stay with our own tests
+     (`web_quic`'s loopback tests verify the test CA's "localhost").
+3. **`examples/hq`** serves a directory over hq-interop with `QuicServer` and `HqFiles`, on UDP 127.0.0.1:`CW_PORT`.
+   `tests/interop/quic.py` drives it with the client.
+4. **A fix to hq-interop's requests:** a request is now marked `started` once its whole line has arrived and been
+   answered.
+   - Before, being started was inferred from the request line having been cleared. A refused path (`..` or `:`)
+     returned before clearing it, so its stream never got the FIN, and the client waited for its idle timeout (30 s).
+   - The interop run found it. `hq_interop_transfer_over_udp` now asks for `/sub/../small.txt` too, and fails
+     against the old code.
