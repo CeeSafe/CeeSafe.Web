@@ -50,9 +50,16 @@ public struct QuicServerOptions {
     public maxConnections: u32;
     /// Datagrams queued for one connection before more are dropped.
     public inboundQueue: u32;
+    /// Whether a stream's flow-control credit goes back when its data is read with `QuicLink.next` (true), or only
+    /// when the application calls `QuicLink.consume` (false: HTTP/3, Web ADR 0014 amendment 4 item 2).
+    public creditOnRead: bool;
 
-    /// 1000 connections, 64 datagrams each.
-    public fn defaults() -> QuicServerOptions => QuicServerOptions { maxConnections: 1000, inboundQueue: 64 };
+    /// 1000 connections, 64 datagrams each, credit given back on read.
+    public fn defaults() -> QuicServerOptions => QuicServerOptions {
+        maxConnections: 1000,
+        inboundQueue: 64,
+        creditOnRead: true,
+    };
 }
 
 /// What runs on each connection: reads its events with `link.next`, until the connection ends.
@@ -114,6 +121,14 @@ public struct QuicLink {
 
     /// Opens a bidirectional stream: its ID.
     public fn openStream(borrow mut this) -> Result<i64, QuicError> => this.conn.openStream();
+
+    /// Opens a unidirectional stream: its ID.
+    public fn openUniStream(borrow mut this) -> Result<i64, QuicError> => this.conn.openUniStream();
+
+    /// Gives the peer back `n` bytes of credit on `stream`, when the server's `creditOnRead` is false.
+    public fn consume(borrow mut this, stream: i64, n: u64) {
+        this.conn.consume(stream, n);
+    }
 
     /// Queues bytes on a stream (`QuicConnection.writeStream`); `next` sends them.
     public fn writeStream(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError> =>
@@ -386,8 +401,9 @@ async fn admit(
     let i = inbound.clone();
     let o = toListener.clone();
     let from = got.from;
+    let creditOnRead = options.creditOnRead;
     let started = set.trySpawn(async move () =>
-        await connectionTask(t, a, i, o, id, local, from, initial, ids));
+        await connectionTask(t, a, i, o, id, local, from, initial, ids, creditOnRead));
     if (!started) {
         return Ok(); // the set is full: the Initial is dropped, and the client tries again
     }
@@ -418,6 +434,7 @@ async fn connectionTask(
     from: SocketAddress,
     initial: Vector<u8>,
     ids: QuicIds,
+    creditOnRead: bool,
 ) -> Result<void, QuicError> {
     let here = QuicAddress.of(local);
     let there = QuicAddress.of(from);
@@ -430,6 +447,9 @@ async fn connectionTask(
             return Ok();
         },
     };
+    if (!creditOnRead) {
+        conn.creditOnConsume();
+    }
     var out = Vector<u8>.create();
     match (out.resize(quicDatagramSize(), 0)) {
         Ok() => {}

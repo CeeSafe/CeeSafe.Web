@@ -56,6 +56,12 @@ extern "C" {
     @effects()
     fn qs_open_bidi(conn: *mut void) -> i64;
     @effects()
+    fn qs_open_uni(conn: *mut void) -> i64;
+    @effects()
+    fn qs_set_manual_credit(conn: *mut void);
+    @effects()
+    fn qs_consume(conn: *mut void, stream: i64, n: u64);
+    @effects()
     fn qs_stream_write(conn: *mut void, stream: i64, bytes: *u8, length: usize, fin: i32) -> i64;
     @effects()
     fn qs_stream_reset(conn: *mut void, stream: i64, code: u64) -> i32;
@@ -405,6 +411,34 @@ public struct QuicConnection {
             return Err(QuicErrors.of(truncate<i32>(id)));
         }
         return Ok(id);
+    }
+
+    /// Opens a unidirectional stream: its ID (HTTP/3's control and QPACK streams, Web ADR 0014 amendment 4 item 2).
+    /// Safety: as `nextTimeout`.
+    public fn openUniStream(borrow mut this) -> Result<i64, QuicError> {
+        let id = unsafe { qs_open_uni(this.raw) };
+        if (id < 0) {
+            return Err(QuicErrors.of(truncate<i32>(id)));
+        }
+        return Ok(id);
+    }
+
+    /// From now on, a stream's flow-control credit goes back to the peer only through `consume`, not when its data's
+    /// event is taken. The peer then sends no more than the user has consumed plus the windows (1 MiB a stream,
+    /// 16 MiB the connection).
+    /// Safety: as `nextTimeout`.
+    public fn creditOnConsume(borrow mut this) {
+        unsafe {
+            qs_set_manual_credit(this.raw);
+        }
+    }
+
+    /// Gives the peer back `n` bytes of credit on `stream` and on the connection (with `creditOnConsume`).
+    /// Safety: as `nextTimeout`.
+    public fn consume(borrow mut this, stream: i64, n: u64) {
+        unsafe {
+            qs_consume(this.raw, stream, n);
+        }
     }
 
     /// Queues `bytes` on `stream`, and ends the stream after them when `fin`: how many were taken, fewer when the

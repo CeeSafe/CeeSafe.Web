@@ -417,3 +417,117 @@ fn streams_past_the_initial_limit() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+/// With `creditOnConsume`, the server gives credit back only as it consumes (Web ADR 0014 amendment 4 item 2). RFC
+/// 9000 §4.1: a sender sends no more than the receiver's limit, here the stream's initial window of 1 MiB
+/// (`initial_max_stream_data_bidi_remote`, the shim's `qs_params`). So, before any consumption, the server receives at
+/// most 1 MiB of a 3 MiB stream however many rounds pass; once it consumes, the rest arrives.
+@test
+fn credit_waits_for_consume() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let p = pair()?;
+    var link = linked(p)?;
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var out = [0u8; 1452];
+    var rounds = 0;
+    while (rounds < 20 && !(link.clientSeen.handshake && link.serverSeen.handshake)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.clientSeen.handshake && link.serverSeen.handshake, "the handshake")?;
+    match (borrow mut link.server) {
+        Some(s) => { s.creditOnConsume(); }
+        null => { return Err(TestFailure.create("no server")); }
+    }
+    let total: usize = 3 * 1048576;
+    var piece = [0u8; 16384];
+    var written: usize = 0;
+    let stream = ok(link.client.openStream(), "a stream")?;
+    var consumed: usize = 0;
+    var consuming = false;
+    rounds = 0;
+    while (rounds < 20000 && !link.serverSeen.fin) {
+        while (written < total) {
+            let n: usize = if (total - written < piece.length) total - written else piece.length;
+            for (i in 0..n) {
+                piece[i] = lossyByte(written + i);
+            }
+            let taken = ok(link.client.writeStream(stream, piece[0..n], written + n == total), "the write")?;
+            written += taken;
+            if (taken < n) {
+                break;
+            }
+        }
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+        if (!consuming) {
+            Check.isTrue(link.serverSeen.data.length <= 1048576, "no more than the stream's window before consuming")?;
+            if (rounds == 300) {
+                // Long past what 1 MiB needs on this link: the window is full, and nothing more came.
+                Check.equalU64(1048576, link.serverSeen.data.length as u64)?;
+                consuming = true;
+            }
+        }
+        if (consuming && link.serverSeen.data.length > consumed) {
+            let more = link.serverSeen.data.length - consumed;
+            match (borrow mut link.server) {
+                Some(s) => { s.consume(stream, more as u64); }
+                null => {}
+            }
+            consumed += more;
+        }
+    }
+    Check.isTrue(link.serverSeen.fin, "the stream's end arrived once the server consumed")?;
+    Check.equalU64(total as u64, link.serverSeen.data.length as u64)?;
+    let got = link.serverSeen.data.view();
+    for (i in 0..got.length) {
+        if (got[i] != lossyByte(i)) {
+            return Err(TestFailure.create("the bytes, in order"));
+        }
+    }
+    return Ok();
+}
+
+/// Unidirectional streams (RFC 9000 §2.1): the client's first is 2 and the server's first is 3, and each carries its
+/// bytes to the other side.
+@test
+fn unidirectional_streams() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let p = pair()?;
+    var link = linked(p)?;
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var out = [0u8; 1452];
+    var rounds = 0;
+    while (rounds < 20 && !(link.clientSeen.handshake && link.serverSeen.handshake)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    let up = ok(link.client.openUniStream(), "the client's unidirectional stream")?;
+    Check.isTrue(up == 2, "the client's first unidirectional stream is 2")?;
+    let _ = ok(link.client.writeStream(up, "control".bytes(), false), "the client's write")?;
+    var down: i64 = -1;
+    match (borrow mut link.server) {
+        Some(s) => {
+            down = ok(s.openUniStream(), "the server's unidirectional stream")?;
+            let _ = ok(s.writeStream(down, "settings".bytes(), false), "the server's write")?;
+        }
+        null => { return Err(TestFailure.create("no server")); }
+    }
+    Check.isTrue(down == 3, "the server's first unidirectional stream is 3")?;
+    rounds = 0;
+    while (rounds < 20 && (link.serverSeen.data.length < 7 || link.clientSeen.data.length < 8)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.serverSeen.stream == 2, "the server's data came on stream 2")?;
+    Check.equalBytes("control".bytes(), link.serverSeen.data.view())?;
+    Check.isTrue(link.clientSeen.stream == 3, "the client's data came on stream 3")?;
+    Check.equalBytes("settings".bytes(), link.clientSeen.data.view())?;
+    return Ok();
+}

@@ -318,6 +318,7 @@ typedef struct qs_conn {
     uint8_t reset_secret[32]; /* for stateless-reset tokens of the IDs we issue */
     qs_stream *streams;
     qs_queue queue;
+    int manual_credit; /* stream data's credit goes back on qs_consume, not when CeeSafe takes the event */
 } qs_conn;
 
 static ngtcp2_conn *qs_get_conn(ngtcp2_crypto_conn_ref *ref) {
@@ -859,6 +860,29 @@ int64_t qs_open_bidi(qs_conn *c) {
     return rv != 0 ? rv : id;
 }
 
+/* Opens a unidirectional stream: its ID, or ngtcp2's error (STREAM_ID_BLOCKED when the peer's limit is reached). */
+int64_t qs_open_uni(qs_conn *c) {
+    int64_t id;
+    int rv = ngtcp2_conn_open_uni_stream(c->conn, &id, NULL);
+    return rv != 0 ? rv : id;
+}
+
+/* From now on, stream data's flow-control credit goes back to the peer only through qs_consume (Web ADR 0014
+   amendment 4 item 2). The queue stays bounded by flow control: what is not consumed is never credited. */
+void qs_set_manual_credit(qs_conn *c) {
+    c->manual_credit = 1;
+}
+
+/* Gives the peer back `n` bytes of credit on `stream` and on the connection: the user has consumed them. A closed
+   stream has no window to extend, which is not an error. */
+void qs_consume(qs_conn *c, int64_t stream, uint64_t n) {
+    if (n == 0) {
+        return;
+    }
+    (void)ngtcp2_conn_extend_max_stream_offset(c->conn, stream, n);
+    ngtcp2_conn_extend_max_offset(c->conn, n);
+}
+
 /* Takes up to `len` bytes to send on `stream` (`fin`: and ends it after them); how many were taken, which is less
    when the stream already holds QS_STREAM_HOLD unacknowledged bytes; or -1 without memory. The bytes are sent by
    qs_write. A FIN is taken only with the last byte. */
@@ -966,7 +990,7 @@ uint32_t qs_next_event(qs_conn *c, uint8_t *buf, size_t cap, int64_t *stream, ui
     *code = e->code;
     *length = n;
     uint32_t kind = e->kind;
-    if (kind == QS_EV_STREAM_DATA && n > 0) {
+    if (kind == QS_EV_STREAM_DATA && n > 0 && !c->manual_credit) {
         /* CeeSafe has the bytes: their credit goes back to the peer now (flow control bounds the queue). A stream
            already closed has no window to extend, which ngtcp2 reports and nothing needs. */
         (void)ngtcp2_conn_extend_max_stream_offset(c->conn, e->stream, n);

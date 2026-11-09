@@ -412,3 +412,56 @@ This amendment replaces amendment 1's items 4, 5 and 6.
    - The interop's multiplexing check had asked for exactly 100 files, so it passed. It now asks for 250.
    - Found when designing stage 3, by asking for 150 files on one connection: 100 arrived, and the client then hit its
      idle timeout.
+
+## 11. Amendment 4 (2026-11-09, M10 stage 3: the HTTP/3 design)
+
+1. **Layering: `web_server` does not gain `web_http3`, and `web_http3` does not depend on `web_server`** (replaces
+   §3.1's "web_server gains web_http3, behind an option", the question M10.md left open at stage 1).
+   - **Why:** a manifest's dependency is not optional, so `web_server` depending on `web_http3` would link ngtcp2,
+     nghttp3 and OpenSSL 3.5 into every server.
+   - **What web_http3 needs is already below web_server.** HTTP/2's driver serves an `Arc<Box<dyn Application +
+     Send>>` and `Limits`, both `web_http`'s (`web_http2.serveH2`), and `web_server`'s `Server<S>` is such an
+     `Application`. `web_http3` serves the same type, so its dependencies stay `web_core`, `web_http` and `web_quic`
+     (Web ADR 0004 amendment 4, unchanged).
+   - **One application over TCP and QUIC:** `web_server` gains `applicationOf(server)`, the `Arc` it builds today
+     inside `serviceOf`, and `HttpService.of(app, limits)`. A program serves the one `Arc` with `ConnectionServer.run`
+     and `Http3Server.serve`.
+   - **`Alt-Svc`** (§3.8) stays `web_server`'s, a header with a port number: it needs no QUIC code.
+2. **web_quic gains what HTTP/3 needs:**
+   - **unidirectional streams:** `openUniStream`, for the control stream and QPACK's two;
+   - **credit returned by the application:** a connection made with `QuicServerOptions.creditOnRead = false` gives a
+     stream's credit back only when its user calls `QuicLink.consume(stream, n)`, not when the event is taken. HTTP/3
+     consumes at once what nghttp3 reports consumed (framing, control and QPACK streams), and a request body's bytes
+     only as its handler reads them, so a slow handler holds back only its own stream (as HTTP/2 does, Web ADR 0011
+     §3.2). hq-interop keeps `true`.
+3. **The h3 shim (`web_http3/c/h3_shim.c`)** wraps one `nghttp3_conn`, with §3.4's contract: an event queue drained by
+   CeeSafe, allocations through `CEE_ALLOC_FOREIGN`, error codes classified in C.
+   - **In:** `h3_read(stream, bytes, fin)` calls `nghttp3_conn_read_stream` and returns what it consumed. Its
+     callbacks queue events: a request's header fields, its end of headers, DATA, trailers, its end, a stream's reset
+     or close, the peer's GOAWAY.
+   - **Out:** `h3_pull` returns the next bytes nghttp3 has for a stream (`nghttp3_conn_writev_stream`); `h3_wrote`
+     reports what QUIC took (`add_write_offset`), and, since web_quic copies what it takes into its own chunks
+     (amendment 2 item 2), also reports it acknowledged (`add_ack_offset`) so nghttp3 frees its buffers at once. A
+     stream QUIC holds full is blocked in nghttp3 (`block_stream`) until `StreamWritable` (`unblock_stream`).
+   - **Responses:** `h3_respond(stream, fields, hasBody)` (`submit_response` with a data reader) and
+     `h3_body(stream, bytes, end)`, which copies into the stream's body queue (at most 256 KiB, then it takes less; an
+     event says when there is room). The data reader hands nghttp3 vectors into that queue, and frees what nghttp3
+     reports acknowledged. `h3_trailers` and `h3_reset` complete it.
+   - **Settings:** QPACK's dynamic table 4 KiB and 16 blocked streams (§3.6); `max_field_section_size` from
+     `Limits.maxHeadBytes`.
+   - **Validation is nghttp3's** (RFC 9114 §4.1.2 and §4.3: pseudo-header fields, connection-specific fields,
+     `content-length` against DATA): a malformed request is reset with H3_MESSAGE_ERROR by nghttp3 itself. The tests
+     check it from outside.
+4. **The engine:** `H3Connection` (sans-I/O) over the shim. **The driver:** `Http3Server.serve(socket, local, tls,
+   app, limits, options)` runs `web_quic`'s `QuicServer` with an `Http3Application`. Its connection task owns the
+   `QuicLink` and the `H3Connection`. Each request runs in its own task with `Exchange.forStream` and an `H3Port`
+   implementing `StreamSink` over channels to the connection task, as HTTP/2's `StreamPort` does (Web ADR 0011
+   §3.2).
+5. **A client for the tests only.** The shim can also make a client `nghttp3_conn` (`h3_conn_client`), used through a
+   non-public `H3TestClient` in `web_http3`'s tests: package tests see non-public items (as `web_http2`'s tests use
+   `read32`). It is not API, so the owner's answer 7 (no HTTP/3 client) holds.
+6. **Interop:** ngtcp2's example client in its HTTP/3 build (`osslclient`, amendment 3 item 2) and curl where it has
+   HTTP/3.
+7. **The parts of stage 3:** (a) web_quic's additions (item 2); (b) the shim and `H3Connection`, tested in memory
+   with the test client; (c) the driver, `Exchange.forStream`, and tests over UDP; (d) GOAWAY with drain, the flood
+   guards (§3.6) and the QPACK limit tests; (e) interop.
