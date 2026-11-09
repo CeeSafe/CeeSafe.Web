@@ -416,10 +416,20 @@ static int cb_stream_open(ngtcp2_conn *conn, int64_t stream, void *ud) {
 }
 
 static int cb_stream_close(ngtcp2_conn *conn, uint32_t flags, int64_t stream, uint64_t code, void *ud, void *sud) {
-    (void)conn;
     (void)sud;
     qs_conn *c = ud;
     qs_stream_drop(c, stream);
+    /* A stream the peer opened is done: it may open one more (RFC 9000 §4.6). Without this, a peer could open only
+       initial_max_streams_bidi streams (100) in the connection's whole life. Bit 0 of an ID is set for streams a
+       server opens (§2.1), and bit 1 for unidirectional ones. */
+    int peer_opened = ngtcp2_conn_is_server(conn) ? (stream & 1) == 0 : (stream & 1) == 1;
+    if (peer_opened) {
+        if (stream & 2) {
+            ngtcp2_conn_extend_max_streams_uni(conn, 1);
+        } else {
+            ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+        }
+    }
     uint32_t has = (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) ? 1u : 0u;
     return qs_push(&c->queue, QS_EV_STREAM_CLOSE, has, stream, code, NULL, 0) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }

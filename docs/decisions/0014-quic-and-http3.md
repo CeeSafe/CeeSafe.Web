@@ -404,3 +404,11 @@ This amendment replaces amendment 1's items 4, 5 and 6.
      returned before clearing it, so its stream never got the FIN, and the client waited for its idle timeout (30 s).
    - The interop run found it. `hq_interop_transfer_over_udp` now asks for `/sub/../small.txt` too, and fails
      against the old code.
+5. **A peer's stream limit is raised as its streams close** (RFC 9000 §4.6). The shim's `stream_close` callback
+   extends `max_streams` by one for each stream the peer opened, of its own direction (`ngtcp2_conn_extend_max_streams_
+   bidi` or `_uni`), as ngtcp2's example server does.
+   - **Before,** a client could open only `initial_max_streams_bidi` (100) streams in a connection's whole life. The
+     101st waited until the idle timeout.
+   - The interop's multiplexing check had asked for exactly 100 files, so it passed. It now asks for 250.
+   - Found when designing stage 3, by asking for 150 files on one connection: 100 arrived, and the client then hit its
+     idle timeout.

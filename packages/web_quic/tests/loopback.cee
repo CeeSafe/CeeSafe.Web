@@ -357,3 +357,63 @@ fn lossy_transfer_is_whole_and_in_order() -> Result<void, TestFailure> {
     Check.isTrue(link.count > 0, "datagrams were dropped")?;
     return Ok();
 }
+
+/// 250 streams on one connection, one after another, each ended by both sides. RFC 9000 §4.6: a peer's stream limit
+/// is raised as its streams close, so it may open more than `initial_max_streams_bidi` (100) in a connection's life.
+/// Expected: every stream opens (IDs 0, 4, 8 …, §2.1) and every answer arrives.
+@test
+fn streams_past_the_initial_limit() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let p = pair()?;
+    var link = linked(p)?;
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var out = [0u8; 1452];
+    var rounds = 0;
+    while (rounds < 20 && !(link.clientSeen.handshake && link.serverSeen.handshake)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.clientSeen.handshake && link.serverSeen.handshake, "the handshake")?;
+    for (k in 0..250) {
+        // The stream; while the limit is reached, the rounds carry the MAX_STREAMS that raises it.
+        var stream: i64 = -1;
+        rounds = 0;
+        while (stream < 0 && rounds < 50) {
+            match (link.client.openStream()) {
+                Ok(s) => { stream = s; }
+                Err(QuicError.StreamsBlocked) => {
+                    round(mut link, p, buffer.viewMut(), mut out[..])?;
+                    rounds += 1;
+                }
+                Err(_) => { return Err(TestFailure.create("opening a stream")); }
+            }
+        }
+        if (stream < 0) {
+            return Err(TestFailure.create("a stream past the limit: still blocked after 50 rounds"));
+        }
+        Check.isTrue(stream == (k as i64) * 4, "client streams are 0, 4, 8 …")?;
+        link.serverSeen.fin = false;
+        link.clientSeen.fin = false;
+        let _ = ok(link.client.writeStream(stream, "x".bytes(), true), "the request")?;
+        rounds = 0;
+        while (rounds < 20 && !link.serverSeen.fin) {
+            round(mut link, p, buffer.viewMut(), mut out[..])?;
+            rounds += 1;
+        }
+        Check.isTrue(link.serverSeen.fin, "the server received the request's end")?;
+        match (borrow mut link.server) {
+            Some(s) => { let _ = ok(s.writeStream(stream, "y".bytes(), true), "the answer")?; }
+            null => { return Err(TestFailure.create("no server")); }
+        }
+        rounds = 0;
+        while (rounds < 20 && !link.clientSeen.fin) {
+            round(mut link, p, buffer.viewMut(), mut out[..])?;
+            rounds += 1;
+        }
+        Check.isTrue(link.clientSeen.fin, "the client received the answer's end")?;
+    }
+    return Ok();
+}

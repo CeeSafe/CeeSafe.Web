@@ -69,7 +69,7 @@ def main():
              "huge.bin": 32 * 1024 * 1024}
     for n, size in sizes.items():
         (served / n).write_bytes(os.urandom(size))
-    many = [f"m{i:03}.bin" for i in range(100)]
+    many = [f"m{i:03}.bin" for i in range(250)]
     for i, n in enumerate(many):
         (served / n).write_bytes(os.urandom(100 + 997 * i))
     env = dict(os.environ, CW_ROOT=str(served), CW_PORT=str(PORT), CW_CERT=str(CERTS / "server.pem"),
@@ -106,9 +106,10 @@ def run(client, served, download, sizes, many):
     check("32 MiB, twice the connection's window", rc == 0 and not same(served, download, ["huge.bin"]),
           f"exit {rc}, {secs:.2f} s, {32 / secs if secs else 0:.1f} MiB/s {tail}")
 
-    # quic-interop-runner's "multiplexing": many streams at once on one connection.
+    # quic-interop-runner's "multiplexing": many streams on one connection, more than the 100 a client may have open
+    # at first, so the server must raise the limit as streams close (RFC 9000 §4.6).
     rc, secs, tail = fetch(client, ["/" + n for n in many], download)
-    check("multiplexing: 100 files on one connection", rc == 0 and not same(served, download, many),
+    check("multiplexing: 250 files on one connection", rc == 0 and not same(served, download, many),
           f"exit {rc}, {secs:.2f} s, differ {len(same(served, download, many))} {tail}")
 
     # Loss, simulated by the client on what it sends (-t) and what it receives (-r). Lost server packets make the
