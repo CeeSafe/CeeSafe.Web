@@ -1313,6 +1313,29 @@ int64_t qs_stateless_reset(const uint8_t *key, const uint8_t *cid, size_t cidlen
     return n < 0 ? 0 : (int64_t)n;
 }
 
+/* A Version Negotiation packet (RFC 9000 §6, §17.2.1) answering `pkt`, a long-header packet of a version we do not
+   speak, listing version 1 and a reserved version (§15, so clients never come to rely on the list's contents): its
+   length in `out`, or 0 when none is due. Only a datagram of at least 1200 bytes is answered (§6.1, §14.1: a smaller
+   one could make the server an amplifier). */
+int64_t qs_version_negotiation(const uint8_t *pkt, size_t len, uint8_t *out, size_t cap) {
+    if (len < 1200 || len == 0 || !(pkt[0] & 0x80)) {
+        return 0;
+    }
+    ngtcp2_version_cid vc;
+    int rv = ngtcp2_pkt_decode_version_cid(&vc, pkt, len, 20);
+    if (rv != NGTCP2_ERR_VERSION_NEGOTIATION) {
+        return 0;
+    }
+    uint8_t unused = 0;
+    if (RAND_bytes(&unused, 1) != 1) {
+        return 0;
+    }
+    const uint32_t versions[] = {NGTCP2_PROTO_VER_V1, 0x1a2a3a4au};
+    ngtcp2_ssize n = ngtcp2_pkt_write_version_negotiation(out, cap, unused, vc.scid, vc.scidlen, vc.dcid, vc.dcidlen,
+                                                          versions, 2);
+    return n < 0 ? 0 : (int64_t)n;
+}
+
 /* ---- Events ---- */
 
 /* The next event: its kind (0: none), with its stream, flags and code written out, and its data copied into `buf`

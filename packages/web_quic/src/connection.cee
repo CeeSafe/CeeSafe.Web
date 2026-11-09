@@ -73,6 +73,8 @@ extern "C" {
     @effects()
     fn qs_pto(conn: *mut void) -> u64;
     @effects()
+    fn qs_version_negotiation(packet: *u8, length: usize, out: *mut u8, capacity: usize) -> i64;
+    @effects()
     fn qs_read(conn: *mut void, remote: *u8, ecn: u32, packet: *u8, length: usize, now: u64) -> i32;
     @effects()
     fn qs_write(conn: *mut void, out: *mut u8, capacity: usize, now: u64, ecn: *mut u32, to: *mut u8) -> i64;
@@ -822,4 +824,13 @@ public struct QuicRetry {
             _ => QuicRetryCheck.Drop,
         };
     }
+}
+
+/// A Version Negotiation packet answering `datagram`, a long-header packet of a version this server does not speak
+/// (RFC 9000 §6), written to `out`: its length, or 0 when none is due (another kind of packet, or a datagram under
+/// 1200 bytes, which is not answered so the server cannot be an amplifier).
+/// Safety: the shim reads the datagram and writes at most `out.length` bytes, during the call only.
+fn versionNegotiation(datagram: Slice<u8>, out: SliceMut<u8>) -> usize {
+    let n = unsafe { qs_version_negotiation(datagram.ptr, datagram.length, out.ptr, out.length) };
+    return if (n > 0) truncate<usize>(n) else 0;
 }

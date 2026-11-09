@@ -931,3 +931,117 @@ fn early_data_once_per_ticket() -> Result<void, TestFailure> {
     Check.isTrue(!ok(c.resume(plainTicket.view()), "the resumption")?, "no 0-RTT from a server that did not allow it")?;
     return Ok();
 }
+
+/// Whether `hay` holds `needle`.
+fn holds(hay: Slice<u8>, needle: StringView) -> bool {
+    let n = needle.bytes();
+    if (hay.length < n.length) {
+        return false;
+    }
+    for (i in 0..hay.length - n.length + 1) {
+        var all = true;
+        for (j in 0..n.length) {
+            if (hay[i + j] != n[j]) {
+                all = false;
+                break;
+            }
+        }
+        if (all) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `TlsConfig.setCipherSuites13` and `writeKeyLog` (Web ADR 0014 amendment 7), on a QUIC server. Expected: an unknown
+/// suite is refused (`BadSetting`); a server offering only ChaCha20 still completes a handshake; the handshake's
+/// secrets are written in NSS's key log format, whose labels include `SERVER_HANDSHAKE_TRAFFIC_SECRET` and
+/// `SERVER_TRAFFIC_SECRET_0` for TLS 1.3.
+@test
+fn key_log_and_cipher_suites() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let dir = match (Directory.temporary()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a temporary directory")); },
+    };
+    var path = String.create();
+    if (path.append(dir.view()).isErr() || path.append("/keys.log").isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var serverConfig = setup(TlsConfig.server(serverPem().bytes(), serverKey().bytes()), "the server configuration")?;
+    let alpn = [Alpn.Http3];
+    setup(serverConfig.setAlpn(alpn[..]), "the server's ALPN")?;
+    match (serverConfig.setCipherSuites13("NOT_A_SUITE")) {
+        Err(TlsSetupError.BadSetting) => {}
+        _ => { return Err(TestFailure.create("an unknown suite is refused")); }
+    }
+    setup(serverConfig.setCipherSuites13("TLS_CHACHA20_POLY1305_SHA256"), "ChaCha20 only")?;
+    setup(serverConfig.writeKeyLog(path.view()), "the key log")?;
+    let serverTls = ok(QuicTls.of(serverConfig), "the server's QUIC context")?;
+    let clientTls = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    var c = ok(QuicConnection.client(clientTls, "localhost", clientAddress(), serverAddress(), ids, 2000000000), "client")?;
+    var h = earlySeen();
+    let s = pumped(mut c, serverTls, mut h, 20)?;
+    Check.isTrue(c.handshakeDone() && s.handshakeDone(), "the handshake with ChaCha20 only")?;
+    var file = match (File.open(path.view())) {
+        Ok(f) => f,
+        Err(_) => { return Err(TestFailure.create("the key log exists")); },
+    };
+    var text = [0u8; 4096];
+    let n = match (file.read(mut text[..])) {
+        Ok(n) => n,
+        Err(_) => { return Err(TestFailure.create("reading the key log")); },
+    };
+    Check.isTrue(holds(text[0..n], "SERVER_HANDSHAKE_TRAFFIC_SECRET "), "the handshake secret")?;
+    Check.isTrue(holds(text[0..n], "SERVER_TRAFFIC_SECRET_0 "), "the application secret")?;
+    let _ = File.remove(path.view());
+    let _ = Directory.remove(dir.view());
+    return Ok();
+}
+
+/// A long-header packet of version 0x57414954 (unknown), `length` bytes: destination ID 01..08, source ID 11..18.
+fn otherVersion(length: usize) -> Result<Vector<u8>, TestFailure> {
+    var p = Vector<u8>.create();
+    let head = [0xc0u8, 0x57, 0x41, 0x49, 0x54, 8, 1, 2, 3, 4, 5, 6, 7, 8, 8, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
+    if (p.extend(head[..]).isErr() || p.resize(length, 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    return Ok(p);
+}
+
+/// Version Negotiation (RFC 9000 §6, §17.2.1). Expected: a 1200-byte long-header packet of an unknown version is
+/// answered with a long header of version 0 whose destination ID is the packet's source ID and whose source ID is the
+/// packet's destination ID, listing version 1; a 1199-byte one, and a version 1 packet, get nothing (§14.1).
+@test
+fn version_negotiation() -> Result<void, TestFailure> {
+    var out = [0u8; 256];
+    let probe = otherVersion(1200)?;
+    let n = versionNegotiation(probe.view(), mut out[..]);
+    Check.isTrue(n > 0, "an answer")?;
+    let v = out[0..n];
+    Check.isTrue((v[0] & 0x80) != 0, "a long header")?;
+    Check.equalBytes([0u8, 0, 0, 0][..], v[1..5])?; // version 0: Version Negotiation
+    Check.equalU64(8, v[5] as u64)?;
+    Check.equalBytes([0x11u8, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18][..], v[6..14])?;
+    Check.equalU64(8, v[14] as u64)?;
+    Check.equalBytes([1u8, 2, 3, 4, 5, 6, 7, 8][..], v[15..23])?;
+    var listsOne = false;
+    var at: usize = 23;
+    while (at + 4 <= n) {
+        if (v[at] == 0 && v[at + 1] == 0 && v[at + 2] == 0 && v[at + 3] == 1) {
+            listsOne = true;
+        }
+        at += 4;
+    }
+    Check.isTrue(listsOne, "version 1 is listed")?;
+    let small = otherVersion(1199)?;
+    Check.equalU64(0, versionNegotiation(small.view(), mut out[..]) as u64)?;
+    var v1 = otherVersion(1200)?;
+    let all = v1.viewMut();
+    all[1] = 0;
+    all[2] = 0;
+    all[3] = 0;
+    all[4] = 1;
+    return Check.equalU64(0, versionNegotiation(v1.view(), mut out[..]) as u64);
+}

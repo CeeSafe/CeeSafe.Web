@@ -590,6 +590,11 @@ async fn heard(
                 hold(held, header.id(), datagram, got.from, got.ecn)?;
                 return Ok();
             }
+            if (!header.initial && header.version != 0 && header.version != 1) {
+                // Another version: Version Negotiation, within the reset budget (§6; both answer unknown traffic).
+                await negotiate(socket, options, budget, datagram, got.from);
+                return Ok();
+            }
             if (!header.initial) {
                 // A short header for an ID of ours that no connection has (§10.3): a connection this server lost,
                 // or one another server with the same key made. Its peer is told with a stateless reset.
@@ -724,6 +729,32 @@ fn release(
         }
     }
     return Ok();
+}
+
+/// Answers a packet of a version this server does not speak with Version Negotiation, if one is due and the budget
+/// allows.
+async fn negotiate(
+    socket: borrow AsyncUdpSocket,
+    options: QuicServerOptions,
+    budget: borrow mut ResetBudget,
+    datagram: Slice<u8>,
+    to: SocketAddress,
+) {
+    let now = Timer.now();
+    if (now >= budget.since + 1000) {
+        budget.sent = 0;
+        budget.since = now;
+    }
+    if (budget.sent >= options.resetsPerSecond) {
+        return;
+    }
+    var out = [0u8; 256];
+    let n = versionNegotiation(datagram, mut out[..]);
+    if (n == 0) {
+        return;
+    }
+    budget.sent += 1;
+    let _ = await socket.sendTo(out[0..n], to);
 }
 
 /// The stateless resets sent in the current second.

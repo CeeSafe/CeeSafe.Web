@@ -637,3 +637,33 @@ Two improvements to 0-RTT came with them:
    data.
 5. **`CW_NGTCP2_LOG`:** set in the environment, it turns on ngtcp2's own log, to stderr. It is how the cases above
    were found.
+
+## 14. Amendment 7 (2026-11-09, M10 stage 5: quic-interop-runner)
+
+1. **The endpoint** (`tests/interop/endpoint`) is the runner's server. It reads the runner's environment (`ROLE`,
+   `TESTCASE`, `SSLKEYLOGFILE`) and serves `/www` on UDP 443, with `/certs/cert.pem` and `/certs/priv.key`:
+   - hq-interop through `HqFiles` for the transport cases;
+   - HTTP/3 through `Http3Server` with web_static's `StaticFiles` for `http3`;
+   - Retry for `retry`, 0-RTT for `zerortt`, ChaCha20 only for `chacha20`.
+   - It exits 127, as the runner asks, for what it does not do: the client role, QUIC v2 (`v2`), ECN marks (`ecn`), a
+     preferred address (`connectionmigration`).
+   - It binds `[::]` with IPV6_V6ONLY off, so `ipv6` reaches it as well as the IPv4 cases.
+   - Its image (`tests/interop/endpoint/docker`) is the runner's endpoint base (Ubuntu 24.04) with the binary and the
+     OpenSSL 3.5 it links. `build.sh` builds both on a Linux host.
+2. **Version Negotiation** (RFC 9000 §6) was missing.
+   - **Found when:** the runner's simulator starts a test only once the server answers a probe of an unknown version.
+     Our listener dropped every packet of another version, so not one test could start.
+   - **Now:** the listener answers a long-header packet of another version, in a datagram of at least 1200 bytes
+     (§14.1: no amplification), with Version Negotiation listing version 1 and a reserved version (§15). It shares the
+     stateless resets' budget.
+3. **web_tls gains two settings:**
+   - `TlsConfig.setCipherSuites13(list)`, for TLS 1.3's suites (`chacha20` asks for ChaCha20 only);
+   - `TlsConfig.writeKeyLog(path)`, an NSS key log, so the runner can decrypt its captures.
+   - The key log is a method, not something `SSLKEYLOGFILE` turns on by itself: a variable leaking session keys must
+     not be able to enable it in production. The endpoint calls it when the runner sets the variable.
+   - Both have a new error, `TlsSetupError.BadSetting`.
+4. **The results** (M10.md, stage 5 (b)): with ngtcp2, aioquic, quiche, picoquic and quic-go as clients, every case
+   the endpoint supports passed but two:
+   - quiche's `multiplexing`, which failed in the client (too many open files);
+   - `rebind-port` and `rebind-addr` with picoquic and quic-go, on the runner's path-validation checks. ngtcp2's own
+     server fails them the same way, so they are left to ngtcp2 and the clients.

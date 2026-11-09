@@ -11,6 +11,8 @@ public enum TlsSetupError {
     BadAlpn,
     /// OpenSSL could not make the configuration (out of memory, usually).
     Internal,
+    /// A setting was refused: a cipher suite list OpenSSL does not know, or a key log file that cannot be opened.
+    BadSetting,
 }
 
 /// A TLS configuration: TLS 1.2 (ECDHE with AEAD only) and 1.3, no renegotiation, no compression. A server's has its
@@ -53,6 +55,29 @@ public struct TlsConfig {
     public fn trustPem(borrow mut this, pem: Slice<u8>) -> Result<void, TlsSetupError> {
         if (unsafe { wt_cfg_trust_pem(this.raw, pem.ptr, pem.length) } < 1) {
             return Err(TlsSetupError.BadTrust);
+        }
+        return Ok();
+    }
+
+    /// Restricts TLS 1.3 to the cipher suites in `list`, OpenSSL's names, colon-separated and in preference order
+    /// (`"TLS_CHACHA20_POLY1305_SHA256"`).
+    /// Safety: as `trustPem`; the shim copies the list.
+    public fn setCipherSuites13(borrow mut this, list: StringView) -> Result<void, TlsSetupError> {
+        let b = list.bytes();
+        if (unsafe { wt_cfg_cipher_suites13(this.raw, b.ptr, b.length) } != 1) {
+            return Err(TlsSetupError.BadSetting);
+        }
+        return Ok();
+    }
+
+    /// Appends this configuration's TLS secrets to the key log at `path` (NSS's key log format, the one
+    /// `SSLKEYLOGFILE` names for curl and browsers), so captures of its connections can be decrypted. For tests and
+    /// debugging only: whoever reads the file can decrypt those connections. One file per process.
+    /// Safety: as `trustPem`; the shim copies the path.
+    public fn writeKeyLog(borrow mut this, path: StringView) -> Result<void, TlsSetupError> {
+        let b = path.bytes();
+        if (unsafe { wt_cfg_key_log(this.raw, b.ptr, b.length) } != 1) {
+            return Err(TlsSetupError.BadSetting);
         }
         return Ok();
     }

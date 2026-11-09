@@ -21,6 +21,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #ifndef WT_STANDALONE
 #include "ceesafe/foreign.h"
@@ -305,6 +306,8 @@ void wt_cfg_free(SSL_CTX *ctx);
 int32_t wt_cfg_use_pem(SSL_CTX *ctx, const uint8_t *chain, size_t chain_len, const uint8_t *key, size_t key_len);
 int32_t wt_cfg_trust_pem(SSL_CTX *ctx, const uint8_t *pem, size_t len);
 int32_t wt_cfg_trust_default(SSL_CTX *ctx);
+int32_t wt_cfg_cipher_suites13(SSL_CTX *ctx, const uint8_t *list, size_t len);
+int32_t wt_cfg_key_log(SSL_CTX *ctx, const uint8_t *path, size_t len);
 int32_t wt_cfg_set_alpn(SSL_CTX *ctx, const uint8_t *wire, size_t len);
 int32_t wt_cfg_add_name(SSL_CTX *front, const uint8_t *name, size_t name_len, const uint8_t *chain, size_t chain_len,
                         const uint8_t *key, size_t key_len);
@@ -544,6 +547,58 @@ int32_t wt_cfg_trust_pem(SSL_CTX *ctx, const uint8_t *pem, size_t len) {
     ERR_clear_error();
     BIO_free(b);
     return added;
+}
+
+/* TLS 1.3's cipher suites, as OpenSSL names them, colon-separated ("TLS_CHACHA20_POLY1305_SHA256"), in preference
+   order. 1 on success. */
+int32_t wt_cfg_cipher_suites13(SSL_CTX *ctx, const uint8_t *list, size_t len) {
+    char text[256];
+    if (len == 0 || len >= sizeof text) {
+        return 0;
+    }
+    memcpy(text, list, len);
+    text[len] = 0;
+    return SSL_CTX_set_ciphersuites(ctx, text) == 1 ? 1 : 0;
+}
+
+/* The key log: one file for the process (the SSLKEYLOGFILE convention), opened for appending by the first
+   configuration that asks, written and flushed one line at a time. For decrypting captures in tests; anyone who
+   reads it can decrypt the connections it covers. */
+static FILE *key_log_file = NULL;
+static CRYPTO_RWLOCK *key_log_lock = NULL;
+
+static void key_log_line(const SSL *ssl, const char *line) {
+    (void)ssl;
+    if (key_log_file == NULL || !CRYPTO_THREAD_write_lock(key_log_lock)) {
+        return;
+    }
+    fputs(line, key_log_file);
+    fputc('\n', key_log_file);
+    fflush(key_log_file);
+    CRYPTO_THREAD_unlock(key_log_lock);
+}
+
+/* Writes this configuration's TLS secrets to the key log at `path` (NSS's format, as SSLKEYLOGFILE asks). 1 on
+   success; a second path for the process is refused. */
+int32_t wt_cfg_key_log(SSL_CTX *ctx, const uint8_t *path, size_t len) {
+    char name[1024];
+    if (len == 0 || len >= sizeof name) {
+        return 0;
+    }
+    memcpy(name, path, len);
+    name[len] = 0;
+    if (key_log_file == NULL) {
+        key_log_lock = CRYPTO_THREAD_lock_new();
+        if (key_log_lock == NULL) {
+            return 0;
+        }
+        key_log_file = fopen(name, "a");
+        if (key_log_file == NULL) {
+            return 0;
+        }
+    }
+    SSL_CTX_set_keylog_callback(ctx, key_log_line);
+    return 1;
 }
 
 /* Trusts the system's default CA locations: OpenSSL's defaults (a bundle or directory on Unix), and on Windows the
