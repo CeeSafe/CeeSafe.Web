@@ -145,6 +145,28 @@ static wt_front *front_of(SSL_CTX *ctx) {
     return ctx == NULL ? NULL : SSL_CTX_get_ex_data(ctx, front_slot());
 }
 
+/* A server SSL's configuration (its "front" SSL_CTX, before any SNI switch), in a slot of the SSL's own, for the
+   ticket callback. Not the SSL's app data: QUIC's SSLs carry ngtcp2's connection reference there (Web ADR 0014
+   §3.4), so web_tls's callbacks must not read it. */
+/* For web_quic's shim (Web ADR 0014 §3.4). */
+void wt_init(void);
+int32_t wt_ssl_use_front(SSL *ssl, SSL_CTX *ctx);
+
+static int ssl_front_index = -1;
+
+static int ssl_front_slot(void) {
+    if (ssl_front_index < 0) {
+        ssl_front_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+    }
+    return ssl_front_index;
+}
+
+/* For web_quic's shim: binds a QUIC server SSL made from `ctx` (a web_tls server configuration) to it, as
+   wt_ctx_new binds its own, so the ticket callback finds the configuration's keys. 1, or 0 on failure. */
+int32_t wt_ssl_use_front(SSL *ssl, SSL_CTX *ctx) {
+    return SSL_set_ex_data(ssl, ssl_front_slot(), ctx) ? 1 : 0;
+}
+
 static int new_ticket_key(wt_ticket_key *k) {
     k->set = RAND_bytes(k->name, sizeof k->name) > 0 && RAND_bytes(k->aes, sizeof k->aes) > 0 &&
              RAND_bytes(k->hmac, sizeof k->hmac) > 0;
@@ -221,8 +243,7 @@ static int pick_certificate(SSL *ssl, int *alert, void *arg) {
    with the current or the previous one (then renewed: 2). */
 static int ticket_key(SSL *ssl, unsigned char key_name[16], unsigned char *iv, EVP_CIPHER_CTX *cipher,
                       EVP_MAC_CTX *mac, int enc) {
-    wt_ctx *c = SSL_get_app_data(ssl);
-    wt_front *f = c == NULL ? NULL : front_of(c->front);
+    wt_front *f = front_of(SSL_get_ex_data(ssl, ssl_front_slot()));
     if (f == NULL || !CRYPTO_THREAD_read_lock(f->lock)) {
         return -1;
     }
@@ -389,10 +410,17 @@ static void route_allocations(void) {
 }
 #endif
 
-SSL_CTX *wt_cfg_new(int32_t server) {
+/* Routes OpenSSL's allocations through CeeSafe's (route_allocations), once per process. For web_quic's shim, whose
+   first OpenSSL call (ngtcp2_crypto_ossl_init) may come before any configuration is made: OpenSSL takes allocation
+   functions only before its first allocation (Web ADR 0014 §3.4). */
+void wt_init(void) {
 #ifndef WT_STANDALONE
     (void)CRYPTO_THREAD_run_once(&route_once, route_allocations);
 #endif
+}
+
+SSL_CTX *wt_cfg_new(int32_t server) {
+    wt_init();
     SSL_CTX *ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
     if (ctx == NULL) {
         return NULL;
@@ -746,6 +774,9 @@ wt_ctx *wt_ctx_new(SSL_CTX *cfg, int32_t server, const uint8_t *host, size_t hos
     SSL_set_app_data(c->ssl, c);
     if (server) {
         c->front = cfg;
+        if (!SSL_set_ex_data(c->ssl, ssl_front_slot(), cfg)) {
+            goto fail_ssl; /* after SSL_set_bio: the SSL owns both BIOs */
+        }
         wt_front *f = front_of(cfg);
         /* The client-certificate roots and the names sent in CertificateRequest belong to this connection, so a
            switch to an SNI entry's configuration (pick_certificate) keeps them. */

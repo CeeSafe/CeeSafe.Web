@@ -77,6 +77,7 @@ public struct TlsConfig {
             let name = match (p) {
                 Alpn.Http11 => "http/1.1",
                 Alpn.Http2 => "h2",
+                Alpn.Http3 => "h3", // a QUIC listener's configuration (Web ADR 0014 §3.1)
                 _ => "",
             };
             if (name.length == 0) {
@@ -199,6 +200,11 @@ public struct TlsConfig {
 
     /// The SSL_CTX, for a connection.
     fn handle(borrow this) -> *mut void => this.raw;
+
+    /// The SSL_CTX, for `web_quic`'s shim (Web ADR 0014 §3.4), which takes a reference of its own
+    /// (`SSL_CTX_up_ref`) before this call's caller returns, so the context outlives this configuration if need be.
+    /// Not for other uses: the pointer is valid only while this configuration lives.
+    public fn quicContext(borrow this) -> *mut void => this.raw;
 
     /// Safety: `raw` is this configuration's own SSL_CTX reference; connections made from it hold references of
     /// their own, so it lives on until they are freed.

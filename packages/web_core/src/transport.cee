@@ -10,6 +10,8 @@ public enum Alpn {
     Http2,
     /// Something else the peer and the configuration agreed on.
     Other,
+    /// `h3`, over QUIC (Web ADR 0014). Last, so the earlier variants keep their tags.
+    Http3,
 }
 
 /// An async byte stream with explicit close semantics (Web ADR 0001 §3.2). The transport owns its socket: dropping it

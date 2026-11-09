@@ -300,3 +300,31 @@ Each stage is committed and checked.
 6. **0-RTT off by default, safe methods only, 425 for the rest?** Recommended: **yes** (§3.7).
 7. **HTTP/3 in `web_client` in M10?** Recommended: **no.** M10 is the server, and the client is a later item. The
    interop runner tests a server against its own client images.
+
+## 8. Amendment 1 (2026-11-09, M10 stage 2: the shim as built)
+
+1. **TLS.**
+   - `QuicTls.of(config)` takes `web_tls`'s `TlsConfig` and up-refs its SSL_CTX (Web ADR 0002 amendment 6).
+   - A QUIC server's configuration is its own, made from the same PEM with ALPN `h3`, since one SSL_CTX has one ALPN
+     list.
+   - Each QUIC server SSL is bound to its configuration with `wt_ssl_use_front`, for its session tickets.
+2. **`qs_init` routes OpenSSL's allocations first** (`wt_init`), so every allocation of a handshake is counted and
+   swept.
+3. **Error codes.** The shim classifies ngtcp2's codes (`qs_error_kind`), so no ngtcp2 number appears in CeeSafe.
+   - Copying them by hand gave three wrong values out of six (STREAM_ID_BLOCKED, DRAINING and IDLE_CLOSE). Checking
+     against `ngtcp2.h` caught them before any test ran.
+4. **The event queue.**
+   - **Its bound** is 256 events and 256 KiB of data.
+   - **Before each datagram** is read, `qs_read` checks there is room for everything one datagram can report: its
+     length, and 64 events. Otherwise it answers `WouldBlock`, and the caller drains the queue and feeds the
+     datagram again. That is §3.4's "a full queue stops the read", done before the read rather than inside it, since
+     ngtcp2 cannot stop mid-packet.
+   - **No silent truncation.** An event whose data does not fit the caller's buffer stays queued, and is reported as
+     `BufferTooSmall(n)`; `quicEventBufferSize()` (65 527 bytes) is always enough. The first version truncated.
+5. **Stream data.** ngtcp2 keeps no copy of the stream data it sends.
+   - The shim holds each stream's unacknowledged bytes, at most 1 MiB, and frees them in `acked_stream_data_offset`.
+   - `writeStream` takes fewer bytes when a stream is full, and `StreamWritable` says when to try again.
+6. **Received stream data.** Its flow-control credit is given back as soon as it is queued. The backpressure is the
+   queue's bound (item 4).
+7. **Datagrams.** `datagram` writes one packet per call, with data from at most one stream. ngtcp2's default largest
+   datagram, 1452 bytes (`ngtcp2_settings.c`), is the out buffer's size.

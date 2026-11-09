@@ -1,0 +1,258 @@
+// Two QuicConnections, a client and a server, exchanging datagrams in memory on a fake clock (Web ADR 0014 §4, stage
+// 2). Expected outcomes are RFC 9000's and RFC 9001's:
+// - the handshake completes on both sides;
+// - ALPN `h3` is chosen, the only protocol both offer;
+// - a client-initiated bidirectional stream is stream 0 (RFC 9000 §2.1);
+// - its bytes arrive whole and in order with the FIN, and are echoed back;
+// - a CONNECTION_CLOSE leaves the peer draining (§10.2).
+// The server's certificate is the test CA's "localhost" (certs.cee), verified by the client.
+import web_core;
+import web_tls;
+
+fn tls(r: Result<TlsConfig, TlsSetupError>) -> Result<TlsConfig, TlsFailure> => match (r) {
+    Ok(c) => Ok(c),
+    Err(_) => Err(TlsFailure.Setup),
+};
+
+enum TlsFailure {
+    Setup,
+}
+
+fn ok<T>(r: Result<T, QuicError>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(e) => {
+            var m = String.create();
+            let _ = m.append(what);
+            let _ = m.append(": ");
+            let _ = m.append(describe(e));
+            match (e) {
+                QuicError.Failed(code) => {
+                    let _ = m.append(" ");
+                    let _ = m.appendNumber(code as i64);
+                }
+                _ => {}
+            }
+            return Err(TestFailure.create(m.view()));
+        }
+    }
+}
+
+fn describe(e: QuicError) -> StringView => match (e) {
+    QuicError.WouldBlock => "WouldBlock",
+    QuicError.Draining => "Draining",
+    QuicError.IdleTimeout => "IdleTimeout",
+    QuicError.NotInitial => "NotInitial",
+    QuicError.StreamsBlocked => "StreamsBlocked",
+    QuicError.NoMemory => "NoMemory",
+    QuicError.BufferTooSmall(_) => "BufferTooSmall",
+    QuicError.Failed(_) => "Failed",
+};
+
+fn setup<T>(r: Result<T, TlsSetupError>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create(what)); }
+    }
+}
+
+/// Both sides' contexts: a server presenting "localhost" with ALPN h3, and a client trusting the test CA.
+struct Pair {
+    server: QuicTls;
+    client: QuicTls;
+    serverConfig: TlsConfig;
+    clientConfig: TlsConfig;
+}
+
+fn pair() -> Result<Pair, TestFailure> {
+    var serverConfig = setup(TlsConfig.server(serverPem().bytes(), serverKey().bytes()), "the server configuration")?;
+    let alpn = [Alpn.Http3];
+    setup(serverConfig.setAlpn(alpn[..]), "the server's ALPN")?;
+    var clientConfig = setup(TlsConfig.client(), "the client configuration")?;
+    setup(clientConfig.trustPem(caPem().bytes()), "the client's trust")?;
+    setup(clientConfig.setAlpn(alpn[..]), "the client's ALPN")?;
+    let server = ok(QuicTls.of(serverConfig), "the server's QUIC context")?;
+    let client = ok(QuicTls.of(clientConfig), "the client's QUIC context")?;
+    return Ok(Pair { server: server, client: client, serverConfig: serverConfig, clientConfig: clientConfig });
+}
+
+/// What one side received, so far.
+struct Seen {
+    handshake: bool;
+    data: Vector<u8>;
+    fin: bool;
+    stream: i64;
+    opened: i64;
+}
+
+fn seen() -> Seen => Seen { handshake: false, data: Vector<u8>.create(), fin: false, stream: -1, opened: -1 };
+
+fn drain(conn: borrow mut QuicConnection, buffer: SliceMut<u8>, into: borrow mut Seen) -> Result<void, TestFailure> {
+    loop {
+        let event = match (ok(conn.nextEvent(buffer), "an event")?) {
+            Some(e) => e,
+            null => { return Ok(); },
+        };
+        match (event) {
+            QuicEvent.HandshakeDone => { into.handshake = true; }
+            QuicEvent.StreamData(stream, length, fin) => {
+                into.stream = stream;
+                match (into.data.extend(buffer[0..length])) {
+                    Ok() => {}
+                    Err(_) => { return Err(TestFailure.create("out of memory")); }
+                }
+                if (fin) {
+                    into.fin = true;
+                }
+            }
+            QuicEvent.StreamOpened(stream) => { into.opened = stream; }
+            _ => {}
+        }
+    }
+}
+
+/// The two connections and what each has seen; the client's first datagram makes the server.
+struct Link {
+    client: QuicConnection;
+    server: QuicConnection?;
+    clientSeen: Seen;
+    serverSeen: Seen;
+    now: u64;
+}
+
+fn clientAddress() -> QuicAddress {
+    let a = SocketAddress.V4([127u8, 0, 0, 1], 50000);
+    return QuicAddress.of(a);
+}
+
+fn serverAddress() -> QuicAddress {
+    let a = SocketAddress.V4([127u8, 0, 0, 1], 4433);
+    return QuicAddress.of(a);
+}
+
+/// One round: every datagram the client has goes to the server, then every one the server has goes to the client;
+/// the clock moves on 1 ms.
+fn round(link: borrow mut Link, p: borrow Pair, buffer: SliceMut<u8>, out: SliceMut<u8>) -> Result<void, TestFailure> {
+    let local = clientAddress();
+    let remote = serverAddress();
+    loop {
+        let sent = match (ok(link.client.datagram(out, link.now), "the client's datagram")?) {
+            Some(d) => d,
+            null => { break; },
+        };
+        if (link.server.isNull()) {
+            let ids = ok(QuicIds.random(), "random IDs")?;
+            let made = ok(
+                QuicConnection.server(p.server, out[0..sent.length], remote, local, ids, link.now),
+                "the server connection",
+            )?;
+            link.server = Some(made);
+        }
+        match (borrow mut link.server) {
+            Some(s) => {
+                ok(s.feed(local, sent.ecn, out[0..sent.length], link.now), "the server's read")?;
+                drain(s, buffer, mut link.serverSeen)?;
+            }
+            null => {}
+        }
+    }
+    match (borrow mut link.server) {
+        Some(s) => {
+            loop {
+                let sent = match (ok(s.datagram(out, link.now), "the server's datagram")?) {
+                    Some(d) => d,
+                    null => { break; },
+                };
+                ok(link.client.feed(remote, sent.ecn, out[0..sent.length], link.now), "the client's read")?;
+                drain(mut link.client, buffer, mut link.clientSeen)?;
+            }
+        }
+        null => {}
+    }
+    drain(mut link.client, buffer, mut link.clientSeen)?;
+    link.now += 1000000;
+    return Ok();
+}
+
+fn linked(p: borrow Pair) -> Result<Link, TestFailure> {
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    let local = clientAddress();
+    let remote = serverAddress();
+    let client = ok(QuicConnection.client(p.client, "localhost", local, remote, ids, 1000000000), "the client")?;
+    return Ok(Link { client: client, server: null, clientSeen: seen(), serverSeen: seen(), now: 1000000000 });
+}
+
+@test
+fn handshake_stream_echo_and_close() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let p = pair()?;
+    var link = linked(p)?;
+    var buffer = Vector<u8>.create();
+    match (buffer.resize(quicEventBufferSize(), 0)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+    var out = [0u8; 1452];
+    // The handshake: RFC 9001 needs a few round trips; 20 is far more than enough.
+    var rounds = 0;
+    while (rounds < 20 && !(link.clientSeen.handshake && link.serverSeen.handshake)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.clientSeen.handshake, "the client's handshake completed")?;
+    Check.isTrue(link.serverSeen.handshake, "the server's handshake completed")?;
+    Check.isTrue(link.client.handshakeDone(), "handshakeDone, client")?;
+    match (link.client.alpn()) {
+        Alpn.Http3 => {}
+        _ => { return Err(TestFailure.create("ALPN h3 on the client")); }
+    }
+    // A stream: the client's first bidirectional stream is 0 (RFC 9000 §2.1).
+    let stream = ok(link.client.openStream(), "a stream")?;
+    Check.isTrue(stream == 0, "the first client stream is 0")?;
+    let message = "hello over QUIC, from CeeSafe.Web";
+    Check.equalU64(
+        message.length as u64,
+        ok(link.client.writeStream(stream, message.bytes(), true), "the client's write")? as u64,
+    )?;
+    rounds = 0;
+    while (rounds < 20 && !link.serverSeen.fin) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.serverSeen.fin, "the server received the stream's end")?;
+    Check.isTrue(link.serverSeen.stream == 0, "the data came on stream 0")?;
+    Check.isTrue(link.serverSeen.opened == 0, "the server saw stream 0 open")?;
+    Check.equalBytes(message.bytes(), link.serverSeen.data.view())?;
+    // The echo, on the same stream.
+    match (borrow mut link.server) {
+        Some(s) => {
+            let echoed = link.serverSeen.data.view();
+            Check.equalU64(
+                echoed.length as u64,
+                ok(s.writeStream(stream, echoed, true), "the server's write")? as u64,
+            )?;
+        }
+        null => { return Err(TestFailure.create("no server")); }
+    }
+    rounds = 0;
+    while (rounds < 20 && !link.clientSeen.fin) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.clientSeen.fin, "the client received the echo's end")?;
+    Check.equalBytes(message.bytes(), link.clientSeen.data.view())?;
+    // Close: the server, fed the client's CONNECTION_CLOSE, is draining (RFC 9000 §10.2).
+    let n = ok(link.client.closeDatagram(Some(0), mut out[..], link.now), "the close")?;
+    Check.isTrue(n > 0, "a CONNECTION_CLOSE was written")?;
+    let local = clientAddress();
+    match (borrow mut link.server) {
+        Some(s) => {
+            match (s.feed(local, 0, out[0..n], link.now)) {
+                Err(QuicError.Draining) => {}
+                _ => { return Err(TestFailure.create("the server is draining")); }
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}

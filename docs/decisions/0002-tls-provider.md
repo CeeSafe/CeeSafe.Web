@@ -312,3 +312,32 @@ CeeSafe 0.10.0 adds `CEE_ALLOC_FOREIGN` and `ceesafe/foreign.h` (CeeSafe ADR 006
    happened in an `ubuntu:22.04` container. The same sweep, also with LeakSanitizer, found nothing in 2800 runs with
    OpenSSL 3.0.13 (`ubuntu:24.04`) or 3.0.22 (Debian 12): an OpenSSL bug, fixed by 3.0.13. Ubuntu 22.04 still runs
    every test in CI (the io_uring job), without the sweeps; nothing is suppressed.
+
+## 12. Amendment 6 (2026-11-09, M10 stage 2: QUIC's use of `web_tls`'s configuration)
+
+Web ADR 0014 §3.1 has `web_quic` use `web_tls`'s `TlsConfig`, so a QUIC server has the same certificates, SNI names
+and ticket keys as a TCP one. Making that work changed four things here:
+
+1. **A server SSL's configuration is found through an ex-data slot of the SSL's own** (`ssl_front_slot`), not its app
+   data.
+   - **The bug.** ngtcp2's OpenSSL backend keeps its connection reference in the SSL's app data (Web ADR 0014 §1).
+     The ticket callback, `ticket_key`, read the app data as a `wt_ctx`, so on a QUIC connection it would have read
+     ngtcp2's structure as web_tls's own.
+   - **Found by** the first QUIC handshake, which failed with NGTCP2_ERR_CRYPTO when the server issued its tickets.
+   - **Now** `wt_ctx_new` sets the slot for a server connection, and `ticket_key` reads only the slot. No web_tls
+     callback reads the app data any more.
+2. **`wt_ssl_use_front(ssl, ctx)`,** exported for `web_quic`'s shim, sets the same slot on a QUIC server's SSL. Its
+   tickets then come from the configuration's keys, as a TCP connection's do.
+3. **`wt_init()`,** exported, routes OpenSSL's allocations once per process, as making a configuration always did.
+   - **Why.** `web_quic` may call OpenSSL first (`ngtcp2_crypto_ossl_init`), after which OpenSSL refuses allocation
+     functions.
+   - **Found by** counting allocations. Without it, a QUIC handshake counted 101 allocations, only ngtcp2's and
+     CeeSafe's own. With it, it counts 6868, OpenSSL's included.
+4. **For QUIC:** `TlsConfig.quicContext()` gives `web_quic` the SSL_CTX, which its shim up-refs. `Alpn.Http3` (`h3`)
+   is accepted by `setAlpn` and reported by the transport.
+   - A QUIC server needs a configuration of its own, since one SSL_CTX has one ALPN list.
+
+**The allocation sweep found a double free in item 1's first version.** A failure after `SSL_set_bio` jumped to the
+label that frees the BIOs as well as the SSL, which already owns them. It now uses `fail_ssl`, with 0 failures in
+3390 sweep runs. web_tls's tests pass on macOS (OpenSSL 3.6.4), Debian 12 (3.5.9) and Windows 11 ARM64 (4.1.0), with
+no compiler warning.
