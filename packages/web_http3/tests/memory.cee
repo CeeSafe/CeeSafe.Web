@@ -73,7 +73,7 @@ fn serverAddress() -> QuicAddress {
 
 /// Everything QUIC and HTTP/3 have for one side, after it read datagrams: QUIC's events into HTTP/3, HTTP/3's events
 /// into `got`, and HTTP/3's bytes back into QUIC.
-fn process(side: borrow mut Side, buffer: SliceMut<u8>, out: SliceMut<u8>) -> Result<void, TestFailure> {
+fn process(side: borrow mut Side, buffer: SliceMut<u8>, out: SliceMut<u8>, now: u64) -> Result<void, TestFailure> {
     loop {
         let event = match (ok(side.quic.nextEvent(buffer), "a QUIC event")?) {
             Some(e) => e,
@@ -94,7 +94,7 @@ fn process(side: borrow mut Side, buffer: SliceMut<u8>, out: SliceMut<u8>) -> Re
             QuicEvent.StreamData(_, n, _) => n,
             _ => 0,
         };
-        match (H3Glue.onQuic(mut side.h3, mut side.quic, event, buffer[0..n])) {
+        match (H3Glue.onQuic(mut side.h3, mut side.quic, event, buffer[0..n], now)) {
             Ok() => {}
             Err(e) => {
                 // A connection error (nghttp3 allows nothing more): close with its code.
@@ -210,7 +210,7 @@ fn round(p: borrow mut Pair, buffer: SliceMut<u8>, out: SliceMut<u8>) -> Result<
     }
     match (borrow mut p.server) {
         Some(s) => {
-            process(s, buffer, out)?;
+            process(s, buffer, out, p.now)?;
             if (s.closed) {
                 return Ok();
             }
@@ -233,7 +233,7 @@ fn round(p: borrow mut Pair, buffer: SliceMut<u8>, out: SliceMut<u8>) -> Result<
         }
         null => {}
     }
-    process(mut p.client, buffer, out)?;
+    process(mut p.client, buffer, out, p.now)?;
     p.now += 1000000;
     match (p.client.quic.nextTimeout()) {
         Some(t) => {
@@ -485,5 +485,94 @@ fn trailers_both_ways() -> Result<void, TestFailure> {
     Check.equalBytes(":status: 200\n".bytes(), p.client.got.fields.view())?;
     Check.equalBytes("answer".bytes(), p.client.got.data.view())?;
     Check.equalBytes("x-answer-check: 2\n".bytes(), p.client.got.trailers.view())?;
+    return Ok();
+}
+
+/// Opens a client stream and writes `bytes` on it straight into QUIC, past the client's HTTP/3: frames the server's
+/// nghttp3 sees as a misbehaving client's.
+fn raw(p: borrow mut Pair, bytes: Slice<u8>) -> Result<void, TestFailure> {
+    let stream = ok(p.client.quic.openStream(), "a raw stream")?;
+    let taken = ok(p.client.quic.writeStream(stream, bytes, false), "the raw bytes")?;
+    Check.equalU64(bytes.length as u64, taken as u64)?;
+    return Ok();
+}
+
+fn serverClosed(p: borrow Pair) -> bool => match (borrow p.server) {
+    Some(s) => s.closed,
+    null => false,
+};
+
+/// QPACK's blocked-stream limit (RFC 9204 §2.1.2): the server allows 16 streams blocked on its dynamic table
+/// (SETTINGS_QPACK_BLOCKED_STREAMS, Web ADR 0014 §3.6); a 17th is a connection error QPACK_DECOMPRESSION_FAILED
+/// (0x200). Each stream's HEADERS refers to dynamic entry 0 before any insert: Required Insert Count 1, encoded as
+/// 1 mod (2 x 128) + 1 = 2 (the table holds 4096 / 32 = 128 entries, §4.5.1.1), base 0, then an indexed field line
+/// with relative index 0 (§4.5.2): the frame `01 03 02 00 80`. Expected: 16 such streams leave the connection open;
+/// the 17th closes it with 0x200.
+@test
+fn qpack_blocked_streams_past_the_limit() -> Result<void, TestFailure> {
+    var p = pair()?;
+    var b = buffers()?;
+    connect(mut p, mut b)?;
+    let frame = [0x01u8, 0x03, 0x02, 0x00, 0x80];
+    for (k in 0..16) {
+        raw(mut p, frame[..])?;
+    }
+    var rounds = 0;
+    while (rounds < 30) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    Check.isTrue(!serverClosed(p), "16 blocked streams are allowed")?;
+    raw(mut p, frame[..])?;
+    rounds = 0;
+    while (rounds < 30 && p.client.quic.peerApplicationClose().isNull()) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    match (p.client.quic.peerApplicationClose()) {
+        Some(code) => { Check.equalU64(0x200, code)?; }
+        null => { return Err(TestFailure.create("the 17th blocked stream closes the connection")); }
+    }
+    return Ok();
+}
+
+/// Reserved frame types, `n` of them, empty: `0x21` and a zero length each (RFC 9114 §7.2.8).
+fn reserved(n: usize) -> Result<Vector<u8>, TestFailure> {
+    var v = Vector<u8>.create();
+    for (i in 0..n) {
+        mem(v.push(0x21))?;
+        mem(v.push(0x00))?;
+    }
+    return Ok(v);
+}
+
+/// nghttp3's flood guard ("glitch" rate limiter, Web ADR 0014 §3.6): a frame of a reserved type is allowed, and
+/// ignored (RFC 9114 §7.2.8), but nghttp3 counts each against a budget of 1 000, refilled at 33 a second, and closes
+/// with H3_EXCESSIVE_LOAD (0x107) past it. The test's clock moves 1 ms a round, so the refill is a few tokens.
+/// Expected: 900 leave the connection open; 1 100 more close it with 0x107.
+@test
+fn reserved_frame_flood_closes() -> Result<void, TestFailure> {
+    var p = pair()?;
+    var b = buffers()?;
+    connect(mut p, mut b)?;
+    let some = reserved(900)?;
+    raw(mut p, some.view())?;
+    var rounds = 0;
+    while (rounds < 30) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    Check.isTrue(!serverClosed(p), "900 reserved frames are allowed")?;
+    let more = reserved(1100)?;
+    raw(mut p, more.view())?;
+    rounds = 0;
+    while (rounds < 30 && p.client.quic.peerApplicationClose().isNull()) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    match (p.client.quic.peerApplicationClose()) {
+        Some(code) => { Check.equalU64(0x107, code)?; }
+        null => { return Err(TestFailure.create("the flood closes the connection")); }
+    }
     return Ok();
 }

@@ -28,7 +28,7 @@ void h3_conn_free(h3_conn *c);
 int32_t h3_bind(h3_conn *c, int64_t control, int64_t encoder, int64_t decoder);
 uint64_t h3_app_error(int32_t rv);
 int32_t h3_failed(h3_conn *c);
-int64_t h3_read(h3_conn *c, int64_t stream, const uint8_t *bytes, size_t len, int32_t fin);
+int64_t h3_read(h3_conn *c, int64_t stream, const uint8_t *bytes, size_t len, int32_t fin, uint64_t now);
 int32_t h3_shutdown_read(h3_conn *c, int64_t stream);
 int32_t h3_close_stream(h3_conn *c, int64_t stream, uint64_t code);
 int64_t h3_pull(h3_conn *c, int64_t *stream, int32_t *fin, uint8_t *out, size_t cap);
@@ -504,9 +504,11 @@ int32_t h3_failed(h3_conn *c) {
 
 /* Feeds `len` bytes QUIC delivered on `stream`, the stream's end with them if `fin`: how many nghttp3 consumed
    (framing and the control and QPACK streams; not DATA's payload, whose credit goes back as it is read), whose credit
-   CeeSafe gives back at once; or nghttp3's error, which closes the connection. */
-int64_t h3_read(h3_conn *c, int64_t stream, const uint8_t *bytes, size_t len, int32_t fin) {
-    nghttp3_ssize n = nghttp3_conn_read_stream(c->conn, stream, bytes, len, fin ? 1 : 0);
+   CeeSafe gives back at once; or nghttp3's error, which closes the connection. `now` is the caller's monotonic clock
+   in nanoseconds: with it nghttp3's "glitch" rate limiter runs (H3_EXCESSIVE_LOAD past 1000 suspicious events, then
+   33 a second; nghttp3_conn_read_stream2), which the version without a time leaves off. */
+int64_t h3_read(h3_conn *c, int64_t stream, const uint8_t *bytes, size_t len, int32_t fin, uint64_t now) {
+    nghttp3_ssize n = nghttp3_conn_read_stream2(c->conn, stream, bytes, len, fin ? 1 : 0, now);
     if (n >= 0 && c->queue.failed) {
         return NGHTTP3_ERR_NOMEM;
     }

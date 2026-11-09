@@ -74,16 +74,18 @@ public struct H3Glue {
         return h3.bind(control, encoder, decoder);
     }
 
-    /// What one QUIC event means for HTTP/3. `bytes` is the event's data, for `StreamData`.
+    /// What one QUIC event means for HTTP/3. `bytes` is the event's data, for `StreamData`; `now` is the caller's
+    /// monotonic clock in nanoseconds (`H3Connection.read`).
     public fn onQuic(
         h3: borrow mut H3Connection,
         quic: borrow mut dyn H3Streams,
         event: borrow QuicEvent,
         bytes: Slice<u8>,
+        now: u64,
     ) -> Result<void, H3Error> {
         match (event) {
             QuicEvent.StreamData(stream, _, fin) => {
-                let consumed = h3.read(stream, bytes, fin)?;
+                let consumed = h3.read(stream, bytes, fin, now)?;
                 quic.credit(stream, consumed);
             }
             QuicEvent.StreamWritable(stream) => { h3.unblock(stream)?; }

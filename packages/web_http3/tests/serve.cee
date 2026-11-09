@@ -1,13 +1,13 @@
-// Http3Server over real UDP on loopback (Web ADR 0014 amendment 4 item 4, stage 3 part (c)). The application is the
-// test's own `Application`; the client is this package's test client (`H3Connection.client` over a QuicConnection on
-// its own socket). Six requests at once on one connection, each checked against what the application was written to
-// answer (RFC 9114 §4.1 for the framing, RFC 9110 for the statuses):
+// Http3Server over real UDP on loopback (Web ADR 0014 amendment 4 items 4 and 9, stage 3 parts (c) and (d)). The
+// application is the test's own `Application`; the client is `TestClient` (tests/client.cee). Expected values are
+// what the application was written to answer (RFC 9114 §4.1 for the framing, RFC 9110 for the statuses):
 //   GET /hello     200 "hello, h3"
-//   POST /echo     200 and the request's body (1.5 MiB, more than a stream's window), whole
-//   GET /big       200 and 3 MiB written in pieces, whole
+//   POST /echo     200 and the request's body
+//   GET /big       200 and 3 MiB written in pieces
 //   GET /trailers  200 "t" and the trailer `x-check: ok`
+//   GET /slow      200 "slow", after 300 ms
 //   GET /fail      the handler fails: 500
-//   GET /missing   404
+//   anything else  404
 import web_core;
 import web_http;
 import web_quic;
@@ -54,6 +54,13 @@ impl Application for TestApp {
             await exchange.write("t".bytes())?;
             return Ok();
         }
+        if (same(path, "/slow")) {
+            match (await Timer.sleep(300)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+            return await exchange.send(Status.ok(), "slow".bytes());
+        }
         if (same(path, "/fail")) {
             return Err(HandlerError.Internal);
         }
@@ -93,269 +100,6 @@ fn startsWith(a: Slice<u8>, text: StringView) -> bool {
     return true;
 }
 
-/// What the client received on one request's stream.
-struct Answer {
-    stream: i64;
-    fields: Vector<u8>;
-    trailers: Vector<u8>;
-    data: Vector<u8>;
-    ended: bool;
-    reset: bool;
-}
-
-fn answer() -> Answer => Answer {
-    stream: -1,
-    fields: Vector<u8>.create(),
-    trailers: Vector<u8>.create(),
-    data: Vector<u8>.create(),
-    ended: false,
-    reset: false,
-};
-
-fn quic<T>(r: Result<T, QuicError>, what: StringView) -> Result<T, TestFailure> {
-    match (r) {
-        Ok(v) => { return Ok(v); }
-        Err(_) => { return Err(TestFailure.create(what)); }
-    }
-}
-
-fn indexOf(answers: borrow Vector<Answer>, stream: i64) -> usize? {
-    let all = answers.view();
-    for (i in 0..all.length) {
-        if (all[i].stream == stream) {
-            return Some(i);
-        }
-    }
-    return null;
-}
-
-/// The echo's request body: 1.5 MiB, more than a stream's flow-control window (1 MiB).
-fn echoSize() -> usize => 1572864;
-
-/// The client: connects to `server`, sends the six requests at once, and reads until every answer has ended.
-async fn fetch(tls: borrow QuicTls, server: SocketAddress) -> Result<Vector<Answer>, TestFailure> {
-    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
-    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
-        Ok(s) => s,
-        Err(_) => { return Err(TestFailure.create("the client's socket")); },
-    };
-    let local = match (socket.localAddress()) {
-        Ok(a) => a,
-        Err(_) => { return Err(TestFailure.create("the client's address")); },
-    };
-    let ids = quic(QuicIds.random(), "random IDs")?;
-    var conn = quic(
-        QuicConnection.client(tls, "localhost", QuicAddress.of(local), QuicAddress.of(server), ids, Clock.monotonicNanos()),
-        "the client",
-    )?;
-    conn.creditOnConsume();
-    var client = h3(H3Connection.client(65536), "the client's HTTP/3")?;
-    var buffer = Vector<u8>.create();
-    var out = Vector<u8>.create();
-    mem(buffer.resize(65536, 0))?;
-    mem(out.resize(quicDatagramSize(), 0))?;
-    var answers = Vector<Answer>.create();
-    var started = false;
-    var echoSent: usize = 0;
-    var echoStream: i64 = -1;
-    var piece = [0u8; 16384];
-    let deadline = Clock.monotonicNanos() + 30000000000; // 30 s: the transfers take well under one
-    loop {
-        var done = started;
-        for (a in answers.view()) {
-            if (!(a.ended || a.reset)) {
-                done = false;
-            }
-        }
-        if (done) {
-            return Ok(answers);
-        }
-        if (Clock.monotonicNanos() > deadline) {
-            return Err(TestFailure.create("the answers did not all end in 30 s"));
-        }
-        // QUIC's events, into HTTP/3.
-        loop {
-            let event = match (quic(conn.nextEvent(buffer.viewMut()), "a QUIC event")?) {
-                Some(e) => e,
-                null => { break; },
-            };
-            match (event) {
-                QuicEvent.StreamReset(stream, _) => {
-                    match (indexOf(answers, stream)) {
-                        Some(i) => {
-                            let list = answers.viewMut();
-                            list[i].reset = true;
-                        }
-                        null => {}
-                    }
-                }
-                _ => {}
-            }
-            let n = match (event) {
-                QuicEvent.StreamData(_, n, _) => n,
-                _ => 0,
-            };
-            h3(H3Glue.onQuic(mut client, mut conn, event, buffer.view()[0..n]), "HTTP/3's read")?;
-        }
-        if (!started && conn.handshakeDone()) {
-            h3(H3Glue.start(mut client, mut conn), "HTTP/3's streams")?;
-            let all = ["/hello", "/echo", "/big", "/trailers", "/fail", "/missing"];
-            for (k in 0..all.length) {
-                let stream = quic(conn.openStream(), "a request stream")?;
-                var f = H3Fields.create();
-                let method = if (k == 1) "POST" else "GET";
-                mem(f.add(":method".bytes(), method.bytes()))?;
-                mem(f.add(":scheme".bytes(), "https".bytes()))?;
-                mem(f.add(":authority".bytes(), "localhost".bytes()))?;
-                mem(f.add(":path".bytes(), all[k].bytes()))?;
-                h3(client.request(stream, f, k == 1), "a request")?;
-                var a = answer();
-                a.stream = stream;
-                mem(answers.push(a))?;
-                if (k == 1) {
-                    echoStream = stream;
-                }
-            }
-            started = true;
-        }
-        // HTTP/3's events, into the answers.
-        loop {
-            let event = match (h3(client.nextEvent(buffer.viewMut()), "an HTTP/3 event")?) {
-                Some(e) => e,
-                null => { break; },
-            };
-            h3(H3Glue.obey(mut client, mut conn, event), "obeying HTTP/3")?;
-            match (event) {
-                H3Event.Field(stream, nameLength, valueLength, trailer) => {
-                    match (indexOf(answers, stream)) {
-                        Some(i) => {
-                            let list = answers.viewMut();
-                            let a = borrow mut list[i];
-                            let into = if (trailer) borrow mut a.trailers else borrow mut a.fields;
-                            mem(into.extend(buffer.view()[0..nameLength]))?;
-                            mem(into.extend(": ".bytes()))?;
-                            mem(into.extend(buffer.view()[nameLength..nameLength + valueLength]))?;
-                            mem(into.push(10))?;
-                        }
-                        null => {}
-                    }
-                }
-                H3Event.FieldsEnd(stream, _, fin) => {
-                    if (fin) {
-                        match (indexOf(answers, stream)) {
-                            Some(i) => {
-                                let list = answers.viewMut();
-                                list[i].ended = true;
-                            }
-                            null => {}
-                        }
-                    }
-                }
-                H3Event.Data(stream, n) => {
-                    match (indexOf(answers, stream)) {
-                        Some(i) => {
-                            let list = answers.viewMut();
-                            mem(list[i].data.extend(buffer.view()[0..n]))?;
-                        }
-                        null => {}
-                    }
-                    conn.consume(stream, n as u64);
-                }
-                H3Event.End(stream) => {
-                    match (indexOf(answers, stream)) {
-                        Some(i) => {
-                            let list = answers.viewMut();
-                            list[i].ended = true;
-                        }
-                        null => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-        // The echo's body, as far as its queue takes it.
-        while (started && echoSent < echoSize()) {
-            let n = if (echoSize() - echoSent < piece.length) echoSize() - echoSent else piece.length;
-            for (i in 0..n) {
-                piece[i] = pattern(echoSent + i);
-            }
-            let taken = h3(client.sendBody(echoStream, piece[0..n], echoSent + n == echoSize()), "the echo's body")?;
-            echoSent += taken;
-            if (taken < n) {
-                break;
-            }
-        }
-        if (started) {
-            h3(H3Glue.flush(mut client, mut conn, out.viewMut()), "HTTP/3's write")?;
-        }
-        // Datagrams out.
-        loop {
-            let d = match (quic(conn.datagram(out.viewMut(), Clock.monotonicNanos()), "a datagram")?) {
-                Some(d) => d,
-                null => { break; },
-            };
-            match (await socket.sendTo(out.view()[0..d.length], server)) {
-                Ok() => {}
-                Err(_) => { return Err(TestFailure.create("sending")); }
-            }
-        }
-        // A datagram, or the connection's timer (at most 10 ms, so the echo's body keeps flowing).
-        let now = Clock.monotonicNanos();
-        var waitMs: u64 = match (conn.nextTimeout()) {
-            Some(t) => if (t <= now) 0 else (t - now + 999999) / 1000000,
-            null => 1000,
-        };
-        if (waitMs > 10) {
-            waitMs = 10;
-        }
-        if (waitMs == 0) {
-            quic(conn.onTimeout(now), "a timer")?;
-            continue;
-        }
-        let raced: Result<Raced<Datagram?>, AsyncError> = await Async.race(
-            async () => {
-                let d = await socket.recvFrom(buffer.viewMut())?;
-                return Ok(Some(d));
-            },
-            async () => {
-                await Timer.sleep(waitMs)?;
-                return Ok(null);
-            },
-        );
-        let won: Raced<Datagram?> = match (raced) {
-            Ok(w) => w,
-            Err(_) => { return Err(TestFailure.create("waiting")); },
-        };
-        let datagram: Datagram? = if (won.winner == 0) won.value else match (won.other) {
-            Some(d) => d,
-            null => won.value,
-        };
-        match (datagram) {
-            Some(d) => {
-                quic(conn.feed(QuicAddress.of(d.from), 0, buffer.view()[0..d.length], Clock.monotonicNanos()), "a read")?;
-            }
-            null => {
-                let t = Clock.monotonicNanos();
-                match (conn.nextTimeout()) {
-                    Some(due) => {
-                        if (due <= t) {
-                            quic(conn.onTimeout(t), "a timer")?;
-                        }
-                    }
-                    null => {}
-                }
-            }
-        }
-    }
-}
-
-/// How the race between the server and the client ended.
-enum Ended {
-    Server,
-    Client(Vector<Answer>),
-    ClientFailed(TestFailure),
-}
-
 fn isPattern(bytes: Slice<u8>) -> bool {
     for (i in 0..bytes.length) {
         if (bytes[i] != pattern(i)) {
@@ -365,8 +109,19 @@ fn isPattern(bytes: Slice<u8>) -> bool {
     return true;
 }
 
-@test
-async fn six_requests_over_udp() -> Result<void, TestFailure> {
+/// The echo's request body: 1.5 MiB, more than a stream's flow-control window (1 MiB).
+fn echoSize() -> usize => 1572864;
+
+/// What a test's server needs: its socket, address, TLS context and application, and the client's TLS context.
+struct Setup {
+    socket: AsyncUdpSocket;
+    local: SocketAddress;
+    tls: Arc<QuicTls>;
+    app: Arc<Box<dyn Application + Send>>;
+    clientTls: QuicTls;
+}
+
+fn setup() -> Result<Setup, TestFailure> {
     Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
     let alpn = [Alpn.Http3];
     let serverTls = quic(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
@@ -392,52 +147,254 @@ async fn six_requests_over_udp() -> Result<void, TestFailure> {
         Ok(a) => a,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
-    let drain = match (Drain.create()) {
-        Ok(d) => d,
-        Err(_) => { return Err(TestFailure.create("out of memory")); },
-    };
-    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
-        async move () => {
-            let _ = await Http3Server.serve(socket, local, tls, app, Limits.defaults(), drain, Http3Options.defaults());
-            return Ok(Ended.Server);
-        },
-        async () => {
-            match (await fetch(clientTls, local)) {
-                Ok(a) => { return Ok(Ended.Client(a)); }
-                Err(e) => { return Ok(Ended.ClientFailed(e)); }
-            }
-        },
-    );
-    let answers = match (raced) {
-        Ok(won) => match (won.value) {
-            Ended.Client(a) => a,
-            Ended.ClientFailed(e) => { return Err(e); },
-            Ended.Server => { return Err(TestFailure.create("the server ended before the client")); },
-        },
+    return Ok(Setup { socket: socket, local: local, tls: tls, app: app, clientTls: clientTls });
+}
+
+/// How the race between the server and the client ended.
+enum Ended {
+    Server,
+    Client,
+    ClientFailed(TestFailure),
+}
+
+fn outcome(raced: Result<Raced<Ended>, AsyncError>) -> Result<void, TestFailure> {
+    let won = match (raced) {
+        Ok(w) => w,
         Err(_) => { return Err(TestFailure.create("the race")); },
     };
-    let all = answers.view();
-    Check.equalU64(6, all.length as u64)?;
-    // GET /hello
+    match (won.value) {
+        Ended.Client => { return Ok(); }
+        Ended.ClientFailed(e) => { return Err(e); }
+        Ended.Server => { return Err(TestFailure.create("the server ended before the client")); }
+    }
+}
+
+/// Six requests at once on one connection, each answered as the application says, none reset.
+async fn sixRequests(tls: borrow QuicTls, server: SocketAddress) -> Result<void, TestFailure> {
+    var c = await TestClient.connect(tls, server)?;
+    var echo = Vector<u8>.create();
+    for (i in 0..echoSize()) {
+        mem(echo.push(pattern(i)))?;
+    }
+    let none = "".bytes();
+    let _ = c.request("GET", "/hello", none)?;
+    let _ = c.request("POST", "/echo", echo.view())?;
+    let _ = c.request("GET", "/big", none)?;
+    let _ = c.request("GET", "/trailers", none)?;
+    let _ = c.request("GET", "/fail", none)?;
+    let _ = c.request("GET", "/missing", none)?;
+    let deadline = Clock.monotonicNanos() + 30000000000;
+    while (!c.allDone()) {
+        if (Clock.monotonicNanos() > deadline || c.closed) {
+            return Err(TestFailure.create("the answers did not all end in 30 s"));
+        }
+        await c.turn(10)?;
+    }
+    let all = c.answers.view();
     Check.isTrue(startsWith(all[0].fields.view(), ":status: 200\n"), "/hello: 200 first")?;
     Check.equalBytes("hello, h3".bytes(), all[0].data.view())?;
-    // POST /echo
     Check.isTrue(startsWith(all[1].fields.view(), ":status: 200\n"), "/echo: 200")?;
     Check.equalU64(echoSize() as u64, all[1].data.length as u64)?;
     Check.isTrue(isPattern(all[1].data.view()), "/echo: the body back, in order")?;
-    // GET /big
     Check.isTrue(startsWith(all[2].fields.view(), ":status: 200\n"), "/big: 200")?;
     Check.equalU64(3 * 1048576, all[2].data.length as u64)?;
     Check.isTrue(isPattern(all[2].data.view()), "/big: the bytes, in order")?;
-    // GET /trailers
     Check.isTrue(startsWith(all[3].fields.view(), ":status: 200\n"), "/trailers: 200")?;
     Check.equalBytes("t".bytes(), all[3].data.view())?;
     Check.equalBytes("x-check: ok\n".bytes(), all[3].trailers.view())?;
-    // GET /fail and /missing
     Check.isTrue(startsWith(all[4].fields.view(), ":status: 500\n"), "/fail: 500")?;
     Check.isTrue(startsWith(all[5].fields.view(), ":status: 404\n"), "/missing: 404")?;
     for (a in all) {
         Check.isTrue(a.ended && !a.reset, "every answer ended, none reset")?;
     }
     return Ok();
+}
+
+@test
+async fn six_requests_over_udp() -> Result<void, TestFailure> {
+    let s = setup()?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let socket = s.socket;
+    let local = s.local;
+    let tls = s.tls;
+    let app = s.app;
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await Http3Server.serve(socket, local, tls, app, Limits.defaults(), drain, Http3Options.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await sixRequests(s.clientTls, local)) {
+                Ok() => { return Ok(Ended.Client); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    return outcome(raced);
+}
+
+/// The drain, seen by a client with a request in flight: it is answered; the final GOAWAY's ID lets it through (RFC
+/// 9114 §5.2: requests on lower streams may still be processed); then the connection closes with H3_NO_ERROR (0x100).
+async fn drained(tls: borrow QuicTls, server: SocketAddress, drain: borrow Drain) -> Result<void, TestFailure> {
+    var c = await TestClient.connect(tls, server)?;
+    let slow = c.request("GET", "/slow", "".bytes())?;
+    var turns = 0;
+    while (turns < 5) {
+        await c.turn(10)?; // the request reaches the server, and its handler starts
+        turns += 1;
+    }
+    drain.start();
+    let deadline = Clock.monotonicNanos() + 10000000000;
+    while (!c.closed) {
+        if (Clock.monotonicNanos() > deadline) {
+            return Err(TestFailure.create("the connection did not close in 10 s"));
+        }
+        await c.turn(10)?;
+    }
+    let all = c.answers.view();
+    Check.isTrue(all[0].ended && !all[0].reset, "the request in flight was answered")?;
+    Check.isTrue(startsWith(all[0].fields.view(), ":status: 200\n"), "with 200")?;
+    Check.equalBytes("slow".bytes(), all[0].data.view())?;
+    match (c.goAway) {
+        // The final GOAWAY's: the lowest client stream not processed (§5.2). The server processed `slow`, so it is the
+        // next client-initiated bidirectional stream, 4 later (RFC 9000 §2.1); the notice before it carried the
+        // largest ID.
+        Some(id) => { Check.equalU64(truncate<u64>(slow) + 4, id)?; }
+        null => { return Err(TestFailure.create("a GOAWAY arrived")); }
+    }
+    match (c.closeCode) {
+        Some(code) => { Check.equalU64(0x100, code)?; }
+        null => { return Err(TestFailure.create("the close carried H3_NO_ERROR")); }
+    }
+    return Ok();
+}
+
+@test
+async fn drain_sends_goaway_finishes_and_closes() -> Result<void, TestFailure> {
+    let s = setup()?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let shared = drain.share();
+    let socket = s.socket;
+    let local = s.local;
+    let tls = s.tls;
+    let app = s.app;
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await Http3Server.serve(socket, local, tls, app, Limits.defaults(), drain, Http3Options.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await drained(s.clientTls, local, shared)) {
+                Ok() => { return Ok(Ended.Client); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    return outcome(raced);
+}
+
+/// Requests sent, then cancelled before their answers, `n` of them in batches of 50: each batch's HEADERS reach the
+/// server (its handlers start: `/slow` waits 300 ms) before the batch is reset.
+async fn cancelMany(c: borrow mut TestClient, n: usize) -> Result<void, TestFailure> {
+    var done: usize = 0;
+    while (done < n && !c.closed) {
+        let batch = if (n - done < 50) n - done else 50;
+        var streams = Vector<i64>.create();
+        for (k in 0..batch) {
+            var stream: i64 = -1;
+            var tries = 0;
+            while (stream < 0) {
+                match (c.conn.openStream()) {
+                    Ok(s) => {
+                        stream = s;
+                    }
+                    Err(QuicError.StreamsBlocked) => {
+                        tries += 1;
+                        if (tries > 500 || c.closed) {
+                            return Ok(); // the server stopped raising the limit: it closed, or is closing
+                        }
+                        await c.turn(2)?;
+                    }
+                    Err(_) => { return Err(TestFailure.create("a stream")); }
+                }
+            }
+            var f = H3Fields.create();
+            mem(f.add(":method".bytes(), "GET".bytes()))?;
+            mem(f.add(":scheme".bytes(), "https".bytes()))?;
+            mem(f.add(":authority".bytes(), "localhost".bytes()))?;
+            mem(f.add(":path".bytes(), "/slow".bytes()))?;
+            h3(c.h3.request(stream, f, false), "a request")?;
+            mem(streams.push(stream))?;
+        }
+        await c.turn(2)?;
+        await c.turn(2)?;
+        for (s in streams.view()) {
+            c.cancel(s)?;
+        }
+        await c.turn(2)?;
+        done += batch;
+    }
+    return Ok();
+}
+
+/// The rapid-reset guard (Web ADR 0014 §3.6, `Http3Options.resetsPerSecond`, 200): 20 cancelled requests leave the
+/// connection serving; 300 more within the same second close it with H3_EXCESSIVE_LOAD (0x107).
+async fn resetFlood(tls: borrow QuicTls, server: SocketAddress) -> Result<void, TestFailure> {
+    var c = await TestClient.connect(tls, server)?;
+    let start = Clock.monotonicNanos();
+    await cancelMany(mut c, 20)?;
+    let hello = c.request("GET", "/hello", "".bytes())?;
+    var turns = 0;
+    while (turns < 500 && !c.doneFor(hello)) {
+        await c.turn(10)?;
+        turns += 1;
+    }
+    Check.isTrue(!c.closed, "20 resets leave the connection open")?;
+    Check.isTrue(c.doneFor(hello), "and a request after them is answered")?;
+    await cancelMany(mut c, 300)?;
+    let elapsed = Clock.monotonicNanos() - start;
+    let deadline = Clock.monotonicNanos() + 5000000000;
+    while (!c.closed && Clock.monotonicNanos() < deadline) {
+        await c.turn(10)?;
+    }
+    if (elapsed > 1000000000 && !c.closed) {
+        return Err(TestFailure.create("too slow to test: the 320 resets took more than a second"));
+    }
+    match (c.closeCode) {
+        Some(code) => { Check.equalU64(0x107, code)?; }
+        null => { return Err(TestFailure.create("the reset flood closes the connection")); }
+    }
+    return Ok();
+}
+
+@test
+async fn rapid_reset_closes() -> Result<void, TestFailure> {
+    let s = setup()?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let socket = s.socket;
+    let local = s.local;
+    let tls = s.tls;
+    let app = s.app;
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await Http3Server.serve(socket, local, tls, app, Limits.defaults(), drain, Http3Options.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await resetFlood(s.clientTls, local)) {
+                Ok() => { return Ok(Ended.Client); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    return outcome(raced);
 }

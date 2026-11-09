@@ -16,7 +16,7 @@ extern "C" {
     @effects()
     fn h3_app_error(code: i32) -> u64;
     @effects()
-    fn h3_read(conn: *mut void, stream: i64, bytes: *u8, length: usize, fin: i32) -> i64;
+    fn h3_read(conn: *mut void, stream: i64, bytes: *u8, length: usize, fin: i32, now: u64) -> i64;
     @effects()
     fn h3_shutdown_read(conn: *mut void, stream: i64) -> i32;
     @effects()
@@ -188,11 +188,13 @@ public struct H3Connection {
     public fn bind(borrow mut this, control: i64, encoder: i64, decoder: i64) -> Result<void, H3Error> =>
         H3Errors.check(unsafe { h3_bind(this.raw, control, encoder, decoder) });
 
-    /// Feeds bytes QUIC delivered on `stream` (and its end, with `fin`): how many nghttp3 consumed, whose credit goes
-    /// back to the peer now. DATA's payload is not among them; its credit goes back as the handler reads it.
+    /// Feeds bytes QUIC delivered on `stream` (and its end, with `fin`) at `now` (the caller's monotonic clock, in
+    /// nanoseconds, never decreasing): how many nghttp3 consumed, whose credit goes back to the peer now. DATA's
+    /// payload is not among them; its credit goes back as the handler reads it. `now` runs nghttp3's flood guard
+    /// (H3_EXCESSIVE_LOAD after 1 000 suspicious events, then 33 a second).
     /// Safety: the shim reads at most `bytes.length` bytes and keeps no pointer to them.
-    public fn read(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<u64, H3Error> {
-        let n = unsafe { h3_read(this.raw, stream, bytes.ptr, bytes.length, if (fin) 1 else 0) };
+    public fn read(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool, now: u64) -> Result<u64, H3Error> {
+        let n = unsafe { h3_read(this.raw, stream, bytes.ptr, bytes.length, if (fin) 1 else 0, now) };
         if (n < 0) {
             return Err(H3Error.Failed(truncate<i32>(n)));
         }

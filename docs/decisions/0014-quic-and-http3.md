@@ -513,3 +513,26 @@ This amendment replaces amendment 1's items 4, 5 and 6.
      `tests/interop/h3.py` drives it with ngtcp2's HTTP/3 client (`osslclient`).
    - **curl:** its interop is not run on macOS, where the session's tools block curl. It is for stage 5, with
      quic-interop-runner's images.
+10. **The guards and the drain, as built (part (d)):**
+    - **nghttp3's own flood guard is on.** It counts "glitches" (frames of unknown or unexpected types on control and
+      request streams, malformed streams, and more) against a budget of 1 000, refilled at 33 a second, and closes
+      with H3_EXCESSIVE_LOAD past it.
+      - It runs only through `nghttp3_conn_read_stream2`, which takes the time. The shim had called the version
+        without one, which leaves it off, so `H3Connection.read` and `H3Glue.onQuic` now take the caller's clock.
+    - **The rapid-reset guard is the driver's** (CVE-2023-44487). Neither library counts a request reset after its
+      HEADERS. `Http3Options.resetsPerSecond` (200, as HTTP/2's `H2Guards`) bounds the client's resets of requests
+      whose answer is not done; past it the connection closes with H3_EXCESSIVE_LOAD.
+    - **Empty DATA frames are not guarded,** unlike §3.6's plan.
+      - nghttp3 neither counts them nor reports them: an empty DATA frame makes no event and no allocation.
+      - Each is two bytes of stream data under QUIC's flow control, so its cost grows with the bytes received, as any
+        data's does. HTTP/2's empty-frame guard exists because there a frame costs a header at no data cost.
+    - **QPACK's limits** (4 KiB table, 16 blocked streams) are nghttp3's. The 17th blocked stream closes the
+      connection with QPACK_DECOMPRESSION_FAILED (RFC 9204 §2.1.2).
+    - **GOAWAY with the drain** (RFC 9114 §5.2):
+      - when the server's `Drain` starts, the connection sends GOAWAY's notice (the largest ID);
+      - 100 ms later it sends the final GOAWAY, with the lowest stream not processed, and nghttp3 refuses later
+        streams with H3_REQUEST_REJECTED;
+      - once no request is left and nghttp3 reports itself drained (every stream closed, so every answer
+        acknowledged), it closes with H3_NO_ERROR.
+      - The drain's deadline is the program's: it cancels `Http3Server.serve` when its grace runs out.
+      - The listener still admits connections while draining: each gets the GOAWAY at once.

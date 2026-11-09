@@ -18,6 +18,11 @@ import web_quic;
 fn h3NoErrorCode() -> u64 => 0x100;
 fn h3InternalError() -> u64 => 0x102;
 fn h3RequestRejected() -> u64 => 0x10b;
+fn h3ExcessiveLoad() -> u64 => 0x107;
+
+/// Between the first GOAWAY, a notice, and the final one with the last stream accepted (RFC 9114 §5.2): time for
+/// requests already sent to arrive.
+fn goAwayDelayMs() -> u64 => 100;
 
 /// The body pieces a request task sends: at most this many bytes each.
 fn h3BodyPiece() -> usize => 65536;
@@ -74,11 +79,16 @@ public struct Http3Options {
     public quic: QuicServerOptions;
     /// The most requests running at once on one connection; a stream past it is refused with H3_REQUEST_REJECTED.
     public requestsPerConnection: u32;
+    /// Requests the client may reset before their answer is done, per second, past which the connection closes with
+    /// H3_EXCESSIVE_LOAD: the rapid-reset guard (CVE-2023-44487; HTTP/2's is `H2Guards.resetsPerInterval`).
+    public resetsPerSecond: u32;
 
-    /// QUIC's defaults, and 100 requests a connection (as many streams as a client may open at first).
+    /// QUIC's defaults, 100 requests a connection (as many streams as a client may open at first), and 200 resets a
+    /// second (as HTTP/2's).
     public fn defaults() -> Http3Options => Http3Options {
         quic: QuicServerOptions.defaults(),
         requestsPerConnection: 100,
+        resetsPerSecond: 200,
     };
 }
 
@@ -101,6 +111,7 @@ public struct Http3Server {
             limits: limits,
             drain: drain.share(),
             requests: options.requestsPerConnection,
+            resetsPerSecond: options.resetsPerSecond,
         };
         let boxed: Box<dyn QuicApplication + Send> = match (Box.create(h3)) {
             Ok(b) => b,
@@ -122,6 +133,7 @@ struct Http3Application {
     limits: Limits;
     drain: Drain;
     requests: u32;
+    resetsPerSecond: u32;
 }
 
 impl QuicApplication for Http3Application {
@@ -166,6 +178,12 @@ async fn run(
     }
     var heads = HashMap<u64, HeaderBlock>.create();
     var started = false;
+    // The rapid-reset guard: resets of live requests in the current second.
+    var resets: u32 = 0;
+    var resetsSince = Timer.now();
+    // The drain: the notice, then the final GOAWAY, then the close once nghttp3 is drained.
+    var noticeAt: u64? = null;
+    var goAwaySent = false;
     loop {
         // What QUIC has: into nghttp3, before HTTP/3 has started too (amendment 4 item 3).
         loop {
@@ -173,11 +191,27 @@ async fn run(
                 Some(e) => e,
                 null => { break; },
             };
+            match (event) {
+                QuicEvent.StreamReset(stream, _) => {
+                    if (links.get(truncate<u64>(stream)).isSome()) {
+                        let now = Timer.now();
+                        if (now >= resetsSince + 1000) {
+                            resets = 0;
+                            resetsSince = now;
+                        }
+                        resets += 1;
+                        if (resets > server.resetsPerSecond) {
+                            return await failWith(link, h3ExcessiveLoad());
+                        }
+                    }
+                }
+                _ => {}
+            }
             let n = match (event) {
                 QuicEvent.StreamData(_, n, _) => n,
                 _ => 0,
             };
-            match (H3Glue.onQuic(h3, link, event, buffer.view()[0..n])) {
+            match (H3Glue.onQuic(h3, link, event, buffer.view()[0..n], Clock.monotonicNanos())) {
                 Ok() => {}
                 Err(e) => { return await fail(link, e); }
             }
@@ -289,14 +323,41 @@ async fn run(
                 null => { break; }
             }
         }
+        // The drain (RFC 9114 §5.2): GOAWAY's notice, then, after `goAwayDelayMs`, the final GOAWAY with the last
+        // stream accepted (nghttp3 refuses later ones with H3_REQUEST_REJECTED); once every stream is done, the close
+        // with H3_NO_ERROR. nghttp3 is drained only when its streams are closed, so every answer was acknowledged.
+        let draining = started && context.drain.isDraining();
+        if (draining) {
+            match (noticeAt) {
+                null => {
+                    match (h3.goAwayNotice()) {
+                        Ok() => {}
+                        Err(e) => { return await fail(link, e); }
+                    }
+                    noticeAt = Some(Timer.now());
+                }
+                Some(at) => {
+                    if (!goAwaySent && Timer.now() >= at + goAwayDelayMs()) {
+                        match (h3.goAway()) {
+                            Ok() => {}
+                            Err(e) => { return await fail(link, e); }
+                        }
+                        goAwaySent = true;
+                    } else if (goAwaySent && links.length() == 0 && h3.drained()) {
+                        return await failWith(link, h3NoErrorCode());
+                    }
+                }
+            }
+        }
         if (started) {
             match (H3Glue.flush(h3, link, out.viewMut())) {
                 Ok() => {}
                 Err(e) => { return await fail(link, e); }
             }
         }
-        // Wait for a datagram, a timer or a request's message (`waitWith` sends what QUIC has first).
-        match (await link.waitWith(outgoing, 1000)?) {
+        // Wait for a datagram, a timer or a request's message (`waitWith` sends what QUIC has first); while
+        // draining, briefly, to see the streams end.
+        match (await link.waitWith(outgoing, if (draining) 20 else 1000)?) {
             Some(m) => { handle(h3, link, links, m)?; }
             null => {}
         }
@@ -304,8 +365,12 @@ async fn run(
 }
 
 /// A connection error from HTTP/3: close with its code (RFC 9114 §8), and end the connection's task.
-async fn fail(link: borrow mut QuicLink, e: H3Error) -> Result<void, QuicError> {
-    let _ = await link.close(Some(H3Errors.closeCode(e)));
+async fn fail(link: borrow mut QuicLink, e: H3Error) -> Result<void, QuicError> =>
+    await failWith(link, H3Errors.closeCode(e));
+
+/// Closes the connection with HTTP/3's `code`, and ends the connection's task.
+async fn failWith(link: borrow mut QuicLink, code: u64) -> Result<void, QuicError> {
+    let _ = await link.close(Some(code));
     return Err(QuicError.Draining);
 }
 

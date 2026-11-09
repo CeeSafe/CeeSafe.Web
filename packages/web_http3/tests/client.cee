@@ -1,0 +1,339 @@
+// The tests' HTTP/3 client over real UDP: a QuicConnection on its own socket with this package's test client
+// (`H3Connection.client`) over H3Glue (Web ADR 0014 amendment 4 item 5). A test drives it a turn at a time.
+import web_core;
+import web_quic;
+
+/// What the client received on one request's stream.
+struct Answer {
+    stream: i64;
+    fields: Vector<u8>;
+    trailers: Vector<u8>;
+    data: Vector<u8>;
+    ended: bool;
+    reset: bool;
+}
+
+fn answer(stream: i64) -> Answer => Answer {
+    stream: stream,
+    fields: Vector<u8>.create(),
+    trailers: Vector<u8>.create(),
+    data: Vector<u8>.create(),
+    ended: false,
+    reset: false,
+};
+
+/// A request body still being sent.
+struct Upload {
+    stream: i64;
+    bytes: Vector<u8>;
+    sent: usize;
+}
+
+fn quic<T>(r: Result<T, QuicError>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create(what)); }
+    }
+}
+
+struct TestClient {
+    socket: AsyncUdpSocket;
+    server: SocketAddress;
+    conn: QuicConnection;
+    h3: H3Connection;
+    buffer: Vector<u8>;
+    out: Vector<u8>;
+    answers: Vector<Answer>;
+    uploads: Vector<Upload>;
+    started: bool;
+    /// The last GOAWAY ID the server sent.
+    goAway: u64?;
+    /// The server closed the connection: with this HTTP/3 code, if it gave one.
+    closed: bool;
+    closeCode: u64?;
+
+    /// A client connected (once `started`) to `server`.
+    async fn connect(tls: borrow QuicTls, server: SocketAddress) -> Result<TestClient, TestFailure> {
+        let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+        let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+            Ok(s) => s,
+            Err(_) => { return Err(TestFailure.create("the client's socket")); },
+        };
+        let local = match (socket.localAddress()) {
+            Ok(a) => a,
+            Err(_) => { return Err(TestFailure.create("the client's address")); },
+        };
+        let ids = quic(QuicIds.random(), "random IDs")?;
+        var conn = quic(
+            QuicConnection.client(
+                tls,
+                "localhost",
+                QuicAddress.of(local),
+                QuicAddress.of(server),
+                ids,
+                Clock.monotonicNanos(),
+            ),
+            "the client",
+        )?;
+        conn.creditOnConsume();
+        var c = TestClient {
+            socket: socket,
+            server: server,
+            conn: conn,
+            h3: h3(H3Connection.client(65536), "the client's HTTP/3")?,
+            buffer: Vector<u8>.create(),
+            out: Vector<u8>.create(),
+            answers: Vector<Answer>.create(),
+            uploads: Vector<Upload>.create(),
+            started: false,
+            goAway: null,
+            closed: false,
+            closeCode: null,
+        };
+        mem(c.buffer.resize(65536, 0))?;
+        mem(c.out.resize(quicDatagramSize(), 0))?;
+        let deadline = Clock.monotonicNanos() + 10000000000;
+        while (!c.started) {
+            if (Clock.monotonicNanos() > deadline || c.closed) {
+                return Err(TestFailure.create("HTTP/3 did not start in 10 s"));
+            }
+            await c.turn(10)?;
+        }
+        return Ok(c);
+    }
+
+    /// Sends a request on a new stream, its body (if any) sent over the next turns: its stream.
+    fn request(borrow mut this, method: StringView, path: StringView, body: Slice<u8>) -> Result<i64, TestFailure> {
+        let stream = quic(this.conn.openStream(), "a request stream")?;
+        var f = H3Fields.create();
+        mem(f.add(":method".bytes(), method.bytes()))?;
+        mem(f.add(":scheme".bytes(), "https".bytes()))?;
+        mem(f.add(":authority".bytes(), "localhost".bytes()))?;
+        mem(f.add(":path".bytes(), path.bytes()))?;
+        h3(this.h3.request(stream, f, body.length > 0), "a request")?;
+        mem(this.answers.push(answer(stream)))?;
+        if (body.length > 0) {
+            var copy = Vector<u8>.create();
+            mem(copy.extend(body))?;
+            mem(this.uploads.push(Upload { stream: stream, bytes: copy, sent: 0 }))?;
+        }
+        return Ok(stream);
+    }
+
+    /// Resets a request's stream, both ways (RFC 9000 §3.1, §3.5), with H3_REQUEST_CANCELLED.
+    fn cancel(borrow mut this, stream: i64) -> Result<void, TestFailure> {
+        quic(this.conn.resetStream(stream, 0x10c), "a reset")?;
+        this.h3.shutdownWrite(stream);
+        return Ok();
+    }
+
+    /// The answer on `stream`'s index.
+    fn indexOf(borrow this, stream: i64) -> usize? {
+        let all = this.answers.view();
+        for (i in 0..all.length) {
+            if (all[i].stream == stream) {
+                return Some(i);
+            }
+        }
+        return null;
+    }
+
+    /// Whether every request's answer has ended or been reset.
+    fn allDone(borrow this) -> bool {
+        for (a in this.answers.view()) {
+            if (!(a.ended || a.reset)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether the answer on `stream` has ended or been reset.
+    fn doneFor(borrow this, stream: i64) -> bool {
+        match (this.indexOf(stream)) {
+            Some(i) => {
+                let all = this.answers.view();
+                return all[i].ended || all[i].reset;
+            }
+            null => { return false; }
+        }
+    }
+
+    /// One turn: QUIC's and HTTP/3's events, the bodies, the datagrams out, then a wait for a datagram or the
+    /// connection's timer, at most `capMs`. A close by the server ends the turns (`closed`).
+    async fn turn(borrow mut this, capMs: u64) -> Result<void, TestFailure> {
+        if (this.closed) {
+            return Ok();
+        }
+        loop {
+            let event = match (quic(this.conn.nextEvent(this.buffer.viewMut()), "a QUIC event")?) {
+                Some(e) => e,
+                null => { break; },
+            };
+            match (event) {
+                QuicEvent.StreamReset(stream, _) => {
+                    match (this.indexOf(stream)) {
+                        Some(i) => {
+                            let list = this.answers.viewMut();
+                            list[i].reset = true;
+                        }
+                        null => {}
+                    }
+                }
+                _ => {}
+            }
+            let n = match (event) {
+                QuicEvent.StreamData(_, n, _) => n,
+                _ => 0,
+            };
+            let now = Clock.monotonicNanos();
+            h3(H3Glue.onQuic(mut this.h3, mut this.conn, event, this.buffer.view()[0..n], now), "HTTP/3's read")?;
+        }
+        if (!this.started && this.conn.handshakeDone()) {
+            h3(H3Glue.start(mut this.h3, mut this.conn), "HTTP/3's streams")?;
+            this.started = true;
+        }
+        loop {
+            let event = match (h3(this.h3.nextEvent(this.buffer.viewMut()), "an HTTP/3 event")?) {
+                Some(e) => e,
+                null => { break; },
+            };
+            h3(H3Glue.obey(mut this.h3, mut this.conn, event), "obeying HTTP/3")?;
+            match (event) {
+                H3Event.Field(stream, nameLength, valueLength, trailer) => {
+                    match (this.indexOf(stream)) {
+                        Some(i) => {
+                            let bytes = this.buffer.view();
+                            let list = this.answers.viewMut();
+                            let a = borrow mut list[i];
+                            let into = if (trailer) borrow mut a.trailers else borrow mut a.fields;
+                            mem(into.extend(bytes[0..nameLength]))?;
+                            mem(into.extend(": ".bytes()))?;
+                            mem(into.extend(bytes[nameLength..nameLength + valueLength]))?;
+                            mem(into.push(10))?;
+                        }
+                        null => {}
+                    }
+                }
+                H3Event.FieldsEnd(stream, _, fin) => {
+                    if (fin) {
+                        match (this.indexOf(stream)) {
+                            Some(i) => {
+                                let list = this.answers.viewMut();
+                                list[i].ended = true;
+                            }
+                            null => {}
+                        }
+                    }
+                }
+                H3Event.Data(stream, n) => {
+                    match (this.indexOf(stream)) {
+                        Some(i) => {
+                            let bytes = this.buffer.view();
+                            let list = this.answers.viewMut();
+                            mem(list[i].data.extend(bytes[0..n]))?;
+                        }
+                        null => {}
+                    }
+                    this.conn.consume(stream, n as u64);
+                }
+                H3Event.End(stream) => {
+                    match (this.indexOf(stream)) {
+                        Some(i) => {
+                            let list = this.answers.viewMut();
+                            list[i].ended = true;
+                        }
+                        null => {}
+                    }
+                }
+                H3Event.GoAway(id) => { this.goAway = Some(id); }
+                _ => {}
+            }
+        }
+        // The request bodies, as far as their queues take them.
+        let ups = this.uploads.viewMut();
+        for (i in 0..ups.length) {
+            let u = borrow mut ups[i];
+            while (u.sent < u.bytes.length) {
+                let rest = u.bytes.view()[u.sent..];
+                let n = if (rest.length > 16384) 16384 else rest.length;
+                let taken = h3(this.h3.sendBody(u.stream, rest[0..n], u.sent + n == u.bytes.length), "a body")?;
+                u.sent += taken;
+                if (taken < n) {
+                    break;
+                }
+            }
+        }
+        if (this.started) {
+            h3(H3Glue.flush(mut this.h3, mut this.conn, this.out.viewMut()), "HTTP/3's write")?;
+        }
+        loop {
+            let d = match (quic(this.conn.datagram(this.out.viewMut(), Clock.monotonicNanos()), "a datagram")?) {
+                Some(d) => d,
+                null => { break; },
+            };
+            match (await this.socket.sendTo(this.out.view()[0..d.length], this.server)) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("sending")); }
+            }
+        }
+        let now = Clock.monotonicNanos();
+        var waitMs: u64 = match (this.conn.nextTimeout()) {
+            Some(t) => if (t <= now) 0 else (t - now + 999999) / 1000000,
+            null => 1000,
+        };
+        if (waitMs > capMs) {
+            waitMs = capMs;
+        }
+        if (waitMs == 0) {
+            quic(this.conn.onTimeout(now), "a timer")?;
+            return Ok();
+        }
+        let raced: Result<Raced<Datagram?>, AsyncError> = await Async.race(
+            async () => {
+                let d = await this.socket.recvFrom(this.buffer.viewMut())?;
+                return Ok(Some(d));
+            },
+            async () => {
+                await Timer.sleep(waitMs)?;
+                return Ok(null);
+            },
+        );
+        let won: Raced<Datagram?> = match (raced) {
+            Ok(w) => w,
+            Err(_) => { return Err(TestFailure.create("waiting")); },
+        };
+        let datagram: Datagram? = if (won.winner == 0) won.value else match (won.other) {
+            Some(d) => d,
+            null => won.value,
+        };
+        match (datagram) {
+            Some(d) => {
+                let from = QuicAddress.of(d.from);
+                match (this.conn.feed(from, 0, this.buffer.view()[0..d.length], Clock.monotonicNanos())) {
+                    Ok() => {}
+                    Err(QuicError.Draining) => {
+                        this.closed = true;
+                        this.closeCode = this.conn.peerApplicationClose();
+                    }
+                    Err(_) => { return Err(TestFailure.create("a read")); }
+                }
+            }
+            null => {
+                let t = Clock.monotonicNanos();
+                match (this.conn.nextTimeout()) {
+                    Some(due) => {
+                        if (due <= t) {
+                            match (this.conn.onTimeout(t)) {
+                                Ok() => {}
+                                Err(_) => { this.closed = true; }
+                            }
+                        }
+                    }
+                    null => {}
+                }
+            }
+        }
+        return Ok();
+    }
+}
