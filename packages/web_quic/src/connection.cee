@@ -66,6 +66,10 @@ extern "C" {
     @effects()
     fn qs_stream_reset(conn: *mut void, stream: i64, code: u64) -> i32;
     @effects()
+    fn qs_stream_reset_sending(conn: *mut void, stream: i64, code: u64) -> i32;
+    @effects()
+    fn qs_stream_stop_reading(conn: *mut void, stream: i64, code: u64) -> i32;
+    @effects()
     fn qs_error_kind(code: i32) -> i32;
     @effects()
     fn qs_packet_dcid(packet: *u8, length: usize, out: *mut u8, initial: *mut i32, version: *mut u32) -> i32;
@@ -457,6 +461,16 @@ public struct QuicConnection {
     /// Safety: as `nextTimeout`.
     public fn resetStream(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
         QuicErrors.check(unsafe { qs_stream_reset(this.raw, stream, code) });
+
+    /// Resets only our sending side of `stream` (RESET_STREAM, RFC 9000 §3.1); the peer's data still arrives.
+    /// Safety: as `nextTimeout`.
+    public fn resetSending(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
+        QuicErrors.check(unsafe { qs_stream_reset_sending(this.raw, stream, code) });
+
+    /// Asks the peer to stop sending on `stream` (STOP_SENDING, RFC 9000 §3.5); our side may still send.
+    /// Safety: as `nextTimeout`.
+    public fn stopReading(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
+        QuicErrors.check(unsafe { qs_stream_stop_reading(this.raw, stream, code) });
 
     /// The next event, its data (for `StreamData`) copied into `buffer`, which should hold `quicEventBufferSize()`
     /// bytes; null when there is none. Drain it after every `feed`, `datagram` and `onTimeout`.

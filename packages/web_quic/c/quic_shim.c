@@ -522,7 +522,9 @@ static void qs_callbacks(ngtcp2_callbacks *cb, int server) {
     cb->stream_open = cb_stream_open;
     cb->stream_close = cb_stream_close;
     cb->stream_reset = cb_stream_reset;
-    cb->stream_stop_sending = cb_stop_sending;
+    /* recv_stop_sending is the peer's STOP_SENDING (ngtcp2 1.24). stream_stop_sending is not: it reports our own
+       shutdown of a stream's reading, which CeeSafe made and needs no event for. */
+    cb->recv_stop_sending = cb_stop_sending;
     cb->acked_stream_data_offset = cb_acked;
     cb->extend_max_stream_data = cb_extend_stream;
     cb->extend_max_local_streams_bidi = cb_extend_bidi;
@@ -937,6 +939,18 @@ int32_t qs_stream_reset(qs_conn *c, int64_t stream, uint64_t code) {
     int rv = ngtcp2_conn_shutdown_stream(c->conn, 0, stream, code);
     qs_stream_drop(c, stream);
     return rv;
+}
+
+/* Resets only our sending side of `stream` (RESET_STREAM), leaving its receiving side open. */
+int32_t qs_stream_reset_sending(qs_conn *c, int64_t stream, uint64_t code) {
+    int rv = ngtcp2_conn_shutdown_stream_write(c->conn, 0, stream, code);
+    qs_stream_drop(c, stream);
+    return rv;
+}
+
+/* Asks the peer to stop sending on `stream` (STOP_SENDING), leaving our sending side open. */
+int32_t qs_stream_stop_reading(qs_conn *c, int64_t stream, uint64_t code) {
+    return ngtcp2_conn_shutdown_stream_read(c->conn, 0, stream, code);
 }
 
 /* ---- Routing, before there is a connection ---- */

@@ -138,6 +138,14 @@ public struct QuicLink {
     public fn resetStream(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
         this.conn.resetStream(stream, code);
 
+    /// Resets only our sending side of a stream (`QuicConnection.resetSending`).
+    public fn resetSending(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
+        this.conn.resetSending(stream, code);
+
+    /// Asks the peer to stop sending on a stream (`QuicConnection.stopReading`).
+    public fn stopReading(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
+        this.conn.stopReading(stream, code);
+
     /// The application protocol the handshake chose.
     public fn alpn(borrow this) -> Alpn => this.conn.alpn();
 

@@ -462,6 +462,13 @@ This amendment replaces amendment 1's items 4, 5 and 6.
    `read32`). It is not API, so the owner's answer 7 (no HTTP/3 client) holds.
 6. **Interop:** ngtcp2's example client in its HTTP/3 build (`osslclient`, amendment 3 item 2) and curl where it has
    HTTP/3.
-7. **The parts of stage 3:** (a) web_quic's additions (item 2); (b) the shim and `H3Connection`, tested in memory
+7. **One direction at a time:** web_quic gains `resetSending` (RESET_STREAM only) and `stopReading` (STOP_SENDING
+   only), on `QuicConnection` and `QuicLink`. nghttp3 asks for each separately (its `reset_stream` and
+   `stop_sending` callbacks). `resetStream`, which shuts both down, would also cut a response short when nghttp3 only
+   wants a request body stopped.
+   - **A fix found by its test:** the shim registered `QuicEvent.StopSending` on ngtcp2's `stream_stop_sending`
+     callback. That one reports our own shutdown of a stream's reading, not the peer's STOP_SENDING, which is
+     `recv_stop_sending` (ngtcp2 1.24). So a peer's STOP_SENDING was never reported, and our own stops were.
+8. **The parts of stage 3:** (a) web_quic's additions (item 2); (b) the shim and `H3Connection`, tested in memory
    with the test client; (c) the driver, `Exchange.forStream`, and tests over UDP; (d) GOAWAY with drain, the flood
    guards (§3.6) and the QPACK limit tests; (e) interop.

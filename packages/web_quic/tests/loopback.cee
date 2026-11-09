@@ -82,9 +82,20 @@ struct Seen {
     fin: bool;
     stream: i64;
     opened: i64;
+    /// The code of the last RESET_STREAM and STOP_SENDING received, or -1.
+    resetCode: i64;
+    stopCode: i64;
 }
 
-fn seen() -> Seen => Seen { handshake: false, data: Vector<u8>.create(), fin: false, stream: -1, opened: -1 };
+fn seen() -> Seen => Seen {
+    handshake: false,
+    data: Vector<u8>.create(),
+    fin: false,
+    stream: -1,
+    opened: -1,
+    resetCode: -1,
+    stopCode: -1,
+};
 
 fn drain(conn: borrow mut QuicConnection, buffer: SliceMut<u8>, into: borrow mut Seen) -> Result<void, TestFailure> {
     loop {
@@ -105,6 +116,8 @@ fn drain(conn: borrow mut QuicConnection, buffer: SliceMut<u8>, into: borrow mut
                 }
             }
             QuicEvent.StreamOpened(stream) => { into.opened = stream; }
+            QuicEvent.StreamReset(_, code) => { into.resetCode = truncate<i64>(code); }
+            QuicEvent.StopSending(_, code) => { into.stopCode = truncate<i64>(code); }
             _ => {}
         }
     }
@@ -529,5 +542,56 @@ fn unidirectional_streams() -> Result<void, TestFailure> {
     Check.equalBytes("control".bytes(), link.serverSeen.data.view())?;
     Check.isTrue(link.clientSeen.stream == 3, "the client's data came on stream 3")?;
     Check.equalBytes("settings".bytes(), link.clientSeen.data.view())?;
+    return Ok();
+}
+
+/// One direction at a time (RFC 9000 §3.1, §3.5): the server resets its sending side, and the client still delivers
+/// its bytes on the same stream; the client asks the server to stop sending, and the server is told so. Expected: the
+/// codes arrive as sent (7 and 9), and the client's data and FIN arrive after the server's reset.
+@test
+fn one_direction_reset_and_stop() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let p = pair()?;
+    var link = linked(p)?;
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var out = [0u8; 1452];
+    var rounds = 0;
+    while (rounds < 20 && !(link.clientSeen.handshake && link.serverSeen.handshake)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    let first = ok(link.client.openStream(), "a stream")?;
+    let _ = ok(link.client.writeStream(first, "a".bytes(), false), "the client's first byte")?;
+    rounds = 0;
+    while (rounds < 20 && link.serverSeen.data.length < 1) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    match (borrow mut link.server) {
+        Some(s) => { ok(s.resetSending(first, 7), "the server's reset of its side")?; }
+        null => { return Err(TestFailure.create("no server")); }
+    }
+    let _ = ok(link.client.writeStream(first, "b".bytes(), true), "the client's last byte")?;
+    rounds = 0;
+    while (rounds < 20 && !(link.serverSeen.fin && link.clientSeen.resetCode >= 0)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.clientSeen.resetCode == 7, "the client saw RESET_STREAM with code 7")?;
+    Check.isTrue(link.serverSeen.fin, "the client's data still arrived after the server's reset")?;
+    Check.equalBytes("ab".bytes(), link.serverSeen.data.view())?;
+    // The other direction: the client stops reading a second stream; the server hears STOP_SENDING.
+    let second = ok(link.client.openStream(), "a second stream")?;
+    let _ = ok(link.client.writeStream(second, "c".bytes(), false), "the second stream's byte")?;
+    ok(link.client.stopReading(second, 9), "the client's STOP_SENDING")?;
+    rounds = 0;
+    while (rounds < 20 && link.serverSeen.stopCode < 0) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.serverSeen.stopCode == 9, "the server saw STOP_SENDING with code 9")?;
     return Ok();
 }
