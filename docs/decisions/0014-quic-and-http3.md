@@ -603,3 +603,37 @@ This amendment replaces amendment 1's items 4, 5 and 6.
        affected.
    - **The client's side** (the tests'): `QuicConnection.ticket` (the TLS session and the server's 0-RTT transport
      parameters, RFC 9000 §7.4.1), `resume`, `resumed` and `earlyDataAccepted`.
+
+## 13. Amendment 6 (2026-11-09, M10 stage 5: what loss and reordering found)
+
+The stage 5 tests ran web_quic's and web_http3's real-UDP tests inside a Linux network namespace whose loopback has
+`tc netem` delay (10 ms ± 5 ms), loss (5%) and reordering (25%). Three defects showed up, each invisible on a clean
+path, and each is fixed:
+
+1. **A blocked header block was dropped when its stream closed.**
+   - QUIC closes a stream once everything on it has arrived. But nghttp3 may still hold a header block that refers
+     to QPACK dynamic-table entries whose instructions are late on the encoder stream (RFC 9204 §2.1.2).
+   - `nghttp3_conn_close_stream` deletes the stream as it is, so the answer (or request) was lost. This is also why
+     ngtcp2's example client lost small answers in stage 3.
+   - **Fix:** the h3 shim defers QUIC's close of a bidirectional stream that nghttp3 has not finished reading (no
+     `end_stream`) and the peer did not reset. It carries the close out after the read that lets nghttp3 finish.
+2. **A draining connection could close with data still unacknowledged.**
+   - nghttp3 being drained says nothing of the QPACK encoder stream, which never ends, nor of RESET_STREAM and other
+     frames.
+   - **Fix:** the drain closes only when `QuicConnection.allAcknowledged()`: every stream's bytes acknowledged, and
+     ngtcp2's bytes in flight at 0.
+3. **No closing state.**
+   - The server sent CONNECTION_CLOSE once and forgot the connection. When that packet was lost, the client's next
+     packets found no connection, and the listener answered with a stateless reset, which carries no close code.
+   - **Fix:** RFC 9000 §10.2.1's closing state. `QuicLink` keeps the CONNECTION_CLOSE it sent, and for three probe
+     timeouts its IDs stay routed and every datagram from the peer gets the close again.
+   - What remains: a client that has nothing more to send learns of a lost close only at its idle timeout, as QUIC
+     intends.
+
+Two improvements to 0-RTT came with them:
+
+4. **0-RTT packets that arrive before their Initial are held** (RFC 9000 §5.2.2): at most 32, for up to 3 s, then
+   handed to the connection that Initial makes. Before, losing or reordering the Initial cost the client all its early
+   data.
+5. **`CW_NGTCP2_LOG`:** set in the environment, it turns on ngtcp2's own log, to stderr. It is how the cases above
+   were found.

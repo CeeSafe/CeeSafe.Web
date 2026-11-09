@@ -196,11 +196,54 @@ typedef struct h3_body {
     struct h3_body *next;
 } h3_body;
 
+/* What the shim knows of a request stream's reading, so QUIC's close of a stream nghttp3 has not finished reading
+   waits (h3_close_stream). */
+typedef struct h3_track {
+    int64_t id;
+    int ended;    /* nghttp3 reported the stream's end (end_stream): everything on it was read */
+    int reset;    /* the peer reset it: nothing more will be read */
+    int deferred; /* QUIC closed it before nghttp3 finished: the close waits for `ended` */
+    uint64_t code;
+    struct h3_track *next;
+} h3_track;
+
 struct h3_conn {
     nghttp3_conn *conn;
     h3_queue queue;
     h3_body *bodies;
+    h3_track *tracks;
 };
+
+static h3_track *h3_track_get(h3_conn *c, int64_t id, int make) {
+    for (h3_track *t = c->tracks; t; t = t->next) {
+        if (t->id == id) {
+            return t;
+        }
+    }
+    if (!make) {
+        return NULL;
+    }
+    h3_track *t = ceesafe_alloc(sizeof *t, CEE_ALLOC_FOREIGN);
+    if (!t) {
+        return NULL;
+    }
+    memset(t, 0, sizeof *t);
+    t->id = id;
+    t->next = c->tracks;
+    c->tracks = t;
+    return t;
+}
+
+static void h3_track_drop(h3_conn *c, int64_t id) {
+    for (h3_track **p = &c->tracks; *p; p = &(*p)->next) {
+        if ((*p)->id == id) {
+            h3_track *t = *p;
+            *p = t->next;
+            ceesafe_free(t, CEE_ALLOC_FOREIGN);
+            return;
+        }
+    }
+}
 
 static h3_body *h3_find(h3_conn *c, int64_t id) {
     for (h3_body *b = c->bodies; b; b = b->next) {
@@ -376,6 +419,11 @@ static int cb_end_stream(nghttp3_conn *conn, int64_t stream, void *ud, void *sud
     (void)conn;
     (void)sud;
     h3_conn *c = ud;
+    h3_track *t = h3_track_get(c, stream, 1);
+    if (!t) {
+        return NGHTTP3_ERR_CALLBACK_FAILURE;
+    }
+    t->ended = 1;
     return h3_push(&c->queue, H3_EV_END, 0, stream, 0) ? 0 : NGHTTP3_ERR_CALLBACK_FAILURE;
 }
 
@@ -399,6 +447,7 @@ static int cb_stream_close(nghttp3_conn *conn, int64_t stream, uint64_t code, vo
     (void)sud;
     h3_conn *c = ud;
     h3_body_drop(c, stream);
+    h3_track_drop(c, stream);
     return h3_push(&c->queue, H3_EV_CLOSED, 0, stream, code) ? 0 : NGHTTP3_ERR_CALLBACK_FAILURE;
 }
 
@@ -474,6 +523,11 @@ void h3_conn_free(h3_conn *c) {
         c->bodies = b->next;
         h3_body_free(b);
     }
+    while (c->tracks) {
+        h3_track *t = c->tracks;
+        c->tracks = t->next;
+        ceesafe_free(t, CEE_ALLOC_FOREIGN);
+    }
     h3_free_mem(c->queue.data, NULL);
     h3_free_mem(c->queue.events, NULL);
     h3_free_mem(c, NULL);
@@ -507,24 +561,71 @@ int32_t h3_failed(h3_conn *c) {
    CeeSafe gives back at once; or nghttp3's error, which closes the connection. `now` is the caller's monotonic clock
    in nanoseconds: with it nghttp3's "glitch" rate limiter runs (H3_EXCESSIVE_LOAD past 1000 suspicious events, then
    33 a second; nghttp3_conn_read_stream2), which the version without a time leaves off. */
+static int h3_close_now(h3_conn *c, int64_t stream, uint64_t code);
+
 int64_t h3_read(h3_conn *c, int64_t stream, const uint8_t *bytes, size_t len, int32_t fin, uint64_t now) {
     nghttp3_ssize n = nghttp3_conn_read_stream2(c->conn, stream, bytes, len, fin ? 1 : 0, now);
     if (n >= 0 && c->queue.failed) {
         return NGHTTP3_ERR_NOMEM;
+    }
+    if (n < 0) {
+        return (int64_t)n;
+    }
+    /* Closes QUIC made before nghttp3 had read everything (h3_close_stream): this read may have unblocked them (the
+       QPACK encoder stream's instructions arrive), so those whose end has now come close. */
+    for (h3_track *t = c->tracks; t;) {
+        h3_track *next = t->next;
+        if (t->deferred && t->ended) {
+            int rv = h3_close_now(c, t->id, t->code);
+            if (rv != 0) {
+                return rv;
+            }
+        }
+        t = next;
     }
     return (int64_t)n;
 }
 
 /* QUIC says the peer reset `stream` or asked us to stop sending on it: nghttp3 stops reading it. */
 int32_t h3_shutdown_read(h3_conn *c, int64_t stream) {
+    h3_track *t = h3_track_get(c, stream, 1);
+    if (!t) {
+        return NGHTTP3_ERR_NOMEM;
+    }
+    t->reset = 1;
+    if (t->deferred) {
+        return h3_close_now(c, stream, t->code);
+    }
     return nghttp3_conn_shutdown_stream_read(c->conn, stream);
 }
 
-/* QUIC closed `stream` with `code`. */
-int32_t h3_close_stream(h3_conn *c, int64_t stream, uint64_t code) {
+static int h3_close_now(h3_conn *c, int64_t stream, uint64_t code) {
     int rv = nghttp3_conn_close_stream(c->conn, stream, code);
     h3_body_drop(c, stream);
+    h3_track_drop(c, stream);
+    if (rv == 0 && c->queue.failed) {
+        return NGHTTP3_ERR_NOMEM;
+    }
     return rv == NGHTTP3_ERR_STREAM_NOT_FOUND ? 0 : rv;
+}
+
+/* QUIC closed `stream` with `code`. A bidirectional stream nghttp3 has not finished reading, and the peer did not
+   reset, is closed once it has: QUIC delivered everything on it, but nghttp3 may hold a header block blocked on QPACK
+   instructions that have yet to arrive on the encoder stream (RFC 9204 §2.1.2), and closing now would drop it
+   (nghttp3_conn_close_stream deletes the stream as it is). h3_read closes it when its end comes. */
+int32_t h3_close_stream(h3_conn *c, int64_t stream, uint64_t code) {
+    if ((stream & 2) == 0) {
+        h3_track *t = h3_track_get(c, stream, 1);
+        if (!t) {
+            return NGHTTP3_ERR_NOMEM;
+        }
+        if (!t->ended && !t->reset) {
+            t->deferred = 1;
+            t->code = code;
+            return 0;
+        }
+    }
+    return h3_close_now(c, stream, code);
 }
 
 /* ---- Out ---- */

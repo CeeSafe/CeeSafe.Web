@@ -363,8 +363,8 @@ async fn run(
             }
         }
         // The drain (RFC 9114 §5.2): GOAWAY's notice, then, after `goAwayDelayMs`, the final GOAWAY with the last
-        // stream accepted (nghttp3 refuses later ones with H3_REQUEST_REJECTED); once every stream is done, the close
-        // with H3_NO_ERROR. nghttp3 is drained only when its streams are closed, so every answer was acknowledged.
+        // stream accepted (nghttp3 refuses later ones with H3_REQUEST_REJECTED); once every stream is done and QUIC
+        // holds nothing unacknowledged, the close with H3_NO_ERROR.
         let draining = started && context.drain.isDraining();
         if (draining) {
             match (noticeAt) {
@@ -382,7 +382,10 @@ async fn run(
                             Err(e) => { return await fail(link, e); }
                         }
                         goAwaySent = true;
-                    } else if (goAwaySent && links.length() == 0 && h3.drained()) {
+                    } else if (goAwaySent && links.length() == 0 && h3.drained() && link.allAcknowledged()) {
+                        // Only once QUIC holds nothing unacknowledged: the QPACK encoder stream never ends, so a
+                        // response's dynamic-table instructions can still be awaiting retransmission when nghttp3
+                        // is drained, and the close would leave the client's header block blocked forever.
                         return await failWith(link, h3NoErrorCode());
                     }
                 }

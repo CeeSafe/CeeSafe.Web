@@ -20,6 +20,9 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -144,6 +147,22 @@ static int qs_addr_bytes(const ngtcp2_addr *a, uint8_t *out) {
         return 1;
     }
     return 0;
+}
+
+/* ngtcp2's own log, to stderr, when the environment variable CW_NGTCP2_LOG is set: a debugging aid, off otherwise. */
+static void qs_log(void *ud, const char *fmt, ...) {
+    (void)ud;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void qs_log_if_asked(ngtcp2_settings *settings) {
+    if (getenv("CW_NGTCP2_LOG") != NULL) {
+        settings->log_printf = qs_log;
+    }
 }
 
 /* ---- TLS contexts: web_tls's SSL_CTX, with a reference of our own ---- */
@@ -716,6 +735,28 @@ int32_t qs_resume(qs_conn *c, const uint8_t *ticket, size_t len) {
     return 0;
 }
 
+/* 1 when the peer has acknowledged every byte (and FIN) we gave QUIC on every stream, and every packet we sent:
+   closing now loses nothing.
+   HTTP/3's QPACK encoder stream never ends, so its bytes count here though nghttp3 is drained (Web ADR 0014
+   amendment 5 item 6). */
+int32_t qs_all_acked(qs_conn *c) {
+    for (qs_stream *s = c->streams; s; s = s->next) {
+        if (s->acked < s->end || s->sent < s->end || (s->fin && !s->fin_sent)) {
+            return 0;
+        }
+    }
+    /* And nothing sent is still unacknowledged: RESET_STREAM, STOP_SENDING and every other frame that must arrive
+       counts here, which stream data alone does not show. */
+    ngtcp2_conn_info info;
+    ngtcp2_conn_get_conn_info2(c->conn, &info);
+    return info.bytes_in_flight == 0 ? 1 : 0;
+}
+
+/* The connection's probe timeout (RFC 9002 §6.2.1), in nanoseconds: a closing connection lingers three of them. */
+uint64_t qs_pto(qs_conn *c) {
+    return ngtcp2_conn_get_pto2(c->conn);
+}
+
 /* After the handshake, whether it resumed a session (a ticket was accepted): 1, or 0. */
 int32_t qs_resumed(qs_conn *c) {
     return c->ssl && SSL_session_reused(c->ssl) ? 1 : 0;
@@ -746,6 +787,7 @@ qs_conn *qs_conn_client(qs_tls *t, const uint8_t *host, size_t host_len, const u
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now;
+    qs_log_if_asked(&settings);
     ngtcp2_transport_params params;
     qs_params(&params);
     ngtcp2_cid d, s;
@@ -790,6 +832,7 @@ qs_conn *qs_conn_server(qs_tls *t, const uint8_t *pkt, size_t len, const uint8_t
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now;
+    qs_log_if_asked(&settings);
     settings.token = hd.token;
     settings.tokenlen = hd.tokenlen;
     ngtcp2_transport_params params;

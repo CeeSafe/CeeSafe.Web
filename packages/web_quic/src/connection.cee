@@ -69,6 +69,10 @@ extern "C" {
     @effects()
     fn qs_resumed(conn: *mut void) -> i32;
     @effects()
+    fn qs_all_acked(conn: *mut void) -> i32;
+    @effects()
+    fn qs_pto(conn: *mut void) -> u64;
+    @effects()
     fn qs_read(conn: *mut void, remote: *u8, ecn: u32, packet: *u8, length: usize, now: u64) -> i32;
     @effects()
     fn qs_write(conn: *mut void, out: *mut u8, capacity: usize, now: u64, ecn: *mut u32, to: *mut u8) -> i64;
@@ -585,6 +589,14 @@ public struct QuicConnection {
         }
         return Ok(r == 1);
     }
+
+    /// The probe timeout (RFC 9002 §6.2.1), in nanoseconds.
+    /// Safety: as `nextTimeout`.
+    public fn probeTimeout(borrow this) -> u64 => unsafe { qs_pto(this.raw) };
+
+    /// Whether the peer has acknowledged everything written on every stream: a graceful close now loses nothing.
+    /// Safety: as `nextTimeout`.
+    public fn allAcknowledged(borrow this) -> bool => unsafe { qs_all_acked(this.raw) } == 1;
 
     /// After the handshake, whether it resumed an earlier session (the ticket was accepted), on either side.
     /// Safety: as `nextTimeout`.

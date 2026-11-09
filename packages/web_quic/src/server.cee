@@ -91,6 +91,8 @@ public struct QuicLink {
     private peer: SocketAddress;
     private id: u32;
     private out: Vector<u8>;
+    /// The CONNECTION_CLOSE this side sent, kept to send again while the connection is closing (RFC 9000 §10.2.1).
+    private closing: Vector<u8>;
 
     /// The connection's next event, its data (for `StreamData`, and the connection-ID events, which are handled here)
     /// in `buffer` (`quicEventBufferSize()` bytes). It sends what the connection has first, then waits for a datagram
@@ -285,6 +287,9 @@ public struct QuicLink {
     /// Whether the handshake has completed.
     public fn handshakeDone(borrow this) -> bool => this.conn.handshakeDone();
 
+    /// Whether the peer has acknowledged everything written on every stream (`QuicConnection.allAcknowledged`).
+    public fn allAcknowledged(borrow this) -> bool => this.conn.allAcknowledged();
+
     /// The connection's number, unique among the server's connections while it lives.
     public fn number(borrow this) -> u32 => this.id;
 
@@ -293,9 +298,41 @@ public struct QuicLink {
         let n = this.conn.closeDatagram(code, this.out.viewMut(), Clock.monotonicNanos())?;
         if (n > 0) {
             let bytes = copied(this.out.view()[0..n])?;
+            this.closing = copied(this.out.view()[0..n])?;
             await this.post(ToListener.Send(bytes, this.peer))?;
         }
         return Ok();
+    }
+
+    /// The closing state (RFC 9000 §10.2.1), after `close`: for three probe timeouts the connection's IDs stay routed
+    /// here, and each datagram the peer sends gets the CONNECTION_CLOSE again, so a lost one is sent anew. Without it
+    /// the listener would answer those datagrams with a stateless reset, and the peer would not learn the close's
+    /// code.
+    async fn linger(borrow mut this) {
+        if (this.closing.length == 0) {
+            return;
+        }
+        let until = Clock.monotonicNanos() + 3 * this.conn.probeTimeout();
+        loop {
+            let now = Clock.monotonicNanos();
+            if (now >= until) {
+                return;
+            }
+            let leftMs = (until - now + 999999) / 1000000;
+            match (await wake(this.inbound, leftMs)) {
+                Ok(Wake.Datagram(_)) => {
+                    match (copied(this.closing.view())) {
+                        Ok(bytes) => {
+                            if ((await this.post(ToListener.Send(bytes, this.peer))).isErr()) {
+                                return;
+                            }
+                        }
+                        Err(_) => { return; }
+                    }
+                }
+                _ => { return; } // the time is up, or the listener has gone
+            }
+        }
     }
 
     /// Sends every datagram the connection has now.
@@ -441,6 +478,7 @@ async fn listen(
     }
     var next: u32 = 1;
     var budget = ResetBudget { sent: 0, since: Timer.now() };
+    var held = Vector<Held>.create();
     loop {
         let raced: Result<Raced<Heard>, AsyncError> = await Async.race(
             async () => {
@@ -471,6 +509,7 @@ async fn listen(
             live,
             mut next,
             mut budget,
+            mut held,
             buffer.view(),
             won.value,
         )?;
@@ -488,6 +527,7 @@ async fn listen(
                     live,
                     mut next,
                     mut budget,
+                    mut held,
                     buffer.view(),
                     h,
                 )?;
@@ -509,6 +549,7 @@ async fn heard(
     live: borrow mut Vector<Live>,
     next: borrow mut u32,
     budget: borrow mut ResetBudget,
+    held: borrow mut Vector<Held>,
     buffer: Slice<u8>,
     h: Heard,
 ) -> Result<void, QuicError> {
@@ -542,6 +583,12 @@ async fn heard(
                     return Ok();
                 }
                 null => {}
+            }
+            if (!header.initial && isZeroRtt(datagram, header)) {
+                // 0-RTT that came before its Initial (lost, or overtaken): kept a moment for the connection the
+                // Initial will make (RFC 9000 §5.2.2), so the client's early data is not lost with it.
+                hold(held, header.id(), datagram, got.from, got.ecn)?;
+                return Ok();
             }
             if (!header.initial) {
                 // A short header for an ID of ours that no connection has (§10.3): a connection this server lost,
@@ -577,6 +624,7 @@ async fn heard(
                         toListener,
                         routes,
                         live,
+                        held,
                         next,
                         datagram,
                         got,
@@ -595,6 +643,7 @@ async fn heard(
                         toListener,
                         routes,
                         live,
+                        held,
                         next,
                         datagram,
                         got,
@@ -605,6 +654,73 @@ async fn heard(
                 }
                 QuicRetryCheck.Drop => {}
             }
+        }
+    }
+    return Ok();
+}
+
+/// A 0-RTT datagram that came before the Initial of its connection.
+struct Held {
+    cid: Vector<u8>;
+    bytes: Vector<u8>;
+    from: SocketAddress;
+    ecn: u8;
+    at: u64;
+}
+
+/// 0-RTT datagrams held at once, at most, and for how long (RFC 9000 §5.2.2: a limited number, briefly). Long enough
+/// for a client to send its Initial again when the first was lost: with no RTT sample, its probe timeout is about a
+/// second, and doubles.
+fn heldMost() -> usize => 32;
+fn heldMs() -> u64 => 3000;
+
+/// Whether `datagram` is a version 1 0-RTT packet (long header, type 1; RFC 9000 §17.2.3).
+fn isZeroRtt(datagram: Slice<u8>, header: borrow QuicHeader) -> bool =>
+    datagram.length > 0 && (datagram[0] & 0x80) != 0 && ((datagram[0] & 0x30) >> 4) == 1 && header.version == 1;
+
+/// Holds a 0-RTT datagram for `cid`: old ones go first, and past `heldMost` it is dropped.
+fn hold(
+    held: borrow mut Vector<Held>,
+    cid: Slice<u8>,
+    datagram: Slice<u8>,
+    from: SocketAddress,
+    ecn: u8,
+) -> Result<void, QuicError> {
+    let now = Timer.now();
+    var i: usize = 0;
+    while (i < held.length) {
+        if (held.view()[i].at + heldMs() < now) {
+            let _ = held.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+    if (held.length >= heldMost()) {
+        return Ok();
+    }
+    let c = copied(cid)?;
+    let b = copied(datagram)?;
+    match (held.push(Held { cid: c, bytes: b, from: from, ecn: ecn, at: now })) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+}
+
+/// Hands connection `conn` the 0-RTT datagrams held for `cid`, its Initial's destination ID, in the order they came.
+fn release(
+    held: borrow mut Vector<Held>,
+    cid: Slice<u8>,
+    live: borrow Vector<Live>,
+    conn: u32,
+) -> Result<void, QuicError> {
+    var i: usize = 0;
+    while (i < held.length) {
+        let all = held.view();
+        if (same(all[i].cid.view(), cid)) {
+            deliver(live, conn, all[i].bytes.view(), all[i].from, all[i].ecn)?;
+            let _ = held.remove(i);
+        } else {
+            i += 1;
         }
     }
     return Ok();
@@ -658,6 +774,7 @@ async fn admit(
     toListener: borrow Channel<ToListener>,
     routes: borrow mut Vector<Route>,
     live: borrow mut Vector<Live>,
+    held: borrow mut Vector<Held>,
     next: borrow mut u32,
     datagram: Slice<u8>,
     got: UdpReceived,
@@ -703,6 +820,7 @@ async fn admit(
         Ok() => {}
         Err(_) => { return Err(QuicError.NoMemory); }
     }
+    release(held, header.id(), live, id)?;
     return Ok();
 }
 
@@ -749,7 +867,15 @@ async fn connectionTask(
         Err(_) => { return Err(QuicError.NoMemory); }
     }
     let fed = conn.feed(there, 0, initial.view(), now);
-    var link = QuicLink { conn: conn, inbound: inbound, toListener: toListener, peer: from, id: id, out: out };
+    var link = QuicLink {
+        conn: conn,
+        inbound: inbound,
+        toListener: toListener,
+        peer: from,
+        id: id,
+        out: out,
+        closing: Vector<u8>.create(),
+    };
     let result = match (fed) {
         Ok() => await app.get().connection(mut link),
         Err(e) => Err(e),
@@ -760,6 +886,7 @@ async fn connectionTask(
         Err(QuicError.IdleTimeout) => {}
         Err(_) => { let _ = await link.close(null); }
     }
+    await link.linger();
     let _ = await link.toListener.sendAsync(ToListener.Ended(id));
     return Ok();
 }
