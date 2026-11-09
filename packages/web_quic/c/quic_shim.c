@@ -214,8 +214,8 @@ enum {
     QS_EV_STOP_SENDING = 6,    /* stream, code: the peer asked us to stop sending */
     QS_EV_STREAM_WRITABLE = 7, /* stream: its flow-control window grew */
     QS_EV_STREAMS_BIDI = 8,    /* code: the bidirectional streams we may open, now */
-    QS_EV_NEW_CID = 9,         /* data: a connection ID we issued, which the listener must route to us */
-    QS_EV_RETIRE_CID = 10,     /* data: a connection ID of ours the peer retired */
+    QS_EV_NEW_CID = 9,         /* qs_next_id only. data: a connection ID we issued, which the listener must route */
+    QS_EV_RETIRE_CID = 10,     /* qs_next_id only. data: a connection ID of ours the peer retired */
     QS_EV_EARLY = 11,          /* stream: the data that follows on it came in 0-RTT (RFC 9001 §4.6.1) */
     QS_EV_TOO_SMALL = 255,     /* not an event: qs_next_event's buffer is smaller than the next event's data */
 };
@@ -363,6 +363,9 @@ typedef struct qs_conn {
     uint8_t reset_secret[32]; /* for stateless-reset tokens of the IDs we issue */
     qs_stream *streams;
     qs_queue queue;
+    /* The IDs we issued and the peer retired, apart from `queue` (qs_next_id): the server routes each issued ID before
+       it sends the datagram that announces it, which it could not do in the events' order. */
+    qs_queue ids;
     int manual_credit; /* stream data's credit goes back on qs_consume, not when CeeSafe takes the event */
 } qs_conn;
 
@@ -423,7 +426,6 @@ static void cb_rand(uint8_t *dest, size_t len, const ngtcp2_rand_ctx *ctx) {
 
 static int cb_new_cid(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset_token *token, size_t cidlen,
                       void *ud) {
-    (void)conn;
     qs_conn *c = ud;
     if (RAND_bytes(cid->data, (int)cidlen) != 1) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
@@ -433,13 +435,18 @@ static int cb_new_cid(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset
         0) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
-    return qs_push(&c->queue, QS_EV_NEW_CID, 0, -1, 0, cid->data, cidlen) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+    if (!ngtcp2_conn_is_server(conn)) {
+        return 0; /* only a server routes datagrams by our IDs */
+    }
+    return qs_push(&c->ids, QS_EV_NEW_CID, 0, -1, 0, cid->data, cidlen) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 static int cb_remove_cid(ngtcp2_conn *conn, const ngtcp2_cid *cid, void *ud) {
-    (void)conn;
     qs_conn *c = ud;
-    return qs_push(&c->queue, QS_EV_RETIRE_CID, 0, -1, 0, cid->data, cid->datalen) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+    if (!ngtcp2_conn_is_server(conn)) {
+        return 0;
+    }
+    return qs_push(&c->ids, QS_EV_RETIRE_CID, 0, -1, 0, cid->data, cid->datalen) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 static int cb_handshake_completed(ngtcp2_conn *conn, void *ud) {
@@ -904,6 +911,8 @@ void qs_conn_free(qs_conn *c) {
     }
     qs_free(c->queue.data, NULL);
     qs_free(c->queue.events, NULL);
+    qs_free(c->ids.data, NULL);
+    qs_free(c->ids.events, NULL);
     qs_free(c, NULL);
 }
 
@@ -925,7 +934,7 @@ int32_t qs_read(qs_conn *c, const uint8_t *remote, uint32_t ecn, const uint8_t *
     path.remote.addrlen = from.length;
     ngtcp2_pkt_info pi = {(uint8_t)ecn};
     int rv = ngtcp2_conn_read_pkt(c->conn, &path, &pi, pkt, len, now);
-    if (c->queue.failed) {
+    if (c->queue.failed || c->ids.failed) {
         rv = NGTCP2_ERR_NOMEM; /* the queue could not grow: memory, since flow control bounds it */
     }
     if (rv != 0 && rv != NGTCP2_ERR_DRAINING) {
@@ -1367,6 +1376,26 @@ uint32_t qs_next_event(qs_conn *c, uint8_t *buf, size_t cap, int64_t *stream, ui
         (void)ngtcp2_conn_extend_max_stream_offset(c->conn, e->stream, n);
         ngtcp2_conn_extend_max_offset(c->conn, n);
     }
+    q->head += 1;
+    q->count -= 1;
+    if (q->count == 0) {
+        q->head = 0;
+        q->used = 0;
+    }
+    return kind;
+}
+
+/* The next change to our connection IDs, its ID copied into `buf` (`cap` bytes, at least NGTCP2_MAX_CIDLEN) with its
+   length in *length: QS_EV_NEW_CID, QS_EV_RETIRE_CID, or 0 when there is none. */
+uint32_t qs_next_id(qs_conn *c, uint8_t *buf, size_t cap, size_t *length) {
+    qs_queue *q = &c->ids;
+    if (q->count == 0 || cap < NGTCP2_MAX_CIDLEN) {
+        return 0;
+    }
+    qs_event *e = &q->events[q->head];
+    memcpy(buf, q->data + e->offset, e->length);
+    *length = e->length;
+    uint32_t kind = e->kind;
     q->head += 1;
     q->count -= 1;
     if (q->count == 0) {

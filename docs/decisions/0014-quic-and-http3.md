@@ -667,3 +667,26 @@ Two improvements to 0-RTT came with them:
    - quiche's `multiplexing`, which failed in the client (too many open files);
    - `rebind-port` and `rebind-addr` with picoquic and quic-go, on the runner's path-validation checks. ngtcp2's own
      server fails them the same way, so they are left to ngtcp2 and the clients.
+
+## 15. Amendment 8 (2026-11-09, M10 stage 5: curl, and replay restated)
+
+1. **An issued connection ID is routed before the datagram that announces it.**
+   - **Found by curl** (8.14.1, Debian 13's, whose QUIC is OpenSSL's): about one connection in seven never finished
+     its handshake. Its client switched to the ID our NEW_CONNECTION_ID frame had just issued, in an Initial packet,
+     which RFC 9000 §5.1.2 allows. The listener had not routed that ID yet: `QuicLink` posted `Route` when it read the
+     event, after `flush` had already sent the frame. The listener took the packet for a new connection.
+   - **Now:** the shim keeps ID changes in their own queue (`qs_next_id`, `QuicConnection.nextIdChange`), and
+     `QuicLink.flush` posts them before each datagram. The listener takes its messages in order, so the route is in
+     place before the datagram leaves. `QuicEvent.NewConnectionId` and `RetiredConnectionId` are gone; clients do not
+     queue ID changes.
+   - Not reproduced by an in-package test: ngtcp2's client never changes ID during the handshake. curl is its evidence
+     (item 2).
+2. **curl** (§6; `tests/interop/curl_h3.py`): GET, an 8 MiB GET, three requests on one connection (curl's own
+   reuse), four in parallel, a 3 MB POST echoed, 405, HEAD, and 50 connections in turn, with the certificate verified
+   against the test CA. It runs curl through a command prefix, as in a container where the host's curl has no HTTP/3.
+3. **Replay, restated** (amendment 5 item 5 said a replay to another server sharing the ticket keys is not detected).
+   Single-use tickets live in the issuing context's session cache, and web_tls has no way to share ticket keys, or that
+   cache, between configurations. A ticket offered to another server is unknown there: a full handshake, its early
+   data ignored. `early_data_once_per_ticket` now shows it. What remains is RFC 9001 §9.2's: a replay that arrives
+   before the client's own copy runs once, and the client's request is then sent again after the handshake, so it
+   runs twice. That is why only safe methods run early. `packages/web_http3/README.md` says so.

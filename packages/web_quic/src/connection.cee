@@ -122,6 +122,8 @@ extern "C" {
     @effects()
     fn qs_packet_dcid(packet: *u8, length: usize, out: *mut u8, initial: *mut i32, version: *mut u32) -> i32;
     @effects()
+    fn qs_next_id(conn: *mut void, buffer: *mut u8, capacity: usize, length: *mut usize) -> u32;
+    @effects()
     fn qs_next_event(
         conn: *mut void,
         buffer: *mut u8,
@@ -173,13 +175,18 @@ public enum QuicEvent {
     StreamWritable(i64),
     /// This many bidirectional streams may now be open at once.
     StreamsAvailable(u64),
-    /// We issued a connection ID, of this many bytes in the caller's buffer: datagrams to it are this connection's.
-    NewConnectionId(usize),
-    /// The peer retired one of our connection IDs, of this many bytes in the caller's buffer.
-    RetiredConnectionId(usize),
     /// The stream data that follows on this stream came in 0-RTT (RFC 9001 §4.6.1): before the handshake proved the
     /// client, and possibly a replay. Only with `QuicTls.allowEarlyData`.
     EarlyData(i64),
+}
+
+/// A change to a server connection's IDs (`QuicConnection.nextIdChange`), the ID of this many bytes in the caller's
+/// buffer.
+public enum QuicIdChange {
+    /// We issued it: datagrams to it are this connection's.
+    Issued(usize),
+    /// The peer retired it.
+    Retired(usize),
 }
 
 /// What a datagram's header says, before any connection reads it (RFC 9000 §17).
@@ -312,9 +319,10 @@ public struct QuicTls {
         return QuicTls.of(config);
     }
 
-    /// Lets a server's connections accept 0-RTT (Web ADR 0014 §3.7: off unless called). Early data has no protection
-    /// against replay but OpenSSL's single-use tickets, which hold within this process only (RFC 9001 §9.2); HTTP/3
-    /// answers 425 to early requests but GET, HEAD and OPTIONS. Call before the server starts.
+    /// Lets a server's connections accept 0-RTT (Web ADR 0014 §3.7: off unless called). Early data's protection against
+    /// replay is OpenSSL's single-use tickets, kept in this context's session cache: each ticket's early data is taken
+    /// at most once, and nowhere else. A replay that comes before the client's own copy still runs once (RFC 9001
+    /// §9.2), so HTTP/3 answers 425 to early requests but GET, HEAD and OPTIONS. Call before the server starts.
     /// Safety: `raw` is this context's handle; the shim sets a flag read when each connection is made.
     public fn allowEarlyData(borrow mut this) {
         unsafe {
@@ -695,11 +703,23 @@ public struct QuicConnection {
             6 => Ok(Some(QuicEvent.StopSending(stream, code))),
             7 => Ok(Some(QuicEvent.StreamWritable(stream))),
             8 => Ok(Some(QuicEvent.StreamsAvailable(code))),
-            9 => Ok(Some(QuicEvent.NewConnectionId(length))),
-            10 => Ok(Some(QuicEvent.RetiredConnectionId(length))),
             11 => Ok(Some(QuicEvent.EarlyData(stream))),
             255 => Err(QuicError.BufferTooSmall(length)),
             _ => Ok(null),
+        };
+    }
+
+    /// The next change to a server's connection IDs, the ID copied into `buffer` (at least 20 bytes); null when there
+    /// is none. They are apart from `nextEvent`, so a server can route an ID it issued before it sends the datagram
+    /// that announces it: a client may use a new ID at once (RFC 9000 §5.1.2), even in its Initial packets.
+    /// Safety: the shim writes at most `buffer.length` bytes into `buffer` (none if fewer than 20), and the length.
+    public fn nextIdChange(borrow mut this, buffer: SliceMut<u8>) -> QuicIdChange? {
+        var length: usize = 0;
+        let kind = unsafe { qs_next_id(this.raw, buffer.ptr, buffer.length, borrow mut length as *mut usize) };
+        return match (kind) {
+            9 => Some(QuicIdChange.Issued(length)),
+            10 => Some(QuicIdChange.Retired(length)),
+            _ => null,
         };
     }
 

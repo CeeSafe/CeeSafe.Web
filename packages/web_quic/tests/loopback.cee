@@ -909,6 +909,8 @@ fn resumedWithEarly(
 ///     (`EarlyData`) and delivers ("early"), and which the client sees accepted;
 ///   - the same ticket a second time gets a full handshake, its early data ignored: OpenSSL's replay protection makes
 ///     tickets single-use (SSL_read_early_data(3), "REPLAY PROTECTION");
+///   - another server, with its own configuration, takes no early data on a ticket the first issued: single-use
+///     tickets are kept in the issuing server's session cache, so a ticket replayed elsewhere is unknown there;
 ///   - a server that did not allow early data issues tickets that offer no 0-RTT.
 @test
 fn early_data_once_per_ticket() -> Result<void, TestFailure> {
@@ -923,6 +925,14 @@ fn early_data_once_per_ticket() -> Result<void, TestFailure> {
     Check.equalBytes("early".bytes(), once.data.view())?;
     let twice = resumedWithEarly(serverTls, clientTls, ticket.view())?;
     Check.isTrue(!twice.early, "the same ticket's second use gets no early data")?;
+    // Another server: a fresh ticket from the first, offered with early data to the second.
+    var otherTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    otherTls.allowEarlyData();
+    let fresh = ticketFrom(serverTls, clientTls)?;
+    let elsewhere = resumedWithEarly(otherTls, clientTls, fresh.view())?;
+    Check.isTrue(!elsewhere.early, "another server takes no early data on the first's ticket")?;
+    let home = resumedWithEarly(serverTls, clientTls, fresh.view())?;
+    Check.isTrue(home.early, "the ticket's own server still takes it once")?;
     // A server without early data.
     let plainTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
     let plainTicket = ticketFrom(plainTls, clientTls)?;

@@ -99,17 +99,8 @@ public struct QuicLink {
     /// or the connection's next timer. `Draining` and `IdleTimeout` end the connection; return then.
     public async fn next(borrow mut this, buffer: SliceMut<u8>) -> Result<QuicEvent, QuicError> {
         loop {
+            await this.routeIds()?;
             match (this.conn.nextEvent(buffer)?) {
-                Some(QuicEvent.NewConnectionId(n)) => {
-                    let cid = copied(buffer[0..n])?;
-                    await this.post(ToListener.Route(cid, this.id))?;
-                    continue;
-                }
-                Some(QuicEvent.RetiredConnectionId(n)) => {
-                    let cid = copied(buffer[0..n])?;
-                    await this.post(ToListener.Unroute(cid))?;
-                    continue;
-                }
                 Some(e) => {
                     await this.flush()?;
                     return Ok(e);
@@ -141,20 +132,8 @@ public struct QuicLink {
     /// has none. Connection-ID events are handled here. With `waitWith`, it lets an application also wait for its own
     /// messages (HTTP/3's request tasks).
     public async fn poll(borrow mut this, buffer: SliceMut<u8>) -> Result<QuicEvent?, QuicError> {
-        loop {
-            match (this.conn.nextEvent(buffer)?) {
-                Some(QuicEvent.NewConnectionId(n)) => {
-                    let cid = copied(buffer[0..n])?;
-                    await this.post(ToListener.Route(cid, this.id))?;
-                }
-                Some(QuicEvent.RetiredConnectionId(n)) => {
-                    let cid = copied(buffer[0..n])?;
-                    await this.post(ToListener.Unroute(cid))?;
-                }
-                Some(e) => { return Ok(Some(e)); }
-                null => { return Ok(null); }
-            }
-        }
+        await this.routeIds()?;
+        return this.conn.nextEvent(buffer);
     }
 
     /// Sends what the connection has, then waits for a datagram (fed to the connection), the connection's next timer
@@ -335,13 +314,28 @@ public struct QuicLink {
         }
     }
 
-    /// Sends every datagram the connection has now.
+    /// Tells the listener of the IDs the connection issued and the peer retired. Before every datagram: one may announce
+    /// a new ID, which the client may use at once (RFC 9000 §5.1.2), so the listener must route it first. The listener
+    /// takes its messages in order, so the route is in place before the datagram leaves.
+    async fn routeIds(borrow mut this) -> Result<void, QuicError> {
+        var cid = [0u8; 20];
+        loop {
+            match (this.conn.nextIdChange(mut cid[..])) {
+                Some(QuicIdChange.Issued(n)) => { await this.post(ToListener.Route(copied(cid[0..n])?, this.id))?; }
+                Some(QuicIdChange.Retired(n)) => { await this.post(ToListener.Unroute(copied(cid[0..n])?))?; }
+                null => { return Ok(); }
+            }
+        }
+    }
+
+    /// Sends every datagram the connection has now, each after the routes for the IDs it may announce.
     async fn flush(borrow mut this) -> Result<void, QuicError> {
         loop {
             let sent = match (this.conn.datagram(this.out.viewMut(), Clock.monotonicNanos())?) {
                 Some(d) => d,
-                null => { return Ok(); },
+                null => { return await this.routeIds(); },
             };
+            await this.routeIds()?;
             let bytes = copied(this.out.view()[0..sent.length])?;
             // Where ngtcp2 sends it: the peer's address, which follows it when it migrates (RFC 9000 §9).
             match (sent.to.socketAddress()) {
