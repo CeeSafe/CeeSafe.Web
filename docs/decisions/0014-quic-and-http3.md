@@ -536,3 +536,10 @@ This amendment replaces amendment 1's items 4, 5 and 6.
         acknowledged), it closes with H3_NO_ERROR.
       - The drain's deadline is the program's: it cancels `Http3Server.serve` when its grace runs out.
       - The listener still admits connections while draining: each gets the GOAWAY at once.
+
+## 12. Amendment 5 (2026-11-09, M10 stage 4: the rest of the protocol, as built)
+
+1. **`Alt-Svc`** (§3.8). `Server.advertiseHttp3(port)` replaces `ServerOptions.http3Port`, since `web_server` has no
+   options struct: a `Server` carries its own.
+   - Every response whose request did not come over HTTP/3 gains `alt-svc: h3=":<port>"; ma=86400` (RFC 7838 §3),
+     after the middleware's `after` hooks, unless the response already has an `Alt-Svc`.

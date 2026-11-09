@@ -16,6 +16,8 @@ public struct Server<S: Send> {
     private routes: Router<S>;
     private hooks: Vector<Box<dyn Middleware<S> + Send>>;
     private httpLimits: Limits;
+    /// The UDP port the same application is served on over HTTP/3, advertised in `Alt-Svc`.
+    private http3Port: u16?;
 
     /// A server owning `state`, with no routes and no middleware; `limits` bound each connection's requests.
     public fn create(state: S, limits: Limits) -> Result<Server<S>, RouteError> {
@@ -25,6 +27,7 @@ public struct Server<S: Send> {
             routes: routes,
             hooks: Vector<Box<dyn Middleware<S> + Send>>.create(),
             httpLimits: limits,
+            http3Port: null,
         });
     }
 
@@ -34,6 +37,13 @@ public struct Server<S: Send> {
             Ok() => { return Ok(); }
             Err(_) => { return Err(RouteError.OutOfMemory); }
         }
+    }
+
+    /// Advertises HTTP/3 on UDP `port` of the same host (Web ADR 0014 §3.8): every HTTP/1.1 and HTTP/2 response
+    /// gains `alt-svc: h3=":<port>"; ma=86400` (RFC 7838 §3), unless the handler or a middleware set its own `Alt-Svc`.
+    /// Serve the same application there with `applicationOf` and `web_http3`'s `Http3Server.serve`.
+    public fn advertiseHttp3(borrow mut this, port: u16) {
+        this.http3Port = Some(port);
     }
 
     /// The router, to add routes.
@@ -206,8 +216,56 @@ impl<S: Send> Application for Server<S> {
             i -= 1;
             await this.hooks[i].after(request, head)?;
         }
+        match (this.http3Port) {
+            Some(port) => {
+                let overTcp = match (request.version()) {
+                    Version.Http3 => false,
+                    _ => true,
+                };
+                if (overTcp && !head.has("alt-svc")) {
+                    var text = [0u8; 32];
+                    let n = altSvc(port, mut text);
+                    match (head.add("alt-svc", text[0..n])) {
+                        Ok() => {}
+                        Err(_) => { return Err(HandlerError.Internal); }
+                    }
+                }
+            }
+            null => {}
+        }
         return Ok();
     }
+}
+
+/// `h3=":<port>"; ma=86400` in `out`; its length.
+fn altSvc(port: u16, out: borrow mut [u8; 32]) -> usize {
+    let head = "h3=\":".bytes();
+    let tail = "\"; ma=86400".bytes();
+    var n: usize = 0;
+    for (b in head) {
+        out[n] = b;
+        n += 1;
+    }
+    var digits = [0u8; 5];
+    var k: usize = 5;
+    var v = port;
+    loop {
+        k -= 1;
+        digits[k] = 48 + truncate<u8>(v % 10);
+        v /= 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    for (j in k..5) {
+        out[n] = digits[j];
+        n += 1;
+    }
+    for (b in tail) {
+        out[n] = b;
+        n += 1;
+    }
+    return n;
 }
 
 /// The methods in `mask` (over `Methods.index`), as an `Allow` value ("GET, HEAD, OPTIONS") in `out`; its length.
