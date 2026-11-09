@@ -6,41 +6,57 @@ import web_quic;
 
 /// The QUIC streams an HTTP/3 connection runs on. The connection must give credit back on consumption
 /// (`QuicConnection.creditOnConsume`, or `QuicServerOptions.creditOnRead = false`).
+/// Each is one call into web_quic's shim, which does no I/O: they never block, as an async task requires.
 public interface H3Streams {
+    @effects()
     fn openUni(borrow mut this) -> Result<i64, QuicError>;
+    @effects()
     fn write(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError>;
+    @effects()
     fn credit(borrow mut this, stream: i64, n: u64);
+    @effects()
     fn stop(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError>;
+    @effects()
     fn reset(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError>;
 }
 
 impl H3Streams for QuicConnection {
+    @effects()
     fn openUni(borrow mut this) -> Result<i64, QuicError> => this.openUniStream();
 
+    @effects()
     fn write(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError> =>
         this.writeStream(stream, bytes, fin);
 
+    @effects()
     fn credit(borrow mut this, stream: i64, n: u64) {
         this.consume(stream, n);
     }
 
+    @effects()
     fn stop(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> => this.stopReading(stream, code);
 
+    @effects()
     fn reset(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> => this.resetSending(stream, code);
 }
 
 impl H3Streams for QuicLink {
+    @effects()
     fn openUni(borrow mut this) -> Result<i64, QuicError> => this.openUniStream();
 
+    @effects()
     fn write(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError> =>
         this.writeStream(stream, bytes, fin);
 
+    @effects()
     fn credit(borrow mut this, stream: i64, n: u64) {
         this.consume(stream, n);
     }
 
+    @effects()
     fn stop(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> => this.stopReading(stream, code);
 
+    @effects()
     fn reset(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> => this.resetSending(stream, code);
 }
 

@@ -344,8 +344,14 @@ static qs_stream *qs_stream_get(qs_conn *c, int64_t id) {
         return NULL;
     }
     s->id = id;
-    s->next = c->streams;
-    c->streams = s;
+    /* Appended: qs_write visits streams in the order they were made, so streams made first (HTTP/3's control and
+       QPACK streams) are written first. A header block that refers to QPACK's dynamic table then never leaves before
+       the encoder instructions it needs (RFC 9204 §2.1.2), as nghttp3 hands them over in that order. */
+    qs_stream **end = &c->streams;
+    while (*end) {
+        end = &(*end)->next;
+    }
+    *end = s;
     return s;
 }
 

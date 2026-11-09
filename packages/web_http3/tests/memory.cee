@@ -15,10 +15,6 @@ fn ok<T>(r: Result<T, QuicError>, what: StringView) -> Result<T, TestFailure> {
 fn h3<T>(r: Result<T, H3Error>, what: StringView) -> Result<T, TestFailure> {
     match (r) {
         Ok(v) => { return Ok(v); }
-        Err(H3Error.Failed(code)) => {
-            Console.writeLine(code); // nghttp3's code, for the failure's report
-            return Err(TestFailure.create(what));
-        }
         Err(_) => { return Err(TestFailure.create(what)); }
     }
 }

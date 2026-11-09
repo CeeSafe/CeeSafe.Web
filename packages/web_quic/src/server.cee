@@ -119,6 +119,120 @@ public struct QuicLink {
         }
     }
 
+    /// The connection's next event if it has one now, its data in `buffer`, without sending or waiting; null when it
+    /// has none. Connection-ID events are handled here. With `waitWith`, it lets an application also wait for its own
+    /// messages (HTTP/3's request tasks).
+    public async fn poll(borrow mut this, buffer: SliceMut<u8>) -> Result<QuicEvent?, QuicError> {
+        loop {
+            match (this.conn.nextEvent(buffer)?) {
+                Some(QuicEvent.NewConnectionId(n)) => {
+                    let cid = copied(buffer[0..n])?;
+                    await this.post(ToListener.Route(cid, this.id))?;
+                }
+                Some(QuicEvent.RetiredConnectionId(n)) => {
+                    let cid = copied(buffer[0..n])?;
+                    await this.post(ToListener.Unroute(cid))?;
+                }
+                Some(e) => { return Ok(Some(e)); }
+                null => { return Ok(null); }
+            }
+        }
+    }
+
+    /// Sends what the connection has, then waits for a datagram (fed to the connection), the connection's next timer
+    /// (run), or a message on `messages` (returned); at most `capMs`. Then `poll` returns what the datagram or the timer
+    /// made. Both may come at once: a datagram is never dropped for a message, nor a message for a datagram.
+    /// `Draining` when the listener has gone.
+    public async fn waitWith<M: Send>(
+        borrow mut this,
+        messages: borrow Channel<M>,
+        capMs: u64,
+    ) -> Result<M?, QuicError> {
+        await this.flush()?;
+        let now = Clock.monotonicNanos();
+        var waitMs: u64 = match (this.conn.nextTimeout()) {
+            Some(t) => if (t <= now) 0 else (t - now + 999999) / 1000000,
+            null => 60000,
+        };
+        if (waitMs == 0) {
+            this.conn.onTimeout(now)?;
+            return Ok(null);
+        }
+        if (waitMs > capMs) {
+            waitMs = capMs;
+        }
+        let raced: Result<Raced<Woke<M>>, AsyncError> = await Async.race(
+            async () => {
+                // A datagram, or the timer; a datagram taken as the timer won is kept. Cancelled when a message wins:
+                // the cancellation stays an error, so it is never mistaken for a wake.
+                let innerRaced: Result<Raced<Wake>, AsyncError> = await Async.race(
+                    async () => {
+                        match (await this.inbound.recvAsync()) {
+                            Ok(Some(d)) => { return Ok(Wake.Datagram(d)); }
+                            Ok(null) => { return Ok(Wake.Gone); }
+                            Err(e) => { return Err(e); }
+                        }
+                    },
+                    async () => {
+                        await Timer.sleep(waitMs)?;
+                        return Ok(Wake.Timer);
+                    },
+                );
+                let inner = innerRaced?;
+                if (inner.winner == 0) {
+                    return Ok(Woke<M>.Quic(inner.value));
+                }
+                return match (inner.other) {
+                    Some(d) => Ok(Woke<M>.Quic(d)),
+                    null => Ok(Woke<M>.Quic(inner.value)),
+                };
+            },
+            async () => {
+                match (await messages.recvAsync()) {
+                    Ok(Some(m)) => { return Ok(Woke<M>.Message(m)); }
+                    Ok(null) => { return Ok(Woke<M>.Closed); }
+                    Err(e) => { return Err(e); }
+                }
+            },
+        );
+        let won = match (raced) {
+            Ok(w) => w,
+            Err(_) => { return Err(QuicError.Draining); },
+        };
+        var message: M? = null;
+        var current: Woke<M>? = Some(won.value);
+        var later: Woke<M>? = won.other;
+        loop {
+            let w = match (current) {
+                Some(x) => x,
+                null => { break; },
+            };
+            current = later;
+            later = null;
+            match (w) {
+                Woke.Quic(Wake.Datagram(d)) => {
+                    let from = QuicAddress.of(d.from);
+                    this.conn.feed(from, d.ecn as u32, d.bytes.view(), Clock.monotonicNanos())?;
+                }
+                Woke.Quic(Wake.Timer) => {
+                    let t = Clock.monotonicNanos();
+                    match (this.conn.nextTimeout()) {
+                        Some(due) => {
+                            if (due <= t) {
+                                this.conn.onTimeout(t)?;
+                            }
+                        }
+                        null => {}
+                    }
+                }
+                Woke.Quic(Wake.Gone) => { return Err(QuicError.Draining); }
+                Woke.Message(m) => { message = Some(m); }
+                Woke.Closed => {}
+            }
+        }
+        return Ok(message);
+    }
+
     /// Opens a bidirectional stream: its ID.
     public fn openStream(borrow mut this) -> Result<i64, QuicError> => this.conn.openStream();
 
@@ -151,6 +265,12 @@ public struct QuicLink {
 
     /// The peer's address.
     public fn peerAddress(borrow this) -> SocketAddress => this.peer;
+
+    /// Whether the handshake has completed.
+    public fn handshakeDone(borrow this) -> bool => this.conn.handshakeDone();
+
+    /// The connection's number, unique among the server's connections while it lives.
+    public fn number(borrow this) -> u32 => this.id;
 
     /// Sends a CONNECTION_CLOSE with the application's `code`, or for the error that ended the connection.
     public async fn close(borrow mut this, code: u64?) -> Result<void, QuicError> {
@@ -188,6 +308,14 @@ fn copied(bytes: Slice<u8>) -> Result<Vector<u8>, QuicError> {
         Ok() => { return Ok(v); }
         Err(_) => { return Err(QuicError.NoMemory); }
     }
+}
+
+/// What woke `waitWith`.
+enum Woke<M> {
+    Quic(Wake),
+    Message(M),
+    /// The messages' channel closed.
+    Closed,
 }
 
 enum Wake {

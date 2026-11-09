@@ -487,3 +487,29 @@ This amendment replaces amendment 1's items 4, 5 and 6.
 8. **The parts of stage 3:** (a) web_quic's additions (item 2); (b) the shim and `H3Connection`, tested in memory
    with the test client; (c) the driver, `Exchange.forStream`, and tests over UDP; (d) GOAWAY with drain, the flood
    guards (§3.6) and the QPACK limit tests; (e) interop.
+9. **The driver, as built (part (c)):**
+   - **Waking for requests too.** `QuicLink.next` waits only for a datagram or the connection's timer. web_quic gains
+     `QuicLink.poll` (the next event, without waiting) and `QuicLink.waitWith(messages, capMs)`, which also wakes for
+     a message on the application's channel. HTTP/3's connection task waits there for its request tasks.
+     - **A fix before it shipped:** when a message won the race, the cancelled datagram-or-timer child turned its
+       cancellation into a value, "the listener has gone". The race returned it as `other`, and the connection ended
+       with `Draining`. The child now lets cancellation stay an error. `six_requests_over_udp` failed with it (3 runs
+       of 3) and passes without it.
+   - **Request tasks** (`web_http3/src/server.cee`) run `Exchange.forStream` over an `H3Port` (`StreamSink`), as
+     HTTP/2's do.
+     - Each body piece (at most 64 KiB) is acknowledged to its task once nghttp3's body queue has taken all of it.
+     - Response heads and trailers are told apart by whether the head was sent.
+     - Field names are lowercased, and connection-specific fields left out (RFC 9114 §4.2).
+     - A stream past `requestsPerConnection` (100) is refused with H3_REQUEST_REJECTED.
+     - When a response ends before its request's body, STOP_SENDING goes out with H3_NO_ERROR (§4.1.1).
+   - **QUIC writes streams in the order they were made** (`qs_stream_get` appends). Before, the newest went first, so
+     a response's HEADERS could leave before the QPACK encoder instructions it referred to.
+     - ngtcp2's client then found the header block blocked, and dropped the response when its stream closed. Every GET
+       through `examples/h3` came back empty, though `/big`, whose head went out first, arrived whole.
+     - `older_streams_are_written_first` (web_quic) fails with the old order.
+   - **`connection` passes `run`'s end back as it is.** Mapping `Draining` to `Ok` had made the QUIC server send a
+     second close, with code 0.
+   - **`examples/h3`** serves a `web_server` application through `applicationOf` and `Http3Server.serve`.
+     `tests/interop/h3.py` drives it with ngtcp2's HTTP/3 client (`osslclient`).
+   - **curl:** its interop is not run on macOS, where the session's tools block curl. It is for stage 5, with
+     quic-interop-runner's images.

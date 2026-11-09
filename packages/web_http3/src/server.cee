@@ -1,0 +1,829 @@
+// HTTP/3's server (Web ADR 0014 §3.6, amendment 4 item 4): web_quic's QuicServer, with an application that runs
+// HTTP/3 on each connection. One connection task owns the `QuicLink` and the `H3Connection`; each request runs in its
+// own task, a child of the connection's task set (CeeSafe ADR 0053), with `Exchange.forStream` over an `H3Port`, as
+// HTTP/2's streams do (Web ADR 0011 §3.2).
+//
+// A request task talks to its connection through channels:
+//   - `Outgoing`, one channel for the connection: the response's head, its body in pieces, the trailers, the body
+//     bytes the handler has read (their credit goes back to the client then), a reset, and the end;
+//   - its body channel, from the connection: request DATA, collected in a backlog that QUIC's flow control bounds (a
+//     stream's credit goes back only as its handler reads), so a slow handler holds back only its own stream;
+//   - its ack channel: each body piece is acknowledged once nghttp3's body queue has taken all of it, so a task never
+//     has more than one piece waiting beyond that queue (256 KiB).
+import web_core;
+import web_http;
+import web_quic;
+
+/// HTTP/3's error codes (RFC 9114 §8.1) the driver sends.
+fn h3NoErrorCode() -> u64 => 0x100;
+fn h3InternalError() -> u64 => 0x102;
+fn h3RequestRejected() -> u64 => 0x10b;
+
+/// The body pieces a request task sends: at most this many bytes each.
+fn h3BodyPiece() -> usize => 65536;
+
+/// What a request's task sends its connection.
+enum Outgoing {
+    /// The response's head, or, once it was sent, its trailers; `true` ends the response.
+    Head(i64, HeaderBlock, bool),
+    Data(i64, Vector<u8>, bool),
+    /// The handler read this many body bytes: give their credit back.
+    Consumed(i64, usize),
+    Reset(i64, u64),
+    /// The request's task is done.
+    Done(i64),
+}
+
+/// Request body for a request's task.
+enum BodyPart {
+    Data(Vector<u8>),
+    /// The body's end, with the request's trailer fields (empty if none).
+    End(HeaderBlock),
+}
+
+/// The connection's side of one request.
+struct Link {
+    body: Channel<BodyPart>;
+    acks: Channel<u8>;
+    reset: Channel<u8>;
+    backlog: Vector<u8>;
+    ended: bool;
+    endSent: bool;
+    /// The trailers to send with the end (at most one block).
+    trailers: Vector<HeaderBlock>;
+    headSent: bool;
+    /// A body piece nghttp3's queue has not taken all of: the rest, from `pendingAt`, and whether it ends the body.
+    pending: Vector<u8>;
+    pendingAt: usize;
+    pendingEnd: bool;
+    waiting: bool;
+}
+
+/// What a request's task needs of its connection, owned (a task-set child holds no loan).
+struct RequestContext {
+    id: u64;
+    acceptedAt: u64;
+    drain: Drain;
+    peer: SocketAddress?;
+}
+
+/// How HTTP/3 serves.
+public struct Http3Options {
+    /// The QUIC server's admission. `creditOnRead` is set false whatever it says: HTTP/3 gives credit back as
+    /// handlers read (Web ADR 0014 amendment 4 item 2).
+    public quic: QuicServerOptions;
+    /// The most requests running at once on one connection; a stream past it is refused with H3_REQUEST_REJECTED.
+    public requestsPerConnection: u32;
+
+    /// QUIC's defaults, and 100 requests a connection (as many streams as a client may open at first).
+    public fn defaults() -> Http3Options => Http3Options {
+        quic: QuicServerOptions.defaults(),
+        requestsPerConnection: 100,
+    };
+}
+
+/// The HTTP/3 server.
+public struct Http3Server {
+    /// Serves `app` over HTTP/3 on `socket` (bound to `local`) with `tls` (a server's, offering ALPN `h3`), until
+    /// cancelled. `limits` bound each request as over HTTP/1.1 and HTTP/2; a request's head may be at most
+    /// `limits.maxHeadBytes` (RFC 9114 §4.2.2). `drain` is shared with each request's context.
+    public async fn serve(
+        socket: borrow AsyncUdpSocket,
+        local: SocketAddress,
+        tls: Arc<QuicTls>,
+        app: Arc<Box<dyn Application + Send>>,
+        limits: Limits,
+        drain: borrow Drain,
+        options: Http3Options,
+    ) -> Result<void, QuicError> {
+        let h3 = Http3Application {
+            app: app,
+            limits: limits,
+            drain: drain.share(),
+            requests: options.requestsPerConnection,
+        };
+        let boxed: Box<dyn QuicApplication + Send> = match (Box.create(h3)) {
+            Ok(b) => b,
+            Err(_) => { return Err(QuicError.NoMemory); },
+        };
+        let shared = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+            Ok(a) => a,
+            Err(_) => { return Err(QuicError.NoMemory); },
+        };
+        var quic = options.quic;
+        quic.creditOnRead = false;
+        return await QuicServer.serve(socket, local, tls, shared, quic);
+    }
+}
+
+/// HTTP/3 on each QUIC connection.
+struct Http3Application {
+    app: Arc<Box<dyn Application + Send>>;
+    limits: Limits;
+    drain: Drain;
+    requests: u32;
+}
+
+impl QuicApplication for Http3Application {
+    async fn connection(borrow this, link: borrow mut QuicLink) -> Result<void, QuicError> {
+        var h3 = match (H3Connection.server(this.limits.maxHeadBytes as u64)) {
+            Ok(c) => c,
+            Err(_) => { return Err(QuicError.NoMemory); },
+        };
+        let outgoing = match (Channel<Outgoing>.create(256)) {
+            Ok(c) => c,
+            Err(_) => { return Err(QuicError.NoMemory); },
+        };
+        var links = HashMap<u64, Link>.create();
+        let context = RequestContext {
+            id: link.number() as u64,
+            acceptedAt: Timer.now(),
+            drain: this.drain.share(),
+            peer: Some(link.peerAddress()),
+        };
+        // `run` ends only with an error, so the set cancels the requests left. `Draining` and `IdleTimeout` go back as
+        // they are: the QUIC server then sends nothing more (an `Ok` would make it close with code 0).
+        return await Async.tasks(this.requests, QuicError.NoMemory, async (set) =>
+            await run(set, link, mut h3, this, context, outgoing, mut links));
+    }
+}
+
+/// The connection task's loop. It ends with `Err(Draining)` or `Err(IdleTimeout)`, so the set cancels the requests
+/// left.
+async fn run(
+    set: borrow TaskSet<QuicError>,
+    link: borrow mut QuicLink,
+    h3: borrow mut H3Connection,
+    server: borrow Http3Application,
+    context: borrow RequestContext,
+    outgoing: borrow Channel<Outgoing>,
+    links: borrow mut HashMap<u64, Link>,
+) -> Result<void, QuicError> {
+    var buffer = Vector<u8>.create();
+    var out = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr() || out.resize(quicDatagramSize(), 0).isErr()) {
+        return Err(QuicError.NoMemory);
+    }
+    var heads = HashMap<u64, HeaderBlock>.create();
+    var started = false;
+    loop {
+        // What QUIC has: into nghttp3, before HTTP/3 has started too (amendment 4 item 3).
+        loop {
+            let event = match (await link.poll(buffer.viewMut())?) {
+                Some(e) => e,
+                null => { break; },
+            };
+            let n = match (event) {
+                QuicEvent.StreamData(_, n, _) => n,
+                _ => 0,
+            };
+            match (H3Glue.onQuic(h3, link, event, buffer.view()[0..n])) {
+                Ok() => {}
+                Err(e) => { return await fail(link, e); }
+            }
+        }
+        if (!started && link.handshakeDone()) {
+            match (H3Glue.start(h3, link)) {
+                Ok() => {}
+                Err(e) => { return await fail(link, e); }
+            }
+            started = true;
+        }
+        // What nghttp3 made of it.
+        loop {
+            let event = match (h3.nextEvent(buffer.viewMut())) {
+                Ok(Some(e)) => e,
+                Ok(null) => { break; },
+                Err(e) => { return await fail(link, e); },
+            };
+            match (H3Glue.obey(h3, link, event)) {
+                Ok() => {}
+                Err(e) => { return await fail(link, e); }
+            }
+            match (event) {
+                H3Event.Field(stream, nameLength, valueLength, trailer) => {
+                    let key = truncate<u64>(stream);
+                    let bytes = buffer.view();
+                    let name = bytes[0..nameLength];
+                    let value = bytes[nameLength..nameLength + valueLength];
+                    if (trailer) {
+                        match (links.getMut(key)) {
+                            Some(l) => {
+                                if (l.trailers.length == 0) {
+                                    alloc(l.trailers.push(HeaderBlock.create()))?;
+                                }
+                                let all = l.trailers.viewMut();
+                                alloc(all[0].push(name, value, false))?;
+                            }
+                            null => {}
+                        }
+                    } else {
+                        match (heads.getMut(key)) {
+                            Some(h) => { alloc(h.push(name, value, false))?; }
+                            null => {
+                                var h = HeaderBlock.create();
+                                alloc(h.push(name, value, false))?;
+                                match (heads.put(key, h)) {
+                                    Ok(_) => {}
+                                    Err(_) => { return Err(QuicError.NoMemory); }
+                                }
+                            }
+                        }
+                    }
+                }
+                H3Event.FieldsEnd(stream, trailers, fin) => {
+                    let key = truncate<u64>(stream);
+                    if (trailers) {
+                        match (links.getMut(key)) {
+                            Some(l) => {
+                                l.ended = true;
+                                deliver(l)?;
+                            }
+                            null => {}
+                        }
+                    } else {
+                        let head = match (heads.remove(key)) {
+                            Some(h) => h,
+                            null => HeaderBlock.create(),
+                        };
+                        startRequest(set, link, h3, server, context, links, outgoing, stream, head, !fin)?;
+                    }
+                }
+                H3Event.Data(stream, n) => {
+                    let key = truncate<u64>(stream);
+                    var known = false;
+                    match (links.getMut(key)) {
+                        Some(l) => {
+                            known = true;
+                            alloc(l.backlog.extend(buffer.view()[0..n]))?;
+                            deliver(l)?;
+                        }
+                        null => {}
+                    }
+                    if (!known) {
+                        link.consume(stream, n as u64); // a request already done: its credit comes back at once
+                    }
+                }
+                H3Event.End(stream) => {
+                    match (links.getMut(truncate<u64>(stream))) {
+                        Some(l) => {
+                            l.ended = true;
+                            deliver(l)?;
+                        }
+                        null => {}
+                    }
+                }
+                H3Event.Reset(stream, _) => { endLink(links, stream); }
+                H3Event.Closed(stream, _) => {
+                    let _ = heads.remove(truncate<u64>(stream));
+                    endLink(links, stream);
+                }
+                H3Event.BodyRoom(stream) => { pushBody(h3, links, stream)?; }
+                _ => {}
+            }
+        }
+        // What the requests queued, as long as there is any.
+        loop {
+            match (outgoing.tryRecv()) {
+                Some(m) => { handle(h3, link, links, m)?; }
+                null => { break; }
+            }
+        }
+        if (started) {
+            match (H3Glue.flush(h3, link, out.viewMut())) {
+                Ok() => {}
+                Err(e) => { return await fail(link, e); }
+            }
+        }
+        // Wait for a datagram, a timer or a request's message (`waitWith` sends what QUIC has first).
+        match (await link.waitWith(outgoing, 1000)?) {
+            Some(m) => { handle(h3, link, links, m)?; }
+            null => {}
+        }
+    }
+}
+
+/// A connection error from HTTP/3: close with its code (RFC 9114 §8), and end the connection's task.
+async fn fail(link: borrow mut QuicLink, e: H3Error) -> Result<void, QuicError> {
+    let _ = await link.close(Some(H3Errors.closeCode(e)));
+    return Err(QuicError.Draining);
+}
+
+/// Starts request `stream`'s task, or refuses it (H3_REQUEST_REJECTED) if the set is full.
+fn startRequest(
+    set: borrow TaskSet<QuicError>,
+    link: borrow mut QuicLink,
+    h3: borrow mut H3Connection,
+    server: borrow Http3Application,
+    context: borrow RequestContext,
+    links: borrow mut HashMap<u64, Link>,
+    outgoing: borrow Channel<Outgoing>,
+    stream: i64,
+    head: HeaderBlock,
+    hasBody: bool,
+) -> Result<void, QuicError> {
+    let body = channel<BodyPart>(4)?;
+    let acks = channel<u8>(1)?;
+    let reset = channel<u8>(1)?;
+    let owned = RequestContext {
+        id: context.id,
+        acceptedAt: context.acceptedAt,
+        drain: context.drain.share(),
+        peer: context.peer,
+    };
+    let a = server.app.clone();
+    let o = outgoing.clone();
+    let b = body.clone();
+    let k = acks.clone();
+    let rs = reset.clone();
+    let limits = server.limits;
+    let started = set.trySpawn(async move () =>
+        await requestTask(a, owned, stream, head, hasBody, b, o, k, rs, limits));
+    if (!started) {
+        let _ = link.resetStream(stream, h3RequestRejected()); // RFC 9114 §4.1.1: not processed, may be retried
+        h3.shutdownWrite(stream);
+        return Ok();
+    }
+    let l = Link {
+        body: body,
+        acks: acks,
+        reset: reset,
+        backlog: Vector<u8>.create(),
+        ended: !hasBody,
+        endSent: false,
+        trailers: Vector<HeaderBlock>.create(),
+        headSent: false,
+        pending: Vector<u8>.create(),
+        pendingAt: 0,
+        pendingEnd: false,
+        waiting: false,
+    };
+    match (links.put(truncate<u64>(stream), l)) {
+        Ok(_) => {}
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+    if (!hasBody) {
+        match (links.getMut(truncate<u64>(stream))) {
+            Some(x) => { deliver(x)?; }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// One message from a request's task.
+fn handle(
+    h3: borrow mut H3Connection,
+    link: borrow mut QuicLink,
+    links: borrow mut HashMap<u64, Link>,
+    m: Outgoing,
+) -> Result<void, QuicError> {
+    match (m) {
+        Outgoing.Head(stream, fields, end) => {
+            var f = H3Fields.create();
+            for (i in 0..fields.count()) {
+                addField(mut f, fields.name(i), fields.value(i))?;
+            }
+            var ok = true;
+            match (links.getMut(truncate<u64>(stream))) {
+                Some(l) => {
+                    if (!l.headSent) {
+                        l.headSent = true;
+                        ok = h3.respond(stream, f, !end).isOk();
+                    } else {
+                        ok = h3.trailers(stream, f).isOk();
+                    }
+                }
+                null => {}
+            }
+            if (!ok) {
+                refuse(h3, link, links, stream); // the stream is gone: the task learns it at its next send
+            }
+        }
+        Outgoing.Data(stream, bytes, end) => {
+            match (links.getMut(truncate<u64>(stream))) {
+                Some(l) => {
+                    l.pending = bytes;
+                    l.pendingAt = 0;
+                    l.pendingEnd = end;
+                    l.waiting = true;
+                }
+                null => {}
+            }
+            pushBody(h3, links, stream)?;
+        }
+        Outgoing.Consumed(stream, n) => {
+            link.consume(stream, n as u64);
+            match (links.getMut(truncate<u64>(stream))) {
+                Some(l) => { deliver(l)?; }
+                null => {}
+            }
+        }
+        Outgoing.Reset(stream, code) => {
+            let _ = link.resetStream(stream, code);
+            h3.shutdownWrite(stream);
+            endLink(links, stream);
+        }
+        Outgoing.Done(stream) => {
+            match (links.get(truncate<u64>(stream))) {
+                Some(l) => {
+                    if (!l.ended) {
+                        // The response is complete; the client need not send the rest of its request (RFC 9114
+                        // §4.1.1: STOP_SENDING with H3_NO_ERROR).
+                        let _ = link.stopReading(stream, h3NoErrorCode());
+                    }
+                }
+                null => {}
+            }
+            let _ = links.remove(truncate<u64>(stream));
+        }
+    }
+    return Ok();
+}
+
+/// Offers a stream's pending body piece to nghttp3's queue; once all of it is taken, the task is told it may send the
+/// next. What is not taken waits for `BodyRoom`.
+fn pushBody(h3: borrow mut H3Connection, links: borrow mut HashMap<u64, Link>, stream: i64) -> Result<void, QuicError> {
+    match (links.getMut(truncate<u64>(stream))) {
+        Some(l) => {
+            if (!l.waiting) {
+                return Ok();
+            }
+            let rest = l.pending.view()[l.pendingAt..];
+            match (h3.sendBody(stream, rest, l.pendingEnd)) {
+                Ok(n) => {
+                    l.pendingAt += n;
+                    if (l.pendingAt == l.pending.length) {
+                        l.waiting = false;
+                        l.pending.clear();
+                        let _ = l.acks.trySend(1);
+                    }
+                }
+                Err(H3Error.NoMemory) => { return Err(QuicError.NoMemory); }
+                Err(_) => {
+                    l.waiting = false;
+                    let _ = l.acks.trySend(0); // the stream is gone (reset by the client): the task stops
+                }
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+/// A stream the driver can no longer answer on: reset it, and end its task.
+fn refuse(h3: borrow mut H3Connection, link: borrow mut QuicLink, links: borrow mut HashMap<u64, Link>, stream: i64) {
+    let _ = link.resetStream(stream, h3InternalError());
+    h3.shutdownWrite(stream);
+    endLink(links, stream);
+}
+
+/// Appends a response field in HTTP/3's form: the name lowercased (RFC 9114 §4.2), and connection-specific fields left
+/// out (§4.2: `connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade`).
+fn addField(f: borrow mut H3Fields, name: Slice<u8>, value: Slice<u8>) -> Result<void, QuicError> {
+    var lower = [0u8; 256];
+    if (name.length > lower.length) {
+        return Ok(); // longer than any field Exchange writes: not sent
+    }
+    for (i in 0..name.length) {
+        let c = name[i];
+        lower[i] = if (c >= 65 && c <= 90) c + 32 else c;
+    }
+    let n = lower[0..name.length];
+    if (named(n, "connection") || named(n, "keep-alive") || named(n, "proxy-connection") ||
+        named(n, "transfer-encoding") || named(n, "upgrade")) {
+        return Ok();
+    }
+    alloc(f.add(n, value))?;
+    return Ok();
+}
+
+/// Moves a request's backlog into its body channel, and the end after it, as far as the channel has room.
+fn deliver(l: borrow mut Link) -> Result<void, QuicError> {
+    if (l.backlog.length > 0) {
+        var chunk = Vector<u8>.create();
+        alloc(chunk.extend(l.backlog.view()))?;
+        match (l.body.trySend(BodyPart.Data(chunk))) {
+            Ok() => { l.backlog.clear(); }
+            Err(_) => { return Ok(); } // full: the next Consumed tries again
+        }
+    }
+    if (l.ended && !l.endSent) {
+        let trailers = match (l.trailers.pop()) {
+            Some(t) => t,
+            null => HeaderBlock.create(),
+        };
+        match (l.body.trySend(BodyPart.End(trailers))) {
+            Ok() => { l.endSent = true; }
+            Err(BodyPart.End(back)) => { alloc(l.trailers.push(back))?; } // full: kept for the next try
+            Err(_) => {}
+        }
+    }
+    return Ok();
+}
+
+/// A request is over: its task is told (if still running), and its link dropped.
+fn endLink(links: borrow mut HashMap<u64, Link>, stream: i64) {
+    match (links.remove(truncate<u64>(stream))) {
+        Some(l) => {
+            let _ = l.reset.trySend(1);
+            let _ = l.acks.trySend(0);
+            l.body.close();
+            l.acks.close();
+        }
+        null => {}
+    }
+}
+
+// ---- The request's task ----
+
+/// A request task's end of its channels, as the `StreamSink` its exchange uses.
+struct H3Port {
+    stream: i64;
+    body: Channel<BodyPart>;
+    outgoing: Channel<Outgoing>;
+    acks: Channel<u8>;
+    current: Vector<u8>;
+    at: usize;
+    ended: bool;
+    trailers: HeaderBlock;
+}
+
+impl StreamSink for H3Port {
+    async fn readBody(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError> {
+        loop {
+            if (this.at < this.current.length) {
+                let ready = this.current.view();
+                let n = if (into.length < ready.length - this.at) into.length else ready.length - this.at;
+                let to = borrow mut into[0..n];
+                to.copyFrom(ready[this.at..this.at + n]);
+                this.at += n;
+                await post(this.outgoing, Outgoing.Consumed(this.stream, n))?;
+                return Ok(n);
+            }
+            if (this.ended) {
+                return Ok(0);
+            }
+            match (await this.body.recvAsync()) {
+                Ok(Some(BodyPart.Data(bytes))) => {
+                    this.current = bytes;
+                    this.at = 0;
+                }
+                Ok(Some(BodyPart.End(trailers))) => {
+                    this.ended = true;
+                    this.trailers = trailers;
+                }
+                Ok(null) => { return Err(HandlerError.Io(NetError.Reset)); } // the stream was reset
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+        }
+    }
+
+    async fn sendHead(borrow mut this, fields: HeaderBlock, endStream: bool) -> Result<void, HandlerError> =>
+        await post(this.outgoing, Outgoing.Head(this.stream, fields, endStream));
+
+    async fn sendData(borrow mut this, bytes: Slice<u8>, endStream: bool) -> Result<void, HandlerError> {
+        if (bytes.length == 0) {
+            if (endStream) {
+                await this.piece(Vector<u8>.create(), true)?;
+            }
+            return Ok();
+        }
+        var at: usize = 0;
+        while (at < bytes.length) {
+            let n = if (bytes.length - at > h3BodyPiece()) h3BodyPiece() else bytes.length - at;
+            var chunk = Vector<u8>.create();
+            if (chunk.extend(bytes[at..at + n]).isErr()) {
+                return Err(HandlerError.Internal);
+            }
+            at += n;
+            await this.piece(chunk, endStream && at == bytes.length)?;
+        }
+        return Ok();
+    }
+
+    async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError> => Ok(false); // no push in M10
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> =>
+        into.pushAll(this.trailers);
+}
+
+impl H3Port {
+    /// Sends one body piece, and waits until nghttp3's queue has taken all of it.
+    async fn piece(borrow mut this, chunk: Vector<u8>, end: bool) -> Result<void, HandlerError> {
+        await post(this.outgoing, Outgoing.Data(this.stream, chunk, end))?;
+        match (await this.acks.recvAsync()) {
+            Ok(Some(1)) => { return Ok(); }
+            Ok(_) => { return Err(HandlerError.Io(NetError.Reset)); }
+            Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+        }
+    }
+}
+
+async fn post(outgoing: borrow Channel<Outgoing>, m: Outgoing) -> Result<void, HandlerError> {
+    match (await outgoing.sendAsync(m)) {
+        Ok() => { return Ok(); }
+        Err(SendError.Closed(_)) => { return Err(HandlerError.Io(NetError.Closed)); }
+        Err(SendError.Cancelled(_)) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+    }
+}
+
+/// A request's task: the application's handler, unless the stream is reset first (then the handler is cancelled where
+/// it waits).
+async fn requestTask(
+    app: borrow Arc<Box<dyn Application + Send>>,
+    context: borrow RequestContext,
+    stream: i64,
+    head: borrow HeaderBlock,
+    hasBody: bool,
+    body: borrow Channel<BodyPart>,
+    outgoing: borrow Channel<Outgoing>,
+    acks: borrow Channel<u8>,
+    reset: borrow Channel<u8>,
+    limits: Limits,
+) -> Result<void, QuicError> {
+    let r: Result<Raced<u8>, AsyncError> = await Async.race(
+        async () => {
+            await serveRequest(app, context, stream, head, hasBody, body, outgoing, acks, limits);
+            return Ok(0u8);
+        },
+        async () => {
+            let _ = await reset.recvAsync()?;
+            return Ok(1u8);
+        },
+    );
+    match (r) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    let _ = outgoing.trySend(Outgoing.Done(stream));
+    return Ok(); // a request's failure is its own: it never cancels its siblings
+}
+
+/// The request built from the stream's head, run through the application, its response finished.
+async fn serveRequest(
+    app: borrow Arc<Box<dyn Application + Send>>,
+    context: borrow RequestContext,
+    stream: i64,
+    head: borrow HeaderBlock,
+    hasBody: bool,
+    body: borrow Channel<BodyPart>,
+    outgoing: borrow Channel<Outgoing>,
+    acks: borrow Channel<u8>,
+    limits: Limits,
+) {
+    // The request: its regular fields, and `host` from `:authority` when the client sent none (RFC 9114 §4.3.1).
+    var fields = HeaderBlock.create();
+    var method = Method.Get;
+    var hasHost = false;
+    for (i in 0..head.count()) {
+        if (named(head.name(i), "host")) {
+            hasHost = true;
+        }
+    }
+    for (i in 0..head.count()) {
+        if (fields.push(head.name(i), head.value(i), false).isErr()) {
+            return;
+        }
+        if (named(head.name(i), ":authority") && !hasHost) {
+            if (fields.push("host".bytes(), head.value(i), false).isErr()) {
+                return;
+            }
+        }
+    }
+    let bytes = fields.allBytes();
+    var list = HeaderList.create(bytes);
+    var tokenAt: usize = 0;
+    var tokenEnd: usize = 0;
+    var pathAt: usize = 0;
+    var pathEnd: usize = 0;
+    var hasPath = false;
+    for (i in 0..fields.count()) {
+        let s = fields.span(i);
+        let nameEnd = (s.nameAt + s.nameLength) as usize;
+        let valueEnd = (s.valueAt + s.valueLength) as usize;
+        let name = bytes[s.nameAt as usize..nameEnd];
+        let value = bytes[s.valueAt as usize..valueEnd];
+        if (named(name, ":method")) {
+            method = Methods.parse(value);
+            tokenAt = s.valueAt as usize;
+            tokenEnd = valueEnd;
+        } else if (named(name, ":path")) {
+            pathAt = s.valueAt as usize;
+            pathEnd = valueEnd;
+            hasPath = true;
+        } else if (name.length > 0 && name[0] != 58) {
+            match (list.push(s.nameAt as usize, nameEnd, s.valueAt as usize, valueEnd, limits.maxHeaders)) {
+                Ok() => {}
+                Err(_) => {
+                    let _ = await post(outgoing, Outgoing.Reset(stream, h3RequestRejected()));
+                    return;
+                }
+            }
+        }
+    }
+    if (!hasPath) {
+        return; // nghttp3 refuses such a request first (RFC 9114 §4.3.1); a CONNECT has none, and is not served
+    }
+    let path = match (StringView.fromUtf8(bytes[pathAt..pathEnd])) {
+        Some(t) => t,
+        null => { return; },
+    };
+    let request = Request.create(method, bytes[tokenAt..tokenEnd], path, Version.Http3, list);
+    let ctx = ConnectionContext.create(context.id, context.acceptedAt, context.drain).withAddresses(context.peer, null);
+    var port = H3Port {
+        stream: stream,
+        body: body.clone(),
+        outgoing: outgoing.clone(),
+        acks: acks.clone(),
+        current: Vector<u8>.create(),
+        at: 0,
+        ended: false,
+        trailers: HeaderBlock.create(),
+    };
+    var none = NoTransport {};
+    var carry = match (OwnedBuffer.create(16)) {
+        Ok(b) => b,
+        Err(_) => { return; },
+    };
+    var out = match (OwnedBuffer.create(16)) {
+        Ok(b) => b,
+        Err(_) => { return; },
+    };
+    var pending = match (OwnedBuffer.create(limits.writeBufferBytes)) {
+        Ok(b) => b,
+        Err(_) => { return; },
+    };
+    var response = match (ResponseHead.create(4096)) {
+        Ok(h) => h,
+        Err(_) => { return; },
+    };
+    var date = DateCache.create(limits.sendDate);
+    let sendable: borrow dyn Application + Send = app.get();
+    let application: borrow dyn Application = sendable;
+    var ex = Exchange.forStream(
+        mut port,
+        mut none,
+        mut carry,
+        mut out,
+        mut pending,
+        mut response,
+        application,
+        request,
+        limits,
+        mut date,
+        hasBody,
+    );
+    var failure: HandlerError? = null;
+    match (await application.handle(request, mut ex, ctx)) {
+        Ok() => {
+            match (await ex.finish()) {
+                Ok() => {}
+                Err(e) => { failure = Some(e); }
+            }
+        }
+        Err(e) => { failure = Some(e); }
+    }
+    match (failure) {
+        Some(HandlerError.Status(s)) => {
+            if (!(await ex.respondError(s, false))) {
+                let _ = await post(outgoing, Outgoing.Reset(stream, h3InternalError()));
+            }
+        }
+        Some(HandlerError.Internal) => {
+            if (!(await ex.respondError(Status.internalServerError(), true))) {
+                let _ = await post(outgoing, Outgoing.Reset(stream, h3InternalError()));
+            }
+        }
+        Some(HandlerError.Io(_)) => { let _ = await post(outgoing, Outgoing.Reset(stream, h3InternalError())); }
+        null => {}
+    }
+}
+
+fn named(a: Slice<u8>, text: StringView) -> bool {
+    let b = text.bytes();
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn channel<T: Send>(n: usize) -> Result<Channel<T>, QuicError> {
+    match (Channel<T>.create(n)) {
+        Ok(c) => { return Ok(c); }
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+}
+
+fn alloc(r: Result<void, AllocError>) -> Result<void, QuicError> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+}

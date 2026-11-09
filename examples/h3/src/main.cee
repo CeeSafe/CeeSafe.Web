@@ -1,0 +1,200 @@
+// HTTP/3: a web_server application served by web_http3's Http3Server (Web ADR 0014 amendment 4), for the HTTP/3
+// interop checks (tests/interop/h3.py). `applicationOf` makes the server a shared application, the one a program
+// would also serve over TCP with `HttpService.of`. Listens on UDP 127.0.0.1:CW_PORT (default 4433) with the
+// certificate chain CW_CERT and key CW_KEY (PEM files), offering ALPN `h3`. It runs until it is killed.
+//
+//   GET  /        "hello, h3"
+//   POST /echo    the request body back (at most 8 MiB)
+//   GET  /big     8 MiB: byte i is 'a' + i % 26
+import web_core;
+import web_http;
+import web_server;
+import web_quic;
+import web_http3;
+
+struct App {}
+
+struct Hello {}
+
+impl Handler<App> for Hello {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> => await exchange.send(Status.ok(), "hello, h3".bytes());
+}
+
+struct Echo {}
+
+impl Handler<App> for Echo {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var body = match (OwnedBuffer.create(8388608)) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        await exchange.readToEnd(mut body)?;
+        return await exchange.send(Status.ok(), body.readable());
+    }
+}
+
+struct Big {}
+
+impl Handler<App> for Big {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        exchange.setStatus(Status.ok());
+        exchange.header("content-type", "application/octet-stream".bytes())?;
+        var piece = [0u8; 65536];
+        var at: usize = 0;
+        let total: usize = 8388608;
+        while (at < total) {
+            let n = if (total - at < piece.length) total - at else piece.length;
+            for (i in 0..n) {
+                piece[i] = 97 + truncate<u8>((at + i) % 26);
+            }
+            await exchange.write(piece[0..n])?;
+            at += n;
+        }
+        return Ok();
+    }
+}
+
+fn handler<H: Handler<App> + Send>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App> + Send>, RouteError> {
+    match (b) {
+        Ok(h) => {
+            let d: Box<dyn Handler<App> + Send> = h;
+            return Ok(d);
+        }
+        Err(_) => { return Err(RouteError.OutOfMemory); }
+    }
+}
+
+/// The limits each request is held to, over HTTP/3 as over HTTP/1.1 and HTTP/2.
+fn limits() -> Limits {
+    var l = Limits.defaults();
+    l.maxBodyBytes = 8388608;
+    return l;
+}
+
+fn application() -> Result<Server<App>, RouteError> {
+    var server = Server<App>.create(App {}, limits())?;
+    server.router().get("/", handler(Box.create(Hello {}))?)?;
+    server.router().post("/echo", handler(Box.create(Echo {}))?)?;
+    server.router().get("/big", handler(Box.create(Big {}))?)?;
+    return Ok(server);
+}
+
+/// Why the server did not start.
+enum Failure {
+    Setting,
+    Certificate,
+    Socket,
+    Memory,
+    Quic,
+}
+
+/// The whole file at the path in environment variable `name`, into `out`.
+async fn readFile(name: StringView, out: borrow mut Vector<u8>) -> Result<void, Failure> {
+    let path = match (Environment.variable(name)) {
+        Some(p) => p,
+        null => { return Err(Failure.Setting); },
+    };
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(_) => { return Err(Failure.Setting); },
+    };
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (await AsyncFiles.read(mut file, mut chunk[..])) {
+            Ok(n) => n,
+            Err(_) => { return Err(Failure.Setting); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        match (out.extend(chunk[0..n])) {
+            Ok() => {}
+            Err(_) => { return Err(Failure.Memory); }
+        }
+    }
+}
+
+fn port() -> u16 {
+    let text = match (Environment.variable("CW_PORT")) {
+        Some(t) => t,
+        null => { return 4433; },
+    };
+    var v: u32 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57 || v > 6553) {
+            return 4433;
+        }
+        v = v * 10 + (b - 48) as u32;
+    }
+    return if (v > 0 && v < 65536) truncate<u16>(v) else 4433;
+}
+
+async fn serve(server: Server<App>) -> Result<void, Failure> {
+    if (!QuicLibrary.initialise()) {
+        return Err(Failure.Quic);
+    }
+    var chain = Vector<u8>.create();
+    var key = Vector<u8>.create();
+    await readFile("CW_CERT", mut chain)?;
+    await readFile("CW_KEY", mut key)?;
+    let protocols = [Alpn.Http3];
+    let quicTls = match (QuicTls.serverFromPem(chain.view(), key.view(), protocols[..])) {
+        Ok(t) => t,
+        Err(_) => { return Err(Failure.Certificate); },
+    };
+    let tls = match (Arc<QuicTls>.create(quicTls)) {
+        Ok(t) => t,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let app = match (applicationOf(server)) {
+        Ok(a) => a,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let local = SocketAddress.V4([127u8, 0, 0, 1], port());
+    let socket = match (AsyncUdpSocket.bind(local, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(Failure.Socket); },
+    };
+    let _ = await AsyncConsole.writeLine("h3: listening");
+    match (await Http3Server.serve(socket, local, tls, app, limits(), drain, Http3Options.defaults())) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(Failure.Quic); }
+    }
+}
+
+fn main() {
+    let server = match (application()) {
+        Ok(s) => s,
+        Err(_) => {
+            Console.writeLine("h3: could not build the routes");
+            return;
+        },
+    };
+    match (Async.run(serve(server))) {
+        Ok() => {}
+        Err(Failure.Setting) => { Console.writeLine("h3: set CW_CERT and CW_KEY to readable paths"); }
+        Err(Failure.Certificate) => { Console.writeLine("h3: the certificate or key could not be used"); }
+        Err(Failure.Socket) => { Console.writeLine("h3: the UDP socket could not be bound"); }
+        Err(Failure.Memory) => { Console.writeLine("h3: out of memory"); }
+        Err(Failure.Quic) => { Console.writeLine("h3: QUIC failed"); }
+    }
+}

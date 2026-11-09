@@ -110,14 +110,29 @@ impl ConnectionHandler for HttpService {
 /// The service of `server`, which it owns from now on.
 public fn serviceOf<S: Send>(server: Server<S>) -> Result<HttpService, NetError> {
     let limits = server.httpLimits;
+    let app = applicationOf(server)?;
+    return Ok(HttpService.of(app, limits));
+}
+
+/// `server` as a shared application, which it owns from now on: the one `serviceOf` serves. Serve it over TCP with
+/// `HttpService.of` and, in the same program, over HTTP/3 with `web_http3`'s `Http3Server.serve`, so both run the
+/// same routes, middleware and state (Web ADR 0014 amendment 4 item 1). `web_server` itself never depends on
+/// `web_http3`.
+public fn applicationOf<S: Send>(server: Server<S>) -> Result<Arc<Box<dyn Application + Send>>, NetError> {
     let boxed: Box<dyn Application + Send> = match (Box.create(server)) {
         Ok(b) => b,
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
     match (Arc<Box<dyn Application + Send>>.create(boxed)) {
-        Ok(app) => { return Ok(HttpService { app: app, httpLimits: limits }); }
+        Ok(app) => { return Ok(app); }
         Err(_) => { return Err(NetError.OutOfMemory); }
     }
+}
+
+impl HttpService {
+    /// The service of a shared application (`applicationOf`), its requests held to `limits`.
+    public fn of(app: Arc<Box<dyn Application + Send>>, limits: Limits) -> HttpService =>
+        HttpService { app: app, httpLimits: limits };
 }
 
 /// Whether `bytes` is where `whole` starts.

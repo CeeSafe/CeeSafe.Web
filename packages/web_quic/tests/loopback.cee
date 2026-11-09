@@ -656,3 +656,58 @@ fn contexts_from_pem() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+/// Streams are written in the order they were made, whatever the order of the writes (Web ADR 0014 amendment 4
+/// item 4): HTTP/3's QPACK encoder stream, made first, then goes out before a request stream whose header block needs
+/// its instructions (RFC 9204 §2.1.2). Each datagram carries one stream's data (amendment 1 item 7), so the first
+/// datagram after both writes must carry the older stream's bytes, though the newer was written first.
+@test
+fn older_streams_are_written_first() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let p = pair()?;
+    var link = linked(p)?;
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var out = [0u8; 1452];
+    var rounds = 0;
+    while (rounds < 20 && !(link.clientSeen.handshake && link.serverSeen.handshake)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    let older = ok(link.client.openUniStream(), "a unidirectional stream")?;
+    let newer = ok(link.client.openStream(), "a bidirectional stream")?;
+    let _ = ok(link.client.writeStream(older, "1".bytes(), false), "the older stream's first byte")?;
+    let _ = ok(link.client.writeStream(newer, "2".bytes(), false), "the newer stream's first byte")?;
+    rounds = 0;
+    while (rounds < 20 && link.serverSeen.data.length < 2) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.equalU64(2, link.serverSeen.data.length as u64)?;
+    // The newer stream written first, then the older.
+    let _ = ok(link.client.writeStream(newer, "b".bytes(), false), "the newer stream's write")?;
+    let _ = ok(link.client.writeStream(older, "a".bytes(), false), "the older stream's write")?;
+    let first = match (ok(link.client.datagram(mut out[..], link.now), "the next datagram")?) {
+        Some(d) => d,
+        null => { return Err(TestFailure.create("a datagram")); },
+    };
+    match (borrow mut link.server) {
+        Some(s) => {
+            ok(s.feed(clientAddress(), 0, out[0..first.length], link.now), "the server's read")?;
+            loop {
+                match (ok(s.nextEvent(buffer.viewMut()), "an event")?) {
+                    Some(QuicEvent.StreamData(stream, n, _)) => {
+                        Check.isTrue(stream == older, "the first data is the older stream's")?;
+                        Check.equalBytes("a".bytes(), buffer.view()[0..n])?;
+                        return Ok();
+                    }
+                    Some(_) => {}
+                    null => { return Err(TestFailure.create("stream data in the first datagram")); }
+                }
+            }
+        }
+        null => { return Err(TestFailure.create("no server")); }
+    }
+}
