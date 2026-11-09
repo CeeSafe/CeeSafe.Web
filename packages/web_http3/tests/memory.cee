@@ -1,0 +1,493 @@
+// HTTP/3 in memory (Web ADR 0014 amendment 4 items 3-5): two QuicConnections exchange datagrams on a fake clock, each
+// with an H3Connection over H3Glue; the client is the package's test client (`H3Connection.client`). Expected
+// outcomes are RFC 9114's and RFC 9204's: fields arrive as sent, in order; bodies arrive whole; a malformed request
+// is a stream error H3_MESSAGE_ERROR (0x10e, §4.1.2, §8.1).
+import web_core;
+import web_quic;
+
+fn ok<T>(r: Result<T, QuicError>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create(what)); }
+    }
+}
+
+fn h3<T>(r: Result<T, H3Error>, what: StringView) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(H3Error.Failed(code)) => {
+            Console.writeLine(code); // nghttp3's code, for the failure's report
+            return Err(TestFailure.create(what));
+        }
+        Err(_) => { return Err(TestFailure.create(what)); }
+    }
+}
+
+fn mem<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+/// What one side received on its current request stream.
+struct Got {
+    /// Each field as `name: value\n`, in order; trailers apart.
+    fields: Vector<u8>;
+    trailers: Vector<u8>;
+    headDone: bool;
+    data: Vector<u8>;
+    ended: bool;
+    stream: i64;
+    /// The code of a RESET_STREAM QUIC delivered, or -1.
+    resetCode: i64;
+}
+
+fn got() -> Got => Got {
+    fields: Vector<u8>.create(),
+    trailers: Vector<u8>.create(),
+    headDone: false,
+    data: Vector<u8>.create(),
+    ended: false,
+    stream: -1,
+    resetCode: -1,
+};
+
+/// One endpoint: its QUIC connection, its HTTP/3 connection once the handshake is done, and what it got.
+struct Side {
+    quic: QuicConnection;
+    h3: H3Connection;
+    started: bool;
+    handshake: bool;
+    got: Got;
+    /// The HTTP/3 code this side closes the connection with, after a connection error; sent once by `round`.
+    closeWith: u64?;
+    closed: bool;
+}
+
+fn clientAddress() -> QuicAddress {
+    let a = SocketAddress.V4([127u8, 0, 0, 1], 50000);
+    return QuicAddress.of(a);
+}
+
+fn serverAddress() -> QuicAddress {
+    let a = SocketAddress.V4([127u8, 0, 0, 1], 4433);
+    return QuicAddress.of(a);
+}
+
+/// Everything QUIC and HTTP/3 have for one side, after it read datagrams: QUIC's events into HTTP/3, HTTP/3's events
+/// into `got`, and HTTP/3's bytes back into QUIC.
+fn process(side: borrow mut Side, buffer: SliceMut<u8>, out: SliceMut<u8>) -> Result<void, TestFailure> {
+    loop {
+        let event = match (ok(side.quic.nextEvent(buffer), "a QUIC event")?) {
+            Some(e) => e,
+            null => { break; },
+        };
+        match (event) {
+            QuicEvent.HandshakeDone => { side.handshake = true; }
+            QuicEvent.StreamReset(stream, code) => {
+                if (stream == side.got.stream) {
+                    side.got.resetCode = truncate<i64>(code);
+                }
+            }
+            _ => {}
+        }
+        // Always into HTTP/3, before it has started too: reading the peer's streams needs nothing of ours, and the
+        // peer's control and QPACK streams may arrive with the handshake's end.
+        let n = match (event) {
+            QuicEvent.StreamData(_, n, _) => n,
+            _ => 0,
+        };
+        match (H3Glue.onQuic(mut side.h3, mut side.quic, event, buffer[0..n])) {
+            Ok() => {}
+            Err(e) => {
+                // A connection error (nghttp3 allows nothing more): close with its code.
+                side.closeWith = Some(H3Errors.closeCode(e));
+                return Ok();
+            }
+        }
+    }
+    if (!side.started && side.quic.handshakeDone()) {
+        h3(H3Glue.start(mut side.h3, mut side.quic), "HTTP/3's streams")?;
+        side.started = true;
+    }
+    loop {
+        let event = match (h3(side.h3.nextEvent(buffer), "an HTTP/3 event")?) {
+            Some(e) => e,
+            null => { break; },
+        };
+        h3(H3Glue.obey(mut side.h3, mut side.quic, event), "obeying HTTP/3")?;
+        match (event) {
+            H3Event.Field(stream, nameLength, valueLength, trailer) => {
+                side.got.stream = stream;
+                let into = if (trailer) borrow mut side.got.trailers else borrow mut side.got.fields;
+                mem(into.extend(buffer[0..nameLength]))?;
+                mem(into.extend(": ".bytes()))?;
+                mem(into.extend(buffer[nameLength..nameLength + valueLength]))?;
+                mem(into.push(10))?;
+            }
+            H3Event.FieldsEnd(_, trailers, fin) => {
+                if (!trailers) {
+                    side.got.headDone = true;
+                }
+                if (fin) {
+                    side.got.ended = true;
+                }
+            }
+            H3Event.Data(stream, n) => {
+                mem(side.got.data.extend(buffer[0..n]))?;
+                side.quic.consume(stream, n as u64); // read at once: give the credit back
+            }
+            H3Event.End(_) => { side.got.ended = true; }
+            _ => {}
+        }
+    }
+    if (side.started) {
+        h3(H3Glue.flush(mut side.h3, mut side.quic, out), "HTTP/3's write")?;
+    }
+    return Ok();
+}
+
+/// The two endpoints; the client's first datagram makes the server's QUIC connection.
+struct Pair {
+    client: Side;
+    server: Side?;
+    serverTls: QuicTls;
+    now: u64;
+}
+
+fn pair() -> Result<Pair, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let alpn = [Alpn.Http3];
+    let serverTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    let clientTls = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    var quic = ok(
+        QuicConnection.client(clientTls, "localhost", clientAddress(), serverAddress(), ids, 1000000000),
+        "the client",
+    )?;
+    quic.creditOnConsume();
+    let client = Side {
+        quic: quic,
+        h3: h3(H3Connection.client(65536), "the client's HTTP/3")?,
+        started: false,
+        handshake: false,
+        got: got(),
+        closeWith: null,
+        closed: false,
+    };
+    return Ok(Pair { client: client, server: null, serverTls: serverTls, now: 1000000000 });
+}
+
+/// One round: the client's datagrams to the server, then the server's to the client, each side processed; then the
+/// clock moves 1 ms and the timers due run.
+fn round(p: borrow mut Pair, buffer: SliceMut<u8>, out: SliceMut<u8>) -> Result<void, TestFailure> {
+    loop {
+        let sent = match (ok(p.client.quic.datagram(out, p.now), "the client's datagram")?) {
+            Some(d) => d,
+            null => { break; },
+        };
+        if (p.server.isNull()) {
+            let ids = ok(QuicIds.random(), "random IDs")?;
+            var quic = ok(
+                QuicConnection.server(p.serverTls, out[0..sent.length], serverAddress(), clientAddress(), ids, p.now),
+                "the server",
+            )?;
+            quic.creditOnConsume();
+            let side = Side {
+                quic: quic,
+                h3: h3(H3Connection.server(65536), "the server's HTTP/3")?,
+                started: false,
+                handshake: false,
+                got: got(),
+                closeWith: null,
+                closed: false,
+            };
+            p.server = Some(side);
+        }
+        match (borrow mut p.server) {
+            Some(s) => {
+                ok(s.quic.feed(clientAddress(), sent.ecn, out[0..sent.length], p.now), "the server's read")?;
+            }
+            null => {}
+        }
+    }
+    match (borrow mut p.server) {
+        Some(s) => {
+            process(s, buffer, out)?;
+            if (s.closed) {
+                return Ok();
+            }
+            match (s.closeWith) {
+                Some(code) => {
+                    let n = ok(s.quic.closeDatagram(Some(code), out, p.now), "the server's close")?;
+                    s.closed = true;
+                    let _ = p.client.quic.feed(serverAddress(), 0, out[0..n], p.now); // Draining, as expected
+                    return Ok();
+                }
+                null => {}
+            }
+            loop {
+                let sent = match (ok(s.quic.datagram(out, p.now), "the server's datagram")?) {
+                    Some(d) => d,
+                    null => { break; },
+                };
+                ok(p.client.quic.feed(serverAddress(), sent.ecn, out[0..sent.length], p.now), "the client's read")?;
+            }
+        }
+        null => {}
+    }
+    process(mut p.client, buffer, out)?;
+    p.now += 1000000;
+    match (p.client.quic.nextTimeout()) {
+        Some(t) => {
+            if (t <= p.now) {
+                ok(p.client.quic.onTimeout(p.now), "the client's timer")?;
+            }
+        }
+        null => {}
+    }
+    match (borrow mut p.server) {
+        Some(s) => {
+            match (s.quic.nextTimeout()) {
+                Some(t) => {
+                    if (t <= p.now) {
+                        ok(s.quic.onTimeout(p.now), "the server's timer")?;
+                    }
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+/// Buffers for the rounds.
+struct Buffers {
+    buffer: Vector<u8>;
+    out: Vector<u8>;
+}
+
+fn buffers() -> Result<Buffers, TestFailure> {
+    var b = Buffers { buffer: Vector<u8>.create(), out: Vector<u8>.create() };
+    mem(b.buffer.resize(65536, 0))?;
+    mem(b.out.resize(1452, 0))?;
+    return Ok(b);
+}
+
+/// Rounds until both sides have started HTTP/3.
+fn connect(p: borrow mut Pair, b: borrow mut Buffers) -> Result<void, TestFailure> {
+    var rounds = 0;
+    while (rounds < 30) {
+        round(p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+        let serverUp = match (borrow p.server) {
+            Some(s) => s.started,
+            null => false,
+        };
+        if (p.client.started && serverUp) {
+            return Ok();
+        }
+    }
+    return Err(TestFailure.create("HTTP/3 started on both sides"));
+}
+
+fn fields(pairs: Slice<StringView>) -> Result<H3Fields, TestFailure> {
+    var f = H3Fields.create();
+    var i: usize = 0;
+    while (i + 1 < pairs.length) {
+        mem(f.add(pairs[i].bytes(), pairs[i + 1].bytes()))?;
+        i += 2;
+    }
+    return Ok(f);
+}
+
+fn server(p: borrow mut Pair) -> Result<borrow mut Side, TestFailure> {
+    match (borrow mut p.server) {
+        Some(s) => { return Ok(s); }
+        null => { return Err(TestFailure.create("no server")); }
+    }
+}
+
+/// A GET and its answer. Expected: the server sees the request's four pseudo-header fields in the order sent and the
+/// stream's end with them (no body, RFC 9114 §4.1); the client sees `:status` 200 first, then the answer's field and
+/// its body, then the end.
+@test
+fn get_and_its_answer() -> Result<void, TestFailure> {
+    var p = pair()?;
+    var b = buffers()?;
+    connect(mut p, mut b)?;
+    let stream = ok(p.client.quic.openStream(), "a request stream")?;
+    p.client.got.stream = stream;
+    let names = [":method", "GET", ":scheme", "https", ":authority", "localhost", ":path", "/hello"];
+    let request = fields(names[..])?;
+    h3(p.client.h3.request(stream, request, false), "the request")?;
+    var rounds = 0;
+    while (rounds < 30 && !server(mut p)?.got.ended) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    let s = server(mut p)?;
+    Check.isTrue(s.got.ended && s.got.headDone, "the server saw the request's head and end")?;
+    Check.isTrue(s.got.stream == stream, "on the client's stream")?;
+    Check.equalBytes(":method: GET\n:scheme: https\n:authority: localhost\n:path: /hello\n".bytes(), s.got.fields.view())?;
+    let names2 = [":status", "200", "content-type", "text/plain"];
+    let answer = fields(names2[..])?;
+    h3(s.h3.respond(stream, answer, true), "the answer's head")?;
+    Check.equalU64(9, h3(s.h3.sendBody(stream, "hello, h3".bytes(), true), "the answer's body")? as u64)?;
+    rounds = 0;
+    while (rounds < 30 && !p.client.got.ended) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    Check.isTrue(p.client.got.ended, "the client saw the answer's end")?;
+    Check.equalBytes(":status: 200\ncontent-type: text/plain\n".bytes(), p.client.got.fields.view())?;
+    Check.equalBytes("hello, h3".bytes(), p.client.got.data.view())?;
+    return Ok();
+}
+
+/// Byte `i` of the large bodies.
+fn pattern(i: usize) -> u8 => 97 + truncate<u8>(i % 26);
+
+/// Sends what `side`'s body for `stream` takes of `total` pattern bytes from `sent`: the new `sent`.
+fn feedBody(side: borrow mut Side, stream: i64, sent: usize, total: usize) -> Result<usize, TestFailure> {
+    var piece = [0u8; 16384];
+    var at = sent;
+    while (at < total) {
+        let n: usize = if (total - at < piece.length) total - at else piece.length;
+        for (i in 0..n) {
+            piece[i] = pattern(at + i);
+        }
+        let taken = h3(side.h3.sendBody(stream, piece[0..n], at + n == total), "a body piece")?;
+        at += taken;
+        if (taken < n) {
+            break; // the body queue is full: more after BodyRoom (it is offered again each round)
+        }
+    }
+    return Ok(at);
+}
+
+/// A POST of 3 MiB, answered with 3 MiB: more than a body queue (256 KiB), a QUIC stream's hold (1 MiB) and a
+/// stream's flow-control window (1 MiB) each, so every bound waits and resumes. Expected: both bodies arrive whole and
+/// in order.
+@test
+fn large_bodies_both_ways() -> Result<void, TestFailure> {
+    var p = pair()?;
+    var b = buffers()?;
+    connect(mut p, mut b)?;
+    let total: usize = 3 * 1048576;
+    let stream = ok(p.client.quic.openStream(), "a request stream")?;
+    p.client.got.stream = stream;
+    let names = [":method", "POST", ":scheme", "https", ":authority", "localhost", ":path", "/echo"];
+    let request = fields(names[..])?;
+    h3(p.client.h3.request(stream, request, true), "the request")?;
+    var sent: usize = 0;
+    var rounds = 0;
+    while (rounds < 100000 && !server(mut p)?.got.ended) {
+        sent = feedBody(mut p.client, stream, sent, total)?;
+        h3(H3Glue.flush(mut p.client.h3, mut p.client.quic, b.out.viewMut()), "the client's write")?;
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    let s = server(mut p)?;
+    Check.isTrue(s.got.ended, "the request's end arrived")?;
+    Check.equalU64(total as u64, s.got.data.length as u64)?;
+    let body = s.got.data.view();
+    for (i in 0..body.length) {
+        if (body[i] != pattern(i)) {
+            return Err(TestFailure.create("the request body, in order"));
+        }
+    }
+    let names2 = [":status", "200"];
+    let answer = fields(names2[..])?;
+    h3(s.h3.respond(stream, answer, true), "the answer's head")?;
+    var answered: usize = 0;
+    rounds = 0;
+    while (rounds < 100000 && !p.client.got.ended) {
+        answered = feedBody(server(mut p)?, stream, answered, total)?;
+        let s2 = server(mut p)?;
+        h3(H3Glue.flush(mut s2.h3, mut s2.quic, b.out.viewMut()), "the server's write")?;
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    Check.isTrue(p.client.got.ended, "the answer's end arrived")?;
+    Check.equalU64(total as u64, p.client.got.data.length as u64)?;
+    let back = p.client.got.data.view();
+    for (i in 0..back.length) {
+        if (back[i] != pattern(i)) {
+            return Err(TestFailure.create("the answer body, in order"));
+        }
+    }
+    return Ok();
+}
+
+/// A request without `:path` is malformed (RFC 9114 §4.3.1): an H3_MESSAGE_ERROR, 0x10e (§4.1.2, §8.1). nghttp3 makes
+/// it a connection error, which §8 allows (Web ADR 0014 amendment 4 item 3). Expected: the server closes the
+/// connection with application error 0x10e, and its application never sees the request's head.
+@test
+fn a_malformed_request_closes_the_connection() -> Result<void, TestFailure> {
+    var p = pair()?;
+    var b = buffers()?;
+    connect(mut p, mut b)?;
+    let stream = ok(p.client.quic.openStream(), "a request stream")?;
+    p.client.got.stream = stream;
+    let names = [":method", "GET", ":scheme", "https", ":authority", "localhost"];
+    let request = fields(names[..])?;
+    h3(p.client.h3.request(stream, request, false), "the request")?;
+    var rounds = 0;
+    while (rounds < 30 && p.client.quic.peerApplicationClose().isNull()) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    match (p.client.quic.peerApplicationClose()) {
+        Some(code) => { Check.equalU64(0x10e, code)?; }
+        null => { return Err(TestFailure.create("the server closed the connection")); }
+    }
+    Check.isTrue(!server(mut p)?.got.headDone, "the server's application never got the head")?;
+    return Ok();
+}
+
+/// Trailers after a body, both ways (RFC 9114 §4.1). Expected: each side sees the other's trailer fields apart from
+/// its head, after the body, and then the end.
+@test
+fn trailers_both_ways() -> Result<void, TestFailure> {
+    var p = pair()?;
+    var b = buffers()?;
+    connect(mut p, mut b)?;
+    let stream = ok(p.client.quic.openStream(), "a request stream")?;
+    p.client.got.stream = stream;
+    let names = [":method", "POST", ":scheme", "https", ":authority", "localhost", ":path", "/t"];
+    let request = fields(names[..])?;
+    h3(p.client.h3.request(stream, request, true), "the request")?;
+    let _ = h3(p.client.h3.sendBody(stream, "body".bytes(), false), "the request body")?;
+    let t = ["x-request-check", "1"];
+    let requestTrailers = fields(t[..])?;
+    h3(p.client.h3.trailers(stream, requestTrailers), "the request's trailers")?;
+    var rounds = 0;
+    while (rounds < 30 && !server(mut p)?.got.ended) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    let s = server(mut p)?;
+    Check.isTrue(s.got.ended, "the request ended")?;
+    Check.equalBytes("body".bytes(), s.got.data.view())?;
+    Check.equalBytes("x-request-check: 1\n".bytes(), s.got.trailers.view())?;
+    let names2 = [":status", "200"];
+    let answer = fields(names2[..])?;
+    h3(s.h3.respond(stream, answer, true), "the answer's head")?;
+    let _ = h3(s.h3.sendBody(stream, "answer".bytes(), false), "the answer body")?;
+    let t2 = ["x-answer-check", "2"];
+    let answerTrailers = fields(t2[..])?;
+    h3(s.h3.trailers(stream, answerTrailers), "the answer's trailers")?;
+    rounds = 0;
+    while (rounds < 30 && !p.client.got.ended) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    Check.isTrue(p.client.got.ended, "the answer ended")?;
+    Check.equalBytes(":status: 200\n".bytes(), p.client.got.fields.view())?;
+    Check.equalBytes("answer".bytes(), p.client.got.data.view())?;
+    Check.equalBytes("x-answer-check: 2\n".bytes(), p.client.got.trailers.view())?;
+    return Ok();
+}

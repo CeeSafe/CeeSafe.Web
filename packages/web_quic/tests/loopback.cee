@@ -46,6 +46,7 @@ fn describe(e: QuicError) -> StringView => match (e) {
     QuicError.NoMemory => "NoMemory",
     QuicError.BufferTooSmall(_) => "BufferTooSmall",
     QuicError.Failed(_) => "Failed",
+    QuicError.Tls => "Tls",
 };
 
 fn setup<T>(r: Result<T, TlsSetupError>, what: StringView) -> Result<T, TestFailure> {
@@ -593,5 +594,65 @@ fn one_direction_reset_and_stop() -> Result<void, TestFailure> {
         rounds += 1;
     }
     Check.isTrue(link.serverSeen.stopCode == 9, "the server saw STOP_SENDING with code 9")?;
+    return Ok();
+}
+
+/// `QuicTls.serverFromPem` and `clientFromPem` make contexts that complete a handshake with ALPN h3, as `QuicTls.of`'s
+/// do; a key that is not PEM is refused with `QuicError.Tls`.
+@test
+fn contexts_from_pem() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let alpn = [Alpn.Http3];
+    let server = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "the server's")?;
+    let client = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "the client's")?;
+    Check.isTrue(server.isServer() && !client.isServer(), "each side's")?;
+    match (QuicTls.serverFromPem(serverPem().bytes(), "not a key".bytes(), alpn[..])) {
+        Err(QuicError.Tls) => {}
+        _ => { return Err(TestFailure.create("a key that is not PEM is refused")); }
+    }
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    var c = ok(QuicConnection.client(client, "localhost", clientAddress(), serverAddress(), ids, 1000000000), "client")?;
+    var out = [0u8; 1452];
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    let first = match (ok(c.datagram(mut out[..], 1000000000), "the Initial")?) {
+        Some(d) => d,
+        null => { return Err(TestFailure.create("an Initial")); },
+    };
+    let sids = ok(QuicIds.random(), "random IDs")?;
+    var s = ok(
+        QuicConnection.server(server, out[0..first.length], serverAddress(), clientAddress(), sids, 1000000000),
+        "the server",
+    )?;
+    var now: u64 = 1000000000;
+    ok(s.feed(clientAddress(), 0, out[0..first.length], now), "the server's read")?;
+    var rounds = 0;
+    while (rounds < 20 && !(c.handshakeDone() && s.handshakeDone())) {
+        loop {
+            let d = match (ok(s.datagram(mut out[..], now), "the server's datagram")?) {
+                Some(d) => d,
+                null => { break; },
+            };
+            ok(c.feed(serverAddress(), 0, out[0..d.length], now), "the client's read")?;
+        }
+        loop {
+            let d = match (ok(c.datagram(mut out[..], now), "the client's datagram")?) {
+                Some(d) => d,
+                null => { break; },
+            };
+            ok(s.feed(clientAddress(), 0, out[0..d.length], now), "the server's read")?;
+        }
+        while (ok(c.nextEvent(buffer.viewMut()), "an event")?.isSome()) {}
+        while (ok(s.nextEvent(buffer.viewMut()), "an event")?.isSome()) {}
+        now += 1000000;
+        rounds += 1;
+    }
+    Check.isTrue(c.handshakeDone() && s.handshakeDone(), "the handshake")?;
+    match (c.alpn()) {
+        Alpn.Http3 => {}
+        _ => { return Err(TestFailure.create("ALPN h3")); }
+    }
     return Ok();
 }

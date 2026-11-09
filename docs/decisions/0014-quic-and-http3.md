@@ -450,16 +450,31 @@ This amendment replaces amendment 1's items 4, 5 and 6.
    - **Settings:** QPACK's dynamic table 4 KiB and 16 blocked streams (§3.6); `max_field_section_size` from
      `Limits.maxHeadBytes`.
    - **Validation is nghttp3's** (RFC 9114 §4.1.2 and §4.3: pseudo-header fields, connection-specific fields,
-     `content-length` against DATA): a malformed request is reset with H3_MESSAGE_ERROR by nghttp3 itself. The tests
-     check it from outside.
+     `content-length` against DATA).
+   - **Errors.** A malformed request makes `nghttp3_conn_read_stream` fail, and nghttp3 then allows only
+     `nghttp3_conn_del`. So the connection closes with the code nghttp3 infers, H3_MESSAGE_ERROR (0x10e). RFC 9114 §8
+     lets an endpoint treat a stream error as a connection error.
+     - The same holds for every error from `read`, `pull`, `wrote`, `bind`, `shutdownRead` and `closeStream`: close
+       with `H3Errors.closeCode`.
+     - Errors from `respond`, `sendBody` and `trailers` concern only their stream.
+     - (This replaces the first wording here, "a malformed request is reset with H3_MESSAGE_ERROR by nghttp3 itself",
+       which the first test disproved.)
 4. **The engine:** `H3Connection` (sans-I/O) over the shim. **The driver:** `Http3Server.serve(socket, local, tls,
    app, limits, options)` runs `web_quic`'s `QuicServer` with an `Http3Application`. Its connection task owns the
    `QuicLink` and the `H3Connection`. Each request runs in its own task with `Exchange.forStream` and an `H3Port`
    implementing `StreamSink` over channels to the connection task, as HTTP/2's `StreamPort` does (Web ADR 0011
    §3.2).
-5. **A client for the tests only.** The shim can also make a client `nghttp3_conn` (`h3_conn_client`), used through a
-   non-public `H3TestClient` in `web_http3`'s tests: package tests see non-public items (as `web_http2`'s tests use
-   `read32`). It is not API, so the owner's answer 7 (no HTTP/3 client) holds.
+   - **Before the handshake ends,** QUIC's stream events still go to nghttp3: reading the peer's streams needs nothing
+     of ours. Only opening and binding our three streams, and flushing, wait for the handshake.
+     - A first harness dropped events until then. The server then never saw the client's control and QPACK decoder
+       streams, which came with the handshake's last flight, and failed with H3_CLOSED_CRITICAL_STREAM.
+   - **`H3Glue`** (`web_http3/src/glue.cee`) is that plumbing, written once over `H3Streams`, which `QuicConnection`
+     and `QuicLink` implement. web_quic gains `QuicTls.serverFromPem` and `clientFromPem`, so a package with no
+     dependency on `web_tls` can make contexts, and `QuicConnection.peerApplicationClose`, the peer's application
+     close code.
+5. **A client for the tests only.** The shim can also make a client `nghttp3_conn` (`h3_conn_client`). It is used
+   through the non-public `H3Connection.client` and `request` in `web_http3`'s tests: package tests see non-public
+   items (as `web_http2`'s tests use `read32`). It is not API, so the owner's answer 7 (no HTTP/3 client) holds.
 6. **Interop:** ngtcp2's example client in its HTTP/3 build (`osslclient`, amendment 3 item 2) and curl where it has
    HTTP/3.
 7. **One direction at a time:** web_quic gains `resetSending` (RESET_STREAM only) and `stopReading` (STOP_SENDING

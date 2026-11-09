@@ -58,6 +58,8 @@ extern "C" {
     @effects()
     fn qs_open_uni(conn: *mut void) -> i64;
     @effects()
+    fn qs_peer_close(conn: *mut void, code: *mut u64) -> i32;
+    @effects()
     fn qs_set_manual_credit(conn: *mut void);
     @effects()
     fn qs_consume(conn: *mut void, stream: i64, n: u64);
@@ -102,6 +104,8 @@ public enum QuicError {
     BufferTooSmall(usize),
     /// The connection failed: send `closeDatagram`, then drop it. ngtcp2's code, for the log.
     Failed(i32),
+    /// A certificate, key, trust list or ALPN list was refused (`QuicTls.serverFromPem`, `clientFromPem`).
+    Tls,
 }
 
 /// What happened on a connection, from `nextEvent`.
@@ -215,6 +219,31 @@ public struct QuicTls {
             return Err(QuicError.NoMemory);
         }
         return Ok(QuicTls { raw: raw, serverSide: server });
+    }
+
+    /// A server's context for the PEM certificate chain `chain` and its key, offering `protocols` (ALPN, in order of
+    /// preference): `web_tls`'s `TlsConfig.server` and `setAlpn`, for a program that needs no other TLS setting.
+    public fn serverFromPem(chain: Slice<u8>, key: Slice<u8>, protocols: Slice<Alpn>) -> Result<QuicTls, QuicError> {
+        var config = match (TlsConfig.server(chain, key)) {
+            Ok(c) => c,
+            Err(_) => { return Err(QuicError.Tls); },
+        };
+        if (config.setAlpn(protocols).isErr()) {
+            return Err(QuicError.Tls);
+        }
+        return QuicTls.of(config); // its own reference to the SSL_CTX: `config` may go
+    }
+
+    /// A client's context trusting the PEM roots in `trust`, offering `protocols`.
+    public fn clientFromPem(trust: Slice<u8>, protocols: Slice<Alpn>) -> Result<QuicTls, QuicError> {
+        var config = match (TlsConfig.client()) {
+            Ok(c) => c,
+            Err(_) => { return Err(QuicError.Tls); },
+        };
+        if (config.trustPem(trust).isErr() || config.setAlpn(protocols).isErr()) {
+            return Err(QuicError.Tls);
+        }
+        return QuicTls.of(config);
     }
 
     /// Whether this is a server's.
@@ -415,6 +444,15 @@ public struct QuicConnection {
             return Err(QuicErrors.of(truncate<i32>(id)));
         }
         return Ok(id);
+    }
+
+    /// The application error code the peer closed the connection with (CONNECTION_CLOSE of type 0x1d, RFC 9000
+    /// §19.19), or null if it has not closed it so.
+    /// Safety: the shim writes the one value.
+    public fn peerApplicationClose(borrow this) -> u64? {
+        var code: u64 = 0;
+        let kind = unsafe { qs_peer_close(this.raw, borrow mut code as *mut u64) };
+        return if (kind == 2) Some(code) else null;
     }
 
     /// Opens a unidirectional stream: its ID (HTTP/3's control and QPACK streams, Web ADR 0014 amendment 4 item 2).

@@ -862,6 +862,21 @@ int64_t qs_open_bidi(qs_conn *c) {
     return rv != 0 ? rv : id;
 }
 
+/* How the peer closed the connection: 0 if it has not, 1 with a transport error code, 2 with an application's, the
+   code in *code (RFC 9000 §19.19). */
+int32_t qs_peer_close(qs_conn *c, uint64_t *code) {
+    const ngtcp2_ccerr *e = ngtcp2_conn_get_ccerr2(c->conn);
+    *code = e->error_code;
+    switch (e->type) {
+    case NGTCP2_CCERR_TYPE_TRANSPORT:
+        return e->error_code == 0 && e->frame_type == 0 ? 0 : 1;
+    case NGTCP2_CCERR_TYPE_APPLICATION:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
 /* Opens a unidirectional stream: its ID, or ngtcp2's error (STREAM_ID_BLOCKED when the peer's limit is reached). */
 int64_t qs_open_uni(qs_conn *c) {
     int64_t id;
