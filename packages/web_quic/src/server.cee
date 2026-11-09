@@ -306,6 +306,15 @@ public struct QuicLink {
                 null => { return Ok(); },
             };
             let bytes = copied(this.out.view()[0..sent.length])?;
+            // Where ngtcp2 sends it: the peer's address, which follows it when it migrates (RFC 9000 §9).
+            match (sent.to.socketAddress()) {
+                Some(a) => {
+                    if (!sameAddress(a, this.peer)) {
+                        this.peer = a;
+                    }
+                }
+                null => {}
+            }
             await this.post(ToListener.Send(bytes, this.peer))?;
         }
     }
@@ -840,6 +849,17 @@ fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
     }
     for (i in 0..a.length) {
         if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn sameAddress(a: SocketAddress, b: SocketAddress) -> bool {
+    let x = QuicAddress.of(a);
+    let y = QuicAddress.of(b);
+    for (i in 0..19) {
+        if (x.bytes[i] != y.bytes[i]) {
             return false;
         }
     }

@@ -1,0 +1,219 @@
+// Connection migration (RFC 9000 §9, Web ADR 0014 amendment 5 item 4) over real UDP. A client completes a handshake
+// from socket A with a QuicServer serving HqFiles, then binds socket B, migrates to it (`QuicConnection.migrate`), and
+// from then on sends and reads only on B. Expected: the server validates the new path (§8.2) and answers there, so a
+// 3 MiB file requested after the migration arrives whole on B; were the server still sending to A, nothing would
+// arrive, and the test would fail at its deadline.
+import web_core;
+
+/// The client: its connection, the socket it now uses, and what it received on its stream.
+struct Mover {
+    socket: AsyncUdpSocket;
+    conn: QuicConnection;
+    server: SocketAddress;
+    buffer: Vector<u8>;
+    out: Vector<u8>;
+    got: Vector<u8>;
+    fin: bool;
+}
+
+/// Events, datagrams out, then a wait of at most `capMs` for a datagram on the current socket or the timer.
+async fn turn(m: borrow mut Mover, capMs: u64) -> Result<void, TestFailure> {
+    loop {
+        match (m.conn.nextEvent(m.buffer.viewMut())) {
+            Ok(Some(QuicEvent.StreamData(_, n, fin))) => {
+                if (m.got.extend(m.buffer.view()[0..n]).isErr()) {
+                    return Err(TestFailure.create("out of memory"));
+                }
+                if (fin) {
+                    m.fin = true;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(null) => { break; }
+            Err(_) => { return Err(TestFailure.create("an event")); }
+        }
+    }
+    loop {
+        let d = match (m.conn.datagram(m.out.viewMut(), Clock.monotonicNanos())) {
+            Ok(Some(d)) => d,
+            Ok(null) => { break; },
+            Err(_) => { return Err(TestFailure.create("a datagram")); },
+        };
+        match (await m.socket.sendTo(m.out.view()[0..d.length], m.server)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("sending")); }
+        }
+    }
+    let raced: Result<Raced<Datagram?>, AsyncError> = await Async.race(
+        async () => {
+            let d = await m.socket.recvFrom(m.buffer.viewMut())?;
+            return Ok(Some(d));
+        },
+        async () => {
+            await Timer.sleep(capMs)?;
+            return Ok(null);
+        },
+    );
+    let won: Raced<Datagram?> = match (raced) {
+        Ok(w) => w,
+        Err(_) => { return Err(TestFailure.create("waiting")); },
+    };
+    let datagram: Datagram? = if (won.winner == 0) won.value else match (won.other) {
+        Some(d) => d,
+        null => won.value,
+    };
+    let now = Clock.monotonicNanos();
+    match (datagram) {
+        Some(d) => {
+            match (m.conn.feed(QuicAddress.of(d.from), 0, m.buffer.view()[0..d.length], now)) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("a read")); }
+            }
+        }
+        null => {
+            match (m.conn.nextTimeout()) {
+                Some(t) => {
+                    if (t <= now) {
+                        match (m.conn.onTimeout(now)) {
+                            Ok() => {}
+                            Err(_) => { return Err(TestFailure.create("a timer")); }
+                        }
+                    }
+                }
+                null => {}
+            }
+        }
+    }
+    return Ok();
+}
+
+async fn migrating(clientTls: borrow QuicTls, server: SocketAddress) -> Result<Vector<u8>, TestFailure> {
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let first = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("socket A")); },
+    };
+    let firstAddress = match (first.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("socket A's address")); },
+    };
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    let conn = ok(
+        QuicConnection.client(
+            clientTls,
+            "localhost",
+            QuicAddress.of(firstAddress),
+            QuicAddress.of(server),
+            ids,
+            Clock.monotonicNanos(),
+        ),
+        "the client",
+    )?;
+    var m = Mover {
+        socket: first,
+        conn: conn,
+        server: server,
+        buffer: Vector<u8>.create(),
+        out: Vector<u8>.create(),
+        got: Vector<u8>.create(),
+        fin: false,
+    };
+    if (m.buffer.resize(quicEventBufferSize(), 0).isErr() || m.out.resize(quicDatagramSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    let deadline = Clock.monotonicNanos() + 10000000000;
+    while (!m.conn.handshakeDone()) {
+        if (Clock.monotonicNanos() > deadline) {
+            return Err(TestFailure.create("the handshake did not finish in 10 s"));
+        }
+        await turn(mut m, 10)?;
+    }
+    for (i in 0..20) {
+        await turn(mut m, 10)?; // the server's new connection IDs arrive: a migration needs a fresh one (§9.5)
+    }
+    // Socket B, and the migration to it.
+    let second = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("socket B")); },
+    };
+    let secondAddress = match (second.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("socket B's address")); },
+    };
+    ok(m.conn.migrate(QuicAddress.of(secondAddress), Clock.monotonicNanos()), "the migration")?;
+    m.socket = second; // A is closed: only B is read from now on
+    let stream = ok(m.conn.openStream(), "a stream")?;
+    let _ = ok(m.conn.writeStream(stream, "GET /large.bin\r\n".bytes(), true), "the request")?;
+    let end = Clock.monotonicNanos() + 20000000000;
+    while (!m.fin) {
+        if (Clock.monotonicNanos() > end) {
+            return Err(TestFailure.create("the file did not arrive on the new path in 20 s"));
+        }
+        await turn(mut m, 10)?;
+    }
+    return Ok(m.got);
+}
+
+enum Moved {
+    Server,
+    Client(Vector<u8>),
+    ClientFailed(TestFailure),
+}
+
+@test
+async fn migration_moves_the_connection() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    var files = await Async.blocking(() => Files.create())?;
+    let alpn = [Alpn.Http3];
+    let serverTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    let clientTls = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the server's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the server's address")); },
+    };
+    let tls = match (Arc<QuicTls>.create(serverTls)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let hq = match (HqFiles.create(files.dir.view())) {
+        Ok(h) => h,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let boxed: Box<dyn QuicApplication + Send> = match (Box.create(hq)) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let raced: Result<Raced<Moved>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await QuicServer.serve(socket, local, tls, app, QuicServerOptions.defaults());
+            return Ok(Moved.Server);
+        },
+        async () => {
+            match (await migrating(clientTls, local)) {
+                Ok(g) => { return Ok(Moved.Client(g)); }
+                Err(e) => { return Ok(Moved.ClientFailed(e)); }
+            }
+        },
+    );
+    await Async.blocking(() => files.remove());
+    let won = match (raced) {
+        Ok(w) => w,
+        Err(_) => { return Err(TestFailure.create("the race")); },
+    };
+    let got = match (won.value) {
+        Moved.Client(g) => g,
+        Moved.ClientFailed(e) => { return Err(e); },
+        Moved.Server => { return Err(TestFailure.create("the server ended")); },
+    };
+    Check.equalU64(3 * 1048576, got.length as u64)?;
+    return Check.isTrue(isPattern(got.view()), "the file's bytes, in order, on the new path");
+}

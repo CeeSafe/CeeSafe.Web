@@ -122,6 +122,30 @@ static int qs_addr_from(qs_addr *out, const uint8_t *in) {
     return 0;
 }
 
+/* The 19-byte form of `a` (an IPv4 or IPv6 socket address): 1 if written. */
+static int qs_addr_bytes(const ngtcp2_addr *a, uint8_t *out) {
+    memset(out, 0, QS_ADDR_BYTES);
+    if (a->addr->sa_family == AF_INET) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)(const void *)a->addr;
+        uint16_t port = ntohs(v4->sin_port);
+        out[0] = 4;
+        out[1] = (uint8_t)(port >> 8);
+        out[2] = (uint8_t)port;
+        memcpy(out + 3, &v4->sin_addr, 4);
+        return 1;
+    }
+    if (a->addr->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)(const void *)a->addr;
+        uint16_t port = ntohs(v6->sin6_port);
+        out[0] = 6;
+        out[1] = (uint8_t)(port >> 8);
+        out[2] = (uint8_t)port;
+        memcpy(out + 3, &v6->sin6_addr, 16);
+        return 1;
+    }
+    return 0;
+}
+
 /* ---- TLS contexts: web_tls's SSL_CTX, with a reference of our own ---- */
 
 /* web_tls's shim (packages/web_tls/c/tls_shim.c), linked into the same program: binds a server SSL to the
@@ -766,9 +790,40 @@ int32_t qs_read(qs_conn *c, const uint8_t *remote, uint32_t ecn, const uint8_t *
     return rv;
 }
 
+static int64_t qs_write_one(qs_conn *c, uint8_t *out, size_t cap, uint64_t now, uint32_t *ecn);
+
 /* The next datagram to send, into `out` (`cap` bytes): its length, 0 if there is nothing to send now, or ngtcp2's
-   error. Each call writes one packet, with stream data from at most one stream. */
-int64_t qs_write(qs_conn *c, uint8_t *out, size_t cap, uint64_t now, uint32_t *ecn) {
+   error. Each call writes one packet, with stream data from at most one stream. Its destination, in 19-byte form, is
+   written to `to`: ngtcp2 chooses the path, which changes when the peer migrates (RFC 9000 §9) and while a new path is
+   validated (§8.2). */
+int64_t qs_write(qs_conn *c, uint8_t *out, size_t cap, uint64_t now, uint32_t *ecn, uint8_t *to) {
+    int64_t n = qs_write_one(c, out, cap, now, ecn);
+    if (n > 0 && !qs_addr_bytes(&c->path.remote, to)) {
+        return NGTCP2_ERR_INTERNAL;
+    }
+    return n;
+}
+
+/* Moves a client connection to the local address `local` (19 bytes): ngtcp2 validates the new path, then uses it
+   (RFC 9000 §9.2). 0, or ngtcp2's error. */
+int32_t qs_migrate(qs_conn *c, const uint8_t *local, uint64_t now) {
+    qs_addr fresh;
+    if (!qs_addr_from(&fresh, local)) {
+        return NGTCP2_ERR_INVALID_ARGUMENT;
+    }
+    ngtcp2_path path = c->path;
+    path.local.addr = (ngtcp2_sockaddr *)&fresh.storage;
+    path.local.addrlen = fresh.length;
+    int rv = ngtcp2_conn_initiate_migration(c->conn, &path, now);
+    if (rv == 0) {
+        c->local = fresh;
+        c->path.local.addr = (ngtcp2_sockaddr *)&c->local.storage;
+        c->path.local.addrlen = c->local.length;
+    }
+    return rv;
+}
+
+static int64_t qs_write_one(qs_conn *c, uint8_t *out, size_t cap, uint64_t now, uint32_t *ecn) {
     ngtcp2_pkt_info pi;
     memset(&pi, 0, sizeof pi);
     for (qs_stream *s = c->streams; s; s = s->next) {

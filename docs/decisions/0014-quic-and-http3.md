@@ -569,3 +569,11 @@ This amendment replaces amendment 1's items 4, 5 and 6.
      `QuicConnection.retried()` gives the client's view.
    - **§3.5's "encrypted tokens carrying the address and a time"** are ngtcp2's token format (AEAD under a key
      derived from `retryKey`), not one of our own.
+4. **Migration** (RFC 9000 §9; §3.5).
+   - **The server follows the client.** ngtcp2 validates the new path (§8.2) and chooses where each packet goes.
+     `QuicConnection.datagram` now reports that destination (`QuicOut.to`), and `QuicLink` sends each datagram there,
+     so its `peerAddress` follows the client. The listener already routes by connection ID, so the new path's
+     datagrams reach the same connection.
+     - Before, every datagram went to the address of the client's first Initial, so a migrated client heard nothing.
+   - **The server never migrates,** and sends no preferred address (§3.5). `QuicConnection.migrate(local)` is the
+     client's side: ngtcp2's `initiate_migration`, used by the tests.

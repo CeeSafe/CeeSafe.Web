@@ -61,7 +61,9 @@ extern "C" {
     @effects()
     fn qs_read(conn: *mut void, remote: *u8, ecn: u32, packet: *u8, length: usize, now: u64) -> i32;
     @effects()
-    fn qs_write(conn: *mut void, out: *mut u8, capacity: usize, now: u64, ecn: *mut u32) -> i64;
+    fn qs_write(conn: *mut void, out: *mut u8, capacity: usize, now: u64, ecn: *mut u32, to: *mut u8) -> i64;
+    @effects()
+    fn qs_migrate(conn: *mut void, local: *u8, now: u64) -> i32;
     @effects()
     fn qs_close(conn: *mut void, app: i32, code: u64, out: *mut u8, capacity: usize, now: u64) -> i64;
     @effects()
@@ -201,6 +203,23 @@ public struct QuicHeader {
 /// A UDP endpoint as the shim takes it: family (4 or 6), the port big-endian, then 16 address bytes.
 public struct QuicAddress {
     public bytes: [u8; 19];
+
+    /// The socket address this is (a zone of 0 for IPv6), or null if the bytes are neither form.
+    public fn socketAddress(borrow this) -> SocketAddress? {
+        let b = this.bytes;
+        let port = (b[1] as u16 << 8) | b[2] as u16;
+        if (b[0] == 4) {
+            return Some(SocketAddress.V4([b[3], b[4], b[5], b[6]], port));
+        }
+        if (b[0] == 6) {
+            var ip = [0u8; 16];
+            for (i in 0..16) {
+                ip[i] = b[3 + i];
+            }
+            return Some(SocketAddress.V6(ip, port, 0));
+        }
+        return null;
+    }
 
     /// The shim's form of `a`. A zone is not carried (a link-local peer's zone is the socket's).
     public fn of(a: borrow SocketAddress) -> QuicAddress {
@@ -431,14 +450,22 @@ public struct QuicConnection {
     /// Safety: the shim writes at most `out.length` bytes into `out`.
     public fn datagram(borrow mut this, out: SliceMut<u8>, now: u64) -> Result<QuicOut?, QuicError> {
         var ecn: u32 = 0;
-        let n = unsafe { qs_write(this.raw, out.ptr, out.length, now, borrow mut ecn as *mut u32) };
+        var to = QuicAddress { bytes: [0u8; 19] };
+        let n = unsafe { qs_write(
+            this.raw,
+            out.ptr,
+            out.length,
+            now,
+            borrow mut ecn as *mut u32,
+            borrow mut to.bytes[0] as *mut u8,
+        ) };
         if (n < 0) {
             return Err(QuicErrors.of(truncate<i32>(n)));
         }
         if (n == 0) {
             return Ok(null);
         }
-        return Ok(Some(QuicOut { length: truncate<usize>(n), ecn: ecn }));
+        return Ok(Some(QuicOut { length: truncate<usize>(n), ecn: ecn, to: to }));
     }
 
     /// A CONNECTION_CLOSE for the error that ended the connection, or NO_ERROR, or the application's `code`; its
@@ -510,6 +537,12 @@ public struct QuicConnection {
         let kind = unsafe { qs_peer_close(this.raw, borrow mut code as *mut u64) };
         return if (kind == 2) Some(code) else null;
     }
+
+    /// Moves a client connection to the local address `local`, a socket the caller has bound and now sends from and
+    /// reads (RFC 9000 §9.2): ngtcp2 validates the new path with the server, then uses it. A server cannot migrate.
+    /// Safety: the shim reads the address during the call only.
+    public fn migrate(borrow mut this, local: borrow QuicAddress, now: u64) -> Result<void, QuicError> =>
+        QuicErrors.check(unsafe { qs_migrate(this.raw, local.bytes[..].ptr, now) });
 
     /// Whether the server sent a Retry before this connection (a client's view): its transport parameters carry
     /// `retry_source_connection_id`, which ngtcp2 has checked against the Retry it received (RFC 9000 §7.3).
@@ -610,10 +643,12 @@ public struct QuicConnection {
     }
 }
 
-/// A datagram `datagram` wrote: its length in the caller's buffer, and its ECN mark.
+/// A datagram `datagram` wrote: its length in the caller's buffer, its ECN mark, and where it goes, which ngtcp2
+/// chooses: the peer's address, or a new one it migrated to (RFC 9000 §9) or that is being validated (§8.2).
 public struct QuicOut {
     public length: usize;
     public ecn: u32;
+    public to: QuicAddress;
 }
 
 struct QuicErrors {
