@@ -711,3 +711,95 @@ fn older_streams_are_written_first() -> Result<void, TestFailure> {
         null => { return Err(TestFailure.create("no server")); }
     }
 }
+
+/// The client's next Initial at `now`: its datagram's length.
+fn firstInitial(c: borrow mut QuicConnection, out: SliceMut<u8>, now: u64) -> Result<usize, TestFailure> {
+    match (ok(c.datagram(out, now), "the client's Initial")?) {
+        Some(d) => { return Ok(d.length); }
+        null => { return Err(TestFailure.create("an Initial")); }
+    }
+}
+
+/// Address validation with Retry (RFC 9000 §8.1), sans-I/O, as the listener does it. Expected:
+///   - required, the client's first Initial gets a Retry (`SendRetry`);
+///   - the client's next Initial, with the token, is admitted with the client's first destination ID as the original
+///     (`AdmitRetried`, §7.3), and the handshake completes, which ngtcp2 allows only when the server's transport
+///     parameters carry that original ID and the Retry's ID (§7.3); the client then sees `retried()`;
+///   - the same Initial from another address is dropped: the token is bound to the address (§8.1.4);
+///   - not required, a first Initial is admitted as it is, and the client does not see `retried()`.
+@test
+fn retry_validates_the_address() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let p = pair()?;
+    let key = [5u8; 32];
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    var client = ok(QuicConnection.client(p.client, "localhost", clientAddress(), serverAddress(), ids, 1000000000), "client")?;
+    var out = [0u8; 1452];
+    var retry = [0u8; 1452];
+    let n = firstInitial(mut client, mut out[..], 1000000000)?;
+    let sent = match (QuicRetry.check(key, out[0..n], clientAddress(), true, 1000000000, mut retry[..])) {
+        QuicRetryCheck.SendRetry(m) => m,
+        _ => { return Err(TestFailure.create("a Retry for the first Initial")); },
+    };
+    ok(client.feed(serverAddress(), 0, retry[0..sent], 1001000000), "the Retry")?;
+    let m = firstInitial(mut client, mut out[..], 1001000000)?;
+    // From another address, the token is refused.
+    let elsewhere = SocketAddress.V4([127u8, 0, 0, 2], 50000);
+    match (QuicRetry.check(key, out[0..m], QuicAddress.of(elsewhere), true, 1002000000, mut retry[..])) {
+        QuicRetryCheck.Drop => {}
+        _ => { return Err(TestFailure.create("the token is refused from another address")); }
+    }
+    var original = [0u8; 20];
+    var length: usize = 0;
+    match (QuicRetry.check(key, out[0..m], clientAddress(), true, 1002000000, mut retry[..])) {
+        QuicRetryCheck.AdmitRetried(o, l) => {
+            original = o;
+            length = l;
+        }
+        _ => { return Err(TestFailure.create("the token's Initial is admitted")); }
+    }
+    Check.equalBytes(ids.dcid[..], original[0..length])?;
+    let sids = ok(QuicIds.random(), "random IDs")?;
+    var server = ok(
+        QuicConnection.serverAfterRetry(p.server, out[0..m], serverAddress(), clientAddress(), sids, original[0..length], 1002000000),
+        "the server",
+    )?;
+    ok(server.feed(clientAddress(), 0, out[0..m], 1002000000), "the server's read")?;
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var now: u64 = 1003000000;
+    var rounds = 0;
+    while (rounds < 20 && !(client.handshakeDone() && server.handshakeDone())) {
+        loop {
+            let d = match (ok(server.datagram(mut out[..], now), "the server's datagram")?) {
+                Some(d) => d,
+                null => { break; },
+            };
+            ok(client.feed(serverAddress(), 0, out[0..d.length], now), "the client's read")?;
+        }
+        loop {
+            let d = match (ok(client.datagram(mut out[..], now), "the client's datagram")?) {
+                Some(d) => d,
+                null => { break; },
+            };
+            ok(server.feed(clientAddress(), 0, out[0..d.length], now), "the server's read")?;
+        }
+        while (ok(client.nextEvent(buffer.viewMut()), "an event")?.isSome()) {}
+        while (ok(server.nextEvent(buffer.viewMut()), "an event")?.isSome()) {}
+        now += 1000000;
+        rounds += 1;
+    }
+    Check.isTrue(client.handshakeDone() && server.handshakeDone(), "the handshake after the Retry")?;
+    Check.isTrue(client.retried(), "the client sees the Retry in the server's parameters")?;
+    // Not required: admitted as it is.
+    let ids2 = ok(QuicIds.random(), "random IDs")?;
+    var plain = ok(QuicConnection.client(p.client, "localhost", clientAddress(), serverAddress(), ids2, 1000000000), "client")?;
+    let k = firstInitial(mut plain, mut out[..], 1000000000)?;
+    match (QuicRetry.check(key, out[0..k], clientAddress(), false, 1000000000, mut retry[..])) {
+        QuicRetryCheck.Admit => {}
+        _ => { return Err(TestFailure.create("admitted without a Retry when none is required")); }
+    }
+    return Ok();
+}

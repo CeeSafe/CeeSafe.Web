@@ -34,11 +34,30 @@ extern "C" {
         scid: *u8,
         scidLength: usize,
         secret: *u8,
+        odcid: *u8,
+        odcidLength: usize,
         now: u64,
         error: *mut i32,
     ) -> *mut void;
     @effects()
     fn qs_conn_free(conn: *mut void);
+    @effects()
+    fn qs_retry_check(
+        key: *u8,
+        packet: *u8,
+        length: usize,
+        remote: *u8,
+        require: i32,
+        retryScid: *u8,
+        now: u64,
+        out: *mut u8,
+        capacity: usize,
+        outLength: *mut usize,
+        odcid: *mut u8,
+        odcidLength: *mut usize,
+    ) -> i32;
+    @effects()
+    fn qs_retried(conn: *mut void) -> i32;
     @effects()
     fn qs_read(conn: *mut void, remote: *u8, ecn: u32, packet: *u8, length: usize, now: u64) -> i32;
     @effects()
@@ -59,6 +78,15 @@ extern "C" {
     fn qs_open_uni(conn: *mut void) -> i64;
     @effects()
     fn qs_peer_close(conn: *mut void, code: *mut u64) -> i32;
+    @effects()
+    fn qs_stateless_reset(
+        key: *u8,
+        cid: *u8,
+        cidLength: usize,
+        triggerLength: usize,
+        out: *mut u8,
+        capacity: usize,
+    ) -> i64;
     @effects()
     fn qs_set_manual_credit(conn: *mut void);
     @effects()
@@ -338,6 +366,32 @@ public struct QuicConnection {
         ids: borrow QuicIds,
         now: u64,
     ) -> Result<QuicConnection, QuicError> {
+        let none = [0u8; 1];
+        return QuicConnection.made(tls, packet, local, remote, ids, none[0..0], now);
+    }
+
+    /// A server connection for a client's Initial that carried a valid Retry token (`QuicRetryCheck.AdmitRetried`):
+    /// `original` is the destination ID of the client's first Initial, which the token held (RFC 9000 §7.3).
+    public fn serverAfterRetry(
+        tls: borrow QuicTls,
+        packet: Slice<u8>,
+        local: borrow QuicAddress,
+        remote: borrow QuicAddress,
+        ids: borrow QuicIds,
+        original: Slice<u8>,
+        now: u64,
+    ) -> Result<QuicConnection, QuicError> => QuicConnection.made(tls, packet, local, remote, ids, original, now);
+
+    /// Safety: the shim copies every byte it is given and keeps no pointer to them; it returns a fresh handle or null.
+    fn made(
+        tls: borrow QuicTls,
+        packet: Slice<u8>,
+        local: borrow QuicAddress,
+        remote: borrow QuicAddress,
+        ids: borrow QuicIds,
+        original: Slice<u8>,
+        now: u64,
+    ) -> Result<QuicConnection, QuicError> {
         var error: i32 = 0;
         let raw = unsafe { qs_conn_server(
             tls.handle(),
@@ -348,6 +402,8 @@ public struct QuicConnection {
             ids.scid[..].ptr,
             20,
             ids.resetSecret[..].ptr,
+            original.ptr,
+            original.length,
             now,
             borrow mut error as *mut i32,
         ) };
@@ -454,6 +510,11 @@ public struct QuicConnection {
         let kind = unsafe { qs_peer_close(this.raw, borrow mut code as *mut u64) };
         return if (kind == 2) Some(code) else null;
     }
+
+    /// Whether the server sent a Retry before this connection (a client's view): its transport parameters carry
+    /// `retry_source_connection_id`, which ngtcp2 has checked against the Retry it received (RFC 9000 §7.3).
+    /// Safety: as `nextTimeout`.
+    public fn retried(borrow this) -> bool => unsafe { qs_retried(this.raw) } == 1;
 
     /// Opens a unidirectional stream: its ID (HTTP/3's control and QPACK streams, Web ADR 0014 amendment 4 item 2).
     /// Safety: as `nextTimeout`.
@@ -586,4 +647,80 @@ fn bytesAre(a: Slice<u8>, b: Slice<u8>) -> bool {
         }
     }
     return true;
+}
+
+/// A stateless reset (RFC 9000 §10.3) answering a datagram of `triggerLength` bytes to our ID `cid`, its token from
+/// `key`, written to `out`: its length, or 0 when none may be sent (the shim's rules: shorter than the trigger, at
+/// most 43 bytes).
+/// Safety: the shim reads `key` (32 bytes) and `cid`, and writes at most `out.length` bytes, during the call only.
+fn statelessReset(key: [u8; 32], cid: Slice<u8>, triggerLength: usize, out: SliceMut<u8>) -> usize {
+    let k = key;
+    let n = unsafe { qs_stateless_reset(
+        borrow k[0] as *u8,
+        cid.ptr,
+        cid.length,
+        triggerLength,
+        out.ptr,
+        out.length,
+    ) };
+    return if (n > 0) truncate<usize>(n) else 0;
+}
+
+/// What a server does with a client's Initial for an unknown ID (RFC 9000 §8.1; `QuicRetry.check`).
+public enum QuicRetryCheck {
+    /// Send this many bytes of the buffer, a Retry, to the client, and nothing more.
+    SendRetry(usize),
+    /// Admit it: `QuicConnection.server`.
+    Admit,
+    /// Admit it: it carried a valid Retry token, whose original destination ID is the first `usize` bytes
+    /// (`QuicConnection.serverAfterRetry`).
+    AdmitRetried([u8; 20], usize),
+    /// Drop it: a Retry token that is not valid (not ours, another address's, another ID's, or older than 10 s).
+    Drop,
+}
+
+/// Address validation with Retry (RFC 9000 §8.1): sans-I/O, as the listener uses it.
+public struct QuicRetry {
+    /// The decision for the client Initial `datagram` from `from` at `now`, with tokens from `key`. With `require`,
+    /// an Initial without a token gets a Retry (written to `out`, which a datagram's size always fits); an Initial
+    /// with a Retry token is admitted if the token is valid, whatever `require` says.
+    /// Safety: the shim reads the datagram, the address and the key, and writes at most `out.length` bytes and 20
+    /// into a local array, during the call only.
+    public fn check(
+        key: [u8; 32],
+        datagram: Slice<u8>,
+        from: borrow QuicAddress,
+        require: bool,
+        now: u64,
+        out: SliceMut<u8>,
+    ) -> QuicRetryCheck {
+        var scid = [0u8; 20];
+        if (require && Random.fill(mut scid[..]).isErr()) {
+            return QuicRetryCheck.Drop;
+        }
+        let k = key;
+        var odcid = [0u8; 20];
+        var odcidLength: usize = 0;
+        var outLength: usize = 0;
+        let r = unsafe { qs_retry_check(
+            borrow k[0] as *u8,
+            datagram.ptr,
+            datagram.length,
+            from.bytes[..].ptr,
+            if (require) 1 else 0,
+            borrow scid[0] as *u8,
+            now,
+            out.ptr,
+            out.length,
+            borrow mut outLength as *mut usize,
+            borrow mut odcid[0] as *mut u8,
+            borrow mut odcidLength as *mut usize,
+        ) };
+        return match (r) {
+            1 => QuicRetryCheck.SendRetry(outLength),
+            2 => QuicRetryCheck.AdmitRetried(odcid, odcidLength),
+            3 => QuicRetryCheck.Admit,
+            _ => QuicRetryCheck.Drop,
+        };
+    }
 }

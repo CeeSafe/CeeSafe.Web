@@ -543,3 +543,29 @@ This amendment replaces amendment 1's items 4, 5 and 6.
    options struct: a `Server` carries its own.
    - Every response whose request did not come over HTTP/3 gains `alt-svc: h3=":<port>"; ma=86400` (RFC 7838 §3),
      after the middleware's `after` hooks, unless the response already has an `Alt-Svc`.
+2. **Stateless reset** (RFC 9000 §10.3; §3.5's "unknown IDs").
+   - **The key is the server's:** `QuicServerOptions.resetKey`, 32 bytes, random for each `serve` unless configured.
+     Every connection's reset secret is that key, so each token, the first ID's included (now sent in the transport
+     parameters, §18.2), can be derived again from the ID alone (`ngtcp2_crypto_generate_stateless_reset_token`).
+     - This replaces §3.5's "derived from a stateless-reset key with HMAC": ngtcp2's own derivation (HKDF over the
+       ID) does the same with the same properties.
+   - **The listener answers** a short-header datagram for one of our 20-byte IDs that no connection has with a
+     stateless reset. The reset is one byte shorter than its trigger, so two endpoints cannot answer each other's
+     resets forever (§10.3.3), and at most 43 bytes. A trigger too short for the smallest reset ngtcp2 writes
+     (21 bytes) gets none.
+   - **At most `resetsPerSecond` (100)** resets a second, so the listener cannot be used to reflect a flood (§10.3
+     lets an endpoint limit them).
+3. **Retry** (RFC 9000 §8.1; §3.5).
+   - **When:** `QuicServerOptions.retryAbove` (500, half of `maxConnections`). From that many live connections on, a
+     new client's first Initial gets a Retry, which costs the client a round trip and the server no state. 0 means
+     always. A Retry token is checked whenever one comes, whatever the load.
+   - **Tokens:** `ngtcp2_crypto_generate_retry_token2` under `retryKey` (32 bytes, random for each `serve` unless
+     configured). A token is bound to the client's address, its first destination ID and the Retry's new ID, and
+     lasts 10 s (§3.5). One that does not verify drops its Initial.
+   - **After a Retry,** the connection is made with `QuicConnection.serverAfterRetry`. Its transport parameters
+     carry the client's first ID as `original_destination_connection_id`, and the Retry's ID as
+     `retry_source_connection_id` (§7.3).
+   - **Sans-I/O:** the listener's decision is `QuicRetry.check`, so it is tested without sockets.
+     `QuicConnection.retried()` gives the client's view.
+   - **§3.5's "encrypted tokens carrying the address and a time"** are ngtcp2's token format (AEAD under a key
+     derived from `retryKey`), not one of our own.

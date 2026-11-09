@@ -651,7 +651,8 @@ qs_conn *qs_conn_client(qs_tls *t, const uint8_t *host, size_t host_len, const u
 /* A server connection for the client Initial `pkt` (`len` bytes), which arrived at `local` from `remote`. `scid` is
    the server's ID for it. Null on failure: *error is NGTCP2_ERR_INVALID_ARGUMENT if `pkt` is no Initial to accept. */
 qs_conn *qs_conn_server(qs_tls *t, const uint8_t *pkt, size_t len, const uint8_t *local, const uint8_t *remote,
-                        const uint8_t *scid, size_t scid_len, const uint8_t *secret, uint64_t now, int32_t *error) {
+                        const uint8_t *scid, size_t scid_len, const uint8_t *secret, const uint8_t *odcid,
+                        size_t odcid_len, uint64_t now, int32_t *error) {
     *error = -1;
     if (!t || !t->server || scid_len > NGTCP2_MAX_CIDLEN) {
         return NULL;
@@ -677,8 +678,27 @@ qs_conn *qs_conn_server(qs_tls *t, const uint8_t *pkt, size_t len, const uint8_t
     qs_params(&params);
     params.original_dcid = hd.dcid;
     params.original_dcid_present = 1;
+    if (odcid_len > 0) {
+        /* After a Retry (RFC 9000 §7.3): the client's first ID, from the token, is the original; the ID this Initial
+           is sent to is the one our Retry chose. */
+        if (odcid_len > NGTCP2_MAX_CIDLEN) {
+            qs_conn_free(c);
+            return NULL;
+        }
+        ngtcp2_cid_init(&params.original_dcid, odcid, odcid_len);
+        params.retry_scid = hd.dcid;
+        params.retry_scid_present = 1;
+    }
     ngtcp2_cid s;
     ngtcp2_cid_init(&s, scid, scid_len);
+    /* The token for our first ID (RFC 9000 §18.2), from the same secret as later IDs' (cb_new_cid): a listener that
+       has lost the connection derives it again from the ID alone (qs_stateless_reset). */
+    if (ngtcp2_crypto_generate_stateless_reset_token(params.stateless_reset_token, c->reset_secret,
+                                                     sizeof c->reset_secret, &s) != 0) {
+        qs_conn_free(c);
+        return NULL;
+    }
+    params.stateless_reset_token_present = 1;
     rv = ngtcp2_conn_server_new(&c->conn, &hd.scid, &s, &c->path, hd.version, &callbacks, &settings, &params,
                                 &qs_mem, c);
     if (rv != 0) {
@@ -998,6 +1018,100 @@ int32_t qs_packet_dcid(const uint8_t *pkt, size_t len, uint8_t *out, int32_t *in
         *initial = 1;
     }
     return (int32_t)vc.dcidlen;
+}
+
+/* What the listener does with a client's Initial (RFC 9000 §8.1), with Retry tokens from `key` (32 bytes):
+     - 1: a Retry was written to `out` (*outlen bytes): send it, and nothing more. When `require` is set and the
+          Initial has no token; its new ID is `retry_scid` (20 bytes);
+     - 2: the Initial carries a Retry token that is valid (ours, for this address and this destination ID, under 10 s
+          old): admit it, with the original destination ID in `odcid` (*odcidlen bytes);
+     - 3: no Retry token, and none required: admit it as it is;
+     - 0: drop it (a Retry token that is not valid, §8.1.2);
+     - negative: not an Initial ngtcp2 accepts. */
+int32_t qs_retry_check(const uint8_t *key, const uint8_t *pkt, size_t len, const uint8_t *remote, int32_t require,
+                       const uint8_t *retry_scid, uint64_t now, uint8_t *out, size_t cap, size_t *outlen,
+                       uint8_t *odcid, size_t *odcidlen) {
+    *outlen = 0;
+    *odcidlen = 0;
+    ngtcp2_pkt_hd hd;
+    int rv = ngtcp2_accept(&hd, pkt, len);
+    if (rv != 0) {
+        return rv < 0 ? rv : -1;
+    }
+    qs_addr addr;
+    if (!qs_addr_from(&addr, remote)) {
+        return -1;
+    }
+    if (hd.tokenlen > 0 && hd.token[0] == NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2) {
+        ngtcp2_cid original;
+        rv = ngtcp2_crypto_verify_retry_token2(&original, hd.token, hd.tokenlen, key, 32, hd.version,
+                                               (const ngtcp2_sockaddr *)&addr.storage, addr.length, &hd.dcid,
+                                               10 * NGTCP2_SECONDS, now);
+        if (rv != 0) {
+            return 0;
+        }
+        memcpy(odcid, original.data, original.datalen);
+        *odcidlen = original.datalen;
+        return 2;
+    }
+    if (!require) {
+        return 3;
+    }
+    ngtcp2_cid new_scid;
+    ngtcp2_cid_init(&new_scid, retry_scid, 20);
+    uint8_t token[NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2];
+    ngtcp2_ssize tokenlen = ngtcp2_crypto_generate_retry_token2(token, key, 32, hd.version,
+                                                                (const ngtcp2_sockaddr *)&addr.storage, addr.length,
+                                                                &new_scid, &hd.dcid, now);
+    if (tokenlen < 0) {
+        return 0;
+    }
+    ngtcp2_ssize n = ngtcp2_crypto_write_retry(out, cap, hd.version, &hd.scid, &new_scid, &hd.dcid, token,
+                                               (size_t)tokenlen);
+    if (n < 0) {
+        return 0;
+    }
+    *outlen = (size_t)n;
+    return 1;
+}
+
+/* 1 if the server sent a Retry before this connection (its transport parameters carry retry_source_connection_id,
+   RFC 9000 §7.3, which ngtcp2 has checked against the Retry): a client's view. */
+int32_t qs_retried(qs_conn *c) {
+    const ngtcp2_transport_params *p = ngtcp2_conn_get_remote_transport_params(c->conn);
+    return p && p->retry_scid_present ? 1 : 0;
+}
+
+/* A stateless reset (RFC 9000 §10.3) answering a datagram of `trigger_len` bytes to our ID `cid`, whose token comes
+   from `key` (32 bytes, the server's: every connection's IDs were given tokens from it). Written to `out`: its length,
+   or 0 when none may be sent. It is one byte shorter than its trigger, so two endpoints cannot answer each other's
+   resets forever (§10.3.3), and at most 43 bytes; a trigger too short for the smallest reset ngtcp2 writes (5 random
+   bytes and the 16-byte token) gets none. */
+int64_t qs_stateless_reset(const uint8_t *key, const uint8_t *cid, size_t cidlen, size_t trigger_len, uint8_t *out,
+                           size_t cap) {
+    if (cidlen > NGTCP2_MAX_CIDLEN || trigger_len < 1) {
+        return 0;
+    }
+    size_t len = trigger_len - 1;
+    if (len > 43) {
+        len = 43;
+    }
+    if (len < NGTCP2_MIN_STATELESS_RESET_RANDLEN + NGTCP2_STATELESS_RESET_TOKENLEN || len > cap) {
+        return 0;
+    }
+    ngtcp2_cid id;
+    ngtcp2_cid_init(&id, cid, cidlen);
+    ngtcp2_stateless_reset_token token;
+    if (ngtcp2_crypto_generate_stateless_reset_token(token.data, key, 32, &id) != 0) {
+        return 0;
+    }
+    uint8_t rand[43];
+    size_t randlen = len - NGTCP2_STATELESS_RESET_TOKENLEN;
+    if (RAND_bytes(rand, (int)randlen) != 1) {
+        return 0;
+    }
+    ngtcp2_ssize n = ngtcp2_pkt_write_stateless_reset2(out, cap, &token, rand, randlen);
+    return n < 0 ? 0 : (int64_t)n;
 }
 
 /* ---- Events ---- */

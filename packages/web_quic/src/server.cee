@@ -53,12 +53,28 @@ public struct QuicServerOptions {
     /// Whether a stream's flow-control credit goes back when its data is read with `QuicLink.next` (true), or only
     /// when the application calls `QuicLink.consume` (false: HTTP/3, Web ADR 0014 amendment 4 item 2).
     public creditOnRead: bool;
+    /// The key every connection's stateless-reset tokens come from (32 bytes; RFC 9000 §10.3), so that the server, or
+    /// another sharing the key, can still reset a connection it has lost. Null: a random key for each `serve`, which
+    /// lasts until it returns. Keep a configured key secret: whoever holds it can end the server's connections.
+    public resetKey: [u8; 32]?;
+    /// Stateless resets the listener sends a second, at most (§10.3: an endpoint may limit them).
+    public resetsPerSecond: u32;
+    /// From this many live connections on, a new client must first prove its address with a Retry (RFC 9000 §8.1),
+    /// which costs it a round trip and the server no state; 0 is always.
+    public retryAbove: u32;
+    /// The key Retry tokens are made and checked with (32 bytes). Null: a random key for each `serve`.
+    public retryKey: [u8; 32]?;
 
-    /// 1000 connections, 64 datagrams each, credit given back on read.
+    /// 1000 connections, 64 datagrams each, credit given back on read, a random reset key, 100 resets a second, and
+    /// Retry from 500 live connections on, with a random key.
     public fn defaults() -> QuicServerOptions => QuicServerOptions {
         maxConnections: 1000,
         inboundQueue: 64,
         creditOnRead: true,
+        resetKey: null,
+        resetsPerSecond: 100,
+        retryAbove: 500,
+        retryKey: null,
     };
 }
 
@@ -370,8 +386,25 @@ public struct QuicServer {
         };
         var routes = Vector<Route>.create();
         var live = Vector<Live>.create();
-        let r = await Async.tasks(options.maxConnections, QuicError.NoMemory, async (set) =>
-            await listen(set, socket, local, tls, app, options, toListener, mut routes, mut live));
+        var opts = options;
+        if (opts.resetKey.isNull()) {
+            var key = [0u8; 32];
+            match (Random.fill(mut key[..])) {
+                Ok() => {}
+                Err(_) => { return Err(QuicError.NoMemory); }
+            }
+            opts.resetKey = Some(key);
+        }
+        if (opts.retryKey.isNull()) {
+            var key = [0u8; 32];
+            match (Random.fill(mut key[..])) {
+                Ok() => {}
+                Err(_) => { return Err(QuicError.NoMemory); }
+            }
+            opts.retryKey = Some(key);
+        }
+        let r = await Async.tasks(opts.maxConnections, QuicError.NoMemory, async (set) =>
+            await listen(set, socket, local, tls, app, opts, toListener, mut routes, mut live));
         return r;
     }
 }
@@ -398,6 +431,7 @@ async fn listen(
         Err(_) => { return Err(QuicError.NoMemory); }
     }
     var next: u32 = 1;
+    var budget = ResetBudget { sent: 0, since: Timer.now() };
     loop {
         let raced: Result<Raced<Heard>, AsyncError> = await Async.race(
             async () => {
@@ -427,6 +461,7 @@ async fn listen(
             routes,
             live,
             mut next,
+            mut budget,
             buffer.view(),
             won.value,
         )?;
@@ -443,6 +478,7 @@ async fn listen(
                     routes,
                     live,
                     mut next,
+                    mut budget,
                     buffer.view(),
                     h,
                 )?;
@@ -463,6 +499,7 @@ async fn heard(
     routes: borrow mut Vector<Route>,
     live: borrow mut Vector<Live>,
     next: borrow mut u32,
+    budget: borrow mut ResetBudget,
     buffer: Slice<u8>,
     h: Heard,
 ) -> Result<void, QuicError> {
@@ -497,13 +534,108 @@ async fn heard(
                 }
                 null => {}
             }
-            if (!header.initial || live.length as u64 >= options.maxConnections as u64) {
-                return Ok(); // not a new connection's, or no room: dropped
+            if (!header.initial) {
+                // A short header for an ID of ours that no connection has (§10.3): a connection this server lost,
+                // or one another server with the same key made. Its peer is told with a stateless reset.
+                if (header.version == 0 && header.dcidLength == 20) {
+                    await reset(socket, options, budget, header, datagram.length, got.from);
+                }
+                return Ok();
             }
-            await admit(set, local, tls, app, options, toListener, routes, live, next, datagram, got, header)?;
+            if (live.length as u64 >= options.maxConnections as u64) {
+                return Ok(); // no room: dropped
+            }
+            // Address validation (RFC 9000 §8.1): a Retry under load, and a Retry token checked whenever one comes.
+            let key = match (options.retryKey) {
+                Some(k) => k,
+                null => [0u8; 32],
+            };
+            let require = live.length as u64 >= options.retryAbove as u64;
+            var out = [0u8; 1452];
+            let from = QuicAddress.of(got.from);
+            let none = [0u8; 20];
+            match (QuicRetry.check(key, datagram, from, require, Clock.monotonicNanos(), mut out[..])) {
+                QuicRetryCheck.SendRetry(n) => {
+                    let _ = await socket.sendTo(out[0..n], got.from);
+                }
+                QuicRetryCheck.Admit => {
+                    await admit(
+                        set,
+                        local,
+                        tls,
+                        app,
+                        options,
+                        toListener,
+                        routes,
+                        live,
+                        next,
+                        datagram,
+                        got,
+                        header,
+                        none,
+                        0,
+                    )?;
+                }
+                QuicRetryCheck.AdmitRetried(original, n) => {
+                    await admit(
+                        set,
+                        local,
+                        tls,
+                        app,
+                        options,
+                        toListener,
+                        routes,
+                        live,
+                        next,
+                        datagram,
+                        got,
+                        header,
+                        original,
+                        n,
+                    )?;
+                }
+                QuicRetryCheck.Drop => {}
+            }
         }
     }
     return Ok();
+}
+
+/// The stateless resets sent in the current second.
+struct ResetBudget {
+    sent: u32;
+    since: u64;
+}
+
+/// Sends a stateless reset for `header`'s ID to `to`, if the budget allows and the trigger is long enough
+/// (`statelessReset`).
+async fn reset(
+    socket: borrow AsyncUdpSocket,
+    options: QuicServerOptions,
+    budget: borrow mut ResetBudget,
+    header: QuicHeader,
+    triggerLength: usize,
+    to: SocketAddress,
+) {
+    let now = Timer.now();
+    if (now >= budget.since + 1000) {
+        budget.sent = 0;
+        budget.since = now;
+    }
+    if (budget.sent >= options.resetsPerSecond) {
+        return;
+    }
+    let key = match (options.resetKey) {
+        Some(k) => k,
+        null => { return; },
+    };
+    var out = [0u8; 64];
+    let n = statelessReset(key, header.dcid[0..header.dcidLength], triggerLength, mut out[..]);
+    if (n == 0) {
+        return;
+    }
+    budget.sent += 1;
+    let _ = await socket.sendTo(out[0..n], to);
 }
 
 /// A new connection for the Initial `datagram`: its routes (the client's chosen ID and ours), its inbound channel
@@ -521,8 +653,14 @@ async fn admit(
     datagram: Slice<u8>,
     got: UdpReceived,
     header: QuicHeader,
+    retriedFrom: [u8; 20],
+    retriedLength: usize,
 ) -> Result<void, QuicError> {
-    let ids = QuicIds.random()?;
+    var ids = QuicIds.random()?;
+    match (options.resetKey) {
+        Some(k) => { ids.resetSecret = k; } // every connection's tokens from the server's key (`QuicServerOptions`)
+        null => {}
+    }
     let id: u32 = next;
     next += 1;
     let inbound = match (Channel<Inbound>.create(options.inboundQueue as usize)) {
@@ -538,8 +676,9 @@ async fn admit(
     let o = toListener.clone();
     let from = got.from;
     let creditOnRead = options.creditOnRead;
+    let firstId = copied(retriedFrom[0..retriedLength])?;
     let started = set.trySpawn(async move () =>
-        await connectionTask(t, a, i, o, id, local, from, initial, ids, creditOnRead));
+        await connectionTask(t, a, i, o, id, local, from, initial, ids, creditOnRead, firstId));
     if (!started) {
         return Ok(); // the set is full: the Initial is dropped, and the client tries again
     }
@@ -571,11 +710,20 @@ async fn connectionTask(
     initial: Vector<u8>,
     ids: QuicIds,
     creditOnRead: bool,
+    retriedFrom: Vector<u8>,
 ) -> Result<void, QuicError> {
     let here = QuicAddress.of(local);
     let there = QuicAddress.of(from);
     let now = Clock.monotonicNanos();
-    let made = QuicConnection.server(tls.get(), initial.view(), here, there, ids, now);
+    let made = if (retriedFrom.length > 0) QuicConnection.serverAfterRetry(
+        tls.get(),
+        initial.view(),
+        here,
+        there,
+        ids,
+        retriedFrom.view(),
+        now,
+    ) else QuicConnection.server(tls.get(), initial.view(), here, there, ids, now);
     var conn = match (made) {
         Ok(c) => c,
         Err(_) => {

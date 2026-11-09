@@ -1,6 +1,7 @@
 // hq-interop over QUIC: web_quic's QuicServer with HqFiles (Web ADR 0014 §4, stage 2), for the QUIC interop checks
 // (tests/interop/quic.py). Serves the files under CW_ROOT on UDP 127.0.0.1:CW_PORT (default 4433), with the
-// certificate chain CW_CERT and key CW_KEY (PEM files), offering ALPN `hq-interop`. It runs until it is killed.
+// certificate chain CW_CERT and key CW_KEY (PEM files), offering ALPN `hq-interop`. With CW_RETRY=1, every new
+// connection must first answer a Retry (RFC 9000 §8.1). It runs until it is killed.
 import web_core;
 import web_tls;
 import web_quic;
@@ -105,7 +106,16 @@ async fn serve() -> Result<void, Failure> {
         Err(_) => { return Err(Failure.Socket); },
     };
     await say("hq: listening");
-    match (await QuicServer.serve(socket, local, tls, app, QuicServerOptions.defaults())) {
+    var options = QuicServerOptions.defaults();
+    match (Environment.variable("CW_RETRY")) {
+        Some(v) => {
+            if (v.length == 1 && v.bytes()[0] == 49) {
+                options.retryAbove = 0;
+            }
+        }
+        null => {}
+    }
+    match (await QuicServer.serve(socket, local, tls, app, options)) {
         Ok() => { return Ok(); }
         Err(e) => { return Err(Failure.Quic(e)); }
     }
