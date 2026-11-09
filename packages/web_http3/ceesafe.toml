@@ -1,6 +1,6 @@
 [package]
 name = "web_http3"
-version = "0.4.0"
+version = "0.5.0"
 kind = "library"
 # HTTP/3 and QPACK over nghttp3 1.19.0, on web_quic (Web ADR 0014 §3.1, §3.6). The C is the shim and the vendored
 # library, through the wrappers tools/vendor_quic.py writes (§3.2).
