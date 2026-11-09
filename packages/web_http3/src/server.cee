@@ -177,6 +177,8 @@ async fn run(
         return Err(QuicError.NoMemory);
     }
     var heads = HashMap<u64, HeaderBlock>.create();
+    // Streams whose data came in 0-RTT (QUIC's EarlyData; only with `QuicTls.allowEarlyData`).
+    var early = HashMap<u64, u8>.create();
     var started = false;
     // The rapid-reset guard: resets of live requests in the current second.
     var resets: u32 = 0;
@@ -192,6 +194,12 @@ async fn run(
                 null => { break; },
             };
             match (event) {
+                QuicEvent.EarlyData(stream) => {
+                    match (early.put(truncate<u64>(stream), 1)) {
+                        Ok(_) => {}
+                        Err(_) => { return Err(QuicError.NoMemory); }
+                    }
+                }
                 QuicEvent.StreamReset(stream, _) => {
                     if (links.get(truncate<u64>(stream)).isSome()) {
                         let now = Timer.now();
@@ -216,7 +224,10 @@ async fn run(
                 Err(e) => { return await fail(link, e); }
             }
         }
-        if (!started && link.handshakeDone()) {
+        // HTTP/3's own streams: once the handshake is done, or earlier when a request comes in 0-RTT, which the server
+        // may answer before the handshake ends (RFC 9001 §4.1.1: the server has 1-RTT keys once it has sent its
+        // Finished, and the client's transport parameters once it has read its Initial).
+        if (!started && (link.handshakeDone() || early.length() > 0)) {
             match (H3Glue.start(h3, link)) {
                 Ok() => {}
                 Err(e) => { return await fail(link, e); }
@@ -280,7 +291,34 @@ async fn run(
                             Some(h) => h,
                             null => HeaderBlock.create(),
                         };
-                        startRequest(set, link, h3, server, context, links, outgoing, stream, head, !fin)?;
+                        let sentEarly = early.remove(key).isSome();
+                        if (sentEarly && !safeMethod(head)) {
+                            // RFC 8470 §5.2: a request that may be replayed and is not safe is not run: 425, and the
+                            // client sends it again after the handshake. Its body is not needed.
+                            var f = H3Fields.create();
+                            alloc(f.add(":status".bytes(), "425".bytes()))?;
+                            match (h3.respond(stream, f, false)) {
+                                Ok() => {}
+                                Err(_) => {}
+                            }
+                            if (!fin) {
+                                let _ = link.stopReading(stream, h3NoErrorCode());
+                            }
+                        } else {
+                            startRequest(
+                                set,
+                                link,
+                                h3,
+                                server,
+                                context,
+                                links,
+                                outgoing,
+                                stream,
+                                head,
+                                !fin,
+                                sentEarly,
+                            )?;
+                        }
                     }
                 }
                 H3Event.Data(stream, n) => {
@@ -310,6 +348,7 @@ async fn run(
                 H3Event.Reset(stream, _) => { endLink(links, stream); }
                 H3Event.Closed(stream, _) => {
                     let _ = heads.remove(truncate<u64>(stream));
+                    let _ = early.remove(truncate<u64>(stream));
                     endLink(links, stream);
                 }
                 H3Event.BodyRoom(stream) => { pushBody(h3, links, stream)?; }
@@ -386,6 +425,7 @@ fn startRequest(
     stream: i64,
     head: HeaderBlock,
     hasBody: bool,
+    sentEarly: bool,
 ) -> Result<void, QuicError> {
     let body = channel<BodyPart>(4)?;
     let acks = channel<u8>(1)?;
@@ -403,7 +443,7 @@ fn startRequest(
     let rs = reset.clone();
     let limits = server.limits;
     let started = set.trySpawn(async move () =>
-        await requestTask(a, owned, stream, head, hasBody, b, o, k, rs, limits));
+        await requestTask(a, owned, stream, head, hasBody, sentEarly, b, o, k, rs, limits));
     if (!started) {
         let _ = link.resetStream(stream, h3RequestRejected()); // RFC 9114 §4.1.1: not processed, may be retried
         h3.shutdownWrite(stream);
@@ -702,6 +742,7 @@ async fn requestTask(
     stream: i64,
     head: borrow HeaderBlock,
     hasBody: bool,
+    sentEarly: bool,
     body: borrow Channel<BodyPart>,
     outgoing: borrow Channel<Outgoing>,
     acks: borrow Channel<u8>,
@@ -710,7 +751,7 @@ async fn requestTask(
 ) -> Result<void, QuicError> {
     let r: Result<Raced<u8>, AsyncError> = await Async.race(
         async () => {
-            await serveRequest(app, context, stream, head, hasBody, body, outgoing, acks, limits);
+            await serveRequest(app, context, stream, head, hasBody, sentEarly, body, outgoing, acks, limits);
             return Ok(0u8);
         },
         async () => {
@@ -733,6 +774,7 @@ async fn serveRequest(
     stream: i64,
     head: borrow HeaderBlock,
     hasBody: bool,
+    sentEarly: bool,
     body: borrow Channel<BodyPart>,
     outgoing: borrow Channel<Outgoing>,
     acks: borrow Channel<u8>,
@@ -795,7 +837,8 @@ async fn serveRequest(
         Some(t) => t,
         null => { return; },
     };
-    let request = Request.create(method, bytes[tokenAt..tokenEnd], path, Version.Http3, list);
+    let made = Request.create(method, bytes[tokenAt..tokenEnd], path, Version.Http3, list);
+    let request = if (sentEarly) made.sentEarly() else made;
     let ctx = ConnectionContext.create(context.id, context.acceptedAt, context.drain).withAddresses(context.peer, null);
     var port = H3Port {
         stream: stream,
@@ -864,6 +907,18 @@ async fn serveRequest(
         Some(HandlerError.Io(_)) => { let _ = await post(outgoing, Outgoing.Reset(stream, h3InternalError())); }
         null => {}
     }
+}
+
+/// Whether a request head's method may be run from early data: GET, HEAD and OPTIONS (Web ADR 0014 §3.7; RFC 9110
+/// §9.2.1's safe methods but TRACE, which is not served).
+fn safeMethod(head: borrow HeaderBlock) -> bool {
+    for (i in 0..head.count()) {
+        if (named(head.name(i), ":method")) {
+            let m = head.value(i);
+            return named(m, "GET") || named(m, "HEAD") || named(m, "OPTIONS");
+        }
+    }
+    return false;
 }
 
 fn named(a: Slice<u8>, text: StringView) -> bool {

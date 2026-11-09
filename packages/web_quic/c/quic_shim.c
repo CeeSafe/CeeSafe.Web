@@ -156,6 +156,7 @@ int32_t wt_ssl_use_front(SSL *ssl, SSL_CTX *ctx);
 typedef struct qs_tls {
     SSL_CTX *ctx;
     int server;
+    int early; /* a server's connections accept 0-RTT (Web ADR 0014 §3.7): off unless qs_tls_allow_early */
 } qs_tls;
 
 /* `ctx` is web_tls's TlsConfig.quicContext(); null on failure. */
@@ -196,6 +197,7 @@ enum {
     QS_EV_STREAMS_BIDI = 8,    /* code: the bidirectional streams we may open, now */
     QS_EV_NEW_CID = 9,         /* data: a connection ID we issued, which the listener must route to us */
     QS_EV_RETIRE_CID = 10,     /* data: a connection ID of ours the peer retired */
+    QS_EV_EARLY = 11,          /* stream: the data that follows on it came in 0-RTT (RFC 9001 §4.6.1) */
     QS_EV_TOO_SMALL = 255,     /* not an event: qs_next_event's buffer is smaller than the next event's data */
 };
 
@@ -434,6 +436,9 @@ static int cb_recv_stream_data(ngtcp2_conn *conn, uint32_t flags, int64_t stream
     qs_conn *c = ud;
     uint32_t fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) ? 1u : 0u;
     (void)conn;
+    if ((flags & NGTCP2_STREAM_DATA_FLAG_0RTT) && !qs_push(&c->queue, QS_EV_EARLY, 0, stream, 0, NULL, 0)) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     /* The credit is given back when CeeSafe takes the bytes (qs_next_event), so the queue's data stays within the
        connection's window. One datagram can release far more than its own bytes: ngtcp2 delivers what it held out of
        order behind a lost packet once that packet arrives. */
@@ -606,6 +611,16 @@ static int qs_attach_tls(qs_conn *c, qs_tls *t, const uint8_t *host, size_t host
         if (ngtcp2_crypto_ossl_configure_server_session(c->ssl) != 0 || wt_ssl_use_front(c->ssl, t->ctx) != 1) {
             return 0;
         }
+        if (t->early) {
+            /* 0-RTT on this connection, and in the tickets it issues. With max_early_data nonzero, OpenSSL's replay
+               protection is on: tickets become single-use, kept in its server session cache, and a ticket used a
+               second time gets a full handshake with its early data ignored (SSL_read_early_data(3), "REPLAY
+               PROTECTION"). It holds within one process, not across servers (RFC 9001 §9.2). */
+            if (SSL_set_max_early_data(c->ssl, UINT32_MAX) != 1) {
+                return 0;
+            }
+            SSL_set_quic_tls_early_data_enabled(c->ssl, 1);
+        }
         SSL_set_app_data(c->ssl, &c->ref);
         SSL_set_accept_state(c->ssl);
     } else {
@@ -631,6 +646,85 @@ static int qs_attach_tls(qs_conn *c, qs_tls *t, const uint8_t *host, size_t host
 }
 
 void qs_conn_free(qs_conn *c);
+
+/* A server context's connections accept 0-RTT from now on (Web ADR 0014 §3.7). */
+void qs_tls_allow_early(qs_tls *t) {
+    t->early = 1;
+}
+
+/* A resumption ticket for a later connection to the same server, into `out` (`cap` bytes): a client's TLS session
+   (DER, after a 4-byte big-endian length), then the server's transport parameters that 0-RTT must respect (RFC 9000
+   §7.4.1). Its length, or 0 when there is no resumable session yet (the server's NewSessionTicket comes after the
+   handshake). */
+int64_t qs_ticket(qs_conn *c, uint8_t *out, size_t cap) {
+    if (!c->ssl || cap < 4) {
+        return 0;
+    }
+    SSL_SESSION *session = SSL_get1_session(c->ssl);
+    if (!session) {
+        return 0;
+    }
+    int64_t total = 0;
+    if (SSL_SESSION_is_resumable(session)) {
+        int n = i2d_SSL_SESSION(session, NULL);
+        if (n > 0 && (size_t)n + 4 <= cap) {
+            uint8_t *p = out + 4;
+            i2d_SSL_SESSION(session, &p);
+            out[0] = (uint8_t)((uint32_t)n >> 24);
+            out[1] = (uint8_t)((uint32_t)n >> 16);
+            out[2] = (uint8_t)((uint32_t)n >> 8);
+            out[3] = (uint8_t)n;
+            ngtcp2_ssize m = ngtcp2_conn_encode_0rtt_transport_params2(c->conn, out + 4 + n, cap - 4 - (size_t)n);
+            if (m > 0) {
+                total = 4 + (int64_t)n + m;
+            }
+        }
+    }
+    SSL_SESSION_free(session);
+    return total;
+}
+
+/* Resumes a client connection made by qs_conn_client with `ticket` (qs_ticket's), before its first datagram: the TLS
+   session, with 0-RTT if the server's ticket allows it, and the server's remembered transport parameters. 1 if 0-RTT
+   is possible, 0 if only resumption is, negative on a ticket that cannot be used. */
+int32_t qs_resume(qs_conn *c, const uint8_t *ticket, size_t len) {
+    if (len < 4) {
+        return -1;
+    }
+    size_t n = ((size_t)ticket[0] << 24) | ((size_t)ticket[1] << 16) | ((size_t)ticket[2] << 8) | ticket[3];
+    if (n > len - 4) {
+        return -1;
+    }
+    const uint8_t *p = ticket + 4;
+    SSL_SESSION *session = d2i_SSL_SESSION(NULL, &p, (long)n);
+    if (!session) {
+        return -1;
+    }
+    int early = SSL_SESSION_get_max_early_data(session) > 0;
+    int ok = SSL_set_session(c->ssl, session) == 1;
+    SSL_SESSION_free(session);
+    if (!ok) {
+        return -1;
+    }
+    if (early) {
+        if (ngtcp2_conn_decode_and_set_0rtt_transport_params(c->conn, ticket + 4 + n, len - 4 - n) != 0) {
+            return 0; /* resumption without 0-RTT */
+        }
+        SSL_set_quic_tls_early_data_enabled(c->ssl, 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* After the handshake, whether it resumed a session (a ticket was accepted): 1, or 0. */
+int32_t qs_resumed(qs_conn *c) {
+    return c->ssl && SSL_session_reused(c->ssl) ? 1 : 0;
+}
+
+/* After the handshake, whether the server accepted the early data this client sent: 1, or 0. */
+int32_t qs_early_accepted(qs_conn *c) {
+    return c->ssl && SSL_get_early_data_status(c->ssl) == SSL_EARLY_DATA_ACCEPTED ? 1 : 0;
+}
 
 /* A client connection to `remote` from `local`, for `host` (its SNI and the name verified). `dcid` and `scid` are
    CeeSafe's random IDs; `secret` (32 bytes) derives the stateless-reset tokens of the IDs it issues. Null on failure,
@@ -744,6 +838,13 @@ void qs_conn_free(qs_conn *c) {
     }
     if (c->ssl) {
         SSL_set_app_data(c->ssl, NULL); /* ngtcp2's rule for its OpenSSL backend (Web ADR 0014 §3.3) */
+        /* QUIC ends a connection with CONNECTION_CLOSE, never TLS's close_notify. Without this, SSL_free would take
+           the session for a bad one (ssl_clear_bad_session) and remove it from the server's session cache: the
+           single-use tickets 0-RTT's replay protection keeps there (Web ADR 0014 amendment 5 item 5) would be gone
+           as soon as the connection that issued them ended. */
+        if (c->conn && ngtcp2_conn_get_handshake_completed(c->conn)) {
+            SSL_set_shutdown(c->ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+        }
         SSL_free(c->ssl);
     }
     if (c->ossl) {

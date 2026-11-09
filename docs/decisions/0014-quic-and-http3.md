@@ -577,3 +577,29 @@ This amendment replaces amendment 1's items 4, 5 and 6.
      - Before, every datagram went to the address of the client's first Initial, so a migrated client heard nothing.
    - **The server never migrates,** and sends no preferred address (§3.5). `QuicConnection.migrate(local)` is the
      client's side: ngtcp2's `initiate_migration`, used by the tests.
+5. **0-RTT** (§3.7; the owner's answer 6: off by default, safe methods only).
+   - **On per server context:** `QuicTls.allowEarlyData()` enables 0-RTT on each connection, and in the tickets it
+     issues (`SSL_set_max_early_data`, `SSL_set_quic_tls_early_data_enabled`). It is per connection, so a shared
+     `SSL_CTX` is not changed.
+   - **Early data is reported:** ngtcp2 flags stream data that came in 0-RTT (`NGTCP2_STREAM_DATA_FLAG_0RTT`), and the
+     shim reports it as `QuicEvent.EarlyData(stream)`.
+   - **HTTP/3 answers early requests by method:**
+     - anything but GET, HEAD and OPTIONS gets 425 Too Early from the driver itself (RFC 8470 §5.2), and its body
+       STOP_SENDING;
+     - a safe request runs, and its handler sees `Request.earlyData()` (`Status.tooEarly()` lets it refuse too).
+     - The driver starts HTTP/3's own streams when early data first arrives, not only at the handshake's end (RFC 9001
+       §4.1.1).
+   - **Replay: OpenSSL's protection, not a window of our own** (replaces §3.7's "anti-replay window"). With early data
+     enabled, OpenSSL makes tickets single-use, kept in its server session cache. A ticket used a second time gets a
+     full handshake, its early data ignored (`SSL_read_early_data(3)`, "REPLAY PROTECTION").
+     - This allows no replay at all within one server process, rather than one per window.
+     - It holds within one process only: tickets do not survive a restart, and a replay to another server sharing the
+       ticket keys is not detected (RFC 9001 §9.2). The README must say so.
+   - **A fix this needed in the shim:** a connection whose handshake completed is marked shut down
+     (`SSL_set_shutdown`) before `SSL_free`. QUIC never sends TLS's close_notify, so `SSL_free` had taken each
+     session for a bad one and removed it from the server's cache (`ssl_clear_bad_session`).
+     - Every single-use ticket was therefore gone as soon as the connection that issued it ended, and no resumption
+       with 0-RTT could succeed. Stateless tickets (no early data) never depended on the cache, so they were not
+       affected.
+   - **The client's side** (the tests'): `QuicConnection.ticket` (the TLS session and the server's 0-RTT transport
+     parameters, RFC 9000 §7.4.1), `resume`, `resumed` and `earlyDataAccepted`.

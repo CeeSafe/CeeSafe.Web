@@ -59,6 +59,16 @@ extern "C" {
     @effects()
     fn qs_retried(conn: *mut void) -> i32;
     @effects()
+    fn qs_tls_allow_early(tls: *mut void);
+    @effects()
+    fn qs_ticket(conn: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn qs_resume(conn: *mut void, ticket: *u8, length: usize) -> i32;
+    @effects()
+    fn qs_early_accepted(conn: *mut void) -> i32;
+    @effects()
+    fn qs_resumed(conn: *mut void) -> i32;
+    @effects()
     fn qs_read(conn: *mut void, remote: *u8, ecn: u32, packet: *u8, length: usize, now: u64) -> i32;
     @effects()
     fn qs_write(conn: *mut void, out: *mut u8, capacity: usize, now: u64, ecn: *mut u32, to: *mut u8) -> i64;
@@ -161,6 +171,9 @@ public enum QuicEvent {
     NewConnectionId(usize),
     /// The peer retired one of our connection IDs, of this many bytes in the caller's buffer.
     RetiredConnectionId(usize),
+    /// The stream data that follows on this stream came in 0-RTT (RFC 9001 §4.6.1): before the handshake proved the
+    /// client, and possibly a replay. Only with `QuicTls.allowEarlyData`.
+    EarlyData(i64),
 }
 
 /// What a datagram's header says, before any connection reads it (RFC 9000 §17).
@@ -291,6 +304,16 @@ public struct QuicTls {
             return Err(QuicError.Tls);
         }
         return QuicTls.of(config);
+    }
+
+    /// Lets a server's connections accept 0-RTT (Web ADR 0014 §3.7: off unless called). Early data has no protection
+    /// against replay but OpenSSL's single-use tickets, which hold within this process only (RFC 9001 §9.2); HTTP/3
+    /// answers 425 to early requests but GET, HEAD and OPTIONS. Call before the server starts.
+    /// Safety: `raw` is this context's handle; the shim sets a flag read when each connection is made.
+    public fn allowEarlyData(borrow mut this) {
+        unsafe {
+            qs_tls_allow_early(this.raw);
+        }
     }
 
     /// Whether this is a server's.
@@ -544,6 +567,34 @@ public struct QuicConnection {
     public fn migrate(borrow mut this, local: borrow QuicAddress, now: u64) -> Result<void, QuicError> =>
         QuicErrors.check(unsafe { qs_migrate(this.raw, local.bytes[..].ptr, now) });
 
+    /// A ticket for resuming with the same server later (`resume`), into `out`: its length, or 0 while there is none
+    /// (the server's ticket comes after the handshake). A client's.
+    /// Safety: the shim writes at most `out.length` bytes.
+    public fn ticket(borrow this, out: SliceMut<u8>) -> usize {
+        let n = unsafe { qs_ticket(this.raw, out.ptr, out.length) };
+        return if (n > 0) truncate<usize>(n) else 0;
+    }
+
+    /// Resumes this new client connection with `ticket`, before its first datagram: true if 0-RTT is possible, so
+    /// streams opened and written now go out as early data. A ticket that cannot be used is `Failed`.
+    /// Safety: the shim reads the ticket during the call only.
+    public fn resume(borrow mut this, ticket: Slice<u8>) -> Result<bool, QuicError> {
+        let r = unsafe { qs_resume(this.raw, ticket.ptr, ticket.length) };
+        if (r < 0) {
+            return Err(QuicError.Failed(r));
+        }
+        return Ok(r == 1);
+    }
+
+    /// After the handshake, whether it resumed an earlier session (the ticket was accepted), on either side.
+    /// Safety: as `nextTimeout`.
+    public fn resumed(borrow this) -> bool => unsafe { qs_resumed(this.raw) } == 1;
+
+    /// After the handshake, whether the server accepted this client's early data. When it did not, what was sent
+    /// early was not delivered, and must be sent again.
+    /// Safety: as `nextTimeout`.
+    public fn earlyDataAccepted(borrow this) -> bool => unsafe { qs_early_accepted(this.raw) } == 1;
+
     /// Whether the server sent a Retry before this connection (a client's view): its transport parameters carry
     /// `retry_source_connection_id`, which ngtcp2 has checked against the Retry it received (RFC 9000 §7.3).
     /// Safety: as `nextTimeout`.
@@ -632,6 +683,7 @@ public struct QuicConnection {
             8 => Ok(Some(QuicEvent.StreamsAvailable(code))),
             9 => Ok(Some(QuicEvent.NewConnectionId(length))),
             10 => Ok(Some(QuicEvent.RetiredConnectionId(length))),
+            11 => Ok(Some(QuicEvent.EarlyData(stream))),
             255 => Err(QuicError.BufferTooSmall(length)),
             _ => Ok(null),
         };

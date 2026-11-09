@@ -54,6 +54,18 @@ struct TestClient {
 
     /// A client connected (once `started`) to `server`.
     async fn connect(tls: borrow QuicTls, server: SocketAddress) -> Result<TestClient, TestFailure> {
+        let none = [0u8; 1];
+        return await TestClient.connectWith(tls, server, none[0..0]);
+    }
+
+    /// A client to `server`, resuming with `ticket` when it is not empty (`QuicConnection.ticket`): when the ticket
+    /// allows 0-RTT, HTTP/3 starts at once and requests made before the handshake ends go as early data; otherwise
+    /// it returns once HTTP/3 has started.
+    async fn connectWith(
+        tls: borrow QuicTls,
+        server: SocketAddress,
+        ticket: Slice<u8>,
+    ) -> Result<TestClient, TestFailure> {
         let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
         let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
             Ok(s) => s,
@@ -92,6 +104,11 @@ struct TestClient {
         };
         mem(c.buffer.resize(65536, 0))?;
         mem(c.out.resize(quicDatagramSize(), 0))?;
+        if (ticket.length > 0 && quic(c.conn.resume(ticket), "the resumption")?) {
+            h3(H3Glue.start(mut c.h3, mut c.conn), "HTTP/3's streams, early")?;
+            c.started = true;
+            return Ok(c);
+        }
         let deadline = Clock.monotonicNanos() + 10000000000;
         while (!c.started) {
             if (Clock.monotonicNanos() > deadline || c.closed) {
@@ -146,6 +163,23 @@ struct TestClient {
             }
         }
         return true;
+    }
+
+    /// A ticket for a later connection, once the server has sent one: turns until then, at most `turns`.
+    async fn takeTicket(borrow mut this, turns: u32) -> Result<Vector<u8>, TestFailure> {
+        var t = Vector<u8>.create();
+        mem(t.resize(8192, 0))?;
+        var k: u32 = 0;
+        while (k < turns) {
+            let n = this.conn.ticket(t.viewMut());
+            if (n > 0) {
+                t.truncate(n);
+                return Ok(t);
+            }
+            await this.turn(10)?;
+            k += 1;
+        }
+        return Err(TestFailure.create("a ticket"));
     }
 
     /// Whether the answer on `stream` has ended or been reset.

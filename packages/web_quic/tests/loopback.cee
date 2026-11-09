@@ -803,3 +803,131 @@ fn retry_validates_the_address() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+/// What a server saw on a connection: whether stream data came early, and the data.
+struct EarlySeen {
+    early: bool;
+    data: Vector<u8>;
+}
+
+/// A client and the server its first datagram makes, pumped for `rounds` rounds: the server's connection and what it
+/// saw. The client's datagrams go first.
+fn pumped(
+    client: borrow mut QuicConnection,
+    serverTls: borrow QuicTls,
+    heard: borrow mut EarlySeen,
+    rounds: u32,
+) -> Result<QuicConnection, TestFailure> {
+    var out = [0u8; 1452];
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var now: u64 = 2000000000;
+    let first = match (ok(client.datagram(mut out[..], now), "the client's Initial")?) {
+        Some(d) => d,
+        null => { return Err(TestFailure.create("an Initial")); },
+    };
+    let sids = ok(QuicIds.random(), "random IDs")?;
+    var server = ok(QuicConnection.server(serverTls, out[0..first.length], serverAddress(), clientAddress(), sids, now), "server")?;
+    ok(server.feed(clientAddress(), 0, out[0..first.length], now), "the server's read")?;
+    for (r in 0..rounds) {
+        loop {
+            let d = match (ok(client.datagram(mut out[..], now), "the client's datagram")?) {
+                Some(d) => d,
+                null => { break; },
+            };
+            ok(server.feed(clientAddress(), 0, out[0..d.length], now), "the server's read")?;
+        }
+        loop {
+            match (ok(server.nextEvent(buffer.viewMut()), "a server event")?) {
+                Some(QuicEvent.EarlyData(_)) => { heard.early = true; }
+                Some(QuicEvent.StreamData(_, n, _)) => {
+                    if (heard.data.extend(buffer.view()[0..n]).isErr()) {
+                        return Err(TestFailure.create("out of memory"));
+                    }
+                }
+                Some(_) => {}
+                null => { break; }
+            }
+        }
+        loop {
+            let d = match (ok(server.datagram(mut out[..], now), "the server's datagram")?) {
+                Some(d) => d,
+                null => { break; },
+            };
+            ok(client.feed(serverAddress(), 0, out[0..d.length], now), "the client's read")?;
+        }
+        while (ok(client.nextEvent(buffer.viewMut()), "a client event")?.isSome()) {}
+        now += 1000000;
+    }
+    return Ok(server);
+}
+
+fn earlySeen() -> EarlySeen => EarlySeen { early: false, data: Vector<u8>.create() };
+
+/// A ticket from a full handshake with a server using `serverTls`.
+fn ticketFrom(serverTls: borrow QuicTls, clientTls: borrow QuicTls) -> Result<Vector<u8>, TestFailure> {
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    var c = ok(QuicConnection.client(clientTls, "localhost", clientAddress(), serverAddress(), ids, 2000000000), "client")?;
+    var h = earlySeen();
+    let s = pumped(mut c, serverTls, mut h, 20)?;
+    Check.isTrue(c.handshakeDone() && s.handshakeDone(), "the first handshake")?;
+    var t = Vector<u8>.create();
+    if (t.resize(8192, 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    let n = c.ticket(t.viewMut());
+    Check.isTrue(n > 0, "a ticket after the handshake")?;
+    t.truncate(n);
+    return Ok(t);
+}
+
+/// A resumed connection that writes "early" on a stream before its first datagram: what the server saw, and whether
+/// the client's early data was accepted.
+fn resumedWithEarly(
+    serverTls: borrow QuicTls,
+    clientTls: borrow QuicTls,
+    ticket: Slice<u8>,
+) -> Result<EarlySeen, TestFailure> {
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    var c = ok(QuicConnection.client(clientTls, "localhost", clientAddress(), serverAddress(), ids, 2000000000), "client")?;
+    Check.isTrue(ok(c.resume(ticket), "the resumption")?, "the ticket allows 0-RTT")?;
+    let stream = ok(c.openStream(), "an early stream")?;
+    let _ = ok(c.writeStream(stream, "early".bytes(), true), "the early write")?;
+    var h = earlySeen();
+    let s = pumped(mut c, serverTls, mut h, 20)?;
+    Check.isTrue(c.handshakeDone() && s.handshakeDone(), "the resumed handshake")?;
+    if (c.earlyDataAccepted() != h.early) {
+        return Err(TestFailure.create("the client and the server agree on whether early data was accepted"));
+    }
+    return Ok(h);
+}
+
+/// 0-RTT (Web ADR 0014 §3.7, amendment 5 item 5). Expected:
+///   - a ticket from a full handshake lets the next connection send early data, which the server reports as early
+///     (`EarlyData`) and delivers ("early"), and which the client sees accepted;
+///   - the same ticket a second time gets a full handshake, its early data ignored: OpenSSL's replay protection makes
+///     tickets single-use (SSL_read_early_data(3), "REPLAY PROTECTION");
+///   - a server that did not allow early data issues tickets that offer no 0-RTT.
+@test
+fn early_data_once_per_ticket() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let alpn = [Alpn.Http3];
+    var serverTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    serverTls.allowEarlyData();
+    let clientTls = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
+    let ticket = ticketFrom(serverTls, clientTls)?;
+    let once = resumedWithEarly(serverTls, clientTls, ticket.view())?;
+    Check.isTrue(once.early, "the first resumption's data came early")?;
+    Check.equalBytes("early".bytes(), once.data.view())?;
+    let twice = resumedWithEarly(serverTls, clientTls, ticket.view())?;
+    Check.isTrue(!twice.early, "the same ticket's second use gets no early data")?;
+    // A server without early data.
+    let plainTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    let plainTicket = ticketFrom(plainTls, clientTls)?;
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    var c = ok(QuicConnection.client(clientTls, "localhost", clientAddress(), serverAddress(), ids, 2000000000), "client")?;
+    Check.isTrue(!ok(c.resume(plainTicket.view()), "the resumption")?, "no 0-RTT from a server that did not allow it")?;
+    return Ok();
+}

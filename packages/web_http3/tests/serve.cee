@@ -6,6 +6,7 @@
 //   GET /big       200 and 3 MiB written in pieces
 //   GET /trailers  200 "t" and the trailer `x-check: ok`
 //   GET /slow      200 "slow", after 300 ms
+//   GET /early     200 "early" if the request came in 0-RTT (`request.earlyData()`), else "late"
 //   GET /fail      the handler fails: 500
 //   anything else  404
 import web_core;
@@ -60,6 +61,9 @@ impl Application for TestApp {
                 Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
             }
             return await exchange.send(Status.ok(), "slow".bytes());
+        }
+        if (same(path, "/early")) {
+            return await exchange.send(Status.ok(), if (request.earlyData()) "early".bytes() else "late".bytes());
         }
         if (same(path, "/fail")) {
             return Err(HandlerError.Internal);
@@ -121,10 +125,16 @@ struct Setup {
     clientTls: QuicTls;
 }
 
-fn setup() -> Result<Setup, TestFailure> {
+fn setup() -> Result<Setup, TestFailure> => setupWith(false);
+
+/// `setup`, the server allowing 0-RTT when `early`.
+fn setupWith(early: bool) -> Result<Setup, TestFailure> {
     Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
     let alpn = [Alpn.Http3];
-    let serverTls = quic(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    var serverTls = quic(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    if (early) {
+        serverTls.allowEarlyData();
+    }
     let clientTls = quic(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
     let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
     let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
@@ -391,6 +401,71 @@ async fn rapid_reset_closes() -> Result<void, TestFailure> {
         },
         async () => {
             match (await resetFlood(s.clientTls, local)) {
+                Ok() => { return Ok(Ended.Client); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    return outcome(raced);
+}
+
+/// 0-RTT over HTTP/3 (Web ADR 0014 §3.7, amendment 5 item 5). A first connection gives a ticket; a second resumes with
+/// it and, before its handshake ends, sends GET /early and POST /echo as early data. Expected: the early data is
+/// accepted; GET runs, and its handler sees `earlyData()` ("early"); POST, not safe to replay, is answered 425 Too
+/// Early (RFC 8470 §5.2) without running.
+async fn earlyRequests(tls: borrow QuicTls, server: SocketAddress) -> Result<void, TestFailure> {
+    var first = await TestClient.connect(tls, server)?;
+    let hello = first.request("GET", "/hello", "".bytes())?;
+    var turns = 0;
+    while (turns < 500 && !first.doneFor(hello)) {
+        await first.turn(10)?;
+        turns += 1;
+    }
+    let ticket = await first.takeTicket(200)?;
+    var second = await TestClient.connectWith(tls, server, ticket.view())?;
+    let get = second.request("GET", "/early", "".bytes())?;
+    let post = second.request("POST", "/echo", "unsafe".bytes())?;
+    let deadline = Clock.monotonicNanos() + 10000000000;
+    while (!second.allDone()) {
+        if (Clock.monotonicNanos() > deadline || second.closed) {
+            return Err(TestFailure.create("the early requests' answers did not end in 10 s"));
+        }
+        await second.turn(10)?;
+    }
+    Check.isTrue(second.conn.earlyDataAccepted(), "the early data was accepted")?;
+    let all = second.answers.view();
+    let g = match (second.indexOf(get)) {
+        Some(i) => i,
+        null => { return Err(TestFailure.create("the GET's answer")); },
+    };
+    let q = match (second.indexOf(post)) {
+        Some(i) => i,
+        null => { return Err(TestFailure.create("the POST's answer")); },
+    };
+    Check.isTrue(startsWith(all[g].fields.view(), ":status: 200\n"), "the early GET ran")?;
+    Check.equalBytes("early".bytes(), all[g].data.view())?;
+    Check.isTrue(startsWith(all[q].fields.view(), ":status: 425\n"), "the early POST got 425")?;
+    return Ok();
+}
+
+@test
+async fn early_data_runs_safe_requests_only() -> Result<void, TestFailure> {
+    let s = setupWith(true)?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let socket = s.socket;
+    let local = s.local;
+    let tls = s.tls;
+    let app = s.app;
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await Http3Server.serve(socket, local, tls, app, Limits.defaults(), drain, Http3Options.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await earlyRequests(s.clientTls, local)) {
                 Ok() => { return Ok(Ended.Client); }
                 Err(e) => { return Ok(Ended.ClientFailed(e)); }
             }
