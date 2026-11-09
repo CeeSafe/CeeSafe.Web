@@ -1,0 +1,543 @@
+// The QUIC server's driver (Web ADR 0014 §3.5): one listener task owns the UDP socket and the routing table; each
+// connection runs in its own task, a child of the listener's task set (CeeSafe ADR 0053), with its application.
+//
+// - **The listener** reads datagrams and routes each by its destination connection ID to its connection's inbound
+//   channel. A version 1 Initial for an unknown ID makes a connection, while fewer than `maxConnections` live; any
+//   other datagram for an unknown ID is dropped (stateless resets: stage 4). It is the socket's only user: connection
+//   tasks send through it.
+// - **A connection task** owns its `QuicConnection`. Its application drives it through `QuicLink.next`, which feeds
+//   datagrams, runs the timers and sends what the connection has, and returns the connection's events.
+// - **They talk through channels:** datagrams in, on each connection's inbound channel; and datagrams out, connection
+//   IDs issued and retired, and the end, on one channel to the listener.
+// - **Datagrams that do not fit are dropped:** a full inbound channel drops the datagram, as a full socket buffer would.
+//   QUIC recovers from loss (RFC 9002).
+import web_core;
+
+/// A datagram for a connection task.
+struct Inbound {
+    bytes: Vector<u8>;
+    from: SocketAddress;
+    ecn: u8;
+}
+
+/// What a connection task tells its listener.
+enum ToListener {
+    /// Send these bytes to this address.
+    Send(Vector<u8>, SocketAddress),
+    /// Datagrams to this connection ID are connection `u32`'s.
+    Route(Vector<u8>, u32),
+    /// This connection ID is retired.
+    Unroute(Vector<u8>),
+    /// Connection `u32` has ended.
+    Ended(u32),
+}
+
+/// One routing entry: a connection ID, and whose it is.
+struct Route {
+    cid: Vector<u8>;
+    conn: u32;
+}
+
+/// A live connection's inbound channel.
+struct Live {
+    id: u32;
+    inbound: Channel<Inbound>;
+}
+
+/// How a server admits connections.
+public struct QuicServerOptions {
+    /// The most connections live at once; Initials for new ones are dropped past it.
+    public maxConnections: u32;
+    /// Datagrams queued for one connection before more are dropped.
+    public inboundQueue: u32;
+
+    /// 1000 connections, 64 datagrams each.
+    public fn defaults() -> QuicServerOptions => QuicServerOptions { maxConnections: 1000, inboundQueue: 64 };
+}
+
+/// What runs on each connection: reads its events with `link.next`, until the connection ends.
+public interface QuicApplication {
+    async fn connection(borrow this, link: borrow mut QuicLink) -> Result<void, QuicError>;
+}
+
+/// A server connection's handle for its application.
+public struct QuicLink {
+    private conn: QuicConnection;
+    private inbound: Channel<Inbound>;
+    private toListener: Channel<ToListener>;
+    private peer: SocketAddress;
+    private id: u32;
+    private out: Vector<u8>;
+
+    /// The connection's next event, its data (for `StreamData`, and the connection-ID events, which are handled here)
+    /// in `buffer` (`quicEventBufferSize()` bytes). It sends what the connection has first, then waits for a datagram
+    /// or the connection's next timer. `Draining` and `IdleTimeout` end the connection; return then.
+    public async fn next(borrow mut this, buffer: SliceMut<u8>) -> Result<QuicEvent, QuicError> {
+        loop {
+            match (this.conn.nextEvent(buffer)?) {
+                Some(QuicEvent.NewConnectionId(n)) => {
+                    let cid = copied(buffer[0..n])?;
+                    await this.post(ToListener.Route(cid, this.id))?;
+                    continue;
+                }
+                Some(QuicEvent.RetiredConnectionId(n)) => {
+                    let cid = copied(buffer[0..n])?;
+                    await this.post(ToListener.Unroute(cid))?;
+                    continue;
+                }
+                Some(e) => {
+                    await this.flush()?;
+                    return Ok(e);
+                }
+                null => {}
+            }
+            await this.flush()?;
+            let now = Clock.monotonicNanos();
+            let waitMs: u64 = match (this.conn.nextTimeout()) {
+                Some(t) => if (t <= now) 0 else (t - now + 999999) / 1000000,
+                null => 60000,
+            };
+            if (waitMs == 0) {
+                this.conn.onTimeout(now)?;
+                continue;
+            }
+            match (await wake(this.inbound, waitMs)?) {
+                Wake.Datagram(d) => {
+                    let from = QuicAddress.of(d.from);
+                    this.conn.feed(from, d.ecn as u32, d.bytes.view(), Clock.monotonicNanos())?;
+                }
+                Wake.Timer => { this.conn.onTimeout(Clock.monotonicNanos())?; }
+                Wake.Gone => { return Err(QuicError.Draining); }
+            }
+        }
+    }
+
+    /// Opens a bidirectional stream: its ID.
+    public fn openStream(borrow mut this) -> Result<i64, QuicError> => this.conn.openStream();
+
+    /// Queues bytes on a stream (`QuicConnection.writeStream`); `next` sends them.
+    public fn writeStream(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError> =>
+        this.conn.writeStream(stream, bytes, fin);
+
+    /// Resets our side of a stream.
+    public fn resetStream(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
+        this.conn.resetStream(stream, code);
+
+    /// The application protocol the handshake chose.
+    public fn alpn(borrow this) -> Alpn => this.conn.alpn();
+
+    /// The peer's address.
+    public fn peerAddress(borrow this) -> SocketAddress => this.peer;
+
+    /// Sends a CONNECTION_CLOSE with the application's `code`, or for the error that ended the connection.
+    public async fn close(borrow mut this, code: u64?) -> Result<void, QuicError> {
+        let n = this.conn.closeDatagram(code, this.out.viewMut(), Clock.monotonicNanos())?;
+        if (n > 0) {
+            let bytes = copied(this.out.view()[0..n])?;
+            await this.post(ToListener.Send(bytes, this.peer))?;
+        }
+        return Ok();
+    }
+
+    /// Sends every datagram the connection has now.
+    async fn flush(borrow mut this) -> Result<void, QuicError> {
+        loop {
+            let sent = match (this.conn.datagram(this.out.viewMut(), Clock.monotonicNanos())?) {
+                Some(d) => d,
+                null => { return Ok(); },
+            };
+            let bytes = copied(this.out.view()[0..sent.length])?;
+            await this.post(ToListener.Send(bytes, this.peer))?;
+        }
+    }
+
+    async fn post(borrow this, m: ToListener) -> Result<void, QuicError> {
+        match (await this.toListener.sendAsync(m)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(QuicError.Draining); } // the listener has gone
+        }
+    }
+}
+
+fn copied(bytes: Slice<u8>) -> Result<Vector<u8>, QuicError> {
+    var v = Vector<u8>.create();
+    match (v.extend(bytes)) {
+        Ok() => { return Ok(v); }
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+}
+
+enum Wake {
+    Datagram(Inbound),
+    Timer,
+    /// The inbound channel closed: the listener has gone.
+    Gone,
+}
+
+/// A datagram, or `waitMs` passing. A datagram taken as the timer won is kept: the timer's wake is the one dropped.
+async fn wake(inbound: borrow Channel<Inbound>, waitMs: u64) -> Result<Wake, QuicError> {
+    let raced: Result<Raced<Wake>, AsyncError> = await Async.race(
+        async () => {
+            match (await inbound.recvAsync()) {
+                Ok(Some(d)) => { return Ok(Wake.Datagram(d)); }
+                Ok(null) => { return Ok(Wake.Gone); }
+                Err(e) => { return Err(e); }
+            }
+        },
+        async () => {
+            await Timer.sleep(waitMs)?;
+            return Ok(Wake.Timer);
+        },
+    );
+    let won = match (raced) {
+        Ok(w) => w,
+        Err(_) => { return Err(QuicError.Draining); },
+    };
+    if (won.winner == 0) {
+        return Ok(won.value);
+    }
+    return match (won.other) {
+        Some(d) => Ok(d),
+        null => Ok(won.value),
+    };
+}
+
+/// The QUIC server.
+public struct QuicServer {
+    /// Serves QUIC on `socket` with `tls` (a server's, ALPN `h3` or another the clients speak) and `app`, until
+    /// cancelled. `local` is the socket's address, as the connections' path names it.
+    public async fn serve(
+        socket: borrow AsyncUdpSocket,
+        local: SocketAddress,
+        tls: Arc<QuicTls>,
+        app: Arc<Box<dyn QuicApplication + Send>>,
+        options: QuicServerOptions,
+    ) -> Result<void, QuicError> {
+        let toListener = match (Channel<ToListener>.create(256)) {
+            Ok(c) => c,
+            Err(_) => { return Err(QuicError.NoMemory); },
+        };
+        var routes = Vector<Route>.create();
+        var live = Vector<Live>.create();
+        let r = await Async.tasks(options.maxConnections, QuicError.NoMemory, async (set) =>
+            await listen(set, socket, local, tls, app, options, toListener, mut routes, mut live));
+        return r;
+    }
+}
+
+enum Heard {
+    Datagram(UdpReceived),
+    Message(ToListener),
+}
+
+async fn listen(
+    set: borrow TaskSet<QuicError>,
+    socket: borrow AsyncUdpSocket,
+    local: SocketAddress,
+    tls: borrow Arc<QuicTls>,
+    app: borrow Arc<Box<dyn QuicApplication + Send>>,
+    options: QuicServerOptions,
+    toListener: borrow Channel<ToListener>,
+    routes: borrow mut Vector<Route>,
+    live: borrow mut Vector<Live>,
+) -> Result<void, QuicError> {
+    var buffer = Vector<u8>.create();
+    match (buffer.resize(65527, 0)) {
+        Ok() => {}
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+    var next: u32 = 1;
+    loop {
+        let raced: Result<Raced<Heard>, AsyncError> = await Async.race(
+            async () => {
+                let got = await socket.recvMsg(buffer.viewMut())?;
+                return Ok(Heard.Datagram(got));
+            },
+            async () => {
+                match (await toListener.recvAsync()) {
+                    Ok(Some(m)) => { return Ok(Heard.Message(m)); }
+                    Ok(null) => { return Err(AsyncError.Cancelled); }
+                    Err(e) => { return Err(e); }
+                }
+            },
+        );
+        let won = match (raced) {
+            Ok(w) => w,
+            Err(_) => { return Err(QuicError.NoMemory); },
+        };
+        await heard(
+            set,
+            socket,
+            local,
+            tls,
+            app,
+            options,
+            toListener,
+            routes,
+            live,
+            mut next,
+            buffer.view(),
+            won.value,
+        )?;
+        match (won.other) {
+            Some(h) => {
+                await heard(
+                    set,
+                    socket,
+                    local,
+                    tls,
+                    app,
+                    options,
+                    toListener,
+                    routes,
+                    live,
+                    mut next,
+                    buffer.view(),
+                    h,
+                )?;
+            }
+            null => {}
+        }
+    }
+}
+
+async fn heard(
+    set: borrow TaskSet<QuicError>,
+    socket: borrow AsyncUdpSocket,
+    local: SocketAddress,
+    tls: borrow Arc<QuicTls>,
+    app: borrow Arc<Box<dyn QuicApplication + Send>>,
+    options: QuicServerOptions,
+    toListener: borrow Channel<ToListener>,
+    routes: borrow mut Vector<Route>,
+    live: borrow mut Vector<Live>,
+    next: borrow mut u32,
+    buffer: Slice<u8>,
+    h: Heard,
+) -> Result<void, QuicError> {
+    match (h) {
+        Heard.Message(ToListener.Send(bytes, to)) => {
+            match (await socket.sendTo(bytes.view(), to)) {
+                Ok() => {}
+                Err(_) => {} // a send that fails is a datagram lost: QUIC recovers
+            }
+        }
+        Heard.Message(ToListener.Route(cid, conn)) => {
+            match (routes.push(Route { cid: cid, conn: conn })) {
+                Ok() => {}
+                Err(_) => { return Err(QuicError.NoMemory); }
+            }
+        }
+        Heard.Message(ToListener.Unroute(cid)) => { unroute(routes, cid.view()); }
+        Heard.Message(ToListener.Ended(conn)) => { ended(routes, live, conn); }
+        Heard.Datagram(got) => {
+            if (got.truncated) {
+                return Ok(); // larger than any QUIC datagram we accept
+            }
+            let datagram = buffer[0..got.length];
+            let header = match (QuicHeader.of(datagram)) {
+                Some(x) => x,
+                null => { return Ok(); },
+            };
+            match (routed(routes, header.id())) {
+                Some(conn) => {
+                    deliver(live, conn, datagram, got.from, got.ecn)?;
+                    return Ok();
+                }
+                null => {}
+            }
+            if (!header.initial || live.length as u64 >= options.maxConnections as u64) {
+                return Ok(); // not a new connection's, or no room: dropped
+            }
+            await admit(set, local, tls, app, options, toListener, routes, live, next, datagram, got, header)?;
+        }
+    }
+    return Ok();
+}
+
+/// A new connection for the Initial `datagram`: its routes (the client's chosen ID and ours), its inbound channel
+/// with the Initial in it, and its task.
+async fn admit(
+    set: borrow TaskSet<QuicError>,
+    local: SocketAddress,
+    tls: borrow Arc<QuicTls>,
+    app: borrow Arc<Box<dyn QuicApplication + Send>>,
+    options: QuicServerOptions,
+    toListener: borrow Channel<ToListener>,
+    routes: borrow mut Vector<Route>,
+    live: borrow mut Vector<Live>,
+    next: borrow mut u32,
+    datagram: Slice<u8>,
+    got: UdpReceived,
+    header: QuicHeader,
+) -> Result<void, QuicError> {
+    let ids = QuicIds.random()?;
+    let id: u32 = next;
+    next += 1;
+    let inbound = match (Channel<Inbound>.create(options.inboundQueue as usize)) {
+        Ok(c) => c,
+        Err(_) => { return Err(QuicError.NoMemory); },
+    };
+    let initial = copied(datagram)?;
+    let original = copied(header.id())?;
+    let ours = copied(ids.scid[..])?;
+    let t = tls.clone();
+    let a = app.clone();
+    let i = inbound.clone();
+    let o = toListener.clone();
+    let from = got.from;
+    let started = set.trySpawn(async move () =>
+        await connectionTask(t, a, i, o, id, local, from, initial, ids));
+    if (!started) {
+        return Ok(); // the set is full: the Initial is dropped, and the client tries again
+    }
+    match (routes.push(Route { cid: original, conn: id })) {
+        Ok() => {}
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+    match (routes.push(Route { cid: ours, conn: id })) {
+        Ok() => {}
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+    match (live.push(Live { id: id, inbound: inbound })) {
+        Ok() => {}
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+    return Ok();
+}
+
+/// One connection's task: makes the connection from its Initial, runs the application, then closes and tells the
+/// listener.
+async fn connectionTask(
+    tls: Arc<QuicTls>,
+    app: Arc<Box<dyn QuicApplication + Send>>,
+    inbound: Channel<Inbound>,
+    toListener: Channel<ToListener>,
+    id: u32,
+    local: SocketAddress,
+    from: SocketAddress,
+    initial: Vector<u8>,
+    ids: QuicIds,
+) -> Result<void, QuicError> {
+    let here = QuicAddress.of(local);
+    let there = QuicAddress.of(from);
+    let now = Clock.monotonicNanos();
+    let made = QuicConnection.server(tls.get(), initial.view(), here, there, ids, now);
+    var conn = match (made) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = await toListener.sendAsync(ToListener.Ended(id));
+            return Ok();
+        },
+    };
+    var out = Vector<u8>.create();
+    match (out.resize(quicDatagramSize(), 0)) {
+        Ok() => {}
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+    let fed = conn.feed(there, 0, initial.view(), now);
+    var link = QuicLink { conn: conn, inbound: inbound, toListener: toListener, peer: from, id: id, out: out };
+    let result = match (fed) {
+        Ok() => await app.get().connection(mut link),
+        Err(e) => Err(e),
+    };
+    match (result) {
+        Ok() => { let _ = await link.close(Some(0)); }
+        Err(QuicError.Draining) => {}
+        Err(QuicError.IdleTimeout) => {}
+        Err(_) => { let _ = await link.close(null); }
+    }
+    let _ = await link.toListener.sendAsync(ToListener.Ended(id));
+    return Ok();
+}
+
+/// The connection a connection ID routes to.
+fn routed(routes: borrow Vector<Route>, cid: Slice<u8>) -> u32? {
+    for (r in routes.view()) {
+        if (same(r.cid.view(), cid)) {
+            return Some(r.conn);
+        }
+    }
+    return null;
+}
+
+fn unroute(routes: borrow mut Vector<Route>, cid: Slice<u8>) {
+    match (routeIndex(routes, cid)) {
+        Some(i) => { let _ = routes.swapRemove(i); }
+        null => {}
+    }
+}
+
+fn routeIndex(routes: borrow Vector<Route>, cid: Slice<u8>) -> usize? {
+    let all = routes.view();
+    for (i in 0..all.length) {
+        if (same(all[i].cid.view(), cid)) {
+            return Some(i);
+        }
+    }
+    return null;
+}
+
+/// Connection `conn` has ended: its routes and its channel go.
+fn ended(routes: borrow mut Vector<Route>, live: borrow mut Vector<Live>, conn: u32) {
+    loop {
+        match (connRoute(routes, conn)) {
+            Some(i) => { let _ = routes.swapRemove(i); }
+            null => { break; }
+        }
+    }
+    match (liveIndex(live, conn)) {
+        Some(k) => { let _ = live.swapRemove(k); }
+        null => {}
+    }
+}
+
+fn connRoute(routes: borrow Vector<Route>, conn: u32) -> usize? {
+    let all = routes.view();
+    for (i in 0..all.length) {
+        if (all[i].conn == conn) {
+            return Some(i);
+        }
+    }
+    return null;
+}
+
+fn liveIndex(live: borrow Vector<Live>, conn: u32) -> usize? {
+    let all = live.view();
+    for (i in 0..all.length) {
+        if (all[i].id == conn) {
+            return Some(i);
+        }
+    }
+    return null;
+}
+
+/// Puts a datagram on its connection's inbound channel; dropped if the channel is full.
+fn deliver(
+    live: borrow Vector<Live>,
+    conn: u32,
+    datagram: Slice<u8>,
+    from: SocketAddress,
+    ecn: u8,
+) -> Result<void, QuicError> {
+    for (l in live.view()) {
+        if (l.id == conn) {
+            let bytes = copied(datagram)?;
+            let _ = l.inbound.trySend(Inbound { bytes: bytes, from: from, ecn: ecn });
+            return Ok();
+        }
+    }
+    return Ok();
+}
+
+fn same(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}

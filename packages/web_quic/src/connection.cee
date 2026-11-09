@@ -62,6 +62,8 @@ extern "C" {
     @effects()
     fn qs_error_kind(code: i32) -> i32;
     @effects()
+    fn qs_packet_dcid(packet: *u8, length: usize, out: *mut u8, initial: *mut i32, version: *mut u32) -> i32;
+    @effects()
     fn qs_next_event(
         conn: *mut void,
         buffer: *mut u8,
@@ -75,8 +77,6 @@ extern "C" {
 
 /// How a QUIC operation failed (Web ADR 0014 §3.4).
 public enum QuicError {
-    /// The event queue has no room for what one datagram can report: drain `nextEvent`, then feed it again.
-    WouldBlock,
     /// The peer closed the connection: send nothing more, and drop it after the draining period.
     Draining,
     /// The idle timeout passed: drop the connection without sending anything.
@@ -108,10 +108,52 @@ public enum QuicEvent {
     StreamReset(i64, u64),
     /// The peer asked us to stop sending on stream `stream`, with the application's code.
     StopSending(i64, u64),
-    /// Stream `stream` may take more data.
+    /// Stream `stream` may take more data: its flow-control window grew, or acknowledgements made room in what it
+    /// holds.
     StreamWritable(i64),
     /// This many bidirectional streams may now be open at once.
     StreamsAvailable(u64),
+    /// We issued a connection ID, of this many bytes in the caller's buffer: datagrams to it are this connection's.
+    NewConnectionId(usize),
+    /// The peer retired one of our connection IDs, of this many bytes in the caller's buffer.
+    RetiredConnectionId(usize),
+}
+
+/// What a datagram's header says, before any connection reads it (RFC 9000 §17).
+public struct QuicHeader {
+    /// Its destination connection ID: `dcid[0..dcidLength]`.
+    public dcid: [u8; 20];
+    public dcidLength: usize;
+    /// A version 1 Initial: the only packet that may make a connection.
+    public initial: bool;
+    /// The long header's version, or 0 for a short header.
+    public version: u32;
+
+    /// The header of `datagram`, or null if it is not a QUIC packet. Short headers are read with this package's IDs'
+    /// length, 20 bytes.
+    /// Safety: the shim reads the datagram and writes at most 20 bytes into a local array, during the call only.
+    public fn of(datagram: Slice<u8>) -> QuicHeader? {
+        var h = QuicHeader { dcid: [0u8; 20], dcidLength: 0, initial: false, version: 0 };
+        var initial: i32 = 0;
+        var version: u32 = 0;
+        let n = unsafe { qs_packet_dcid(
+            datagram.ptr,
+            datagram.length,
+            borrow mut h.dcid[0] as *mut u8,
+            borrow mut initial as *mut i32,
+            borrow mut version as *mut u32,
+        ) };
+        if (n < 0) {
+            return null;
+        }
+        h.dcidLength = truncate<usize>(n); // 0 to 20 here
+        h.initial = initial == 1;
+        h.version = version;
+        return Some(h);
+    }
+
+    /// The destination connection ID.
+    public fn id(borrow this) -> Slice<u8> => this.dcid[0..this.dcidLength];
 }
 
 /// A UDP endpoint as the shim takes it: family (4 or 6), the port big-endian, then 16 address bytes.
@@ -145,6 +187,9 @@ public struct QuicAddress {
 
 /// A TLS context for QUIC: `web_tls`'s configuration, whose SSL_CTX the shim holds a reference to. A server's
 /// configuration offers ALPN `h3` (`Alpn.Http3`); it cannot be shared with a TCP listener's, whose list differs.
+/// Thread-safe by this package's claim (`trusted`, as web_tls's TlsConfig): the shim never changes a qs_tls after
+/// making it, and OpenSSL 3 lets threads share an SSL_CTX, making each connection's SSL from it under its own lock.
+@threadSafe
 @noncopy
 public struct QuicTls {
     private raw: *mut void;
@@ -392,6 +437,8 @@ public struct QuicConnection {
             6 => Ok(Some(QuicEvent.StopSending(stream, code))),
             7 => Ok(Some(QuicEvent.StreamWritable(stream))),
             8 => Ok(Some(QuicEvent.StreamsAvailable(code))),
+            9 => Ok(Some(QuicEvent.NewConnectionId(length))),
+            10 => Ok(Some(QuicEvent.RetiredConnectionId(length))),
             255 => Err(QuicError.BufferTooSmall(length)),
             _ => Ok(null),
         };
@@ -413,7 +460,6 @@ struct QuicErrors {
     /// The shim classifies ngtcp2's codes (qs_error_kind), so no ngtcp2 number is written here.
     /// Safety: the call takes a number and returns one.
     fn of(code: i32) -> QuicError => match (unsafe { qs_error_kind(code) }) {
-        1 => QuicError.WouldBlock,
         2 => QuicError.Draining,
         3 => QuicError.IdleTimeout,
         4 => QuicError.NoMemory,

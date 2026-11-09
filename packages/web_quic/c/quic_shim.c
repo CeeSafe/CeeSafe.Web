@@ -2,8 +2,9 @@
  *   - CeeSafe holds opaque handles (qs_tls, qs_conn), each made and freed here, and freed once by its owner;
  *   - every call takes byte buffers with explicit lengths and the time in nanoseconds; nothing here reads a clock or
  *     touches a socket, and no pointer from CeeSafe is kept after a call returns;
- *   - ngtcp2's callbacks copy what they report into a bounded queue in the handle, drained with qs_next_event after
- *     every call (§2, option A), so CeeSafe is never called from C;
+ *   - ngtcp2's callbacks copy what they report into a queue in the handle, drained with qs_next_event after every
+ *     call (§2, option A), so CeeSafe is never called from C. Its bound is flow control's: a stream's credit is
+ *     given back when CeeSafe takes its data, so what waits in the queue never passes the connection's window;
  *   - ngtcp2 keeps no copy of stream data it sends: the shim holds each stream's unacknowledged bytes until the peer
  *     acknowledges them (acked_stream_data_offset), and bounds them per stream;
  *   - ngtcp2 allocates through CeeSafe's allocator for C code (CEE_ALLOC_FOREIGN, CeeSafe ADR 0060), so the
@@ -169,12 +170,18 @@ enum {
     QS_EV_STOP_SENDING = 6,    /* stream, code: the peer asked us to stop sending */
     QS_EV_STREAM_WRITABLE = 7, /* stream: its flow-control window grew */
     QS_EV_STREAMS_BIDI = 8,    /* code: the bidirectional streams we may open, now */
+    QS_EV_NEW_CID = 9,         /* data: a connection ID we issued, which the listener must route to us */
+    QS_EV_RETIRE_CID = 10,     /* data: a connection ID of ours the peer retired */
     QS_EV_TOO_SMALL = 255,     /* not an event: qs_next_event's buffer is smaller than the next event's data */
 };
 
-#define QS_QUEUE_EVENTS 256u
-#define QS_QUEUE_BYTES (256u * 1024u)
-#define QS_MAX_DATAGRAM 65527u /* the largest UDP payload over IPv4 */
+#define QS_MAX_DATAGRAM 65527u /* the largest UDP payload over IPv4, and the most data one event carries */
+#define QS_MAX_DATA (16u * 1024u * 1024u) /* the connection's flow-control window, initial_max_data (qs_params) */
+/* The queue's limits. Stream data waits there only until CeeSafe takes it, and its credit is given back only then,
+   so it never passes QS_MAX_DATA; the rest of the events' data is connection IDs. Past these limits the shim fails
+   the connection with NGTCP2_ERR_NOMEM; flow control means they are not reached. */
+#define QS_QUEUE_BYTES_LIMIT (QS_MAX_DATA + 1024u * 1024u)
+#define QS_QUEUE_EVENTS_LIMIT 65536u
 
 typedef struct qs_event {
     uint32_t kind;
@@ -185,21 +192,55 @@ typedef struct qs_event {
     size_t length;
 } qs_event;
 
+/* Events in order, [head, head + count) of `events`; their data in order in `data`. Both grow as needed and start
+   over when the queue empties, which it does after every drain. */
 typedef struct qs_queue {
-    qs_event events[QS_QUEUE_EVENTS];
-    size_t head, count;
-    uint8_t *data; /* QS_QUEUE_BYTES; events' data in order, reset when the queue empties */
-    size_t used, consumed;
-    int overflow; /* set if a callback could not queue: a bug in the bounds, reported as a failure */
+    qs_event *events;
+    size_t head, count, capacity;
+    uint8_t *data;
+    size_t used, room;
+    int failed; /* a push could not grow the queue: the connection fails with NGTCP2_ERR_NOMEM */
 } qs_queue;
 
-static int qs_push(qs_queue *q, uint32_t kind, uint32_t flags, int64_t stream, uint64_t code, const uint8_t *bytes,
-                   size_t length) {
-    if (q->count == QS_QUEUE_EVENTS || length > QS_QUEUE_BYTES - q->used) {
-        q->overflow = 1;
-        return 0;
+static int qs_push_one(qs_queue *q, uint32_t kind, uint32_t flags, int64_t stream, uint64_t code,
+                       const uint8_t *bytes, size_t length) {
+    if (q->head + q->count == q->capacity) {
+        if (q->head > 0) {
+            memmove(q->events, q->events + q->head, q->count * sizeof *q->events);
+            q->head = 0;
+        } else {
+            size_t want = q->capacity ? q->capacity * 2 : 64u;
+            if (want > QS_QUEUE_EVENTS_LIMIT) {
+                q->failed = 1;
+                return 0;
+            }
+            qs_event *grown = qs_realloc(q->events, want * sizeof *grown, NULL);
+            if (!grown) {
+                q->failed = 1;
+                return 0;
+            }
+            q->events = grown;
+            q->capacity = want;
+        }
     }
-    qs_event *e = &q->events[(q->head + q->count) % QS_QUEUE_EVENTS];
+    if (length > q->room - q->used) {
+        size_t want = q->room ? q->room : 65536u;
+        while (want - q->used < length) {
+            want *= 2;
+        }
+        if (want > QS_QUEUE_BYTES_LIMIT) {
+            q->failed = 1;
+            return 0;
+        }
+        uint8_t *grown = qs_realloc(q->data, want, NULL);
+        if (!grown) {
+            q->failed = 1;
+            return 0;
+        }
+        q->data = grown;
+        q->room = want;
+    }
+    qs_event *e = &q->events[q->head + q->count];
     e->kind = kind;
     e->flags = flags;
     e->stream = stream;
@@ -214,26 +255,55 @@ static int qs_push(qs_queue *q, uint32_t kind, uint32_t flags, int64_t stream, u
     return 1;
 }
 
-/* Room for everything one datagram can report: its bytes, and an event per frame it could hold. */
-static int qs_room_for_datagram(const qs_queue *q, size_t length) {
-    return q->count + 64u <= QS_QUEUE_EVENTS && length <= QS_QUEUE_BYTES - q->used;
+/* Queues an event; stream data longer than QS_MAX_DATAGRAM as several, the FIN with the last, so every event's
+   data fits qs_next_event's buffer of QS_MAX_DATAGRAM bytes. */
+static int qs_push(qs_queue *q, uint32_t kind, uint32_t flags, int64_t stream, uint64_t code, const uint8_t *bytes,
+                   size_t length) {
+    while (kind == QS_EV_STREAM_DATA && length > QS_MAX_DATAGRAM) {
+        if (!qs_push_one(q, kind, flags & ~1u, stream, code, bytes, QS_MAX_DATAGRAM)) {
+            return 0;
+        }
+        bytes += QS_MAX_DATAGRAM;
+        length -= QS_MAX_DATAGRAM;
+    }
+    return qs_push_one(q, kind, flags, stream, code, bytes, length);
 }
 
 /* ---- Streams we send on: bytes held until acknowledged ---- */
 
-#define QS_STREAM_HOLD (1024u * 1024u) /* unacknowledged bytes per stream; past it, qs_stream_write takes less */
+#define QS_STREAM_HOLD (1024u * 1024u) /* bytes held per stream; past it, qs_stream_write takes less */
+#define QS_CHUNK 16384u
+#define QS_VECS 8 /* chunks handed to ngtcp2 per packet written */
+
+/* A stream's bytes are kept in chunks that never move: ngtcp2 keeps pointers into the bytes it was given until they
+   are acknowledged, to retransmit them. A chunk is filled in order and freed only once all its bytes are
+   acknowledged; nothing is moved or reallocated while ngtcp2 may hold a pointer into it. */
+typedef struct qs_chunk {
+    struct qs_chunk *next;
+    size_t length;
+    uint8_t bytes[QS_CHUNK];
+} qs_chunk;
 
 typedef struct qs_stream {
     int64_t id;
-    uint8_t *bytes;   /* [acked .. acked + length) of the stream */
-    size_t length;    /* bytes held */
-    size_t capacity;
-    uint64_t acked;   /* stream offset of bytes[0] */
-    uint64_t sent;    /* stream offset handed to ngtcp2 so far */
-    int fin;          /* the application ended the stream */
+    qs_chunk *head, *tail; /* the oldest chunk held, whose bytes[0] is stream offset `base`, and the newest */
+    uint64_t base;         /* stream offset of head->bytes[0] */
+    uint64_t end;          /* stream offset after the last byte held */
+    uint64_t acked;        /* every byte below it is acknowledged */
+    uint64_t sent;         /* stream offset handed to ngtcp2 so far */
+    int fin;               /* the application ended the stream */
     int fin_sent;
     struct qs_stream *next;
 } qs_stream;
+
+static void qs_chunks_free(qs_stream *s) {
+    while (s->head) {
+        qs_chunk *c = s->head;
+        s->head = c->next;
+        qs_free(c, NULL);
+    }
+    s->tail = NULL;
+}
 
 /* ---- Connections ---- */
 
@@ -283,7 +353,7 @@ static void qs_stream_drop(qs_conn *c, int64_t id) {
         if ((*p)->id == id) {
             qs_stream *s = *p;
             *p = s->next;
-            qs_free(s->bytes, NULL);
+            qs_chunks_free(s);
             qs_free(s, NULL);
             return;
         }
@@ -311,7 +381,13 @@ static int cb_new_cid(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset
         0) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
-    return 0;
+    return qs_push(&c->queue, QS_EV_NEW_CID, 0, -1, 0, cid->data, cidlen) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+static int cb_remove_cid(ngtcp2_conn *conn, const ngtcp2_cid *cid, void *ud) {
+    (void)conn;
+    qs_conn *c = ud;
+    return qs_push(&c->queue, QS_EV_RETIRE_CID, 0, -1, 0, cid->data, cid->datalen) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 static int cb_handshake_completed(ngtcp2_conn *conn, void *ud) {
@@ -326,14 +402,11 @@ static int cb_recv_stream_data(ngtcp2_conn *conn, uint32_t flags, int64_t stream
     (void)sud;
     qs_conn *c = ud;
     uint32_t fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) ? 1u : 0u;
-    if (!qs_push(&c->queue, QS_EV_STREAM_DATA, fin, stream, 0, data, len)) {
-        return NGTCP2_ERR_CALLBACK_FAILURE;
-    }
-    /* The bytes are CeeSafe's once queued: give the window back now. Backpressure is the queue's room
-       (qs_room_for_datagram), checked before every read. */
-    ngtcp2_conn_extend_max_stream_offset(conn, stream, len);
-    ngtcp2_conn_extend_max_offset(conn, len);
-    return 0;
+    (void)conn;
+    /* The credit is given back when CeeSafe takes the bytes (qs_next_event), so the queue's data stays within the
+       connection's window. One datagram can release far more than its own bytes: ngtcp2 delivers what it held out of
+       order behind a lost packet once that packet arrives. */
+    return qs_push(&c->queue, QS_EV_STREAM_DATA, fin, stream, 0, data, len) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 static int cb_stream_open(ngtcp2_conn *conn, int64_t stream, void *ud) {
@@ -372,18 +445,30 @@ static int cb_acked(ngtcp2_conn *conn, int64_t stream, uint64_t offset, uint64_t
     (void)sud;
     qs_conn *c = ud;
     qs_stream *s = qs_find(c, stream);
-    if (!s || offset + len <= s->acked) {
+    /* ngtcp2 reports the acknowledged prefix growing (ngtcp2_acked_stream_data_offset): a range that starts past
+       what is acknowledged so far is not a prefix, and frees nothing. */
+    if (!s || offset > s->acked || offset + len <= s->acked) {
         return 0;
     }
-    /* Acknowledgements of a stream's data arrive in order of offset (ngtcp2_acked_stream_data_offset). */
-    uint64_t upto = offset + len;
-    size_t drop = (size_t)(upto - s->acked);
-    if (drop > s->length) {
-        drop = s->length;
+    int was_full = s->end - s->base >= QS_STREAM_HOLD;
+    s->acked = offset + len;
+    /* Free the chunks every byte of which is acknowledged; the rest stay where they are. */
+    int freed = 0;
+    while (s->head && s->base + s->head->length <= s->acked &&
+           (s->head != s->tail || s->head->length == QS_CHUNK || s->base + s->head->length == s->end)) {
+        qs_chunk *done = s->head;
+        s->base += done->length;
+        s->head = done->next;
+        if (!s->head) {
+            s->tail = NULL;
+        }
+        qs_free(done, NULL);
+        freed = 1;
     }
-    memmove(s->bytes, s->bytes + drop, s->length - drop);
-    s->length -= drop;
-    s->acked += drop;
+    if (was_full && freed) {
+        /* The stream refused bytes while it held QS_STREAM_HOLD; there is room again. */
+        return qs_push(&c->queue, QS_EV_STREAM_WRITABLE, 0, stream, 0, NULL, 0) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     return 0;
 }
 
@@ -420,6 +505,7 @@ static void qs_callbacks(ngtcp2_callbacks *cb, int server) {
     cb->get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
     cb->rand = cb_rand;
     cb->get_new_connection_id2 = cb_new_cid;
+    cb->remove_connection_id = cb_remove_cid;
     cb->handshake_completed = cb_handshake_completed;
     cb->recv_stream_data = cb_recv_stream_data;
     cb->stream_open = cb_stream_open;
@@ -448,9 +534,7 @@ static qs_conn *qs_conn_alloc(const uint8_t *local, const uint8_t *remote, const
     if (!c) {
         return NULL;
     }
-    c->queue.data = qs_malloc(QS_QUEUE_BYTES, NULL);
-    if (!c->queue.data || !qs_addr_from(&c->local, local) || !qs_addr_from(&c->remote, remote)) {
-        qs_free(c->queue.data, NULL);
+    if (!qs_addr_from(&c->local, local) || !qs_addr_from(&c->remote, remote)) {
         qs_free(c, NULL);
         return NULL;
     }
@@ -608,26 +692,22 @@ void qs_conn_free(qs_conn *c) {
     while (c->streams) {
         qs_stream *s = c->streams;
         c->streams = s->next;
-        qs_free(s->bytes, NULL);
+        qs_chunks_free(s);
         qs_free(s, NULL);
     }
     qs_free(c->queue.data, NULL);
+    qs_free(c->queue.events, NULL);
     qs_free(c, NULL);
 }
 
 /* ---- Reading and writing datagrams ---- */
 
-#define QS_WOULD_BLOCK (-1000) /* the queue lacks room for what one datagram can report: drain it and feed again */
-
-/* Feeds one datagram (`len` bytes, ECN mark `ecn`) that arrived from `remote`. 0; QS_WOULD_BLOCK; or ngtcp2's error,
+/* Feeds one datagram (`len` bytes, ECN mark `ecn`) that arrived from `remote`. 0, or ngtcp2's error,
    after which the connection is closing (qs_close writes its CONNECTION_CLOSE) or, for NGTCP2_ERR_DRAINING, the peer
    closed it. */
 int32_t qs_read(qs_conn *c, const uint8_t *remote, uint32_t ecn, const uint8_t *pkt, size_t len, uint64_t now) {
     if (len > QS_MAX_DATAGRAM) {
         return NGTCP2_ERR_INVALID_ARGUMENT;
-    }
-    if (!qs_room_for_datagram(&c->queue, len)) {
-        return QS_WOULD_BLOCK;
     }
     qs_addr from;
     if (!qs_addr_from(&from, remote)) {
@@ -638,8 +718,8 @@ int32_t qs_read(qs_conn *c, const uint8_t *remote, uint32_t ecn, const uint8_t *
     path.remote.addrlen = from.length;
     ngtcp2_pkt_info pi = {(uint8_t)ecn};
     int rv = ngtcp2_conn_read_pkt(c->conn, &path, &pi, pkt, len, now);
-    if (c->queue.overflow) {
-        return NGTCP2_ERR_INTERNAL; /* a bound above was wrong: never seen, but never silent */
+    if (c->queue.failed) {
+        rv = NGTCP2_ERR_NOMEM; /* the queue could not grow: memory, since flow control bounds it */
     }
     if (rv != 0 && rv != NGTCP2_ERR_DRAINING) {
         ngtcp2_ccerr_set_liberr(&c->last_error, rv, NULL, 0);
@@ -653,14 +733,28 @@ int64_t qs_write(qs_conn *c, uint8_t *out, size_t cap, uint64_t now, uint32_t *e
     ngtcp2_pkt_info pi;
     memset(&pi, 0, sizeof pi);
     for (qs_stream *s = c->streams; s; s = s->next) {
-        size_t unsent = (size_t)(s->acked + s->length - s->sent);
-        if (unsent == 0 && !(s->fin && !s->fin_sent)) {
+        if (s->sent == s->end && !(s->fin && !s->fin_sent)) {
             continue;
         }
-        ngtcp2_vec v = {s->bytes + (size_t)(s->sent - s->acked), unsent};
+        /* The unsent bytes, from the chunk holding `sent`, up to QS_VECS chunks. */
+        ngtcp2_vec v[QS_VECS];
+        size_t count = 0;
+        uint64_t at = s->base;
+        uint64_t reach = s->sent;
+        for (qs_chunk *ch = s->head; ch && count < QS_VECS; ch = ch->next) {
+            uint64_t chunk_end = at + ch->length;
+            if (reach < chunk_end) {
+                v[count].base = ch->bytes + (size_t)(reach - at);
+                v[count].len = (size_t)(chunk_end - reach);
+                count += 1;
+                reach = chunk_end;
+            }
+            at = chunk_end;
+        }
         ngtcp2_ssize taken = 0;
-        uint32_t flags = s->fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
-        ngtcp2_ssize n = ngtcp2_conn_writev_stream(c->conn, &c->path, &pi, out, cap, &taken, flags, s->id, &v, 1,
+        /* The FIN only with the stream's last bytes: never when the vectors stop short of the end. */
+        uint32_t flags = (s->fin && reach == s->end) ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
+        ngtcp2_ssize n = ngtcp2_conn_writev_stream(c->conn, &c->path, &pi, out, cap, &taken, flags, s->id, v, count,
                                                    now);
         if (n == NGTCP2_ERR_STREAM_DATA_BLOCKED || n == NGTCP2_ERR_STREAM_SHUT_WR ||
             n == NGTCP2_ERR_STREAM_NOT_FOUND) {
@@ -672,7 +766,7 @@ int64_t qs_write(qs_conn *c, uint8_t *out, size_t cap, uint64_t now, uint32_t *e
         }
         if (taken >= 0) {
             s->sent += (uint64_t)taken;
-            if (s->fin && s->sent == s->acked + s->length) {
+            if (s->fin && s->sent == s->end && (flags & NGTCP2_WRITE_STREAM_FLAG_FIN)) {
                 s->fin_sent = 1;
             }
         }
@@ -732,11 +826,10 @@ size_t qs_alpn(qs_conn *c, uint8_t *out, size_t cap) {
     return n;
 }
 
-/* What an error code means to CeeSafe, so ngtcp2's numbers stay in C: 1 would block (the shim's), 2 draining, 3 idle
-   timeout, 4 no memory, 5 no stream may be opened now, 6 not an Initial to accept, 0 anything else. */
+/* What an error code means to CeeSafe, so ngtcp2's numbers stay in C: 2 draining, 3 idle timeout, 4 no memory, 5 no
+   stream may be opened now, 6 not an Initial to accept, 0 anything else. */
 int32_t qs_error_kind(int32_t code) {
     switch (code) {
-    case QS_WOULD_BLOCK: return 1;
     case NGTCP2_ERR_DRAINING: return 2;
     case NGTCP2_ERR_IDLE_CLOSE: return 3;
     case NGTCP2_ERR_NOMEM: return 4;
@@ -764,24 +857,40 @@ int64_t qs_stream_write(qs_conn *c, int64_t stream, const uint8_t *bytes, size_t
     if (!s || s->fin) {
         return -1;
     }
-    size_t room = s->length >= QS_STREAM_HOLD ? 0 : QS_STREAM_HOLD - s->length;
+    uint64_t held = s->end - s->base;
+    size_t room = held >= QS_STREAM_HOLD ? 0 : (size_t)(QS_STREAM_HOLD - held);
     size_t take = len < room ? len : room;
-    if (take > 0) {
-        if (s->length + take > s->capacity) {
-            size_t want = s->capacity ? s->capacity : 16384u;
-            while (want < s->length + take) {
-                want *= 2;
+    size_t done = 0;
+    while (done < take) {
+        if (!s->tail || s->tail->length == QS_CHUNK) {
+            qs_chunk *fresh = qs_malloc(sizeof *fresh, NULL);
+            if (!fresh) {
+                if (done == 0) {
+                    return -1;
+                }
+                break; /* what was taken stays taken */
             }
-            uint8_t *grown = qs_realloc(s->bytes, want, NULL);
-            if (!grown) {
-                return -1;
+            fresh->next = NULL;
+            fresh->length = 0;
+            if (s->tail) {
+                s->tail->next = fresh;
+            } else {
+                s->head = fresh;
+                s->base = s->end;
             }
-            s->bytes = grown;
-            s->capacity = want;
+            s->tail = fresh;
         }
-        memcpy(s->bytes + s->length, bytes, take);
-        s->length += take;
+        size_t n = QS_CHUNK - s->tail->length;
+        if (n > take - done) {
+            n = take - done;
+        }
+        /* Only past the bytes already given to ngtcp2: appending never moves them. */
+        memcpy(s->tail->bytes + s->tail->length, bytes + done, n);
+        s->tail->length += n;
+        s->end += n;
+        done += n;
     }
+    take = done;
     if (fin && take == len) {
         s->fin = 1;
     }
@@ -790,8 +899,36 @@ int64_t qs_stream_write(qs_conn *c, int64_t stream, const uint8_t *bytes, size_t
 
 /* Resets our sending side of `stream` with the application's `code`, and asks the peer to stop sending. */
 int32_t qs_stream_reset(qs_conn *c, int64_t stream, uint64_t code) {
+    /* ngtcp2 first, then the bytes: after the reset it sends none of them again. */
+    int rv = ngtcp2_conn_shutdown_stream(c->conn, 0, stream, code);
     qs_stream_drop(c, stream);
-    return ngtcp2_conn_shutdown_stream(c->conn, 0, stream, code);
+    return rv;
+}
+
+/* ---- Routing, before there is a connection ---- */
+
+/* A datagram's destination connection ID, into `out` (20 bytes): its length, or -1 if the datagram is not a QUIC packet
+   ngtcp2 can read. Short headers are read with our IDs' length, 20. *initial is 1 for a version 1 long-header Initial,
+   the only packet that may make a connection (RFC 9000 §17.2.2); *version is the long header's version (0 for a short
+   header). */
+int32_t qs_packet_dcid(const uint8_t *pkt, size_t len, uint8_t *out, int32_t *initial, uint32_t *version) {
+    *initial = 0;
+    *version = 0;
+    ngtcp2_version_cid vc;
+    int rv = ngtcp2_pkt_decode_version_cid(&vc, pkt, len, 20);
+    if (rv != 0 && rv != NGTCP2_ERR_VERSION_NEGOTIATION) {
+        return -1;
+    }
+    if (vc.dcidlen > 20) {
+        return -1;
+    }
+    memcpy(out, vc.dcid, vc.dcidlen);
+    *version = vc.version;
+    /* Long header (bit 7), version 1, packet type 0 (bits 5-4): an Initial. */
+    if (len > 0 && (pkt[0] & 0x80) && vc.version == NGTCP2_PROTO_VER_V1 && ((pkt[0] & 0x30) >> 4) == 0) {
+        *initial = 1;
+    }
+    return (int32_t)vc.dcidlen;
 }
 
 /* ---- Events ---- */
@@ -803,8 +940,8 @@ uint32_t qs_next_event(qs_conn *c, uint8_t *buf, size_t cap, int64_t *stream, ui
                        size_t *length) {
     qs_queue *q = &c->queue;
     if (q->count == 0) {
+        q->head = 0;
         q->used = 0;
-        q->consumed = 0;
         return 0;
     }
     qs_event *e = &q->events[q->head];
@@ -819,11 +956,17 @@ uint32_t qs_next_event(qs_conn *c, uint8_t *buf, size_t cap, int64_t *stream, ui
     *code = e->code;
     *length = n;
     uint32_t kind = e->kind;
-    q->head = (q->head + 1) % QS_QUEUE_EVENTS;
+    if (kind == QS_EV_STREAM_DATA && n > 0) {
+        /* CeeSafe has the bytes: their credit goes back to the peer now (flow control bounds the queue). A stream
+           already closed has no window to extend, which ngtcp2 reports and nothing needs. */
+        (void)ngtcp2_conn_extend_max_stream_offset(c->conn, e->stream, n);
+        ngtcp2_conn_extend_max_offset(c->conn, n);
+    }
+    q->head += 1;
     q->count -= 1;
     if (q->count == 0) {
+        q->head = 0;
         q->used = 0;
-        q->consumed = 0;
     }
     return kind;
 }

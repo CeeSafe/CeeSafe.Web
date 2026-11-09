@@ -328,3 +328,51 @@ Each stage is committed and checked.
    queue's bound (item 4).
 7. **Datagrams.** `datagram` writes one packet per call, with data from at most one stream. ngtcp2's default largest
    datagram, 1452 bytes (`ngtcp2_settings.c`), is the out buffer's size.
+
+## 9. Amendment 2 (2026-11-09, M10 stage 2: the driver, and what real UDP found)
+
+This amendment replaces amendment 1's items 4, 5 and 6.
+
+1. **The queue's bound is flow control's** (replaces amendment 1 items 4 and 6).
+   - **Why:** one datagram can release far more than its own bytes. ngtcp2 holds data received out of order behind a
+     lost packet, and delivers all of it when that packet arrives. No check before a read can bound that, and over
+     real UDP on epoll and WSAPoll the fixed 256 KiB queue overflowed (ngtcp2 error -228, the callback's failure).
+   - **Now:** a stream's flow-control credit is given back only when CeeSafe takes its data (`qs_next_event`), not when
+     it is queued. So the queued data never passes the connection's window, `initial_max_data`, 16 MiB
+     (`QS_MAX_DATA`).
+   - **The queue grows** within that bound: QS_MAX_DATA + 1 MiB of data and 65 536 events
+     (`QS_QUEUE_BYTES_LIMIT`, `QS_QUEUE_EVENTS_LIMIT`). Past them, or if growing fails, the connection fails with
+     `NGTCP2_ERR_NOMEM`, which is `QuicError.NoMemory`.
+   - **`WouldBlock` is removed:** `feed` never needs to be repeated.
+   - **Long data is split:** stream data longer than 65 527 bytes is queued as several events, the FIN with the last, so
+     every event fits `quicEventBufferSize()`. `BufferTooSmall` stays for a smaller buffer.
+2. **A stream's sent bytes never move** (replaces amendment 1 item 5).
+   - **Why:** ngtcp2 keeps pointers into the stream data it was given until that data is acknowledged, and retransmits
+     from them. The first buffer `memmove`d the acknowledged prefix away and `realloc`ed to grow, which moved bytes
+     ngtcp2 still pointed into. Under loss the peer then received wrong bytes: the 3 MiB transfer's check failed on
+     epoll.
+   - **Now:** each stream holds its bytes in 16 KiB chunks (`qs_chunk`), filled in order. A chunk is freed only when
+     every byte in it is acknowledged; nothing is moved or reallocated while ngtcp2 may hold a pointer into it.
+   - **A stream holds at most 1 MiB** (`QS_STREAM_HOLD`), as before: `writeStream` takes less, and `StreamWritable`
+     follows an acknowledgement that frees room.
+   - **Writing:** `qs_write` hands ngtcp2 the unsent bytes as up to 8 vectors, one per chunk. It sets the FIN only when
+     the vectors reach the stream's end, and records the FIN as sent only when it was passed.
+   - **Resetting:** `qs_stream_reset` shuts the stream down in ngtcp2 first, then frees its bytes, so ngtcp2 never
+     holds a pointer into freed chunks.
+3. **The driver** (`web_quic/src/server.cee`, §3.5):
+   - **One listener task** owns the UDP socket and the routing table, a vector of (connection ID, connection) scanned
+     in order. It is the socket's only user.
+   - **Admission:** a version 1 Initial for an unknown ID makes a connection while fewer than `maxConnections` (1000)
+     are live. Any other datagram for an unknown ID is dropped; stateless resets are stage 4's.
+   - **Each connection runs in its own task**, a child of the listener's task set (`Async.tasks`), with its application
+     (`QuicApplication.connection`, driven through `QuicLink`).
+   - **Channels:** each connection has an inbound channel of `inboundQueue` (64) datagrams; when it is full, a datagram
+     is dropped as a full socket buffer would drop it. Connections send to the listener on one channel: `Send`,
+     `Route` and `Unroute` (from `NewConnectionId` and `RetiredConnectionId`, the shim's events 9 and 10), and
+     `Ended`.
+4. **hq-interop** (`web_quic/src/hq.cee`): HTTP/0.9 over QUIC, as quic-interop-runner's transport cases use it, for
+   interop testing only.
+   - `GET /path` on a bidirectional stream gets the file's bytes, then FIN.
+   - The path guard: it must start with `/`, and may not hold `..`, `\`, `:`, a space or a zero byte. A refused or
+     missing file gets an empty answer.
+   - Files are read in 64 KiB pieces, and a piece the stream does not take waits for `StreamWritable`.

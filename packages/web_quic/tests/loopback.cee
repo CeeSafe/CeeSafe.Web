@@ -39,7 +39,6 @@ fn ok<T>(r: Result<T, QuicError>, what: StringView) -> Result<T, TestFailure> {
 }
 
 fn describe(e: QuicError) -> StringView => match (e) {
-    QuicError.WouldBlock => "WouldBlock",
     QuicError.Draining => "Draining",
     QuicError.IdleTimeout => "IdleTimeout",
     QuicError.NotInitial => "NotInitial",
@@ -118,6 +117,15 @@ struct Link {
     clientSeen: Seen;
     serverSeen: Seen;
     now: u64;
+    /// Drop every `dropEvery`-th datagram, in either direction (0: none); `count` numbers them.
+    dropEvery: u64;
+    count: u64;
+}
+
+/// Whether the next datagram is dropped.
+fn dropped(link: borrow mut Link) -> bool {
+    link.count += 1;
+    return link.dropEvery > 0 && link.count % link.dropEvery == 0;
 }
 
 fn clientAddress() -> QuicAddress {
@@ -148,6 +156,9 @@ fn round(link: borrow mut Link, p: borrow Pair, buffer: SliceMut<u8>, out: Slice
             )?;
             link.server = Some(made);
         }
+        if (dropped(link)) {
+            continue;
+        }
         match (borrow mut link.server) {
             Some(s) => {
                 ok(s.feed(local, sent.ecn, out[0..sent.length], link.now), "the server's read")?;
@@ -163,6 +174,10 @@ fn round(link: borrow mut Link, p: borrow Pair, buffer: SliceMut<u8>, out: Slice
                     Some(d) => d,
                     null => { break; },
                 };
+                link.count += 1;
+                if (link.dropEvery > 0 && link.count % link.dropEvery == 0) {
+                    continue;
+                }
                 ok(link.client.feed(remote, sent.ecn, out[0..sent.length], link.now), "the client's read")?;
                 drain(mut link.client, buffer, mut link.clientSeen)?;
             }
@@ -171,6 +186,28 @@ fn round(link: borrow mut Link, p: borrow Pair, buffer: SliceMut<u8>, out: Slice
     }
     drain(mut link.client, buffer, mut link.clientSeen)?;
     link.now += 1000000;
+    // Timers due (loss recovery's among them): RFC 9002's probe timeout is what recovers a tail lost.
+    match (link.client.nextTimeout()) {
+        Some(t) => {
+            if (t <= link.now) {
+                ok(link.client.onTimeout(link.now), "the client's timer")?;
+            }
+        }
+        null => {}
+    }
+    match (borrow mut link.server) {
+        Some(s) => {
+            match (s.nextTimeout()) {
+                Some(t) => {
+                    if (t <= link.now) {
+                        ok(s.onTimeout(link.now), "the server's timer")?;
+                    }
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
     return Ok();
 }
 
@@ -179,7 +216,15 @@ fn linked(p: borrow Pair) -> Result<Link, TestFailure> {
     let local = clientAddress();
     let remote = serverAddress();
     let client = ok(QuicConnection.client(p.client, "localhost", local, remote, ids, 1000000000), "the client")?;
-    return Ok(Link { client: client, server: null, clientSeen: seen(), serverSeen: seen(), now: 1000000000 });
+    return Ok(Link {
+        client: client,
+        server: null,
+        clientSeen: seen(),
+        serverSeen: seen(),
+        now: 1000000000,
+        dropEvery: 0,
+        count: 0,
+    });
 }
 
 @test
@@ -254,5 +299,61 @@ fn handshake_stream_echo_and_close() -> Result<void, TestFailure> {
         }
         null => {}
     }
+    return Ok();
+}
+
+/// Byte `i` of the lossy transfer's stream.
+fn lossyByte(i: usize) -> u8 => 97 + truncate<u8>(i % 26);
+
+/// 3 MiB on one stream while every fifth datagram is dropped, both ways. RFC 9000 §2.2 and RFC 9002: the bytes arrive
+/// whole and in order, so lost packets were retransmitted from the bytes the sender still held (held in chunks that
+/// never move, Web ADR 0014 amendment 2), and data held behind a loss was delivered once the loss was repaired.
+@test
+fn lossy_transfer_is_whole_and_in_order() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let p = pair()?;
+    var link = linked(p)?;
+    link.dropEvery = 5;
+    var buffer = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var out = [0u8; 1452];
+    var rounds = 0;
+    while (rounds < 2000 && !(link.clientSeen.handshake && link.serverSeen.handshake)) {
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.clientSeen.handshake && link.serverSeen.handshake, "the handshake, under loss")?;
+    let total: usize = 3 * 1048576;
+    var piece = [0u8; 16384];
+    var written: usize = 0;
+    let stream = ok(link.client.openStream(), "a stream")?;
+    rounds = 0;
+    while (rounds < 200000 && !link.serverSeen.fin) {
+        // Write what the stream takes; it holds at most a megabyte unacknowledged.
+        while (written < total) {
+            let n: usize = if (total - written < piece.length) total - written else piece.length;
+            for (i in 0..n) {
+                piece[i] = lossyByte(written + i);
+            }
+            let taken = ok(link.client.writeStream(stream, piece[0..n], written + n == total), "the write")?;
+            written += taken;
+            if (taken < n) {
+                break;
+            }
+        }
+        round(mut link, p, buffer.viewMut(), mut out[..])?;
+        rounds += 1;
+    }
+    Check.isTrue(link.serverSeen.fin, "the stream's end arrived")?;
+    Check.equalU64(total as u64, link.serverSeen.data.length as u64)?;
+    let got = link.serverSeen.data.view();
+    for (i in 0..got.length) {
+        if (got[i] != lossyByte(i)) {
+            return Err(TestFailure.create("the bytes, in order"));
+        }
+    }
+    Check.isTrue(link.count > 0, "datagrams were dropped")?;
     return Ok();
 }

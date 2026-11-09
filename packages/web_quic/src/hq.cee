@@ -1,0 +1,221 @@
+// `hq-interop`: HTTP/0.9 over QUIC, as quic-interop-runner's transport cases use it (its README, "hq-interop"). A
+// client opens a bidirectional stream and sends `GET /path` (CRLF optional), then the stream's FIN; the server
+// answers with the file's bytes, then FIN. For interop testing (Web ADR 0014 §4, stages 2 and 5), not for serving.
+//
+// The path rules are a guard, not web_static's (which this package sits below, Web ADR 0004): a path must start with
+// `/` and may not hold `..`, a backslash, a `:` or a zero byte. A refused or missing file gets an empty answer.
+import web_core;
+
+/// The longest request line read.
+fn hqRequestLimit() -> usize => 4096;
+
+/// The files under a root, over hq-interop.
+public struct HqFiles {
+    root: String;
+
+    /// Serves the files under `root` (a directory path without a trailing `/`).
+    public fn create(root: StringView) -> Result<HqFiles, AllocError> {
+        var r = String.create();
+        r.append(root)?;
+        return Ok(HqFiles { root: r });
+    }
+}
+
+/// One request: its stream, the request line so far, and, once started, its file and how far it has been sent.
+struct HqRequest {
+    stream: i64;
+    line: Vector<u8>;
+    file: File?;
+    offset: u64;
+    size: u64;
+    finSent: bool;
+    blocked: bool;
+}
+
+impl QuicApplication for HqFiles {
+    async fn connection(borrow this, link: borrow mut QuicLink) -> Result<void, QuicError> {
+        var buffer = Vector<u8>.create();
+        var chunk = Vector<u8>.create();
+        match (buffer.resize(quicEventBufferSize(), 0)) {
+            Ok() => {}
+            Err(_) => { return Err(QuicError.NoMemory); }
+        }
+        match (chunk.resize(65536, 0)) {
+            Ok() => {}
+            Err(_) => { return Err(QuicError.NoMemory); }
+        }
+        var requests = Vector<HqRequest>.create();
+        loop {
+            let event = match (await link.next(buffer.viewMut())) {
+                Ok(e) => e,
+                Err(QuicError.Draining) => { return Ok(); },
+                Err(QuicError.IdleTimeout) => { return Ok(); },
+                Err(e) => { return Err(e); },
+            };
+            match (event) {
+                QuicEvent.StreamData(stream, n, fin) => {
+                    let k = requestFor(mut requests, stream)?;
+                    let all = requests.viewMut();
+                    let r = borrow mut all[k];
+                    if (r.line.length + n <= hqRequestLimit()) {
+                        match (r.line.extend(buffer.view()[0..n])) {
+                            Ok() => {}
+                            Err(_) => { return Err(QuicError.NoMemory); }
+                        }
+                    }
+                    if (fin && r.file.isNull() && !r.finSent) {
+                        await this.start(r);
+                    }
+                }
+                QuicEvent.StreamWritable(stream) => {
+                    let all = requests.viewMut();
+                    for (i in 0..all.length) {
+                        if (all[i].stream == stream) {
+                            all[i].blocked = false;
+                        }
+                    }
+                }
+                QuicEvent.StreamClosed(stream, _) => { dropRequest(mut requests, stream); }
+                QuicEvent.StreamReset(stream, _) => { dropRequest(mut requests, stream); }
+                _ => {}
+            }
+            await pump(link, mut requests, chunk.viewMut())?;
+        }
+    }
+}
+
+impl HqFiles {
+    /// Opens the requested file; a refused or missing one is an empty answer.
+    async fn start(borrow this, r: borrow mut HqRequest) {
+        let path = match (requestPath(r.line.view())) {
+            Some(p) => p,
+            null => {
+                r.size = 0;
+                return;
+            },
+        };
+        var full = String.create();
+        let ok = full.append(this.root.view()).isOk() && full.append(path).isOk();
+        if (!ok) {
+            return;
+        }
+        match (await AsyncFiles.openRegular(full.view())) {
+            Ok(f) => {
+                var file = f;
+                r.size = match (await AsyncFiles.length(mut file)) {
+                    Ok(n) => n,
+                    Err(_) => 0,
+                };
+                r.file = Some(file);
+            }
+            Err(_) => { r.size = 0; }
+        }
+        r.offset = 0;
+        r.line.clear();
+        if (r.file.isNull()) {
+            r.offset = 0; // nothing to send: the FIN goes alone (pump)
+        }
+    }
+}
+
+/// Sends what each started request can: pieces of its file until the stream holds what it may, then the FIN.
+async fn pump(
+    link: borrow mut QuicLink,
+    requests: borrow mut Vector<HqRequest>,
+    chunk: SliceMut<u8>,
+) -> Result<void, QuicError> {
+    let all = requests.viewMut();
+    for (i in 0..all.length) {
+        let r = borrow mut all[i];
+        if (r.finSent || r.blocked || (r.file.isNull() && r.line.length > 0)) {
+            continue; // done, waiting for room, or its request line is still arriving
+        }
+        loop {
+            if (r.offset >= r.size) {
+                let _ = link.writeStream(r.stream, chunk[0..0], true)?;
+                r.finSent = true;
+                break;
+            }
+            let want: usize = if (r.size - r.offset < chunk.length as u64) truncate<usize>(
+                r.size - r.offset,
+            ) else chunk.length;
+            var n: usize = 0;
+            match (borrow mut r.file) {
+                Some(f) => {
+                    let got = await AsyncFiles.readAt(f, mut chunk[0..want], r.offset);
+                    n = match (got) {
+                        Ok(x) => x,
+                        Err(_) => 0,
+                    };
+                }
+                null => {}
+            }
+            if (n == 0) {
+                r.size = r.offset; // the file ended early: end the answer here
+                continue;
+            }
+            let taken = link.writeStream(r.stream, chunk[0..n], false)?;
+            r.offset += taken as u64;
+            if (taken < n) {
+                r.blocked = true; // the stream holds what it may: wait for StreamWritable
+                break;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// The index of `stream`'s request, made if new.
+fn requestFor(requests: borrow mut Vector<HqRequest>, stream: i64) -> Result<usize, QuicError> {
+    let all = requests.view();
+    for (i in 0..all.length) {
+        if (all[i].stream == stream) {
+            return Ok(i);
+        }
+    }
+    let r = HqRequest {
+        stream: stream,
+        line: Vector<u8>.create(),
+        file: null,
+        offset: 0,
+        size: 0,
+        finSent: false,
+        blocked: false,
+    };
+    match (requests.push(r)) {
+        Ok() => { return Ok(requests.length - 1); }
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+}
+
+fn dropRequest(requests: borrow mut Vector<HqRequest>, stream: i64) {
+    let all = requests.view();
+    for (i in 0..all.length) {
+        if (all[i].stream == stream) {
+            let _ = requests.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// The path of `GET /path` (with an optional CRLF), or null if the line is not one or the path is refused.
+fn requestPath(line: Slice<u8>) -> StringView? {
+    var end = line.length;
+    while (end > 0 && (line[end - 1] == 10 || line[end - 1] == 13 || line[end - 1] == 32)) {
+        end -= 1;
+    }
+    if (end < 5 || line[0] != 71 || line[1] != 69 || line[2] != 84 || line[3] != 32 || line[4] != 47) {
+        return null;
+    }
+    let path = line[4..end];
+    for (i in 0..path.length) {
+        let b = path[i];
+        if (b == 0 || b == 92 || b == 58 || b == 32) {
+            return null;
+        }
+        if (b == 46 && i + 1 < path.length && path[i + 1] == 46) {
+            return null;
+        }
+    }
+    return StringView.fromUtf8(path);
+}
