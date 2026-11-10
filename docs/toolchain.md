@@ -115,5 +115,5 @@ tests passed (interpreter, native, sanitizers, 371 allocation-failure points).
 | Tool | Version | For |
 |---|---|---|
 | C compiler | clang (macOS), GCC 12 (Debian 12), clang + `cl` (Windows 11) | native builds, sanitizers |
-| OpenSSL | ≥ 3.0 (M4), ≥ 3.5 (M10) | `web_tls`, QUIC crypto |
+| OpenSSL | ≥ 3.0 (M4), ≥ 3.5 (M10; 3.5.6 or later advised: 3.5.0–3.5.5 can corrupt the session cache when an allocation fails, openssl/openssl#28632, `docs/milestones/M10.md`) | `web_tls`, QUIC crypto |
 | Python | 3.10+ | `tools/`, oracles (`h11`, `h2`, `hpack`) |
