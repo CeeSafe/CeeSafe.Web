@@ -51,8 +51,8 @@ impl Handler<St> for Named {
 }
 
 /// A boxed `Named`.
-fn named(id: u32) -> Result<Box<dyn Handler<St> + Send>, TestFailure> {
-    let h: Box<dyn Handler<St> + Send> = alloc(Box.create(Named { id: id }))?;
+fn named(id: u32) -> Result<Box<dyn Handler<St> + Send + Share>, TestFailure> {
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Named { id: id }))?;
     return Ok(h);
 }
 
@@ -82,8 +82,8 @@ impl Handler<St> for Params2 {
     }
 }
 
-fn params2() -> Result<Box<dyn Handler<St> + Send>, TestFailure> {
-    let h: Box<dyn Handler<St> + Send> = alloc(Box.create(Params2 {}))?;
+fn params2() -> Result<Box<dyn Handler<St> + Send + Share>, TestFailure> {
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Params2 {}))?;
     return Ok(h);
 }
 
@@ -133,8 +133,8 @@ impl Middleware<St> for Mark {
     }
 }
 
-fn mark(id: u32) -> Result<Box<dyn Middleware<St> + Send>, TestFailure> {
-    let m: Box<dyn Middleware<St> + Send> = alloc(Box.create(Mark { id: id }))?;
+fn mark(id: u32) -> Result<Box<dyn Middleware<St> + Send + Share>, TestFailure> {
+    let m: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(Mark { id: id }))?;
     return Ok(m);
 }
 

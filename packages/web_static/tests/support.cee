@@ -223,7 +223,7 @@ async fn served(root: borrow Root, options: StaticOptions, request: StringView) 
         Err(_) => { return Err(TestFailure.create("a server")); },
     };
     let files = alloc(StaticFiles<St>.create(root.dir.view(), options))?;
-    let h: Box<dyn Handler<St> + Send> = alloc(Box.create(files))?;
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(files))?;
     match (s.router().get("/s/*path", h)) {
         Ok() => {}
         Err(_) => { return Err(TestFailure.create("a route")); }

@@ -287,11 +287,11 @@ async fn servedAs(
         drain: drain.share(),
         output: Vector<u8>.create(),
     };
-    let site: Box<dyn Application + Send> = match (Box.create(Site {})) {
+    let site: Box<dyn Application + Send + Share> = match (Box.create(Site {})) {
         Ok(b) => b,
         Err(_) => { return Err(TestFailure.create("a box")); },
     };
-    let app = match (Arc<Box<dyn Application + Send>>.create(site)) {
+    let app = match (Arc<Box<dyn Application + Send + Share>>.create(site)) {
         Ok(a) => a,
         Err(_) => { return Err(TestFailure.create("an arc")); },
     };

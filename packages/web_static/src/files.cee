@@ -45,7 +45,7 @@ public struct StaticFiles<S> {
     }
 }
 
-impl<S: Send> Handler<S> for StaticFiles<S> {
+impl<S: Send + Share> Handler<S> for StaticFiles<S> {
     async fn handle(
         borrow this,
         ctx: borrow mut RequestContext<S>,

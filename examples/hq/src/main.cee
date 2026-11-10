@@ -92,11 +92,11 @@ async fn serve() -> Result<void, Failure> {
         Ok(h) => h,
         Err(_) => { return Err(Failure.Memory); },
     };
-    let boxed: Box<dyn QuicApplication + Send> = match (Box.create(files)) {
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(files)) {
         Ok(b) => b,
         Err(_) => { return Err(Failure.Memory); },
     };
-    let app = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+    let app = match (Arc<Box<dyn QuicApplication + Send + Share>>.create(boxed)) {
         Ok(a) => a,
         Err(_) => { return Err(Failure.Memory); },
     };

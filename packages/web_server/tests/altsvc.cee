@@ -33,7 +33,7 @@ async fn answer(how: u32) -> Result<Vector<u8>, TestFailure> {
         s.advertiseHttp3(4433);
     }
     if (how == 2) {
-        let m: Box<dyn Middleware<St> + Send> = alloc(Box.create(OwnAltSvc {}))?;
+        let m: Box<dyn Middleware<St> + Send + Share> = alloc(Box.create(OwnAltSvc {}))?;
         routed(s.use(m))?;
     }
     let service = net(serviceOf(s))?;

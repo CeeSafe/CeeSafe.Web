@@ -152,7 +152,7 @@ fn application(p: borrow ReverseProxy) -> Result<Server<App>, RouteError> {
             4 => Method.Options,
             _ => Method.Patch,
         };
-        let route: Box<dyn Handler<App> + Send> = match (Box.create(p.route<App>())) {
+        let route: Box<dyn Handler<App> + Send + Share> = match (Box.create(p.route<App>())) {
             Ok(b) => b,
             Err(_) => { return Err(RouteError.OutOfMemory); },
         };

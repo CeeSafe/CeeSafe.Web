@@ -115,7 +115,7 @@ async fn servedFile(request: Slice<u8>, handler: FileBody, h2: bool) -> Result<S
     var limits = quiet();
     limits.idleTimeoutMs = 200;
     var s = routed(Server<St>.create(state()?, limits))?;
-    let h: Box<dyn Handler<St> + Send> = alloc(Box.create(handler))?;
+    let h: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(handler))?;
     added(s.router().get("/f", h))?;
     let service = net(serviceOf(s))?;
     let drain = net(Drain.create())?;

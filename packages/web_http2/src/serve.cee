@@ -74,7 +74,7 @@ enum Wake {
 public async fn serveH2(
     conn: borrow mut dyn Transport,
     connection: borrow ConnectionContext,
-    app: borrow Arc<Box<dyn Application + Send>>,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
     limits: Limits,
     already: Slice<u8>,
 ) -> Result<void, NetError> {
@@ -110,7 +110,7 @@ async fn run(
     set: borrow TaskSet<NetError>,
     conn: borrow mut dyn Transport,
     connection: borrow ConnectionContext,
-    app: borrow Arc<Box<dyn Application + Send>>,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
     limits: Limits,
     engine: borrow mut H2Connection,
     input: borrow mut OwnedBuffer,
@@ -273,7 +273,7 @@ async fn run(
 fn startStream(
     set: borrow TaskSet<NetError>,
     connection: borrow ConnectionContext,
-    app: borrow Arc<Box<dyn Application + Send>>,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
     limits: Limits,
     engine: borrow mut H2Connection,
     links: borrow mut HashMap<u32, Link>,
@@ -349,7 +349,7 @@ fn startStream(
 async fn handle(
     set: borrow TaskSet<NetError>,
     connection: borrow ConnectionContext,
-    app: borrow Arc<Box<dyn Application + Send>>,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
     limits: Limits,
     engine: borrow mut H2Connection,
     links: borrow mut HashMap<u32, Link>,
@@ -698,7 +698,7 @@ async fn post(outgoing: borrow Channel<Outgoing>, m: Outgoing) -> Result<void, H
 /// A stream's task: the application's handler for its request, unless the stream is reset first (then the handler is
 /// cancelled where it waits).
 async fn streamTask(
-    app: borrow Arc<Box<dyn Application + Send>>,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
     context: borrow StreamContext,
     id: u32,
     head: borrow HeaderBlock,
@@ -735,7 +735,7 @@ async fn streamTask(
 
 /// The request built from the stream's head, run through the application, its response finished.
 async fn serveStream(
-    app: borrow Arc<Box<dyn Application + Send>>,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
     context: borrow StreamContext,
     id: u32,
     head: borrow HeaderBlock,
@@ -840,9 +840,10 @@ async fn serveStream(
         Err(_) => { return; },
     };
     var date = DateCache.create(limits.sendDate);
-    // Box<dyn Application + Send> lends a `dyn Application + Send`, which lends a `dyn Application`: no wrapper, so the
-    // handler's call is a plain dyn await, not a stacked one through a wrapper that may hold itself (ADR 0056).
-    let sendable: borrow dyn Application + Send = app.get();
+    // Box<dyn Application + Send + Share> lends a `dyn Application + Send + Share`, which lends a `dyn Application`: no
+    // wrapper, so the handler's call is a plain dyn await, not a stacked one through a wrapper that may hold itself
+    // (ADR 0056).
+    let sendable: borrow dyn Application + Send + Share = app.get();
     let application: borrow dyn Application = sendable;
     var ex = Exchange.forStream(
         mut port,

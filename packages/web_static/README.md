@@ -4,7 +4,7 @@ Static files for a CeeSafe.Web server (Web ADR 0013 §3.5). `StaticFiles<S>` is 
 serves the regular files under a root.
 
 ```ceesafe
-let files: Box<dyn Handler<App> + Send> = Box.create(StaticFiles<App>.create("/srv/www", StaticOptions.defaults())?)?;
+let files: Box<dyn Handler<App> + Send + Share> = Box.create(StaticFiles<App>.create("/srv/www", StaticOptions.defaults())?)?;
 server.router().get("/assets/*path", files)?;
 ```
 

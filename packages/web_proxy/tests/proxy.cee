@@ -138,11 +138,12 @@ fn proxyWith(scripts: borrow Channel<MockTransport>, backends: u32, settings: Pr
             Err(_) => { return Err(TestFailure.create("a backend")); }
         }
     }
-    let resolver: Box<dyn Resolver + Send> = boxed(Box.create(FixedResolver { fails: fails }))?;
-    let dialer: Box<dyn Dialer + Send> = boxed(Box.create(ScriptDialer { scripts: scripts.clone(), hangs: hangs }))?;
-    var tls: Box<dyn Connector + Send>? = null;
+    let resolver: Box<dyn Resolver + Send + Share> = boxed(Box.create(FixedResolver { fails: fails }))?;
+    let script = ScriptDialer { scripts: scripts.clone(), hangs: hangs };
+    let dialer: Box<dyn Dialer + Send + Share> = boxed(Box.create(script))?;
+    var tls: Box<dyn Connector + Send + Share>? = null;
     if (tlsFails) {
-        let failing: Box<dyn Connector + Send> = boxed(Box.create(FailingTls {}))?;
+        let failing: Box<dyn Connector + Send + Share> = boxed(Box.create(FailingTls {}))?;
         tls = failing;
     }
     let proxy = match (builder.buildWithNetwork(tls, resolver, dialer)) {
@@ -161,7 +162,7 @@ fn serverFor(proxy: borrow ReverseProxy) -> Result<Server<St>, TestFailure> {
         Err(_) => { return Err(TestFailure.create("a server")); },
     };
     for (k in 0..2u32) {
-        let route: Box<dyn Handler<St> + Send> = boxed(Box.create(proxy.route<St>()))?;
+        let route: Box<dyn Handler<St> + Send + Share> = boxed(Box.create(proxy.route<St>()))?;
         let method = if (k == 0) Method.Get else Method.Post;
         match (server.router().add(method, "/*rest", route)) {
             Ok() => {}

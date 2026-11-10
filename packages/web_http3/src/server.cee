@@ -101,7 +101,7 @@ public struct Http3Server {
         socket: borrow AsyncUdpSocket,
         local: SocketAddress,
         tls: Arc<QuicTls>,
-        app: Arc<Box<dyn Application + Send>>,
+        app: Arc<Box<dyn Application + Send + Share>>,
         limits: Limits,
         drain: borrow Drain,
         options: Http3Options,
@@ -113,11 +113,11 @@ public struct Http3Server {
             requests: options.requestsPerConnection,
             resetsPerSecond: options.resetsPerSecond,
         };
-        let boxed: Box<dyn QuicApplication + Send> = match (Box.create(h3)) {
+        let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(h3)) {
             Ok(b) => b,
             Err(_) => { return Err(QuicError.NoMemory); },
         };
-        let shared = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+        let shared = match (Arc<Box<dyn QuicApplication + Send + Share>>.create(boxed)) {
             Ok(a) => a,
             Err(_) => { return Err(QuicError.NoMemory); },
         };
@@ -129,7 +129,7 @@ public struct Http3Server {
 
 /// HTTP/3 on each QUIC connection.
 struct Http3Application {
-    app: Arc<Box<dyn Application + Send>>;
+    app: Arc<Box<dyn Application + Send + Share>>;
     limits: Limits;
     drain: Drain;
     requests: u32;
@@ -740,7 +740,7 @@ async fn post(outgoing: borrow Channel<Outgoing>, m: Outgoing) -> Result<void, H
 /// A request's task: the application's handler, unless the stream is reset first (then the handler is cancelled where
 /// it waits).
 async fn requestTask(
-    app: borrow Arc<Box<dyn Application + Send>>,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
     context: borrow RequestContext,
     stream: i64,
     head: borrow HeaderBlock,
@@ -772,7 +772,7 @@ async fn requestTask(
 
 /// The request built from the stream's head, run through the application, its response finished.
 async fn serveRequest(
-    app: borrow Arc<Box<dyn Application + Send>>,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
     context: borrow RequestContext,
     stream: i64,
     head: borrow HeaderBlock,
@@ -871,7 +871,7 @@ async fn serveRequest(
         Err(_) => { return; },
     };
     var date = DateCache.create(limits.sendDate);
-    let sendable: borrow dyn Application + Send = app.get();
+    let sendable: borrow dyn Application + Send + Share = app.get();
     let application: borrow dyn Application = sendable;
     var ex = Exchange.forStream(
         mut port,

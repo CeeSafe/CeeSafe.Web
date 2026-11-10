@@ -70,10 +70,12 @@ fn setting(name: StringView, otherwise: u64) -> u64 {
     };
 }
 
-fn handler<H: Handler<App> + Send>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App> + Send>, RouteError> {
+fn handler<H: Handler<App> + Send + Share>(
+    b: Result<Box<H>, AllocError>,
+) -> Result<Box<dyn Handler<App> + Send + Share>, RouteError> {
     match (b) {
         Ok(h) => {
-            let d: Box<dyn Handler<App> + Send> = h;
+            let d: Box<dyn Handler<App> + Send + Share> = h;
             return Ok(d);
         }
         Err(_) => { return Err(RouteError.OutOfMemory); }
