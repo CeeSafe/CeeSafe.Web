@@ -417,7 +417,7 @@ public struct QuicServer {
         socket: borrow AsyncUdpSocket,
         local: SocketAddress,
         tls: Arc<QuicTls>,
-        app: Arc<Box<dyn QuicApplication + Send>>,
+        app: Arc<Box<dyn QuicApplication + Send + Share>>,
         options: QuicServerOptions,
     ) -> Result<void, QuicError> {
         let toListener = match (Channel<ToListener>.create(256)) {
@@ -459,7 +459,7 @@ async fn listen(
     socket: borrow AsyncUdpSocket,
     local: SocketAddress,
     tls: borrow Arc<QuicTls>,
-    app: borrow Arc<Box<dyn QuicApplication + Send>>,
+    app: borrow Arc<Box<dyn QuicApplication + Send + Share>>,
     options: QuicServerOptions,
     toListener: borrow Channel<ToListener>,
     routes: borrow mut Vector<Route>,
@@ -536,7 +536,7 @@ async fn heard(
     socket: borrow AsyncUdpSocket,
     local: SocketAddress,
     tls: borrow Arc<QuicTls>,
-    app: borrow Arc<Box<dyn QuicApplication + Send>>,
+    app: borrow Arc<Box<dyn QuicApplication + Send + Share>>,
     options: QuicServerOptions,
     toListener: borrow Channel<ToListener>,
     routes: borrow mut Vector<Route>,
@@ -794,7 +794,7 @@ async fn admit(
     set: borrow TaskSet<QuicError>,
     local: SocketAddress,
     tls: borrow Arc<QuicTls>,
-    app: borrow Arc<Box<dyn QuicApplication + Send>>,
+    app: borrow Arc<Box<dyn QuicApplication + Send + Share>>,
     options: QuicServerOptions,
     toListener: borrow Channel<ToListener>,
     routes: borrow mut Vector<Route>,
@@ -853,7 +853,7 @@ async fn admit(
 /// listener.
 async fn connectionTask(
     tls: Arc<QuicTls>,
-    app: Arc<Box<dyn QuicApplication + Send>>,
+    app: Arc<Box<dyn QuicApplication + Send + Share>>,
     inbound: Channel<Inbound>,
     toListener: Channel<ToListener>,
     id: u32,

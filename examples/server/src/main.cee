@@ -151,10 +151,12 @@ fn application() -> Result<Server<App>, RouteError> {
 }
 
 /// A boxed handler, or `OutOfMemory`.
-fn handler<H: Handler<App> + Send>(b: Result<Box<H>, AllocError>) -> Result<Box<dyn Handler<App> + Send>, RouteError> {
+fn handler<H: Handler<App> + Send + Share>(
+    b: Result<Box<H>, AllocError>,
+) -> Result<Box<dyn Handler<App> + Send + Share>, RouteError> {
     match (b) {
         Ok(h) => {
-            let d: Box<dyn Handler<App> + Send> = h;
+            let d: Box<dyn Handler<App> + Send + Share> = h;
             return Ok(d);
         }
         Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -162,12 +164,12 @@ fn handler<H: Handler<App> + Send>(b: Result<Box<H>, AllocError>) -> Result<Box<
 }
 
 /// A boxed middleware, or `OutOfMemory`.
-fn boxed<M: Middleware<App> + Send>(
+fn boxed<M: Middleware<App> + Send + Share>(
     b: Result<Box<M>, AllocError>,
-) -> Result<Box<dyn Middleware<App> + Send>, RouteError> {
+) -> Result<Box<dyn Middleware<App> + Send + Share>, RouteError> {
     match (b) {
         Ok(m) => {
-            let d: Box<dyn Middleware<App> + Send> = m;
+            let d: Box<dyn Middleware<App> + Send + Share> = m;
             return Ok(d);
         }
         Err(_) => { return Err(RouteError.OutOfMemory); }

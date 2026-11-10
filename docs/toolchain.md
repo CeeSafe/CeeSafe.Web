@@ -21,12 +21,14 @@ that needs an unreleased compiler is not merged to main.
 | M8 reverse proxy | **0.11.0** | U20 (a type that holds loans as a `borrow mut dyn I`, CeeSafe ADR 0064 §3.2) for the request-body relay; ADR 0064 §1's generic methods for `ReverseProxy.route<S>()` | gate passed, on main (#3, 2026-11-06); released with M9 in v0.4.0 (`docs/milestones/M8.md`) |
 | M9 low-level I/O | **0.22.0** | `Vector.resize` (ADR 0071, 0.15.0) for `OwnedBuffer.create`; U7 sendfile (ADR 0051); `readAt`/`length` (ADR 0075) for TLS and HTTP/2 file bodies; B19 (`sendFile` to a reset connection raised SIGPIPE on Linux) and U22 (`File.openRegular`, `f.modified()`, `f.kind()`) for `web_static`, both CeeSafe ADR 0078 | done; main's minimum, released in v0.4.0 (`docs/milestones/M9.md`) |
 | M10 HTTP/3 | **0.22.0** | U6 UDP (ADR 0050, 0.9.0); nothing newer than M9's minimum | done; main's minimum, released in v0.5.0 (`docs/milestones/M10.md`) |
+| After v0.5: `Share` | **0.27.0** (proposed) | CeeSafe ADR 0084 (0.25.0): `Share` is no longer every `Send` type, and `Arc<T>` needs `T: Share`. What a server or proxy shares across requests is bounded `Send + Share`: `Server<S: Send + Share>`, `Box<dyn Handler<S> + Send + Share>`, `Box<dyn Middleware<S> + Send + Share>`, `Box<dyn Application + Send + Share>`, `Box<dyn QuicApplication + Send + Share>`, and the client's connector, resolver and dialer. `dyn … + Share` exists from 0.25.0, so 0.22.0 cannot build it; 0.27.0 is the newest release (2026-11-10) | on branch `toolchain-0.27`, for the owner |
 
 ## Current machine (2026-11-06)
 
 | Binary | Version | Use |
 |---|---|---|
 | `~/.ceesafe/bin/ceesafec` (on `PATH`) | 0.20.0 (release, osx-arm64; found 2026-11-06) | checks every manifest; not yet tested |
+| `~/.ceesafe/bin/ceesafec-0.27.0` | 0.27.0 (release, tag `v0.27.0` = CeeSafe `405dc50`, osx-arm64; the archive matches the release's `SHA256SUMS`, 2026-11-10; no signature checked) | the `Share` change (CeeSafe ADR 0084), branch `toolchain-0.27` |
 | `~/.ceesafe/bin/ceesafec-0.22.0` | **0.22.0** (release, tag `v0.22.0` = CeeSafe `f225f7a`, osx-arm64; the archive matches the release's `SHA256SUMS`, signature checked, 2026-11-08) | M9's minimum: B19 and U22 (CeeSafe ADR 0078) |
 | `~/.ceesafe/bin/ceesafec-0.19.1` | 0.19.1 (release, tag `v0.19.1` = CeeSafe `619145e`, osx-arm64) | `File.readAt`, `length` (CeeSafe ADR 0075), for M9 stage 3 |
 | `~/.ceesafe/bin/ceesafec-0.18.2` | 0.18.2 (release, tag `v0.18.2` = CeeSafe `932bb1c`, osx-arm64) | C backend only |

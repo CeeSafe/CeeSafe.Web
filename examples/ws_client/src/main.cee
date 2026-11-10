@@ -95,7 +95,7 @@ async fn sayBytes(bytes: Slice<u8>) -> Result<void, NetError> {
 async fn say(text: StringView) -> Result<void, NetError> => await sayBytes(text.bytes());
 
 /// The wss connector: the roots in CW_CA, or the system's.
-async fn connector() -> Result<Box<dyn Connector + Send>, NetError> {
+async fn connector() -> Result<Box<dyn Connector + Send + Share>, NetError> {
     var config = match (TlsConfig.client()) {
         Ok(c) => c,
         Err(_) => { return Err(NetError.Tls(TlsReason.Internal)); },
@@ -127,7 +127,7 @@ async fn connector() -> Result<Box<dyn Connector + Send>, NetError> {
     };
     match (Box.create(tls)) {
         Ok(b) => {
-            let d: Box<dyn Connector + Send> = b;
+            let d: Box<dyn Connector + Send + Share> = b;
             return Ok(d);
         }
         Err(_) => { return Err(NetError.OutOfMemory); }

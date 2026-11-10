@@ -138,7 +138,7 @@ public struct ProxyBuilder {
     }
 
     /// The proxy, its client making https connections with `tls` (null: http backends only).
-    public fn build(this, tls: Box<dyn Connector + Send>?) -> Result<ReverseProxy, ProxySetupError> {
+    public fn build(this, tls: Box<dyn Connector + Send + Share>?) -> Result<ReverseProxy, ProxySetupError> {
         let client = match (Client.create(this.clientOptions(), tls)) {
             Ok(c) => c,
             Err(_) => { return Err(ProxySetupError.OutOfMemory); },
@@ -150,9 +150,9 @@ public struct ProxyBuilder {
     /// `Client.withNetwork`).
     public fn buildWithNetwork(
         this,
-        tls: Box<dyn Connector + Send>?,
-        resolver: Box<dyn Resolver + Send>,
-        dialer: Box<dyn Dialer + Send>,
+        tls: Box<dyn Connector + Send + Share>?,
+        resolver: Box<dyn Resolver + Send + Share>,
+        dialer: Box<dyn Dialer + Send + Share>,
     ) -> Result<ReverseProxy, ProxySetupError> {
         let client = match (Client.withNetwork(this.clientOptions(), tls, resolver, dialer)) {
             Ok(c) => c,
@@ -230,7 +230,7 @@ public struct ReverseProxy {
     public fn handler(borrow this) -> ProxyHandler => ProxyHandler { core: this.core.clone() };
 
     /// The proxy as a route's handler, for a `Router<S>` of any state.
-    public fn route<S: Send>(borrow this) -> ProxyRoute<S> => ProxyRoute<S> { core: this.core.clone() };
+    public fn route<S: Send + Share>(borrow this) -> ProxyRoute<S> => ProxyRoute<S> { core: this.core.clone() };
 
     /// Drives the upstream client's HTTP/2 connections and, if configured, the active health checks, until `drain`
     /// starts.
@@ -327,7 +327,7 @@ public struct ProxyRoute<S> {
     private core: Arc<ProxyCore>;
 }
 
-impl<S: Send> Handler<S> for ProxyRoute<S> {
+impl<S: Send + Share> Handler<S> for ProxyRoute<S> {
     async fn handle(
         borrow this,
         ctx: borrow mut RequestContext<S>,

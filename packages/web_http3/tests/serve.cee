@@ -121,7 +121,7 @@ struct Setup {
     socket: AsyncUdpSocket;
     local: SocketAddress;
     tls: Arc<QuicTls>;
-    app: Arc<Box<dyn Application + Send>>;
+    app: Arc<Box<dyn Application + Send + Share>>;
     clientTls: QuicTls;
 }
 
@@ -149,11 +149,11 @@ fn setupWith(early: bool) -> Result<Setup, TestFailure> {
         Ok(t) => t,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
-    let boxed: Box<dyn Application + Send> = match (Box.create(TestApp {})) {
+    let boxed: Box<dyn Application + Send + Share> = match (Box.create(TestApp {})) {
         Ok(b) => b,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
-    let app = match (Arc<Box<dyn Application + Send>>.create(boxed)) {
+    let app = match (Arc<Box<dyn Application + Send + Share>>.create(boxed)) {
         Ok(a) => a,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
