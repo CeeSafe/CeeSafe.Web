@@ -191,25 +191,25 @@ struct Failure {
 public struct Client {
     private options: ClientOptions;
     private pool: ConnectionPool;
-    private tls: Box<dyn Connector + Send>?;
-    private resolver: Box<dyn Resolver + Send>;
-    private dialer: Box<dyn Dialer + Send>;
+    private tls: Box<dyn Connector + Send + Share>?;
+    private resolver: Box<dyn Resolver + Send + Share>;
+    private dialer: Box<dyn Dialer + Send + Share>;
     private h2: H2Registry;
 
     /// A client with the system's resolver and TCP. `tls` makes https connections (a web_tls `TlsConnector`); without
     /// one, https URLs are `NoTls`.
-    public fn create(options: ClientOptions, tls: Box<dyn Connector + Send>?) -> Result<Client, ClientError> {
-        let resolver: Box<dyn Resolver + Send> = boxed(Box.create(SystemResolver {}))?;
-        let dialer: Box<dyn Dialer + Send> = boxed(Box.create(TcpDialer {}))?;
+    public fn create(options: ClientOptions, tls: Box<dyn Connector + Send + Share>?) -> Result<Client, ClientError> {
+        let resolver: Box<dyn Resolver + Send + Share> = boxed(Box.create(SystemResolver {}))?;
+        let dialer: Box<dyn Dialer + Send + Share> = boxed(Box.create(TcpDialer {}))?;
         return Client.withNetwork(options, tls, resolver, dialer);
     }
 
     /// A client with its own resolver and dialer (tests: mocks).
     public fn withNetwork(
         options: ClientOptions,
-        tls: Box<dyn Connector + Send>?,
-        resolver: Box<dyn Resolver + Send>,
-        dialer: Box<dyn Dialer + Send>,
+        tls: Box<dyn Connector + Send + Share>?,
+        resolver: Box<dyn Resolver + Send + Share>,
+        dialer: Box<dyn Dialer + Send + Share>,
     ) -> Result<Client, ClientError> {
         let pool = ConnectionPool.create(options)?;
         let h2 = H2Registry.create()?;
@@ -773,7 +773,7 @@ public struct Client {
         );
         let addresses = net(resolved)?;
         let ordered = net(interleave(addresses))?;
-        let sendable: borrow dyn Dialer + Send = borrow this.dialer;
+        let sendable: borrow dyn Dialer + Send + Share = borrow this.dialer;
         let dialer: borrow dyn Dialer = sendable; // in two steps: upstream U19
         let stream = net(await happyEyeballs(ordered, dialer, this.options.connectionAttemptDelayMs, deadline))?;
         match (borrow this.tls) {

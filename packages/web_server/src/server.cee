@@ -11,10 +11,10 @@ import web_http2;
 
 /// An HTTP server for an application whose state is `S`. Its state, handlers and middleware are `Send`: HTTP/2 runs
 /// each request in its own task.
-public struct Server<S: Send> {
+public struct Server<S: Send + Share> {
     private appState: S;
     private routes: Router<S>;
-    private hooks: Vector<Box<dyn Middleware<S> + Send>>;
+    private hooks: Vector<Box<dyn Middleware<S> + Send + Share>>;
     private httpLimits: Limits;
     /// The UDP port the same application is served on over HTTP/3, advertised in `Alt-Svc`.
     private http3Port: u16?;
@@ -25,14 +25,14 @@ public struct Server<S: Send> {
         return Ok(Server {
             appState: state,
             routes: routes,
-            hooks: Vector<Box<dyn Middleware<S> + Send>>.create(),
+            hooks: Vector<Box<dyn Middleware<S> + Send + Share>>.create(),
             httpLimits: limits,
             http3Port: null,
         });
     }
 
     /// Adds `m` after the middleware already added: its `before` runs after theirs, its `after` before theirs.
-    public fn use(borrow mut this, m: Box<dyn Middleware<S> + Send>) -> Result<void, RouteError> {
+    public fn use(borrow mut this, m: Box<dyn Middleware<S> + Send + Share>) -> Result<void, RouteError> {
         match (this.hooks.push(m)) {
             Ok() => { return Ok(); }
             Err(_) => { return Err(RouteError.OutOfMemory); }
@@ -73,7 +73,7 @@ public struct Server<S: Send> {
 
 /// An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection (Web ADR 0011 §3.2).
 public struct HttpService {
-    private app: Arc<Box<dyn Application + Send>>;
+    private app: Arc<Box<dyn Application + Send + Share>>;
     private httpLimits: Limits;
 }
 
@@ -108,7 +108,7 @@ impl ConnectionHandler for HttpService {
             }
             n += got;
         }
-        let sendable: borrow dyn Application + Send = this.app.get();
+        let sendable: borrow dyn Application + Send + Share = this.app.get();
         let app: borrow dyn Application = sendable;
         if (n == first.length && prefixOf(first[..], preface)) {
             return await serveH2(conn, ctx, this.app, this.httpLimits, first[..]);
@@ -118,7 +118,7 @@ impl ConnectionHandler for HttpService {
 }
 
 /// The service of `server`, which it owns from now on.
-public fn serviceOf<S: Send>(server: Server<S>) -> Result<HttpService, NetError> {
+public fn serviceOf<S: Send + Share>(server: Server<S>) -> Result<HttpService, NetError> {
     let limits = server.httpLimits;
     let app = applicationOf(server)?;
     return Ok(HttpService.of(app, limits));
@@ -128,12 +128,14 @@ public fn serviceOf<S: Send>(server: Server<S>) -> Result<HttpService, NetError>
 /// `HttpService.of` and, in the same program, over HTTP/3 with `web_http3`'s `Http3Server.serve`, so both run the
 /// same routes, middleware and state (Web ADR 0014 amendment 4 item 1). `web_server` itself never depends on
 /// `web_http3`.
-public fn applicationOf<S: Send>(server: Server<S>) -> Result<Arc<Box<dyn Application + Send>>, NetError> {
-    let boxed: Box<dyn Application + Send> = match (Box.create(server)) {
+public fn applicationOf<S: Send + Share>(
+    server: Server<S>,
+) -> Result<Arc<Box<dyn Application + Send + Share>>, NetError> {
+    let boxed: Box<dyn Application + Send + Share> = match (Box.create(server)) {
         Ok(b) => b,
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
-    match (Arc<Box<dyn Application + Send>>.create(boxed)) {
+    match (Arc<Box<dyn Application + Send + Share>>.create(boxed)) {
         Ok(app) => { return Ok(app); }
         Err(_) => { return Err(NetError.OutOfMemory); }
     }
@@ -141,7 +143,7 @@ public fn applicationOf<S: Send>(server: Server<S>) -> Result<Arc<Box<dyn Applic
 
 impl HttpService {
     /// The service of a shared application (`applicationOf`), its requests held to `limits`.
-    public fn of(app: Arc<Box<dyn Application + Send>>, limits: Limits) -> HttpService =>
+    public fn of(app: Arc<Box<dyn Application + Send + Share>>, limits: Limits) -> HttpService =>
         HttpService { app: app, httpLimits: limits };
 }
 
@@ -158,7 +160,7 @@ fn prefixOf(bytes: Slice<u8>, whole: Slice<u8>) -> bool {
     return true;
 }
 
-impl<S: Send> ConnectionHandler for Server<S> {
+impl<S: Send + Share> ConnectionHandler for Server<S> {
     async fn serve(
         borrow this,
         conn: borrow mut dyn Transport,
@@ -167,7 +169,7 @@ impl<S: Send> ConnectionHandler for Server<S> {
         await web_http1.serve(conn, ctx, this, this.httpLimits);
 }
 
-impl<S: Send> Application for Server<S> {
+impl<S: Send + Share> Application for Server<S> {
     /// Routes the request, runs every middleware's `before` in order, then the route's handler. A path with no
     /// route is 404; a path with routes but none for the method is 405 with `Allow`, or 204 with `Allow` for OPTIONS
     /// (RFC 9110 §9.3.7, §15.5.6). `OPTIONS *` is 204.

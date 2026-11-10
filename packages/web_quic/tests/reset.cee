@@ -155,11 +155,11 @@ async fn scenario(secondKey: [u8; 32], waitMs: u64) -> Result<LossEnd, TestFailu
         Ok(t) => t,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
-    let boxed: Box<dyn QuicApplication + Send> = match (Box.create(Hold {})) {
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Hold {})) {
         Ok(b) => b,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
-    let app = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+    let app = match (Arc<Box<dyn QuicApplication + Send + Share>>.create(boxed)) {
         Ok(a) => a,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
