@@ -25,8 +25,13 @@ jobs:
           # answer 5): its sweeps, and every test with io_uring. 24.04 (OpenSSL 3.0.13) keeps web_tls's 3.0 minimum
           # tested, sweeps included, without the two QUIC packages. (22.04's OpenSSL 3.0.2 leaked its own global state
           # when an allocation failed, Web ADR 0002 amendment 5.8, so the 3.0 sweeps were already on 24.04.)
+          # Its sweeps link OpenSSL 3.5.9, built from source: 3.5.5's SSL_CTX_add_session mishandled a failed
+          # allocation (openssl/openssl#28632, fixed in 3.5.6), and SSL_CTX_free then never ended, growing until the
+          # runner was shut down (docs/milestones/M10.md, "CI's Linux sanitizer job"). Its other steps keep 3.5.5.
           - os: ubuntu-26.04
             sanitize: true
+            openssl_source: 3.5.9
+            openssl_sha256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
           - os: ubuntu-26.04
             reactor: uring
             env_name: CEESAFE_REACTOR_URING
@@ -61,6 +66,28 @@ jobs:
       - name: OpenSSL (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y libssl-dev
+
+      - name: OpenSSL from source, for the sweeps (cache)
+        if: matrix.openssl_source
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/openssl-${{ matrix.openssl_source }}
+          key: openssl-${{ matrix.openssl_source }}-${{ matrix.openssl_sha256 }}-${{ matrix.os }}
+
+      - name: OpenSSL from source, for the sweeps (build)
+        if: matrix.openssl_source && steps.openssl-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          v=${{ matrix.openssl_source }}
+          curl -fsSL -o "$RUNNER_TEMP/openssl.tar.gz" "https://github.com/openssl/openssl/releases/download/openssl-$v/openssl-$v.tar.gz"
+          echo "${{ matrix.openssl_sha256 }}  $RUNNER_TEMP/openssl.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/openssl.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/openssl-$v"
+          ./Configure --prefix="$HOME/openssl-$v" --libdir=lib no-docs no-tests > /dev/null
+          make -j"$(nproc)" > /dev/null
+          make install_sw > /dev/null
+          "$HOME/openssl-$v/bin/openssl" version
 
       - name: OpenSSL (macOS)
         if: runner.os == 'macOS'
@@ -114,6 +141,11 @@ jobs:
           # on Linux, log memory and disk each minute so the next one shows which ran out.
           if [ "$RUNNER_OS" = Linux ]; then
             (while sleep 60; do echo "resources: $(free -m | awk '/^Mem/{print "mem used " $3 " of " $2 " MiB"}'), $(free -m | awk '/^Swap/{print "swap used " $3 " MiB"}'), $(df -m / | awk 'NR==2{print "disk free " $4 " MiB"}')"; done) &
+          fi
+          if [ -n "${{ matrix.openssl_source }}" ]; then
+            o="$HOME/openssl-${{ matrix.openssl_source }}"
+            export CPATH="$o/include" LIBRARY_PATH="$o/lib" LD_LIBRARY_PATH="$o/lib"
+            "$o/bin/openssl" version
           fi
           python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep --exclude "${{ matrix.exclude }}"
 

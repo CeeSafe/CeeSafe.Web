@@ -1364,7 +1364,9 @@ uint32_t qs_next_event(qs_conn *c, uint8_t *buf, size_t cap, int64_t *stream, ui
         return QS_EV_TOO_SMALL;
     }
     size_t n = e->length;
-    memcpy(buf, q->data + e->offset, n);
+    if (n > 0) { /* data is NULL until an event carries bytes; memcpy from NULL is undefined even for 0 */
+        memcpy(buf, q->data + e->offset, n);
+    }
     *stream = e->stream;
     *flags = e->flags;
     *code = e->code;

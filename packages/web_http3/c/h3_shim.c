@@ -858,7 +858,9 @@ uint32_t h3_next_event(h3_conn *c, uint8_t *buf, size_t cap, int64_t *stream, ui
         *length = e->length;
         return H3_EV_TOO_SMALL;
     }
-    memcpy(buf, q->data + e->offset, e->length);
+    if (e->length > 0) { /* data is NULL until an event carries bytes; memcpy from NULL is undefined even for 0 */
+        memcpy(buf, q->data + e->offset, e->length);
+    }
     *stream = e->stream;
     *flags = e->flags;
     *code = e->code;
