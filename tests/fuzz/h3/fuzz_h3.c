@@ -7,12 +7,13 @@
  * The input is a sequence of operations, each a byte whose low 3 bits choose it:
  *   0  the peer's bytes: a stream byte (one of STREAMS), a 2-byte length, a FIN byte, then the bytes (h3_read)
  *   1  QUIC takes what nghttp3 has: h3_pull with a capacity byte, h3_wrote with all of it or a part (h3_pull/h3_wrote)
- *   2  a response head on a request stream the peer opened, with a body or without (h3_submit)
+ *   2  a response head on a request stream the peer opened, once per stream, with a body or without (h3_submit)
  *   3  body bytes for it: a length byte, an end bit (h3_send_body)
- *   4  trailers for it (h3_trailers)
+ *   4  trailers for it, which end it (h3_trailers)
  *   5  the server stops reading a stream, or closes it with a code (h3_shutdown_read, h3_close_stream)
  *   6  QUIC blocks or unblocks a stream (h3_block, h3_unblock)
- *   7  GOAWAY: the notice, the final one, or asking whether it is drained (h3_goaway_notice, h3_goaway, h3_drained)
+ *   7  GOAWAY: the notice, then the final one, each once; or whether it is drained (h3_goaway_notice, h3_goaway,
+ *      h3_drained)
  * After each, every event is drained, the first with a buffer of 1 to 64 bytes so H3_EV_TOO_SMALL is exercised.
  *
  * Linux (libFuzzer):
@@ -74,10 +75,12 @@ uint32_t h3_next_event(h3_conn *c, uint8_t *buf, size_t cap, int64_t *stream, ui
 #define H3_EV_FIELDS_END 2u
 #define H3_EV_TOO_SMALL 255u
 
-/* The peer's streams: its requests (bidirectional 0, 4, 8), its control, QPACK encoder and decoder streams (2, 6,
-   10) and one more unidirectional stream (14), and two IDs a client may not use (1, a server's bidirectional; 3, a
-   server's unidirectional). The server's own control, encoder and decoder are 3, 7 and 11. */
-static const int64_t STREAMS[] = {0, 4, 8, 2, 6, 10, 14, 1, 3};
+/* The peer's streams: its requests (bidirectional 0, 4, 8, and 400, past the stream limit nghttp3 would see),
+   its control, QPACK encoder and decoder streams (2, 6, 10) and one more unidirectional stream (14). The server's
+   own control, encoder and decoder are 3, 7 and 11. Server-initiated IDs are not offered: QUIC (ngtcp2) refuses a
+   peer's bytes on them before web_http3 sees any, and nghttp3 asserts it is never given them
+   (nghttp3_conn_read_stream2). */
+static const int64_t STREAMS[] = {0, 4, 8, 2, 6, 10, 14, 400};
 #define NSTREAMS (sizeof STREAMS / sizeof STREAMS[0])
 
 #define MAX_REQUESTS 8
@@ -101,8 +104,10 @@ typedef struct {
     int dead; /* a negative h3_read, h3_pull or h3_wrote: only h3_conn_free from now on */
     uint64_t now;
     int64_t requests[MAX_REQUESTS]; /* request streams whose head the peer sent, in order */
+    int answered[MAX_REQUESTS];     /* a head was submitted on it: web_http3 sends one per stream (headSent) */
     size_t nrequests;
     int64_t responded; /* the request stream last given a head with a body, or -1 */
+    int goaway;        /* 0: none sent, 1: the notice, 2: the final one */
 } server;
 
 static uint8_t event_buf[1u << 17];
@@ -200,6 +205,10 @@ static void step(server *s, input *in, uint8_t op) {
         size_t n = want < left ? want : left;
         s->now += 1000000u;
         int64_t rv = h3_read(s->c, STREAMS[which % NSTREAMS], in->data + in->at, n, fin & 1, s->now);
+#ifdef H3_TRACE
+        fprintf(stderr, "read stream %lld len %zu fin %d -> %lld\n", (long long)STREAMS[which % NSTREAMS], n, fin & 1,
+                (long long)rv);
+#endif
         in->at += n;
         if (rv < 0) {
             s->dead = 1;
@@ -229,6 +238,10 @@ static void step(server *s, input *in, uint8_t op) {
             }
             /* QUIC may take less than it was offered: b's low bit takes half. */
             uint64_t took = (b & 1u) && n > 1 ? (uint64_t)n / 2u : (uint64_t)n;
+#ifdef H3_TRACE
+            fprintf(stderr, "pull stream %lld got %lld fin %d, wrote %llu\n", (long long)stream, (long long)n, fin,
+                    (unsigned long long)took);
+#endif
             if (h3_wrote(s->c, stream, took) < 0) {
                 s->dead = 1;
             }
@@ -241,14 +254,19 @@ static void step(server *s, input *in, uint8_t op) {
     case 2: {
         take(in, &a);
         take(in, &b);
-        int64_t stream = pick_request(s, a);
-        if (stream < 0) {
+        if (s->nrequests == 0 || s->answered[a % s->nrequests]) {
             break;
         }
+        s->answered[a % s->nrequests] = 1;
+        int64_t stream = s->requests[a % s->nrequests];
         uint8_t f[512];
         size_t n = fields(in, f, sizeof f, 1);
         int has_body = b & 1u;
-        if (h3_submit(s->c, stream, 0, f, n, has_body) == 0 && has_body) {
+        int32_t rv = h3_submit(s->c, stream, 0, f, n, has_body);
+#ifdef H3_TRACE
+        fprintf(stderr, "submit stream %lld fields %zu body %d -> %d\n", (long long)stream, n, has_body, rv);
+#endif
+        if (rv == 0 && has_body) {
             s->responded = stream;
         }
         break;
@@ -262,6 +280,9 @@ static void step(server *s, input *in, uint8_t op) {
         size_t left = in->len - in->at;
         size_t n = want < left ? want : left;
         int64_t rv = h3_send_body(s->c, s->responded, in->data + in->at, n, a & 1u);
+#ifdef H3_TRACE
+        fprintf(stderr, "body stream %lld len %zu end %d -> %lld\n", (long long)s->responded, n, a & 1u, (long long)rv);
+#endif
         in->at += n;
         if (rv > (int64_t)n) {
             abort();
@@ -274,13 +295,22 @@ static void step(server *s, input *in, uint8_t op) {
         }
         uint8_t f[512];
         size_t n = fields(in, f, sizeof f, 0);
-        (void)h3_trailers(s->c, s->responded, f, n);
+        int32_t rv = h3_trailers(s->c, s->responded, f, n);
+#ifdef H3_TRACE
+        fprintf(stderr, "trailers stream %lld -> %d\n", (long long)s->responded, rv);
+#else
+        (void)rv;
+#endif
+        s->responded = -1; /* trailers end the response: no body after them */
         break;
     }
     case 5: {
         take(in, &a);
         take(in, &b);
         int64_t stream = STREAMS[a % NSTREAMS];
+#ifdef H3_TRACE
+        fprintf(stderr, "%s stream %lld\n", (b & 1u) ? "close" : "shutdown_read", (long long)stream);
+#endif
         if (b & 1u) {
             (void)h3_close_stream(s->c, stream, 0x100u + (b >> 1));
         } else {
@@ -298,6 +328,9 @@ static void step(server *s, input *in, uint8_t op) {
         if (stream < 0) {
             break;
         }
+#ifdef H3_TRACE
+        fprintf(stderr, "%s stream %lld\n", (b & 1u) ? "block" : "unblock", (long long)stream);
+#endif
         if (b & 1u) {
             h3_block(s->c, stream);
         } else {
@@ -306,11 +339,12 @@ static void step(server *s, input *in, uint8_t op) {
         break;
     }
     case 7: {
+        /* As web_http3's drain: the notice once, then the final GOAWAY once (nghttp3 asserts a GOAWAY's ID never
+           grows, so neither may be repeated or reordered); h3_drained at any time. */
         take(in, &a);
-        if (a % 3u == 0) {
-            (void)h3_goaway_notice(s->c);
-        } else if (a % 3u == 1) {
-            (void)h3_goaway(s->c);
+        if ((a & 1u) && s->goaway < 2) {
+            (void)(s->goaway == 0 ? h3_goaway_notice(s->c) : h3_goaway(s->c));
+            s->goaway += 1;
         } else {
             (void)h3_drained(s->c);
         }

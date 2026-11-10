@@ -827,7 +827,8 @@ void h3_shutdown_write(h3_conn *c, int64_t stream) {
 }
 
 /* GOAWAY: first a notice (the largest ID, RFC 9114 §5.2), then, once in-flight requests have had time to arrive, the
-   final one with the last stream accepted. */
+   final one with the last stream accepted. Each at most once, in that order: a GOAWAY's ID may not grow, and nghttp3
+   asserts it (nghttp3_conn_shutdown), which tests/fuzz/h3 found when it called them in any order. */
 int32_t h3_goaway_notice(h3_conn *c) {
     return nghttp3_conn_submit_shutdown_notice(c->conn);
 }
