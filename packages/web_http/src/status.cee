@@ -32,7 +32,7 @@ public struct StatusCode {
     /// Whether a response with this status may have content: not 1xx, 204 or 304 (RFC 9110 §6.4.1).
     public fn allowsContent(this) -> bool => this.value >= 200 && this.value != 204 && this.value != 304;
 
-    /// The reason phrase RFC 9110 §15 gives the code; "" for codes it does not name.
+    /// The reason phrase RFC 9110 §15 gives the code (and RFC 8470 for 425); "" for codes they do not name.
     public fn reason(this) -> StringView => match (this.value) {
         100 => "Continue",
         101 => "Switching Protocols",
@@ -61,6 +61,7 @@ public struct StatusCode {
         415 => "Unsupported Media Type",
         416 => "Range Not Satisfiable",
         417 => "Expectation Failed",
+        425 => "Too Early", // RFC 8470 §5.2
         426 => "Upgrade Required",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
@@ -111,6 +112,9 @@ public struct Status {
     public fn rangeNotSatisfiable() -> StatusCode => StatusCode { value: 416 };
     /// 417 Expectation Failed.
     public fn expectationFailed() -> StatusCode => StatusCode { value: 417 };
+    /// 425 Too Early (RFC 8470 §5.2): the request came in early data, which may be replayed; retry it after the
+    /// handshake.
+    public fn tooEarly() -> StatusCode => StatusCode { value: 425 };
     /// 431 Request Header Fields Too Large.
     public fn headerFieldsTooLarge() -> StatusCode => StatusCode { value: 431 };
     /// 500 Internal Server Error.

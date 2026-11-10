@@ -1,0 +1,285 @@
+// QuicServer with HqFiles, over real UDP sockets on loopback (Web ADR 0014 §4, stage 2). The client is the test's own,
+// a QuicConnection driven over its own socket. It asks hq-interop for two files on two streams (quic-interop-runner's
+// "transfer" shape). Expected bytes are the files' (`pattern`):
+// - a small file;
+// - a 3 MiB one, more than a stream holds unacknowledged (1 MiB), so the server must wait for acknowledgements and
+//   StreamWritable.
+// A missing file gets an empty answer, and so does a refused path: `/sub/../small.txt` names a file that exists, so
+// it would not be empty if the guard let `..` through. The server is cancelled when the client finishes
+// (Async.race).
+import web_core;
+import web_tls;
+
+/// Byte `i` of every test file.
+fn pattern(i: u64) -> u8 => 97 + truncate<u8>(i % 26);
+
+/// The served files, in a new temporary directory.
+struct Files {
+    dir: String;
+
+    fn create() -> Result<Files, TestFailure> {
+        let dir = match (Directory.temporary()) {
+            Ok(d) => d,
+            Err(_) => { return Err(TestFailure.create("a temporary directory")); },
+        };
+        writePattern(dir.view(), "/small.txt", 1000)?;
+        writePattern(dir.view(), "/large.bin", 3 * 1048576)?;
+        return Ok(Files { dir: dir });
+    }
+
+    fn remove(borrow this) {
+        for (n in ["/small.txt", "/large.bin"]) {
+            var p = String.create();
+            if (p.append(this.dir.view()).isOk() && p.append(n).isOk()) {
+                let _ = File.remove(p.view());
+            }
+        }
+        let _ = Directory.remove(this.dir.view());
+    }
+}
+
+fn writePattern(dir: StringView, name: StringView, size: u64) -> Result<void, TestFailure> {
+    var p = String.create();
+    if (!(p.append(dir).isOk() && p.append(name).isOk())) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var f = match (File.create(p.view())) {
+        Ok(f) => f,
+        Err(_) => { return Err(TestFailure.create("creating a file")); },
+    };
+    var block = [0u8; 4096];
+    var at: u64 = 0;
+    while (at < size) {
+        let n: usize = if (size - at < 4096) truncate<usize>(size - at) else 4096;
+        for (i in 0..n) {
+            block[i] = pattern(at + i as u64);
+        }
+        match (f.write(block[0..n])) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("writing a file")); }
+        }
+        at += n as u64;
+    }
+    return Ok();
+}
+
+fn isPattern(bytes: Slice<u8>) -> bool {
+    for (i in 0..bytes.length) {
+        if (bytes[i] != pattern(i as u64)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// What the client received on each of its four streams.
+struct Fetched {
+    small: Vector<u8>;
+    large: Vector<u8>;
+    missing: Vector<u8>;
+    refused: Vector<u8>;
+    ends: u32;
+}
+
+/// The client: connects to `server`, asks for /small.txt, /large.bin, /missing and /sub/../small.txt on four
+/// streams, and reads until all four have ended.
+async fn fetch(tls: borrow QuicTls, server: SocketAddress) -> Result<Fetched, TestFailure> {
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the client's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the client's address")); },
+    };
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    let here = QuicAddress.of(local);
+    let there = QuicAddress.of(server);
+    var conn = ok(QuicConnection.client(tls, "localhost", here, there, ids, Clock.monotonicNanos()), "the client")?;
+    var buffer = Vector<u8>.create();
+    var out = Vector<u8>.create();
+    if (buffer.resize(quicEventBufferSize(), 0).isErr() || out.resize(quicDatagramSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var got = Fetched {
+        small: Vector<u8>.create(),
+        large: Vector<u8>.create(),
+        missing: Vector<u8>.create(),
+        refused: Vector<u8>.create(),
+        ends: 0,
+    };
+    var asked = false;
+    var streams = [-1i64, -1, -1, -1];
+    let deadline = Clock.monotonicNanos() + 20000000000; // 20 s: the transfers take well under one
+    while (got.ends < 4) {
+        if (Clock.monotonicNanos() > deadline) {
+            return Err(TestFailure.create("the transfers did not finish in 20 s"));
+        }
+        // Events.
+        loop {
+            let event = match (ok(conn.nextEvent(buffer.viewMut()), "an event")?) {
+                Some(e) => e,
+                null => { break; },
+            };
+            match (event) {
+                QuicEvent.StreamData(stream, n, fin) => {
+                    let into =
+                        if (stream ==
+                            streams[0]) borrow mut got.small else if (stream ==
+                            streams[1]) borrow mut got.large else if (stream ==
+                            streams[2]) borrow mut got.missing else borrow mut got.refused;
+                    if (into.extend(buffer.view()[0..n]).isErr()) {
+                        return Err(TestFailure.create("out of memory"));
+                    }
+                    if (fin) {
+                        got.ends += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if (!asked && conn.handshakeDone()) {
+            let paths = ["GET /small.txt\r\n", "GET /large.bin\r\n", "GET /missing\r\n", "GET /sub/../small.txt\r\n"];
+            for (k in 0..4) {
+                let s = ok(conn.openStream(), "a stream")?;
+                streams[k] = s;
+                let _ = ok(conn.writeStream(s, paths[k].bytes(), true), "a request")?;
+            }
+            asked = true;
+        }
+        // Datagrams out.
+        loop {
+            let d = match (ok(conn.datagram(out.viewMut(), Clock.monotonicNanos()), "a datagram")?) {
+                Some(d) => d,
+                null => { break; },
+            };
+            match (await socket.sendTo(out.view()[0..d.length], server)) {
+                Ok() => {}
+                Err(_) => { return Err(TestFailure.create("sending")); }
+            }
+        }
+        // Wait for a datagram, or the connection's timer.
+        let now = Clock.monotonicNanos();
+        let waitMs: u64 = match (conn.nextTimeout()) {
+            Some(t) => if (t <= now) 0 else (t - now + 999999) / 1000000,
+            null => 1000,
+        };
+        if (waitMs == 0) {
+            ok(conn.onTimeout(now), "a timer")?;
+            continue;
+        }
+        let raced: Result<Raced<Datagram?>, AsyncError> = await Async.race(
+            async () => {
+                let d = await socket.recvFrom(buffer.viewMut())?;
+                return Ok(Some(d));
+            },
+            async () => {
+                await Timer.sleep(waitMs)?;
+                return Ok(null);
+            },
+        );
+        let won: Raced<Datagram?> = match (raced) {
+            Ok(w) => w,
+            Err(_) => { return Err(TestFailure.create("waiting")); },
+        };
+        let datagram: Datagram? = if (won.winner == 0) won.value else match (won.other) {
+            Some(d) => d,
+            null => won.value,
+        };
+        match (datagram) {
+            Some(d) => {
+                let from = QuicAddress.of(d.from);
+                ok(conn.feed(from, 0, buffer.view()[0..d.length], Clock.monotonicNanos()), "the client's read")?;
+            }
+            null => { ok(conn.onTimeout(Clock.monotonicNanos()), "a timer")?; }
+        }
+    }
+    return Ok(got);
+}
+
+fn configs() -> Result<Pair, TestFailure> {
+    var serverConfig = match (TlsConfig.server(serverPem().bytes(), serverKey().bytes())) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("the server configuration")); },
+    };
+    let alpn = [Alpn.Http3];
+    var clientConfig = match (TlsConfig.client()) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("the client configuration")); },
+    };
+    if (serverConfig.setAlpn(alpn[..]).isErr() || clientConfig.trustPem(caPem().bytes()).isErr() ||
+        clientConfig.setAlpn(alpn[..]).isErr()) {
+        return Err(TestFailure.create("the TLS settings"));
+    }
+    let server = ok(QuicTls.of(serverConfig), "the server's QUIC context")?;
+    let client = ok(QuicTls.of(clientConfig), "the client's QUIC context")?;
+    return Ok(Pair { server: server, client: client, serverConfig: serverConfig, clientConfig: clientConfig });
+}
+
+/// How the race between the server and the client ended.
+enum Ended {
+    Server,
+    Client(Fetched),
+    ClientFailed(TestFailure),
+}
+
+@test
+async fn hq_interop_transfer_over_udp() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    var files = await Async.blocking(() => Files.create())?;
+    let p = configs()?;
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the server's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the server's address")); },
+    };
+    let tls = match (Arc<QuicTls>.create(p.server)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let files2 = match (HqFiles.create(files.dir.view())) {
+        Ok(h) => h,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let boxed: Box<dyn QuicApplication + Send> = match (Box.create(files2)) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await QuicServer.serve(socket, local, tls, app, QuicServerOptions.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await fetch(p.client, local)) {
+                Ok(f) => { return Ok(Ended.Client(f)); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    await Async.blocking(() => files.remove());
+    let fetched = match (raced) {
+        Ok(won) => match (won.value) {
+            Ended.Client(f) => f,
+            Ended.ClientFailed(e) => { return Err(e); },
+            Ended.Server => { return Err(TestFailure.create("the server ended before the client")); },
+        },
+        Err(_) => { return Err(TestFailure.create("the race")); },
+    };
+    Check.equalU64(1000, fetched.small.length as u64)?;
+    Check.isTrue(isPattern(fetched.small.view()), "the small file's bytes")?;
+    Check.equalU64(3 * 1048576, fetched.large.length as u64)?;
+    Check.isTrue(isPattern(fetched.large.view()), "the large file's bytes")?;
+    Check.equalU64(0, fetched.missing.length as u64)?;
+    Check.equalU64(0, fetched.refused.length as u64)?;
+    return Ok();
+}

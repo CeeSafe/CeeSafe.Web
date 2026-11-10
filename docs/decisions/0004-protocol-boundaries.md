@@ -83,7 +83,8 @@ a `web_http.ProtocolError` with one status (or a connection close) per reason. E
 | `web_tls` | `web_core`, `web_transport` |
 | `web_http` | `web_core` |
 | `web_http1`, `web_sse`, `web_ws`, `web_http2` | `web_core`, `web_http` |
-| `web_http3` | `web_core`, `web_http`, `web_tls` |
+| `web_quic` | `web_core`, `web_tls` (amendment 4) |
+| `web_http3` | `web_core`, `web_http`, `web_quic` (amendment 4) |
 | `web_client` | `web_core`, `web_transport`, `web_http`, `web_http1`, `web_http2`, `web_ws` (amendment 2) |
 | `web_server` | `web_core`, `web_transport`, `web_http`, `web_http1`, `web_http2`, `web_sse`, `web_ws` |
 | `web_proxy` | `web_core`, `web_transport`, `web_http`, `web_client`, `web_server` |
@@ -149,3 +150,13 @@ without static files depends on no file code (ADR 0013 §6, answer 2).
   manifests have no test-only dependencies, so it also depends on `web_transport`.
 - **Nothing new is reachable:** `web_server` depends on `web_transport` already. `web_static` stays below `web_tls`
   (in `NO_TLS`), and `tools/check_layers.py` has the row.
+
+## 10. Amendment 4 (2026-11-09, M10 stage 1): `web_quic`, and `web_http3` on it
+
+Web ADR 0014 §3.1 splits QUIC from HTTP/3:
+- **`web_quic`** is QUIC over ngtcp2, with its OpenSSL backend. It may depend on `web_core` and `web_tls`, for
+  `TlsConfig` and the certificates.
+- **`web_http3`** is HTTP/3 and QPACK over nghttp3. It may depend on `web_core`, `web_http` and `web_quic`, and no
+  longer on `web_tls` directly.
+- **Both link OpenSSL,** so neither is in `NO_TLS`. No package in `NO_TLS` depends on them, and `tools/check_layers.py`
+  has both rows.

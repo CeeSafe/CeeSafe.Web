@@ -26,7 +26,7 @@ backpressure and standards compliance.
 | `web_http2` | M7 | HTTP/2 and HPACK |
 | `web_proxy` | M8 | the reverse proxy |
 | `web_static` | M9 | static files: validators, conditionals, one byte range, `sendFile` ([README](packages/web_static/README.md)) |
-| `web_http3` | M10 | HTTP/3 and QPACK over QUIC |
+| `web_http3` | M10 | HTTP/3 and QPACK over QUIC; 0-RTT and replay ([README](packages/web_http3/README.md)) |
 | `web_server` | M1–M3 | server, router, middleware pipeline |
 
 Allowed dependencies: Web ADR 0004 §3.5, checked by `python3 tools/check_layers.py`.

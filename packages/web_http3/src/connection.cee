@@ -1,0 +1,356 @@
+// HTTP/3 over one QUIC connection, through nghttp3 (Web ADR 0014 §3.6, amendment 4 items 3 and 4): sans-I/O. QUIC
+// stream bytes go in with `read`; the bytes nghttp3 has for QUIC come out of `pull` and are acknowledged with `wrote`;
+// what happened comes out of `nextEvent`. No `await`, no timer and no socket here (Web ADR 0004). The shim
+// (c/h3_shim.c) owns nghttp3's state; this type owns the shim's handle.
+import web_core;
+
+extern "C" {
+    @effects()
+    fn h3_conn_server(maxFieldSection: u64) -> *mut void;
+    @effects()
+    fn h3_conn_client(maxFieldSection: u64) -> *mut void;
+    @effects()
+    fn h3_conn_free(conn: *mut void);
+    @effects()
+    fn h3_bind(conn: *mut void, control: i64, encoder: i64, decoder: i64) -> i32;
+    @effects()
+    fn h3_app_error(code: i32) -> u64;
+    @effects()
+    fn h3_read(conn: *mut void, stream: i64, bytes: *u8, length: usize, fin: i32, now: u64) -> i64;
+    @effects()
+    fn h3_shutdown_read(conn: *mut void, stream: i64) -> i32;
+    @effects()
+    fn h3_close_stream(conn: *mut void, stream: i64, code: u64) -> i32;
+    @effects()
+    fn h3_pull(conn: *mut void, stream: *mut i64, fin: *mut i32, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn h3_wrote(conn: *mut void, stream: i64, n: u64) -> i32;
+    @effects()
+    fn h3_block(conn: *mut void, stream: i64);
+    @effects()
+    fn h3_unblock(conn: *mut void, stream: i64) -> i32;
+    @effects()
+    fn h3_submit(conn: *mut void, stream: i64, request: i32, fields: *u8, length: usize, hasBody: i32) -> i32;
+    @effects()
+    fn h3_send_body(conn: *mut void, stream: i64, bytes: *u8, length: usize, end: i32) -> i64;
+    @effects()
+    fn h3_trailers(conn: *mut void, stream: i64, fields: *u8, length: usize) -> i32;
+    @effects()
+    fn h3_shutdown_write(conn: *mut void, stream: i64);
+    @effects()
+    fn h3_goaway_notice(conn: *mut void) -> i32;
+    @effects()
+    fn h3_goaway(conn: *mut void) -> i32;
+    @effects()
+    fn h3_drained(conn: *mut void) -> i32;
+    @effects()
+    fn h3_next_event(
+        conn: *mut void,
+        buffer: *mut u8,
+        capacity: usize,
+        stream: *mut i64,
+        flags: *mut u32,
+        code: *mut u64,
+        length: *mut usize,
+    ) -> u32;
+}
+
+/// What went wrong.
+public enum H3Error {
+    /// Memory ran out; the connection must close.
+    NoMemory,
+    /// The next event's data needs a buffer of this many bytes; nothing was taken.
+    BufferTooSmall(usize),
+    /// A field list was malformed.
+    BadFields,
+    /// nghttp3's error: its code. From `read`, `pull`, `wrote`, `bind`, `shutdownRead` and `closeStream` it is a
+    /// connection error: close the QUIC connection with `H3Errors.closeCode` (nghttp3's rule; RFC 9114 §8 lets an
+    /// endpoint treat a stream error so). From `respond`, `sendBody` and `trailers` it concerns only that stream,
+    /// which is gone or ended.
+    Failed(i32),
+}
+
+/// The classification of nghttp3's error codes, done by nghttp3 itself through the shim.
+public struct H3Errors {
+    /// The HTTP/3 error code to close the connection with after `e` (RFC 9114 §8.1): nghttp3's
+    /// `nghttp3_err_infer_quic_app_error_code`, so H3_MESSAGE_ERROR (0x10e) for a malformed request; H3_INTERNAL_ERROR
+    /// (0x102) for memory.
+    /// Safety: the call takes a number and returns one.
+    public fn closeCode(e: borrow H3Error) -> u64 => match (e) {
+        H3Error.Failed(code) => unsafe { h3_app_error(code) },
+        _ => 0x102,
+    };
+
+    fn check(code: i32) -> Result<void, H3Error> {
+        if (code == 0) {
+            return Ok();
+        }
+        return Err(H3Error.Failed(code));
+    }
+}
+
+/// What happened on the connection. A field's name and value, and DATA's bytes, are in the buffer `nextEvent` was
+/// given.
+public enum H3Event {
+    /// A field of a request's head (or, with `true`, of its trailers): the stream, the name's length, then the
+    /// value's; the name comes first in the buffer.
+    Field(i64, usize, usize, bool),
+    /// A head (or, with the first `true`, the trailers) is complete; with the second `true`, the stream ended with it.
+    FieldsEnd(i64, bool, bool),
+    /// Body bytes: their count. Their credit goes back (`QuicLink.consume`) as the handler reads them.
+    Data(i64, usize),
+    /// The peer's side of the stream has ended.
+    End(i64),
+    /// nghttp3 consumed this many more bytes of the stream, later than `read` (QPACK's blocked streams): give their
+    /// credit back.
+    Consumed(i64, u64),
+    /// Send STOP_SENDING on the stream with this code (`QuicLink.stopReading`).
+    StopSending(i64, u64),
+    /// Reset our sending side of the stream with this code (`QuicLink.resetSending`).
+    Reset(i64, u64),
+    /// nghttp3 is done with the stream, with this code.
+    Closed(i64, u64),
+    /// The stream's body queue, once full, has room again.
+    BodyRoom(i64),
+    /// The peer sent GOAWAY with this ID (RFC 9114 §5.2).
+    GoAway(u64),
+}
+
+/// Bytes `pull` copied for QUIC: their stream and count, and whether they end the stream.
+public struct H3Out {
+    public stream: i64;
+    public length: usize;
+    public fin: bool;
+}
+
+/// A field list for `respond` and `trailers`, in the shim's form: per field, a 2-byte name length and a 4-byte value
+/// length (big-endian), then the name and the value. Names must be lowercase (RFC 9114 §4.2).
+public struct H3Fields {
+    private bytes: Vector<u8>;
+
+    /// An empty list.
+    public fn create() -> H3Fields => H3Fields { bytes: Vector<u8>.create() };
+
+    /// Appends a field.
+    public fn add(borrow mut this, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+        if (name.length > 65535 || value.length > 0xFFFFFFFF) {
+            return Err(AllocError.OutOfMemory);
+        }
+        let n = name.length;
+        let v = value.length as u64;
+        this.bytes.push(truncate<u8>(n >> 8))?;
+        this.bytes.push(truncate<u8>(n))?;
+        this.bytes.push(truncate<u8>(v >> 24))?;
+        this.bytes.push(truncate<u8>(v >> 16))?;
+        this.bytes.push(truncate<u8>(v >> 8))?;
+        this.bytes.push(truncate<u8>(v))?;
+        this.bytes.extend(name)?;
+        this.bytes.extend(value)?;
+        return Ok();
+    }
+
+    /// Empties the list.
+    public fn clear(borrow mut this) {
+        this.bytes.clear();
+    }
+
+    fn view(borrow this) -> Slice<u8> => this.bytes.view();
+}
+
+/// One HTTP/3 connection's state (nghttp3's), for a server, or, in this package's tests, a client.
+public struct H3Connection {
+    private raw: *mut void;
+
+    /// A server's connection; a request's head may be at most `maxFieldSection` bytes (RFC 9114 §4.2.2, from
+    /// `Limits.maxHeadBytes`).
+    /// Safety: the shim returns a fresh handle or null.
+    public fn server(maxFieldSection: u64) -> Result<H3Connection, H3Error> {
+        let raw = unsafe { h3_conn_server(maxFieldSection) };
+        if (raw.isNull()) {
+            return Err(H3Error.NoMemory);
+        }
+        return Ok(H3Connection { raw: raw });
+    }
+
+    /// A client's connection, for this package's tests only (Web ADR 0014 amendment 4 item 5).
+    /// Safety: as `server`.
+    fn client(maxFieldSection: u64) -> Result<H3Connection, H3Error> {
+        let raw = unsafe { h3_conn_client(maxFieldSection) };
+        if (raw.isNull()) {
+            return Err(H3Error.NoMemory);
+        }
+        return Ok(H3Connection { raw: raw });
+    }
+
+    /// Binds our three unidirectional streams, opened on the QUIC connection: the control stream, then QPACK's
+    /// encoder and decoder streams (RFC 9114 §6.2.1, RFC 9204 §4.2).
+    /// Safety: the call takes numbers.
+    public fn bind(borrow mut this, control: i64, encoder: i64, decoder: i64) -> Result<void, H3Error> =>
+        H3Errors.check(unsafe { h3_bind(this.raw, control, encoder, decoder) });
+
+    /// Feeds bytes QUIC delivered on `stream` (and its end, with `fin`) at `now` (the caller's monotonic clock, in
+    /// nanoseconds, never decreasing): how many nghttp3 consumed, whose credit goes back to the peer now. DATA's
+    /// payload is not among them; its credit goes back as the handler reads it. `now` runs nghttp3's flood guard
+    /// (H3_EXCESSIVE_LOAD after 1 000 suspicious events, then 33 a second).
+    /// Safety: the shim reads at most `bytes.length` bytes and keeps no pointer to them.
+    public fn read(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool, now: u64) -> Result<u64, H3Error> {
+        let n = unsafe { h3_read(this.raw, stream, bytes.ptr, bytes.length, if (fin) 1 else 0, now) };
+        if (n < 0) {
+            return Err(H3Error.Failed(truncate<i32>(n)));
+        }
+        return Ok(truncate<u64>(n)); // n >= 0
+    }
+
+    /// The next bytes nghttp3 has for QUIC, copied into `out`: null when there are none. Give them to
+    /// `QuicLink.writeStream`, then say how many it took with `wrote`.
+    /// Safety: the shim writes at most `out.length` bytes into `out`, and the two values.
+    public fn pull(borrow mut this, out: SliceMut<u8>) -> Result<H3Out?, H3Error> {
+        var stream: i64 = -1;
+        var fin: i32 = 0;
+        let n = unsafe { h3_pull(
+            this.raw,
+            borrow mut stream as *mut i64,
+            borrow mut fin as *mut i32,
+            out.ptr,
+            out.length,
+        ) };
+        if (n < 0) {
+            return Err(H3Error.Failed(truncate<i32>(n)));
+        }
+        if (stream < 0) {
+            return Ok(null);
+        }
+        return Ok(Some(H3Out { stream: stream, length: truncate<usize>(n), fin: fin == 1 }));
+    }
+
+    /// QUIC took `n` of the bytes `pull` gave for `stream` (0 for a FIN alone).
+    /// Safety: the call takes numbers.
+    public fn wrote(borrow mut this, stream: i64, n: u64) -> Result<void, H3Error> =>
+        H3Errors.check(unsafe { h3_wrote(this.raw, stream, n) });
+
+    /// QUIC holds `stream` full: `pull` offers nothing more for it until `unblock`.
+    /// Safety: the call takes numbers.
+    public fn block(borrow mut this, stream: i64) {
+        unsafe {
+            h3_block(this.raw, stream);
+        }
+    }
+
+    /// QUIC has room on `stream` again (`QuicEvent.StreamWritable`).
+    /// Safety: the call takes numbers.
+    public fn unblock(borrow mut this, stream: i64) -> Result<void, H3Error> =>
+        H3Errors.check(unsafe { h3_unblock(this.raw, stream) });
+
+    /// Submits a response's head on `stream`, `:status` first. With `hasBody`, its body follows through `sendBody`;
+    /// without, the head ends the stream.
+    /// Safety: the shim reads the field list and keeps no pointer to it (nghttp3 copies it).
+    public fn respond(borrow mut this, stream: i64, fields: borrow H3Fields, hasBody: bool) -> Result<void, H3Error> {
+        let f = fields.view();
+        return H3Errors.check(unsafe { h3_submit(this.raw, stream, 0, f.ptr, f.length, if (hasBody) 1 else 0) });
+    }
+
+    /// Submits a request's head on `stream` (a client's, for this package's tests).
+    /// Safety: as `respond`.
+    fn request(borrow mut this, stream: i64, fields: borrow H3Fields, hasBody: bool) -> Result<void, H3Error> {
+        let f = fields.view();
+        return H3Errors.check(unsafe { h3_submit(this.raw, stream, 1, f.ptr, f.length, if (hasBody) 1 else 0) });
+    }
+
+    /// Takes up to `bytes.length` body bytes for `stream`, and ends the body after them when `end`: how many were
+    /// taken, fewer when the stream holds 256 KiB not yet sent (wait for `BodyRoom`).
+    /// Safety: the shim copies at most `bytes.length` bytes.
+    public fn sendBody(borrow mut this, stream: i64, bytes: Slice<u8>, end: bool) -> Result<usize, H3Error> {
+        let n = unsafe { h3_send_body(this.raw, stream, bytes.ptr, bytes.length, if (end) 1 else 0) };
+        if (n < 0) {
+            return Err(H3Error.Failed(truncate<i32>(n)));
+        }
+        return Ok(truncate<usize>(n)); // n >= 0
+    }
+
+    /// Ends `stream`'s body with trailer fields.
+    /// Safety: as `respond`.
+    public fn trailers(borrow mut this, stream: i64, fields: borrow H3Fields) -> Result<void, H3Error> {
+        let f = fields.view();
+        return H3Errors.check(unsafe { h3_trailers(this.raw, stream, f.ptr, f.length) });
+    }
+
+    /// The peer reset `stream`, or asked us to stop sending on it: nghttp3 reads no more of it.
+    /// Safety: the call takes numbers.
+    public fn shutdownRead(borrow mut this, stream: i64) -> Result<void, H3Error> =>
+        H3Errors.check(unsafe { h3_shutdown_read(this.raw, stream) });
+
+    /// Our sending side of `stream` was reset: nghttp3 sends nothing more on it.
+    /// Safety: the call takes numbers.
+    public fn shutdownWrite(borrow mut this, stream: i64) {
+        unsafe {
+            h3_shutdown_write(this.raw, stream);
+        }
+    }
+
+    /// QUIC closed `stream` with `code` (`QuicEvent.StreamClosed`).
+    /// Safety: the call takes numbers.
+    public fn closeStream(borrow mut this, stream: i64, code: u64) -> Result<void, H3Error> =>
+        H3Errors.check(unsafe { h3_close_stream(this.raw, stream, code) });
+
+    /// Sends the first GOAWAY, which only announces the shutdown (RFC 9114 §5.2).
+    /// Safety: the call takes the handle.
+    public fn goAwayNotice(borrow mut this) -> Result<void, H3Error> =>
+        H3Errors.check(unsafe { h3_goaway_notice(this.raw) });
+
+    /// Sends the final GOAWAY, with the last stream accepted.
+    /// Safety: as `goAwayNotice`.
+    public fn goAway(borrow mut this) -> Result<void, H3Error> => H3Errors.check(unsafe { h3_goaway(this.raw) });
+
+    /// After `goAway`, whether every stream is done and the connection may close.
+    /// Safety: as `goAwayNotice`.
+    public fn drained(borrow this) -> bool => unsafe { h3_drained(this.raw) } == 1;
+
+    /// The next event, its data copied into `buffer` (`h3EventBufferSize()` bytes is always enough for body data; a
+    /// field may need up to the head's limit); null when there is none. Drain it after every `read` and `wrote`.
+    /// Safety: the shim writes at most `buffer.length` bytes into `buffer`, and the four values.
+    public fn nextEvent(borrow mut this, buffer: SliceMut<u8>) -> Result<H3Event?, H3Error> {
+        var stream: i64 = 0;
+        var flags: u32 = 0;
+        var code: u64 = 0;
+        var length: usize = 0;
+        let kind = unsafe { h3_next_event(
+            this.raw,
+            buffer.ptr,
+            buffer.length,
+            borrow mut stream as *mut i64,
+            borrow mut flags as *mut u32,
+            borrow mut code as *mut u64,
+            borrow mut length as *mut usize,
+        ) };
+        return match (kind) {
+            1 => {
+                let nameLength = truncate<usize>(code);
+                if (nameLength > length) {
+                    return Err(H3Error.BadFields);
+                }
+                return Ok(Some(H3Event.Field(stream, nameLength, length - nameLength, (flags & 1) == 1)));
+            },
+            2 => Ok(Some(H3Event.FieldsEnd(stream, (flags & 1) == 1, (flags & 2) == 2))),
+            3 => Ok(Some(H3Event.Data(stream, length))),
+            4 => Ok(Some(H3Event.End(stream))),
+            5 => Ok(Some(H3Event.Consumed(stream, code))),
+            6 => Ok(Some(H3Event.StopSending(stream, code))),
+            7 => Ok(Some(H3Event.Reset(stream, code))),
+            8 => Ok(Some(H3Event.Closed(stream, code))),
+            9 => Ok(Some(H3Event.BodyRoom(stream))),
+            10 => Ok(Some(H3Event.GoAway(code))),
+            255 => Err(H3Error.BufferTooSmall(length)),
+            _ => Ok(null),
+        };
+    }
+
+    /// Safety: `raw` is this connection's handle, freed once.
+    drop {
+        unsafe {
+            h3_conn_free(this.raw);
+        }
+    }
+}
+
+/// A buffer for `nextEvent` that holds any DATA event (the shim splits longer DATA).
+public fn h3EventBufferSize() -> usize => 65527;

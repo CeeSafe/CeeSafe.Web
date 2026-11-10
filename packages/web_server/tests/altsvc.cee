@@ -1,0 +1,89 @@
+// `Server.advertiseHttp3` (Web ADR 0014 §3.8): HTTP/1.1 responses carry `alt-svc: h3=":<port>"; ma=86400` (RFC 7838
+// §3, the `h3` ALPN token, RFC 9114 §3.1), unless the response already has an `Alt-Svc`; without the call, none.
+import web_core;
+import web_transport;
+import web_http;
+
+/// A middleware that sets its own `Alt-Svc` in `after`.
+struct OwnAltSvc {}
+
+impl Middleware<St> for OwnAltSvc {
+    async fn before(
+        borrow this,
+        ctx: borrow mut RequestContext<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError> => Ok(Flow.Continue);
+
+    async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError> {
+        match (head.add("alt-svc", "clear".bytes())) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+}
+
+/// `POST /users` over HTTP/1.1 to a server set up by `how` (0: plain, 1: advertising port 4433, 2: advertising, with a
+/// middleware setting its own `Alt-Svc`): what it wrote.
+async fn answer(how: u32) -> Result<Vector<u8>, TestFailure> {
+    let limits = quiet();
+    var s = routed(Server<St>.create(state()?, limits))?;
+    added(s.router().post("/users", named(5)?))?;
+    if (how >= 1) {
+        s.advertiseHttp3(4433);
+    }
+    if (how == 2) {
+        let m: Box<dyn Middleware<St> + Send> = alloc(Box.create(OwnAltSvc {}))?;
+        routed(s.use(m))?;
+    }
+    let service = net(serviceOf(s))?;
+    let drain = net(Drain.create())?;
+    let text = "POST /users HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n";
+    var c = alloc(MockTransport.create(text.bytes()))?;
+    netDone(await service.serve(mut c, ConnectionContext.acceptedNow(1, drain)))?;
+    var out = Vector<u8>.create();
+    alloc(out.extend(c.written()))?;
+    return Ok(out);
+}
+
+/// How many times `needle` occurs in `hay`.
+fn occurrences(hay: Slice<u8>, needle: StringView) -> u32 {
+    let n = needle.bytes();
+    var count: u32 = 0;
+    if (hay.length < n.length) {
+        return 0;
+    }
+    for (i in 0..hay.length - n.length + 1) {
+        var all = true;
+        for (j in 0..n.length) {
+            if (hay[i + j] != n[j]) {
+                all = false;
+                break;
+            }
+        }
+        if (all) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+@test
+async fn alt_svc_advertises_http3() -> Result<void, TestFailure> {
+    let out = await answer(1)?;
+    Check.equalU64(1, occurrences(out.view(), "\r\nalt-svc: h3=\":4433\"; ma=86400\r\n") as u64)?;
+    return Check.equalU64(1, occurrences(out.view(), "alt-svc") as u64);
+}
+
+@test
+async fn alt_svc_keeps_one_already_set() -> Result<void, TestFailure> {
+    let out = await answer(2)?;
+    Check.equalU64(1, occurrences(out.view(), "\r\nalt-svc: clear\r\n") as u64)?;
+    return Check.equalU64(1, occurrences(out.view(), "alt-svc") as u64);
+}
+
+@test
+async fn no_alt_svc_without_http3() -> Result<void, TestFailure> {
+    let out = await answer(0)?;
+    return Check.equalU64(0, occurrences(out.view(), "alt-svc") as u64);
+}

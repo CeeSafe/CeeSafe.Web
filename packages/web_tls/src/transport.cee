@@ -140,8 +140,8 @@ public struct TlsTransport {
         }
         var name = [0u8; 16];
         let n = unsafe { wt_alpn(this.conn, borrow mut name[0] as *mut u8, name.length) };
-        this.negotiated =
-            if (n == 2 && name[0] == 104 && name[1] == 50) Alpn.Http2 else if (n == 8) Alpn.Http11 else Alpn.None;
+        this.negotiated = if (n == 2 && name[0] == 104 && name[1] == 50) Alpn.Http2 else if (n == 2 && name[0] == 104 &&
+            name[1] == 51) Alpn.Http3 else if (n == 8) Alpn.Http11 else Alpn.None;
         return Ok();
     }
 

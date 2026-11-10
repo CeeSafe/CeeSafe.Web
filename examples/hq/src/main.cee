@@ -1,0 +1,133 @@
+// hq-interop over QUIC: web_quic's QuicServer with HqFiles (Web ADR 0014 §4, stage 2), for the QUIC interop checks
+// (tests/interop/quic.py). Serves the files under CW_ROOT on UDP 127.0.0.1:CW_PORT (default 4433), with the
+// certificate chain CW_CERT and key CW_KEY (PEM files), offering ALPN `hq-interop`. With CW_RETRY=1, every new
+// connection must first answer a Retry (RFC 9000 §8.1). It runs until it is killed.
+import web_core;
+import web_tls;
+import web_quic;
+
+/// Why the server did not start.
+enum Failure {
+    Setting,
+    Certificate,
+    Socket,
+    Memory,
+    Quic(QuicError),
+}
+
+/// The whole file at the path in environment variable `name`, into `out`.
+async fn readFile(name: StringView, out: borrow mut Vector<u8>) -> Result<void, Failure> {
+    let path = match (Environment.variable(name)) {
+        Some(p) => p,
+        null => { return Err(Failure.Setting); },
+    };
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(_) => { return Err(Failure.Setting); },
+    };
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (await AsyncFiles.read(mut file, mut chunk[..])) {
+            Ok(n) => n,
+            Err(_) => { return Err(Failure.Setting); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        match (out.extend(chunk[0..n])) {
+            Ok() => {}
+            Err(_) => { return Err(Failure.Memory); }
+        }
+    }
+}
+
+fn port() -> u16 {
+    let text = match (Environment.variable("CW_PORT")) {
+        Some(t) => t,
+        null => { return 4433; },
+    };
+    var v: u32 = 0;
+    for (b in text.bytes()) {
+        if (b < 48 || b > 57 || v > 6553) {
+            return 4433;
+        }
+        v = v * 10 + (b - 48) as u32;
+    }
+    return if (v > 0 && v < 65536) truncate<u16>(v) else 4433;
+}
+
+async fn say(text: StringView) {
+    let _ = await AsyncConsole.writeLine(text);
+}
+
+async fn serve() -> Result<void, Failure> {
+    if (!QuicLibrary.initialise()) {
+        return Err(Failure.Quic(QuicError.Failed(0)));
+    }
+    let root = match (Environment.variable("CW_ROOT")) {
+        Some(r) => r,
+        null => { return Err(Failure.Setting); },
+    };
+    var chain = Vector<u8>.create();
+    var key = Vector<u8>.create();
+    await readFile("CW_CERT", mut chain)?;
+    await readFile("CW_KEY", mut key)?;
+    var config = match (TlsConfig.server(chain.view(), key.view())) {
+        Ok(c) => c,
+        Err(_) => { return Err(Failure.Certificate); },
+    };
+    let protocols = [Alpn.HqInterop];
+    if (config.setAlpn(protocols[..]).isErr()) {
+        return Err(Failure.Certificate);
+    }
+    let quicTls = match (QuicTls.of(config)) {
+        Ok(t) => t,
+        Err(e) => { return Err(Failure.Quic(e)); },
+    };
+    let tls = match (Arc<QuicTls>.create(quicTls)) {
+        Ok(t) => t,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let files = match (HqFiles.create(root)) {
+        Ok(h) => h,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let boxed: Box<dyn QuicApplication + Send> = match (Box.create(files)) {
+        Ok(b) => b,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let local = SocketAddress.V4([127u8, 0, 0, 1], port());
+    let socket = match (AsyncUdpSocket.bind(local, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(Failure.Socket); },
+    };
+    await say("hq: listening");
+    var options = QuicServerOptions.defaults();
+    match (Environment.variable("CW_RETRY")) {
+        Some(v) => {
+            if (v.length == 1 && v.bytes()[0] == 49) {
+                options.retryAbove = 0;
+            }
+        }
+        null => {}
+    }
+    match (await QuicServer.serve(socket, local, tls, app, options)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(Failure.Quic(e)); }
+    }
+}
+
+fn main() {
+    match (Async.run(serve())) {
+        Ok() => {}
+        Err(Failure.Setting) => { Console.writeLine("hq: set CW_ROOT, CW_CERT and CW_KEY to readable paths"); }
+        Err(Failure.Certificate) => { Console.writeLine("hq: the certificate or key could not be used"); }
+        Err(Failure.Socket) => { Console.writeLine("hq: the UDP socket could not be bound"); }
+        Err(Failure.Memory) => { Console.writeLine("hq: out of memory"); }
+        Err(Failure.Quic(_)) => { Console.writeLine("hq: QUIC failed"); }
+    }
+}

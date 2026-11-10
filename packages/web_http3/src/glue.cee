@@ -1,0 +1,164 @@
+// Between QUIC and nghttp3 (Web ADR 0014 amendment 4 items 3 and 4): one HTTP/3 connection's streams, fed from QUIC's
+// events and flushed into QUIC's streams. Sans-I/O. Written once over `H3Streams`, which both `QuicConnection` (this
+// package's tests) and `QuicLink` (the server's driver) implement.
+import web_core;
+import web_quic;
+
+/// The QUIC streams an HTTP/3 connection runs on. The connection must give credit back on consumption
+/// (`QuicConnection.creditOnConsume`, or `QuicServerOptions.creditOnRead = false`).
+/// Each is one call into web_quic's shim, which does no I/O: they never block, as an async task requires.
+public interface H3Streams {
+    @effects()
+    fn openUni(borrow mut this) -> Result<i64, QuicError>;
+    @effects()
+    fn write(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError>;
+    @effects()
+    fn credit(borrow mut this, stream: i64, n: u64);
+    @effects()
+    fn stop(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError>;
+    @effects()
+    fn reset(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError>;
+}
+
+impl H3Streams for QuicConnection {
+    @effects()
+    fn openUni(borrow mut this) -> Result<i64, QuicError> => this.openUniStream();
+
+    @effects()
+    fn write(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError> =>
+        this.writeStream(stream, bytes, fin);
+
+    @effects()
+    fn credit(borrow mut this, stream: i64, n: u64) {
+        this.consume(stream, n);
+    }
+
+    @effects()
+    fn stop(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> => this.stopReading(stream, code);
+
+    @effects()
+    fn reset(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> => this.resetSending(stream, code);
+}
+
+impl H3Streams for QuicLink {
+    @effects()
+    fn openUni(borrow mut this) -> Result<i64, QuicError> => this.openUniStream();
+
+    @effects()
+    fn write(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError> =>
+        this.writeStream(stream, bytes, fin);
+
+    @effects()
+    fn credit(borrow mut this, stream: i64, n: u64) {
+        this.consume(stream, n);
+    }
+
+    @effects()
+    fn stop(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> => this.stopReading(stream, code);
+
+    @effects()
+    fn reset(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> => this.resetSending(stream, code);
+}
+
+/// H3_NO_ERROR (RFC 9114 §8.1), for a stream QUIC closed without an application code.
+fn h3NoError() -> u64 => 0x100;
+
+/// The glue's operations.
+public struct H3Glue {
+    /// Opens our control stream and QPACK's two, and binds them (RFC 9114 §6.2.1, RFC 9204 §4.2). Once the handshake
+    /// is done.
+    public fn start(h3: borrow mut H3Connection, quic: borrow mut dyn H3Streams) -> Result<void, H3Error> {
+        let control = quicOk(quic.openUni())?;
+        let encoder = quicOk(quic.openUni())?;
+        let decoder = quicOk(quic.openUni())?;
+        return h3.bind(control, encoder, decoder);
+    }
+
+    /// What one QUIC event means for HTTP/3. `bytes` is the event's data, for `StreamData`; `now` is the caller's
+    /// monotonic clock in nanoseconds (`H3Connection.read`).
+    public fn onQuic(
+        h3: borrow mut H3Connection,
+        quic: borrow mut dyn H3Streams,
+        event: borrow QuicEvent,
+        bytes: Slice<u8>,
+        now: u64,
+    ) -> Result<void, H3Error> {
+        match (event) {
+            QuicEvent.StreamData(stream, _, fin) => {
+                let consumed = h3.read(stream, bytes, fin, now)?;
+                quic.credit(stream, consumed);
+            }
+            QuicEvent.StreamWritable(stream) => { h3.unblock(stream)?; }
+            QuicEvent.StreamReset(stream, _) => { h3.shutdownRead(stream)?; }
+            QuicEvent.StopSending(stream, _) => { h3.shutdownRead(stream)?; }
+            QuicEvent.StreamClosed(stream, code) => {
+                var c = h3NoError();
+                match (code) {
+                    Some(v) => { c = v; }
+                    null => {}
+                }
+                h3.closeStream(stream, c)?;
+            }
+            _ => {}
+        }
+        return Ok();
+    }
+
+    /// Carries out what nghttp3 asks of QUIC in `event`: credit for bytes it consumed late, STOP_SENDING, a reset.
+    /// Other events are the caller's.
+    public fn obey(
+        h3: borrow mut H3Connection,
+        quic: borrow mut dyn H3Streams,
+        event: borrow H3Event,
+    ) -> Result<void, H3Error> {
+        match (event) {
+            H3Event.Consumed(stream, n) => { quic.credit(stream, n); }
+            H3Event.StopSending(stream, code) => {
+                let _ = quic.stop(stream, code); // a stream QUIC has closed meanwhile: nothing to stop
+            }
+            H3Event.Reset(stream, code) => {
+                let _ = quic.reset(stream, code);
+                h3.shutdownWrite(stream);
+            }
+            _ => {}
+        }
+        return Ok();
+    }
+
+    /// Moves what nghttp3 has into QUIC's streams, through `out` (at least a datagram's worth): until nghttp3 has
+    /// nothing more, or every stream it offers is full. A stream QUIC takes less of is blocked until
+    /// `StreamWritable`.
+    public fn flush(
+        h3: borrow mut H3Connection,
+        quic: borrow mut dyn H3Streams,
+        out: SliceMut<u8>,
+    ) -> Result<void, H3Error> {
+        loop {
+            let got = match (h3.pull(out)?) {
+                Some(g) => g,
+                null => { return Ok(); },
+            };
+            let taken = match (quic.write(got.stream, out[0..got.length], got.fin)) {
+                Ok(n) => n,
+                Err(QuicError.NoMemory) => { return Err(H3Error.NoMemory); },
+                Err(_) => {
+                    // The stream is gone on QUIC's side (reset or closed): nghttp3 sends nothing more on it.
+                    h3.shutdownWrite(got.stream);
+                    continue;
+                },
+            };
+            h3.wrote(got.stream, taken as u64)?;
+            if (taken < got.length) {
+                h3.block(got.stream);
+            }
+        }
+    }
+}
+
+fn quicOk(r: Result<i64, QuicError>) -> Result<i64, H3Error> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(QuicError.NoMemory) => { return Err(H3Error.NoMemory); }
+        Err(_) => { return Err(H3Error.Failed(0)); }
+    }
+}

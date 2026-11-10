@@ -1,0 +1,856 @@
+// A QUIC connection over ngtcp2 (Web ADR 0014 §3.4, §3.5): sans-I/O. Datagrams go in with `feed` and come out of
+// `datagrams`; the time is the caller's, in nanoseconds; what happened comes out of `nextEvent`. No `await`, no timer
+// and no socket here (Web ADR 0004). The shim (c/quic_shim.c) owns ngtcp2's state; this type owns the shim's handle.
+import web_core;
+import web_tls;
+
+extern "C" {
+    @effects()
+    fn qs_tls_new(ctx: *mut void, server: i32) -> *mut void;
+    @effects()
+    fn qs_tls_free(tls: *mut void);
+    @effects()
+    fn qs_conn_client(
+        tls: *mut void,
+        host: *u8,
+        hostLength: usize,
+        local: *u8,
+        remote: *u8,
+        dcid: *u8,
+        dcidLength: usize,
+        scid: *u8,
+        scidLength: usize,
+        secret: *u8,
+        now: u64,
+        error: *mut i32,
+    ) -> *mut void;
+    @effects()
+    fn qs_conn_server(
+        tls: *mut void,
+        packet: *u8,
+        length: usize,
+        local: *u8,
+        remote: *u8,
+        scid: *u8,
+        scidLength: usize,
+        secret: *u8,
+        odcid: *u8,
+        odcidLength: usize,
+        now: u64,
+        error: *mut i32,
+    ) -> *mut void;
+    @effects()
+    fn qs_conn_free(conn: *mut void);
+    @effects()
+    fn qs_retry_check(
+        key: *u8,
+        packet: *u8,
+        length: usize,
+        remote: *u8,
+        require: i32,
+        retryScid: *u8,
+        now: u64,
+        out: *mut u8,
+        capacity: usize,
+        outLength: *mut usize,
+        odcid: *mut u8,
+        odcidLength: *mut usize,
+    ) -> i32;
+    @effects()
+    fn qs_retried(conn: *mut void) -> i32;
+    @effects()
+    fn qs_tls_allow_early(tls: *mut void);
+    @effects()
+    fn qs_ticket(conn: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn qs_resume(conn: *mut void, ticket: *u8, length: usize) -> i32;
+    @effects()
+    fn qs_early_accepted(conn: *mut void) -> i32;
+    @effects()
+    fn qs_resumed(conn: *mut void) -> i32;
+    @effects()
+    fn qs_all_acked(conn: *mut void) -> i32;
+    @effects()
+    fn qs_pto(conn: *mut void) -> u64;
+    @effects()
+    fn qs_version_negotiation(packet: *u8, length: usize, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn qs_read(conn: *mut void, remote: *u8, ecn: u32, packet: *u8, length: usize, now: u64) -> i32;
+    @effects()
+    fn qs_write(conn: *mut void, out: *mut u8, capacity: usize, now: u64, ecn: *mut u32, to: *mut u8) -> i64;
+    @effects()
+    fn qs_migrate(conn: *mut void, local: *u8, now: u64) -> i32;
+    @effects()
+    fn qs_close(conn: *mut void, app: i32, code: u64, out: *mut u8, capacity: usize, now: u64) -> i64;
+    @effects()
+    fn qs_expiry(conn: *mut void) -> u64;
+    @effects()
+    fn qs_handle_expiry(conn: *mut void, now: u64) -> i32;
+    @effects()
+    fn qs_handshake_done(conn: *mut void) -> i32;
+    @effects()
+    fn qs_alpn(conn: *mut void, out: *mut u8, capacity: usize) -> usize;
+    @effects()
+    fn qs_open_bidi(conn: *mut void) -> i64;
+    @effects()
+    fn qs_open_uni(conn: *mut void) -> i64;
+    @effects()
+    fn qs_peer_close(conn: *mut void, code: *mut u64) -> i32;
+    @effects()
+    fn qs_stateless_reset(
+        key: *u8,
+        cid: *u8,
+        cidLength: usize,
+        triggerLength: usize,
+        out: *mut u8,
+        capacity: usize,
+    ) -> i64;
+    @effects()
+    fn qs_set_manual_credit(conn: *mut void);
+    @effects()
+    fn qs_consume(conn: *mut void, stream: i64, n: u64);
+    @effects()
+    fn qs_stream_write(conn: *mut void, stream: i64, bytes: *u8, length: usize, fin: i32) -> i64;
+    @effects()
+    fn qs_stream_reset(conn: *mut void, stream: i64, code: u64) -> i32;
+    @effects()
+    fn qs_stream_reset_sending(conn: *mut void, stream: i64, code: u64) -> i32;
+    @effects()
+    fn qs_stream_stop_reading(conn: *mut void, stream: i64, code: u64) -> i32;
+    @effects()
+    fn qs_error_kind(code: i32) -> i32;
+    @effects()
+    fn qs_packet_dcid(packet: *u8, length: usize, out: *mut u8, initial: *mut i32, version: *mut u32) -> i32;
+    @effects()
+    fn qs_next_id(conn: *mut void, buffer: *mut u8, capacity: usize, length: *mut usize) -> u32;
+    @effects()
+    fn qs_next_event(
+        conn: *mut void,
+        buffer: *mut u8,
+        capacity: usize,
+        stream: *mut i64,
+        flags: *mut u32,
+        code: *mut u64,
+        length: *mut usize,
+    ) -> u32;
+}
+
+/// How a QUIC operation failed (Web ADR 0014 §3.4).
+public enum QuicError {
+    /// The peer closed the connection: send nothing more, and drop it after the draining period.
+    Draining,
+    /// The idle timeout passed: drop the connection without sending anything.
+    IdleTimeout,
+    /// The datagram is not a client Initial a server can accept (`QuicConnection.server`).
+    NotInitial,
+    /// A stream cannot be opened now: wait for `QuicEvent.StreamsAvailable`.
+    StreamsBlocked,
+    /// The TLS context or the connection could not be made, or memory ran out.
+    NoMemory,
+    /// `nextEvent`'s buffer is smaller than the next event's data, which needs this many bytes; nothing was taken.
+    /// A buffer of `quicEventBufferSize()` bytes is always enough.
+    BufferTooSmall(usize),
+    /// The connection failed: send `closeDatagram`, then drop it. ngtcp2's code, for the log.
+    Failed(i32),
+    /// A certificate, key, trust list or ALPN list was refused (`QuicTls.serverFromPem`, `clientFromPem`).
+    Tls,
+}
+
+/// What happened on a connection, from `nextEvent`.
+public enum QuicEvent {
+    /// The handshake completed.
+    HandshakeDone,
+    /// `length` bytes of stream `stream` are in the caller's buffer; `fin`: the stream's data ends with them.
+    StreamData(i64, usize, bool),
+    /// The peer opened stream `stream`.
+    StreamOpened(i64),
+    /// Stream `stream` is closed in both directions, with the application's code if one was given.
+    StreamClosed(i64, u64?),
+    /// The peer reset its side of stream `stream` with the application's code.
+    StreamReset(i64, u64),
+    /// The peer asked us to stop sending on stream `stream`, with the application's code.
+    StopSending(i64, u64),
+    /// Stream `stream` may take more data: its flow-control window grew, or acknowledgements made room in what it
+    /// holds.
+    StreamWritable(i64),
+    /// This many bidirectional streams may now be open at once.
+    StreamsAvailable(u64),
+    /// The stream data that follows on this stream came in 0-RTT (RFC 9001 §4.6.1): before the handshake proved the
+    /// client, and possibly a replay. Only with `QuicTls.allowEarlyData`.
+    EarlyData(i64),
+}
+
+/// A change to a server connection's IDs (`QuicConnection.nextIdChange`), the ID of this many bytes in the caller's
+/// buffer.
+public enum QuicIdChange {
+    /// We issued it: datagrams to it are this connection's.
+    Issued(usize),
+    /// The peer retired it.
+    Retired(usize),
+}
+
+/// What a datagram's header says, before any connection reads it (RFC 9000 §17).
+public struct QuicHeader {
+    /// Its destination connection ID: `dcid[0..dcidLength]`.
+    public dcid: [u8; 20];
+    public dcidLength: usize;
+    /// A version 1 Initial: the only packet that may make a connection.
+    public initial: bool;
+    /// The long header's version, or 0 for a short header.
+    public version: u32;
+
+    /// The header of `datagram`, or null if it is not a QUIC packet. Short headers are read with this package's IDs'
+    /// length, 20 bytes.
+    /// Safety: the shim reads the datagram and writes at most 20 bytes into a local array, during the call only.
+    public fn of(datagram: Slice<u8>) -> QuicHeader? {
+        var h = QuicHeader { dcid: [0u8; 20], dcidLength: 0, initial: false, version: 0 };
+        var initial: i32 = 0;
+        var version: u32 = 0;
+        let n = unsafe { qs_packet_dcid(
+            datagram.ptr,
+            datagram.length,
+            borrow mut h.dcid[0] as *mut u8,
+            borrow mut initial as *mut i32,
+            borrow mut version as *mut u32,
+        ) };
+        if (n < 0) {
+            return null;
+        }
+        h.dcidLength = truncate<usize>(n); // 0 to 20 here
+        h.initial = initial == 1;
+        h.version = version;
+        return Some(h);
+    }
+
+    /// The destination connection ID.
+    public fn id(borrow this) -> Slice<u8> => this.dcid[0..this.dcidLength];
+}
+
+/// A UDP endpoint as the shim takes it: family (4 or 6), the port big-endian, then 16 address bytes.
+public struct QuicAddress {
+    public bytes: [u8; 19];
+
+    /// The socket address this is (a zone of 0 for IPv6), or null if the bytes are neither form.
+    public fn socketAddress(borrow this) -> SocketAddress? {
+        let b = this.bytes;
+        let port = (b[1] as u16 << 8) | b[2] as u16;
+        if (b[0] == 4) {
+            return Some(SocketAddress.V4([b[3], b[4], b[5], b[6]], port));
+        }
+        if (b[0] == 6) {
+            var ip = [0u8; 16];
+            for (i in 0..16) {
+                ip[i] = b[3 + i];
+            }
+            return Some(SocketAddress.V6(ip, port, 0));
+        }
+        return null;
+    }
+
+    /// The shim's form of `a`. A zone is not carried (a link-local peer's zone is the socket's).
+    public fn of(a: borrow SocketAddress) -> QuicAddress {
+        var b = [0u8; 19];
+        match (a) {
+            SocketAddress.V4(ip, port) => {
+                b[0] = 4;
+                b[1] = truncate<u8>(port as u32 >> 8);
+                b[2] = truncate<u8>(port as u32);
+                for (i in 0..4) {
+                    b[3 + i] = ip[i];
+                }
+            }
+            SocketAddress.V6(ip, port, _) => {
+                b[0] = 6;
+                b[1] = truncate<u8>(port as u32 >> 8);
+                b[2] = truncate<u8>(port as u32);
+                for (i in 0..16) {
+                    b[3 + i] = ip[i];
+                }
+            }
+        }
+        return QuicAddress { bytes: b };
+    }
+}
+
+/// A TLS context for QUIC: `web_tls`'s configuration, whose SSL_CTX the shim holds a reference to. A server's
+/// configuration offers ALPN `h3` (`Alpn.Http3`); it cannot be shared with a TCP listener's, whose list differs.
+/// Thread-safe by this package's claim (`trusted`, as web_tls's TlsConfig): the shim never changes a qs_tls after
+/// making it, and OpenSSL 3 lets threads share an SSL_CTX, making each connection's SSL from it under its own lock.
+@threadSafe
+@noncopy
+public struct QuicTls {
+    private raw: *mut void;
+    private serverSide: bool;
+
+    /// The QUIC context of `config`.
+    /// Safety: `quicContext` is the configuration's live SSL_CTX, and qs_tls_new takes its own reference to it
+    /// (SSL_CTX_up_ref) before returning, so the context outlives `config` if need be.
+    public fn of(config: borrow TlsConfig) -> Result<QuicTls, QuicError> {
+        let server = config.isServer();
+        let raw = unsafe { qs_tls_new(config.quicContext(), if (server) 1 else 0) };
+        if (raw.isNull()) {
+            return Err(QuicError.NoMemory);
+        }
+        return Ok(QuicTls { raw: raw, serverSide: server });
+    }
+
+    /// A server's context for the PEM certificate chain `chain` and its key, offering `protocols` (ALPN, in order of
+    /// preference): `web_tls`'s `TlsConfig.server` and `setAlpn`, for a program that needs no other TLS setting.
+    public fn serverFromPem(chain: Slice<u8>, key: Slice<u8>, protocols: Slice<Alpn>) -> Result<QuicTls, QuicError> {
+        var config = match (TlsConfig.server(chain, key)) {
+            Ok(c) => c,
+            Err(_) => { return Err(QuicError.Tls); },
+        };
+        if (config.setAlpn(protocols).isErr()) {
+            return Err(QuicError.Tls);
+        }
+        return QuicTls.of(config); // its own reference to the SSL_CTX: `config` may go
+    }
+
+    /// A client's context trusting the PEM roots in `trust`, offering `protocols`.
+    public fn clientFromPem(trust: Slice<u8>, protocols: Slice<Alpn>) -> Result<QuicTls, QuicError> {
+        var config = match (TlsConfig.client()) {
+            Ok(c) => c,
+            Err(_) => { return Err(QuicError.Tls); },
+        };
+        if (config.trustPem(trust).isErr() || config.setAlpn(protocols).isErr()) {
+            return Err(QuicError.Tls);
+        }
+        return QuicTls.of(config);
+    }
+
+    /// Lets a server's connections accept 0-RTT (Web ADR 0014 §3.7: off unless called). Early data's protection against
+    /// replay is OpenSSL's single-use tickets, kept in this context's session cache: each ticket's early data is taken
+    /// at most once, and nowhere else. A replay that comes before the client's own copy still runs once (RFC 9001
+    /// §9.2), so HTTP/3 answers 425 to early requests but GET, HEAD and OPTIONS. Call before the server starts.
+    /// Safety: `raw` is this context's handle; the shim sets a flag read when each connection is made.
+    public fn allowEarlyData(borrow mut this) {
+        unsafe {
+            qs_tls_allow_early(this.raw);
+        }
+    }
+
+    /// Whether this is a server's.
+    public fn isServer(borrow this) -> bool => this.serverSide;
+
+    fn handle(borrow this) -> *mut void => this.raw;
+
+    /// Safety: `raw` is this context's own reference, freed once.
+    drop {
+        unsafe { qs_tls_free(this.raw); }
+    }
+}
+
+/// The buffer `datagram` writes into: 1452 bytes, ngtcp2's default largest datagram (`max_tx_udp_payload_size`,
+/// 1500 - 48, `ngtcp2_settings.c`), which fits IPv6 under a 1500-byte MTU.
+public fn quicDatagramSize() -> usize => 1452;
+
+/// The buffer `nextEvent` takes, which every event's data fits: the largest UDP payload over IPv4, since a peer's
+/// datagram, and the stream data in it, may be larger than ours.
+public fn quicEventBufferSize() -> usize => 65527;
+
+/// A connection's random material: its source ID, and the secret its stateless-reset tokens come from.
+public struct QuicIds {
+    public scid: [u8; 20];
+    public dcid: [u8; 20];
+    public resetSecret: [u8; 32];
+
+    /// Fresh random IDs and secret (lib/std's `Random.fill`, the system's CSPRNG).
+    public fn random() -> Result<QuicIds, QuicError> {
+        var ids = QuicIds { scid: [0u8; 20], dcid: [0u8; 20], resetSecret: [0u8; 32] };
+        match (Random.fill(mut ids.scid[..])) {
+            Ok() => {}
+            Err(_) => { return Err(QuicError.NoMemory); }
+        }
+        match (Random.fill(mut ids.dcid[..])) {
+            Ok() => {}
+            Err(_) => { return Err(QuicError.NoMemory); }
+        }
+        match (Random.fill(mut ids.resetSecret[..])) {
+            Ok() => {}
+            Err(_) => { return Err(QuicError.NoMemory); }
+        }
+        return Ok(ids);
+    }
+}
+
+/// One QUIC connection, client or server.
+@noncopy
+public struct QuicConnection {
+    private raw: *mut void;
+
+    /// A client connection to `remote` from `local`, for `host` (its SNI, and the name its certificate is verified
+    /// against).
+    /// Safety: the shim copies every byte it is given and keeps no pointer to them; it returns a fresh handle or null.
+    public fn client(
+        tls: borrow QuicTls,
+        host: StringView,
+        local: borrow QuicAddress,
+        remote: borrow QuicAddress,
+        ids: borrow QuicIds,
+        now: u64,
+    ) -> Result<QuicConnection, QuicError> {
+        var error: i32 = 0;
+        let raw = unsafe { qs_conn_client(
+            tls.handle(),
+            host.ptr,
+            host.length,
+            local.bytes[..].ptr,
+            remote.bytes[..].ptr,
+            ids.dcid[..].ptr,
+            20,
+            ids.scid[..].ptr,
+            20,
+            ids.resetSecret[..].ptr,
+            now,
+            borrow mut error as *mut i32,
+        ) };
+        if (raw.isNull()) {
+            return Err(if (error == 0 || error == -1) QuicError.NoMemory else QuicErrors.of(error));
+        }
+        return Ok(QuicConnection { raw: raw });
+    }
+
+    /// A server connection for the client Initial `packet`, which arrived at `local` from `remote`. The packet is
+    /// not consumed: `feed` it next.
+    /// Safety: as `client`.
+    public fn server(
+        tls: borrow QuicTls,
+        packet: Slice<u8>,
+        local: borrow QuicAddress,
+        remote: borrow QuicAddress,
+        ids: borrow QuicIds,
+        now: u64,
+    ) -> Result<QuicConnection, QuicError> {
+        let none = [0u8; 1];
+        return QuicConnection.made(tls, packet, local, remote, ids, none[0..0], now);
+    }
+
+    /// A server connection for a client's Initial that carried a valid Retry token (`QuicRetryCheck.AdmitRetried`):
+    /// `original` is the destination ID of the client's first Initial, which the token held (RFC 9000 §7.3).
+    public fn serverAfterRetry(
+        tls: borrow QuicTls,
+        packet: Slice<u8>,
+        local: borrow QuicAddress,
+        remote: borrow QuicAddress,
+        ids: borrow QuicIds,
+        original: Slice<u8>,
+        now: u64,
+    ) -> Result<QuicConnection, QuicError> => QuicConnection.made(tls, packet, local, remote, ids, original, now);
+
+    /// Safety: the shim copies every byte it is given and keeps no pointer to them; it returns a fresh handle or null.
+    fn made(
+        tls: borrow QuicTls,
+        packet: Slice<u8>,
+        local: borrow QuicAddress,
+        remote: borrow QuicAddress,
+        ids: borrow QuicIds,
+        original: Slice<u8>,
+        now: u64,
+    ) -> Result<QuicConnection, QuicError> {
+        var error: i32 = 0;
+        let raw = unsafe { qs_conn_server(
+            tls.handle(),
+            packet.ptr,
+            packet.length,
+            local.bytes[..].ptr,
+            remote.bytes[..].ptr,
+            ids.scid[..].ptr,
+            20,
+            ids.resetSecret[..].ptr,
+            original.ptr,
+            original.length,
+            now,
+            borrow mut error as *mut i32,
+        ) };
+        if (raw.isNull()) {
+            return Err(if (error == 0 || error == -1) QuicError.NoMemory else QuicErrors.of(error));
+        }
+        return Ok(QuicConnection { raw: raw });
+    }
+
+    /// Feeds one datagram from `remote`, with its ECN mark.
+    /// Safety: the shim reads the datagram and the address during the call only.
+    public fn feed(
+        borrow mut this,
+        remote: borrow QuicAddress,
+        ecn: u32,
+        datagram: Slice<u8>,
+        now: u64,
+    ) -> Result<void, QuicError> {
+        let r = unsafe { qs_read(this.raw, remote.bytes[..].ptr, ecn, datagram.ptr, datagram.length, now) };
+        return QuicErrors.check(r);
+    }
+
+    /// The next datagram to send, written into `out`: its length and ECN mark, or null when there is nothing to send
+    /// now. `out` should hold `quicDatagramSize()` bytes.
+    /// Safety: the shim writes at most `out.length` bytes into `out`.
+    public fn datagram(borrow mut this, out: SliceMut<u8>, now: u64) -> Result<QuicOut?, QuicError> {
+        var ecn: u32 = 0;
+        var to = QuicAddress { bytes: [0u8; 19] };
+        let n = unsafe { qs_write(
+            this.raw,
+            out.ptr,
+            out.length,
+            now,
+            borrow mut ecn as *mut u32,
+            borrow mut to.bytes[0] as *mut u8,
+        ) };
+        if (n < 0) {
+            return Err(QuicErrors.of(truncate<i32>(n)));
+        }
+        if (n == 0) {
+            return Ok(null);
+        }
+        return Ok(Some(QuicOut { length: truncate<usize>(n), ecn: ecn, to: to }));
+    }
+
+    /// A CONNECTION_CLOSE for the error that ended the connection, or NO_ERROR, or the application's `code`; its
+    /// length in `out`. Send it, then drop the connection.
+    /// Safety: as `datagram`.
+    public fn closeDatagram(borrow mut this, code: u64?, out: SliceMut<u8>, now: u64) -> Result<usize, QuicError> {
+        let n = match (code) {
+            Some(c) => unsafe { qs_close(this.raw, 1, c, out.ptr, out.length, now) },
+            null => unsafe { qs_close(this.raw, 0, 0, out.ptr, out.length, now) },
+        };
+        if (n < 0) {
+            return Err(QuicErrors.of(truncate<i32>(n)));
+        }
+        return Ok(truncate<usize>(n));
+    }
+
+    /// When the connection's next timer is due, in nanoseconds on the caller's clock; null for never.
+    /// Safety: no arguments but the handle.
+    public fn nextTimeout(borrow this) -> u64? {
+        let t = unsafe { qs_expiry(this.raw) };
+        return if (t == 0xFFFFFFFFFFFFFFFF) null else Some(t);
+    }
+
+    /// Runs the timers due at `now`.
+    /// Safety: as `nextTimeout`.
+    public fn onTimeout(borrow mut this, now: u64) -> Result<void, QuicError> =>
+        QuicErrors.check(unsafe { qs_handle_expiry(this.raw, now) });
+
+    /// Whether the handshake has completed.
+    /// Safety: as `nextTimeout`.
+    public fn handshakeDone(borrow this) -> bool => unsafe { qs_handshake_done(this.raw) } == 1;
+
+    /// The application protocol the handshake chose (`Alpn.Http3` for `h3`, `Alpn.HqInterop` for `hq-interop`).
+    /// Safety: the shim writes at most 16 bytes into a local array.
+    public fn alpn(borrow this) -> Alpn {
+        var name = [0u8; 16];
+        let n = unsafe { qs_alpn(this.raw, borrow mut name[0] as *mut u8, 16) };
+        if (n == 0) {
+            return Alpn.None;
+        }
+        if (n > name.length) {
+            return Alpn.Other;
+        }
+        let got = name[0..n];
+        if (bytesAre(got, "h3".bytes())) {
+            return Alpn.Http3;
+        }
+        if (bytesAre(got, "hq-interop".bytes())) {
+            return Alpn.HqInterop;
+        }
+        return Alpn.Other;
+    }
+
+    /// Opens a bidirectional stream: its ID.
+    /// Safety: as `nextTimeout`.
+    public fn openStream(borrow mut this) -> Result<i64, QuicError> {
+        let id = unsafe { qs_open_bidi(this.raw) };
+        if (id < 0) {
+            return Err(QuicErrors.of(truncate<i32>(id)));
+        }
+        return Ok(id);
+    }
+
+    /// The application error code the peer closed the connection with (CONNECTION_CLOSE of type 0x1d, RFC 9000
+    /// §19.19), or null if it has not closed it so.
+    /// Safety: the shim writes the one value.
+    public fn peerApplicationClose(borrow this) -> u64? {
+        var code: u64 = 0;
+        let kind = unsafe { qs_peer_close(this.raw, borrow mut code as *mut u64) };
+        return if (kind == 2) Some(code) else null;
+    }
+
+    /// Moves a client connection to the local address `local`, a socket the caller has bound and now sends from and
+    /// reads (RFC 9000 §9.2): ngtcp2 validates the new path with the server, then uses it. A server cannot migrate.
+    /// Safety: the shim reads the address during the call only.
+    public fn migrate(borrow mut this, local: borrow QuicAddress, now: u64) -> Result<void, QuicError> =>
+        QuicErrors.check(unsafe { qs_migrate(this.raw, local.bytes[..].ptr, now) });
+
+    /// A ticket for resuming with the same server later (`resume`), into `out`: its length, or 0 while there is none
+    /// (the server's ticket comes after the handshake). A client's.
+    /// Safety: the shim writes at most `out.length` bytes.
+    public fn ticket(borrow this, out: SliceMut<u8>) -> usize {
+        let n = unsafe { qs_ticket(this.raw, out.ptr, out.length) };
+        return if (n > 0) truncate<usize>(n) else 0;
+    }
+
+    /// Resumes this new client connection with `ticket`, before its first datagram: true if 0-RTT is possible, so
+    /// streams opened and written now go out as early data. A ticket that cannot be used is `Failed`.
+    /// Safety: the shim reads the ticket during the call only.
+    public fn resume(borrow mut this, ticket: Slice<u8>) -> Result<bool, QuicError> {
+        let r = unsafe { qs_resume(this.raw, ticket.ptr, ticket.length) };
+        if (r < 0) {
+            return Err(QuicError.Failed(r));
+        }
+        return Ok(r == 1);
+    }
+
+    /// The probe timeout (RFC 9002 §6.2.1), in nanoseconds.
+    /// Safety: as `nextTimeout`.
+    public fn probeTimeout(borrow this) -> u64 => unsafe { qs_pto(this.raw) };
+
+    /// Whether the peer has acknowledged everything written on every stream: a graceful close now loses nothing.
+    /// Safety: as `nextTimeout`.
+    public fn allAcknowledged(borrow this) -> bool => unsafe { qs_all_acked(this.raw) } == 1;
+
+    /// After the handshake, whether it resumed an earlier session (the ticket was accepted), on either side.
+    /// Safety: as `nextTimeout`.
+    public fn resumed(borrow this) -> bool => unsafe { qs_resumed(this.raw) } == 1;
+
+    /// After the handshake, whether the server accepted this client's early data. When it did not, what was sent
+    /// early was not delivered, and must be sent again.
+    /// Safety: as `nextTimeout`.
+    public fn earlyDataAccepted(borrow this) -> bool => unsafe { qs_early_accepted(this.raw) } == 1;
+
+    /// Whether the server sent a Retry before this connection (a client's view): its transport parameters carry
+    /// `retry_source_connection_id`, which ngtcp2 has checked against the Retry it received (RFC 9000 §7.3).
+    /// Safety: as `nextTimeout`.
+    public fn retried(borrow this) -> bool => unsafe { qs_retried(this.raw) } == 1;
+
+    /// Opens a unidirectional stream: its ID (HTTP/3's control and QPACK streams, Web ADR 0014 amendment 4 item 2).
+    /// Safety: as `nextTimeout`.
+    public fn openUniStream(borrow mut this) -> Result<i64, QuicError> {
+        let id = unsafe { qs_open_uni(this.raw) };
+        if (id < 0) {
+            return Err(QuicErrors.of(truncate<i32>(id)));
+        }
+        return Ok(id);
+    }
+
+    /// From now on, a stream's flow-control credit goes back to the peer only through `consume`, not when its data's
+    /// event is taken. The peer then sends no more than the user has consumed plus the windows (1 MiB a stream,
+    /// 16 MiB the connection).
+    /// Safety: as `nextTimeout`.
+    public fn creditOnConsume(borrow mut this) {
+        unsafe {
+            qs_set_manual_credit(this.raw);
+        }
+    }
+
+    /// Gives the peer back `n` bytes of credit on `stream` and on the connection (with `creditOnConsume`).
+    /// Safety: as `nextTimeout`.
+    public fn consume(borrow mut this, stream: i64, n: u64) {
+        unsafe {
+            qs_consume(this.raw, stream, n);
+        }
+    }
+
+    /// Queues `bytes` on `stream`, and ends the stream after them when `fin`: how many were taken, fewer when the
+    /// stream already holds a megabyte the peer has not acknowledged (wait for `StreamWritable`). `datagram` sends
+    /// them.
+    /// Safety: the shim copies at most `bytes.length` bytes.
+    public fn writeStream(borrow mut this, stream: i64, bytes: Slice<u8>, fin: bool) -> Result<usize, QuicError> {
+        let n = unsafe { qs_stream_write(this.raw, stream, bytes.ptr, bytes.length, if (fin) 1 else 0) };
+        if (n < 0) {
+            return Err(QuicError.NoMemory);
+        }
+        return Ok(truncate<usize>(n));
+    }
+
+    /// Resets our side of `stream` with the application's `code`, and asks the peer to stop sending on it.
+    /// Safety: as `nextTimeout`.
+    public fn resetStream(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
+        QuicErrors.check(unsafe { qs_stream_reset(this.raw, stream, code) });
+
+    /// Resets only our sending side of `stream` (RESET_STREAM, RFC 9000 §3.1); the peer's data still arrives.
+    /// Safety: as `nextTimeout`.
+    public fn resetSending(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
+        QuicErrors.check(unsafe { qs_stream_reset_sending(this.raw, stream, code) });
+
+    /// Asks the peer to stop sending on `stream` (STOP_SENDING, RFC 9000 §3.5); our side may still send.
+    /// Safety: as `nextTimeout`.
+    public fn stopReading(borrow mut this, stream: i64, code: u64) -> Result<void, QuicError> =>
+        QuicErrors.check(unsafe { qs_stream_stop_reading(this.raw, stream, code) });
+
+    /// The next event, its data (for `StreamData`) copied into `buffer`, which should hold `quicEventBufferSize()`
+    /// bytes; null when there is none. Drain it after every `feed`, `datagram` and `onTimeout`.
+    /// Safety: the shim writes at most `buffer.length` bytes into `buffer`, and the four values.
+    public fn nextEvent(borrow mut this, buffer: SliceMut<u8>) -> Result<QuicEvent?, QuicError> {
+        var stream: i64 = 0;
+        var flags: u32 = 0;
+        var code: u64 = 0;
+        var length: usize = 0;
+        let kind = unsafe { qs_next_event(
+            this.raw,
+            buffer.ptr,
+            buffer.length,
+            borrow mut stream as *mut i64,
+            borrow mut flags as *mut u32,
+            borrow mut code as *mut u64,
+            borrow mut length as *mut usize,
+        ) };
+        return match (kind) {
+            1 => Ok(Some(QuicEvent.HandshakeDone)),
+            2 => Ok(Some(QuicEvent.StreamData(stream, length, (flags & 1) == 1))),
+            3 => Ok(Some(QuicEvent.StreamOpened(stream))),
+            4 => Ok(Some(QuicEvent.StreamClosed(stream, if ((flags & 1) == 1) Some(code) else null))),
+            5 => Ok(Some(QuicEvent.StreamReset(stream, code))),
+            6 => Ok(Some(QuicEvent.StopSending(stream, code))),
+            7 => Ok(Some(QuicEvent.StreamWritable(stream))),
+            8 => Ok(Some(QuicEvent.StreamsAvailable(code))),
+            11 => Ok(Some(QuicEvent.EarlyData(stream))),
+            255 => Err(QuicError.BufferTooSmall(length)),
+            _ => Ok(null),
+        };
+    }
+
+    /// The next change to a server's connection IDs, the ID copied into `buffer` (at least 20 bytes); null when there
+    /// is none. They are apart from `nextEvent`, so a server can route an ID it issued before it sends the datagram
+    /// that announces it: a client may use a new ID at once (RFC 9000 §5.1.2), even in its Initial packets.
+    /// Safety: the shim writes at most `buffer.length` bytes into `buffer` (none if fewer than 20), and the length.
+    public fn nextIdChange(borrow mut this, buffer: SliceMut<u8>) -> QuicIdChange? {
+        var length: usize = 0;
+        let kind = unsafe { qs_next_id(this.raw, buffer.ptr, buffer.length, borrow mut length as *mut usize) };
+        return match (kind) {
+            9 => Some(QuicIdChange.Issued(length)),
+            10 => Some(QuicIdChange.Retired(length)),
+            _ => null,
+        };
+    }
+
+    /// Safety: `raw` is this connection's handle, freed once; the shim frees the SSL first (Web ADR 0014 §3.3).
+    drop {
+        unsafe { qs_conn_free(this.raw); }
+    }
+}
+
+/// A datagram `datagram` wrote: its length in the caller's buffer, its ECN mark, and where it goes, which ngtcp2
+/// chooses: the peer's address, or a new one it migrated to (RFC 9000 §9) or that is being validated (§8.2).
+public struct QuicOut {
+    public length: usize;
+    public ecn: u32;
+    public to: QuicAddress;
+}
+
+struct QuicErrors {
+    /// The shim classifies ngtcp2's codes (qs_error_kind), so no ngtcp2 number is written here.
+    /// Safety: the call takes a number and returns one.
+    fn of(code: i32) -> QuicError => match (unsafe { qs_error_kind(code) }) {
+        2 => QuicError.Draining,
+        3 => QuicError.IdleTimeout,
+        4 => QuicError.NoMemory,
+        5 => QuicError.StreamsBlocked,
+        6 => QuicError.NotInitial,
+        _ => QuicError.Failed(code),
+    };
+
+    fn check(code: i32) -> Result<void, QuicError> {
+        if (code == 0) {
+            return Ok();
+        }
+        return Err(QuicErrors.of(code));
+    }
+}
+
+/// Whether `a` and `b` hold the same bytes.
+fn bytesAre(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A stateless reset (RFC 9000 §10.3) answering a datagram of `triggerLength` bytes to our ID `cid`, its token from
+/// `key`, written to `out`: its length, or 0 when none may be sent (the shim's rules: shorter than the trigger, at
+/// most 43 bytes).
+/// Safety: the shim reads `key` (32 bytes) and `cid`, and writes at most `out.length` bytes, during the call only.
+fn statelessReset(key: [u8; 32], cid: Slice<u8>, triggerLength: usize, out: SliceMut<u8>) -> usize {
+    let k = key;
+    let n = unsafe { qs_stateless_reset(
+        borrow k[0] as *u8,
+        cid.ptr,
+        cid.length,
+        triggerLength,
+        out.ptr,
+        out.length,
+    ) };
+    return if (n > 0) truncate<usize>(n) else 0;
+}
+
+/// What a server does with a client's Initial for an unknown ID (RFC 9000 §8.1; `QuicRetry.check`).
+public enum QuicRetryCheck {
+    /// Send this many bytes of the buffer, a Retry, to the client, and nothing more.
+    SendRetry(usize),
+    /// Admit it: `QuicConnection.server`.
+    Admit,
+    /// Admit it: it carried a valid Retry token, whose original destination ID is the first `usize` bytes
+    /// (`QuicConnection.serverAfterRetry`).
+    AdmitRetried([u8; 20], usize),
+    /// Drop it: a Retry token that is not valid (not ours, another address's, another ID's, or older than 10 s).
+    Drop,
+}
+
+/// Address validation with Retry (RFC 9000 §8.1): sans-I/O, as the listener uses it.
+public struct QuicRetry {
+    /// The decision for the client Initial `datagram` from `from` at `now`, with tokens from `key`. With `require`,
+    /// an Initial without a token gets a Retry (written to `out`, which a datagram's size always fits); an Initial
+    /// with a Retry token is admitted if the token is valid, whatever `require` says.
+    /// Safety: the shim reads the datagram, the address and the key, and writes at most `out.length` bytes and 20
+    /// into a local array, during the call only.
+    public fn check(
+        key: [u8; 32],
+        datagram: Slice<u8>,
+        from: borrow QuicAddress,
+        require: bool,
+        now: u64,
+        out: SliceMut<u8>,
+    ) -> QuicRetryCheck {
+        var scid = [0u8; 20];
+        if (require && Random.fill(mut scid[..]).isErr()) {
+            return QuicRetryCheck.Drop;
+        }
+        let k = key;
+        var odcid = [0u8; 20];
+        var odcidLength: usize = 0;
+        var outLength: usize = 0;
+        let r = unsafe { qs_retry_check(
+            borrow k[0] as *u8,
+            datagram.ptr,
+            datagram.length,
+            from.bytes[..].ptr,
+            if (require) 1 else 0,
+            borrow scid[0] as *u8,
+            now,
+            out.ptr,
+            out.length,
+            borrow mut outLength as *mut usize,
+            borrow mut odcid[0] as *mut u8,
+            borrow mut odcidLength as *mut usize,
+        ) };
+        return match (r) {
+            1 => QuicRetryCheck.SendRetry(outLength),
+            2 => QuicRetryCheck.AdmitRetried(odcid, odcidLength),
+            3 => QuicRetryCheck.Admit,
+            _ => QuicRetryCheck.Drop,
+        };
+    }
+}
+
+/// A Version Negotiation packet answering `datagram`, a long-header packet of a version this server does not speak
+/// (RFC 9000 §6), written to `out`: its length, or 0 when none is due (another kind of packet, or a datagram under
+/// 1200 bytes, which is not answered so the server cannot be an amplifier).
+/// Safety: the shim reads the datagram and writes at most `out.length` bytes, during the call only.
+fn versionNegotiation(datagram: Slice<u8>, out: SliceMut<u8>) -> usize {
+    let n = unsafe { qs_version_negotiation(datagram.ptr, datagram.length, out.ptr, out.length) };
+    return if (n > 0) truncate<usize>(n) else 0;
+}

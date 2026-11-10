@@ -1,0 +1,231 @@
+// The server for quic-interop-runner (Web ADR 0014 §4, stage 5; the runner's quic.md). It reads the runner's
+// environment and serves the files under /www on UDP port 443 (IPv4 and IPv6), with the certificate chain
+// /certs/cert.pem and key /certs/priv.key:
+//   - over hq-interop (web_quic's HqFiles) for the transport test cases, and over HTTP/3 (web_http3, with web_static's
+//     StaticFiles) for `http3`;
+//   - with a Retry for every connection for `retry`, 0-RTT allowed for `zerortt`, ChaCha20 only for `chacha20`;
+//   - the TLS secrets written to SSLKEYLOGFILE when it is set, so the runner can decrypt its captures.
+// A test case it does not support exits with 127, as the runner asks; a failure to start exits with 1.
+import web_core;
+import web_tls;
+import web_http;
+import web_server;
+import web_static;
+import web_quic;
+import web_http3;
+
+struct App {}
+
+/// What the test case asks of the server.
+struct Plan {
+    http3: bool;
+    retry: bool;
+    early: bool;
+    chacha: bool;
+}
+
+/// The plan for `testcase`, or null when it is not supported.
+fn plan(testcase: Slice<u8>) -> Plan? {
+    var p = Plan { http3: false, retry: false, early: false, chacha: false };
+    if (is(testcase, "http3")) {
+        p.http3 = true;
+        return Some(p);
+    }
+    if (is(testcase, "retry")) {
+        p.retry = true;
+        return Some(p);
+    }
+    if (is(testcase, "zerortt")) {
+        p.early = true;
+        return Some(p);
+    }
+    if (is(testcase, "chacha20")) {
+        p.chacha = true;
+        return Some(p);
+    }
+    // The transfer cases: only the network between client and server differs, or the client's behaviour.
+    let plain = [
+        "handshake", "transfer", "ipv6", "multiconnect", "resumption", "multiplexing", "keyupdate", "longrtt",
+        "blackhole", "handshakeloss", "transferloss", "handshakecorruption", "transfercorruption", "goodput",
+        "crosstraffic", "rebind-port", "rebind-addr", "amplificationlimit",
+    ];
+    for (name in plain) {
+        if (is(testcase, name)) {
+            return Some(p);
+        }
+    }
+    return null;
+}
+
+fn is(a: Slice<u8>, text: StringView) -> bool {
+    let b = text.bytes();
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Why the server did not start.
+enum Failure {
+    Files,
+    Certificate,
+    Socket,
+    Memory,
+    Quic,
+}
+
+async fn readFile(path: StringView, out: borrow mut Vector<u8>) -> Result<void, Failure> {
+    var file = match (await AsyncFiles.open(path)) {
+        Ok(f) => f,
+        Err(_) => { return Err(Failure.Files); },
+    };
+    var chunk = [0u8; 4096];
+    loop {
+        let n = match (await AsyncFiles.read(mut file, mut chunk[..])) {
+            Ok(n) => n,
+            Err(_) => { return Err(Failure.Files); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        if (out.extend(chunk[0..n]).isErr()) {
+            return Err(Failure.Memory);
+        }
+    }
+}
+
+async fn serve(p: Plan) -> Result<void, Failure> {
+    if (!QuicLibrary.initialise()) {
+        return Err(Failure.Quic);
+    }
+    var chain = Vector<u8>.create();
+    var key = Vector<u8>.create();
+    await readFile("/certs/cert.pem", mut chain)?;
+    await readFile("/certs/priv.key", mut key)?;
+    var config = match (TlsConfig.server(chain.view(), key.view())) {
+        Ok(c) => c,
+        Err(_) => { return Err(Failure.Certificate); },
+    };
+    let alpn = [if (p.http3) Alpn.Http3 else Alpn.HqInterop];
+    if (config.setAlpn(alpn[..]).isErr()) {
+        return Err(Failure.Certificate);
+    }
+    if (p.chacha && config.setCipherSuites13("TLS_CHACHA20_POLY1305_SHA256").isErr()) {
+        return Err(Failure.Certificate);
+    }
+    match (Environment.variable("SSLKEYLOGFILE")) {
+        Some(path) => {
+            if (path.length > 0 && config.writeKeyLog(path).isErr()) {
+                return Err(Failure.Files);
+            }
+        }
+        null => {}
+    }
+    var quicTls = match (QuicTls.of(config)) {
+        Ok(t) => t,
+        Err(_) => { return Err(Failure.Certificate); },
+    };
+    if (p.early) {
+        quicTls.allowEarlyData();
+    }
+    let tls = match (Arc<QuicTls>.create(quicTls)) {
+        Ok(t) => t,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    // [::] with IPV6_V6ONLY off (the default): the `ipv6` case reaches server6, the others server4.
+    let local = SocketAddress.V6([0u8; 16], 443, 0);
+    let socket = match (AsyncUdpSocket.bind(local, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(Failure.Socket); },
+    };
+    var quic = QuicServerOptions.defaults();
+    if (p.retry) {
+        quic.retryAbove = 0;
+    }
+    let _ = await AsyncConsole.writeLine(if (p.http3) "endpoint: HTTP/3 on :443" else "endpoint: hq-interop on :443");
+    if (!p.http3) {
+        let files = match (HqFiles.create("/www")) {
+            Ok(h) => h,
+            Err(_) => { return Err(Failure.Memory); },
+        };
+        let boxed: Box<dyn QuicApplication + Send> = match (Box.create(files)) {
+            Ok(b) => b,
+            Err(_) => { return Err(Failure.Memory); },
+        };
+        let app = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+            Ok(a) => a,
+            Err(_) => { return Err(Failure.Memory); },
+        };
+        match (await QuicServer.serve(socket, local, tls, app, quic)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(Failure.Quic); }
+        }
+    }
+    var server = match (Server<App>.create(App {}, Limits.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let files = match (StaticFiles<App>.create("/www", StaticOptions.defaults())) {
+        Ok(f) => f,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let handler: Box<dyn Handler<App> + Send> = match (Box.create(files)) {
+        Ok(h) => h,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    if (server.router().get("/*path", handler).isErr()) {
+        return Err(Failure.Memory);
+    }
+    let app = match (applicationOf(server)) {
+        Ok(a) => a,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(Failure.Memory); },
+    };
+    var options = Http3Options.defaults();
+    options.quic = quic;
+    match (await Http3Server.serve(socket, local, tls, app, Limits.defaults(), drain, options)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(Failure.Quic); }
+    }
+}
+
+fn main() -> i32 {
+    let role = match (Environment.variable("ROLE")) {
+        Some(r) => r,
+        null => "server",
+    };
+    if (!is(role.bytes(), "server")) {
+        Console.writeLine("endpoint: only the server role is implemented");
+        return 127;
+    }
+    let testcase = match (Environment.variable("TESTCASE")) {
+        Some(t) => t,
+        null => "handshake",
+    };
+    let p = match (plan(testcase.bytes())) {
+        Some(p) => p,
+        null => {
+            Console.writeLine("endpoint: test case not supported");
+            return 127;
+        },
+    };
+    match (Async.run(serve(p))) {
+        Ok() => { return 0; }
+        Err(Failure.Files) => { Console.writeLine("endpoint: /certs or SSLKEYLOGFILE could not be used"); }
+        Err(Failure.Certificate) => {
+            Console.writeLine("endpoint: the certificate, key or a TLS setting was refused");
+        }
+        Err(Failure.Socket) => { Console.writeLine("endpoint: UDP port 443 could not be bound"); }
+        Err(Failure.Memory) => { Console.writeLine("endpoint: out of memory"); }
+        Err(Failure.Quic) => { Console.writeLine("endpoint: QUIC failed"); }
+    }
+    return 1;
+}

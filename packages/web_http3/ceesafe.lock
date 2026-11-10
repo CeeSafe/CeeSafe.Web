@@ -9,6 +9,10 @@ name = "web_http"
 source = "path+../web_http"
 
 [[package]]
+name = "web_quic"
+source = "path+../web_quic"
+
+[[package]]
 name = "web_tls"
 source = "path+../web_tls"
 

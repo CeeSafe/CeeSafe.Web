@@ -21,6 +21,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #ifndef WT_STANDALONE
 #include "ceesafe/foreign.h"
@@ -145,6 +146,28 @@ static wt_front *front_of(SSL_CTX *ctx) {
     return ctx == NULL ? NULL : SSL_CTX_get_ex_data(ctx, front_slot());
 }
 
+/* A server SSL's configuration (its "front" SSL_CTX, before any SNI switch), in a slot of the SSL's own, for the
+   ticket callback. Not the SSL's app data: QUIC's SSLs carry ngtcp2's connection reference there (Web ADR 0014
+   §3.4), so web_tls's callbacks must not read it. */
+/* For web_quic's shim (Web ADR 0014 §3.4). */
+void wt_init(void);
+int32_t wt_ssl_use_front(SSL *ssl, SSL_CTX *ctx);
+
+static int ssl_front_index = -1;
+
+static int ssl_front_slot(void) {
+    if (ssl_front_index < 0) {
+        ssl_front_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+    }
+    return ssl_front_index;
+}
+
+/* For web_quic's shim: binds a QUIC server SSL made from `ctx` (a web_tls server configuration) to it, as
+   wt_ctx_new binds its own, so the ticket callback finds the configuration's keys. 1, or 0 on failure. */
+int32_t wt_ssl_use_front(SSL *ssl, SSL_CTX *ctx) {
+    return SSL_set_ex_data(ssl, ssl_front_slot(), ctx) ? 1 : 0;
+}
+
 static int new_ticket_key(wt_ticket_key *k) {
     k->set = RAND_bytes(k->name, sizeof k->name) > 0 && RAND_bytes(k->aes, sizeof k->aes) > 0 &&
              RAND_bytes(k->hmac, sizeof k->hmac) > 0;
@@ -221,8 +244,7 @@ static int pick_certificate(SSL *ssl, int *alert, void *arg) {
    with the current or the previous one (then renewed: 2). */
 static int ticket_key(SSL *ssl, unsigned char key_name[16], unsigned char *iv, EVP_CIPHER_CTX *cipher,
                       EVP_MAC_CTX *mac, int enc) {
-    wt_ctx *c = SSL_get_app_data(ssl);
-    wt_front *f = c == NULL ? NULL : front_of(c->front);
+    wt_front *f = front_of(SSL_get_ex_data(ssl, ssl_front_slot()));
     if (f == NULL || !CRYPTO_THREAD_read_lock(f->lock)) {
         return -1;
     }
@@ -284,6 +306,8 @@ void wt_cfg_free(SSL_CTX *ctx);
 int32_t wt_cfg_use_pem(SSL_CTX *ctx, const uint8_t *chain, size_t chain_len, const uint8_t *key, size_t key_len);
 int32_t wt_cfg_trust_pem(SSL_CTX *ctx, const uint8_t *pem, size_t len);
 int32_t wt_cfg_trust_default(SSL_CTX *ctx);
+int32_t wt_cfg_cipher_suites13(SSL_CTX *ctx, const uint8_t *list, size_t len);
+int32_t wt_cfg_key_log(SSL_CTX *ctx, const uint8_t *path, size_t len);
 int32_t wt_cfg_set_alpn(SSL_CTX *ctx, const uint8_t *wire, size_t len);
 int32_t wt_cfg_add_name(SSL_CTX *front, const uint8_t *name, size_t name_len, const uint8_t *chain, size_t chain_len,
                         const uint8_t *key, size_t key_len);
@@ -389,10 +413,17 @@ static void route_allocations(void) {
 }
 #endif
 
-SSL_CTX *wt_cfg_new(int32_t server) {
+/* Routes OpenSSL's allocations through CeeSafe's (route_allocations), once per process. For web_quic's shim, whose
+   first OpenSSL call (ngtcp2_crypto_ossl_init) may come before any configuration is made: OpenSSL takes allocation
+   functions only before its first allocation (Web ADR 0014 §3.4). */
+void wt_init(void) {
 #ifndef WT_STANDALONE
     (void)CRYPTO_THREAD_run_once(&route_once, route_allocations);
 #endif
+}
+
+SSL_CTX *wt_cfg_new(int32_t server) {
+    wt_init();
     SSL_CTX *ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
     if (ctx == NULL) {
         return NULL;
@@ -516,6 +547,58 @@ int32_t wt_cfg_trust_pem(SSL_CTX *ctx, const uint8_t *pem, size_t len) {
     ERR_clear_error();
     BIO_free(b);
     return added;
+}
+
+/* TLS 1.3's cipher suites, as OpenSSL names them, colon-separated ("TLS_CHACHA20_POLY1305_SHA256"), in preference
+   order. 1 on success. */
+int32_t wt_cfg_cipher_suites13(SSL_CTX *ctx, const uint8_t *list, size_t len) {
+    char text[256];
+    if (len == 0 || len >= sizeof text) {
+        return 0;
+    }
+    memcpy(text, list, len);
+    text[len] = 0;
+    return SSL_CTX_set_ciphersuites(ctx, text) == 1 ? 1 : 0;
+}
+
+/* The key log: one file for the process (the SSLKEYLOGFILE convention), opened for appending by the first
+   configuration that asks, written and flushed one line at a time. For decrypting captures in tests; anyone who
+   reads it can decrypt the connections it covers. */
+static FILE *key_log_file = NULL;
+static CRYPTO_RWLOCK *key_log_lock = NULL;
+
+static void key_log_line(const SSL *ssl, const char *line) {
+    (void)ssl;
+    if (key_log_file == NULL || !CRYPTO_THREAD_write_lock(key_log_lock)) {
+        return;
+    }
+    fputs(line, key_log_file);
+    fputc('\n', key_log_file);
+    fflush(key_log_file);
+    CRYPTO_THREAD_unlock(key_log_lock);
+}
+
+/* Writes this configuration's TLS secrets to the key log at `path` (NSS's format, as SSLKEYLOGFILE asks). 1 on
+   success; a second path for the process is refused. */
+int32_t wt_cfg_key_log(SSL_CTX *ctx, const uint8_t *path, size_t len) {
+    char name[1024];
+    if (len == 0 || len >= sizeof name) {
+        return 0;
+    }
+    memcpy(name, path, len);
+    name[len] = 0;
+    if (key_log_file == NULL) {
+        key_log_lock = CRYPTO_THREAD_lock_new();
+        if (key_log_lock == NULL) {
+            return 0;
+        }
+        key_log_file = fopen(name, "a");
+        if (key_log_file == NULL) {
+            return 0;
+        }
+    }
+    SSL_CTX_set_keylog_callback(ctx, key_log_line);
+    return 1;
 }
 
 /* Trusts the system's default CA locations: OpenSSL's defaults (a bundle or directory on Unix), and on Windows the
@@ -746,6 +829,9 @@ wt_ctx *wt_ctx_new(SSL_CTX *cfg, int32_t server, const uint8_t *host, size_t hos
     SSL_set_app_data(c->ssl, c);
     if (server) {
         c->front = cfg;
+        if (!SSL_set_ex_data(c->ssl, ssl_front_slot(), cfg)) {
+            goto fail_ssl; /* after SSL_set_bio: the SSL owns both BIOs */
+        }
         wt_front *f = front_of(cfg);
         /* The client-certificate roots and the names sent in CertificateRequest belong to this connection, so a
            switch to an SNI entry's configuration (pick_certificate) keeps them. */

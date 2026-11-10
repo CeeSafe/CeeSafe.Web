@@ -110,3 +110,24 @@ fn bytes(out: borrow mut Vector<u8>, b: Slice<u8>) -> Result<void, TestFailure> 
     }
     return Ok();
 }
+
+/// `applicationOf` shares one server between services (Web ADR 0014 amendment 4 item 1): two `HttpService.of` made
+/// from the same `Arc` each serve a request with the server's routes. Expected: each answers as `serviceOf`'s does
+/// (`POST /users` is handler 5).
+@test
+async fn one_application_two_services() -> Result<void, TestFailure> {
+    let limits = quiet();
+    var s = routed(Server<St>.create(state()?, limits))?;
+    added(s.router().post("/users", named(5)?))?;
+    let app = net(applicationOf(s))?;
+    let first = HttpService.of(app.clone(), limits);
+    let second = HttpService.of(app, limits);
+    let drain = net(Drain.create())?;
+    let text = "POST /users HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n";
+    var a = alloc(MockTransport.create(text.bytes()))?;
+    netDone(await first.serve(mut a, ConnectionContext.acceptedNow(1, drain)))?;
+    Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh5".bytes(), a.written())?;
+    var b = alloc(MockTransport.create(text.bytes()))?;
+    netDone(await second.serve(mut b, ConnectionContext.acceptedNow(2, drain)))?;
+    return Check.equalBytes("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nh5".bytes(), b.written());
+}

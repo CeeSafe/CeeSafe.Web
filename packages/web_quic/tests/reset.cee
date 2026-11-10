@@ -1,0 +1,268 @@
+// Stateless reset (RFC 9000 §10.3, Web ADR 0014 amendment 5 item 2) over real UDP. A client completes a handshake
+// with a QuicServer; that server is cancelled, as a server that loses its state is, sending nothing; a new QuicServer
+// starts on the same socket; the client then sends on a stream. The new server has no connection for the client's
+// ID, so it answers with a stateless reset whose token comes from its reset key.
+// Expected:
+//   - with the first server's key, the token is the one the client was given for that ID: the client's connection
+//     ends (draining, §10.3.1) at once, not at its idle timeout (30 s);
+//   - with another key, the token does not match, and the client ignores the reset (§10.3.1): it is not draining.
+import web_core;
+
+/// An application that keeps each connection until it ends.
+struct Hold {}
+
+impl QuicApplication for Hold {
+    async fn connection(borrow this, link: borrow mut QuicLink) -> Result<void, QuicError> {
+        var buffer = Vector<u8>.create();
+        if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+            return Err(QuicError.NoMemory);
+        }
+        loop {
+            let _ = await link.next(buffer.viewMut())?;
+        }
+    }
+}
+
+/// The client's side: its socket and connection.
+struct Peer {
+    socket: AsyncUdpSocket;
+    conn: QuicConnection;
+    server: SocketAddress;
+    buffer: Vector<u8>;
+    out: Vector<u8>;
+}
+
+/// Sends what the connection has, then waits up to `capMs` for a datagram or its timer: whether it is draining.
+async fn step(p: borrow mut Peer, capMs: u64) -> Result<bool, TestFailure> {
+    loop {
+        match (p.conn.nextEvent(p.buffer.viewMut())) {
+            Ok(Some(_)) => {}
+            Ok(null) => { break; }
+            Err(_) => { return Err(TestFailure.create("an event")); }
+        }
+    }
+    loop {
+        let d = match (p.conn.datagram(p.out.viewMut(), Clock.monotonicNanos())) {
+            Ok(Some(d)) => d,
+            Ok(null) => { break; },
+            Err(QuicError.Draining) => { return Ok(true); },
+            Err(_) => { return Err(TestFailure.create("a datagram")); },
+        };
+        match (await p.socket.sendTo(p.out.view()[0..d.length], p.server)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("sending")); }
+        }
+    }
+    let raced: Result<Raced<Datagram?>, AsyncError> = await Async.race(
+        async () => {
+            let d = await p.socket.recvFrom(p.buffer.viewMut())?;
+            return Ok(Some(d));
+        },
+        async () => {
+            await Timer.sleep(capMs)?;
+            return Ok(null);
+        },
+    );
+    let won: Raced<Datagram?> = match (raced) {
+        Ok(w) => w,
+        Err(_) => { return Err(TestFailure.create("waiting")); },
+    };
+    let datagram: Datagram? = if (won.winner == 0) won.value else match (won.other) {
+        Some(d) => d,
+        null => won.value,
+    };
+    let now = Clock.monotonicNanos();
+    match (datagram) {
+        Some(d) => {
+            match (p.conn.feed(QuicAddress.of(d.from), 0, p.buffer.view()[0..d.length], now)) {
+                Ok() => {}
+                Err(QuicError.Draining) => { return Ok(true); }
+                Err(_) => { return Err(TestFailure.create("a read")); }
+            }
+        }
+        null => {
+            match (p.conn.nextTimeout()) {
+                Some(t) => {
+                    if (t <= now) {
+                        match (p.conn.onTimeout(now)) {
+                            Ok() => {}
+                            Err(QuicError.Draining) => { return Ok(true); }
+                            Err(_) => { return Err(TestFailure.create("a timer")); }
+                        }
+                    }
+                }
+                null => {}
+            }
+        }
+    }
+    return Ok(false);
+}
+
+/// Phase one: the handshake.
+async fn handshake(p: borrow mut Peer) -> Result<void, TestFailure> {
+    let deadline = Clock.monotonicNanos() + 10000000000;
+    while (!p.conn.handshakeDone()) {
+        if (Clock.monotonicNanos() > deadline) {
+            return Err(TestFailure.create("the handshake did not finish in 10 s"));
+        }
+        let _ = await step(p, 10)?;
+    }
+    // A few more turns, so the server's acknowledgements and new connection IDs arrive.
+    for (i in 0..10) {
+        let _ = await step(p, 10)?;
+    }
+    return Ok();
+}
+
+/// Phase two: bytes on a stream, then turns for `waitMs`: whether the connection ended, and when (ns after the send).
+async fn afterLoss(p: borrow mut Peer, waitMs: u64) -> Result<LossEnd, TestFailure> {
+    let stream = match (p.conn.openStream()) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("a stream")); },
+    };
+    match (p.conn.writeStream(stream, "after the server forgot us".bytes(), false)) {
+        Ok(_) => {}
+        Err(_) => { return Err(TestFailure.create("a write")); }
+    }
+    let start = Clock.monotonicNanos();
+    while (Clock.monotonicNanos() < start + waitMs * 1000000) {
+        if (await step(p, 10)?) {
+            return Ok(LossEnd { draining: true, after: Clock.monotonicNanos() - start });
+        }
+    }
+    return Ok(LossEnd { draining: false, after: 0 });
+}
+
+struct LossEnd {
+    draining: bool;
+    after: u64;
+}
+
+/// What a race between a server and a client phase gave.
+enum Phase {
+    Server,
+    Done(LossEnd),
+    Failed(TestFailure),
+}
+
+/// The scenario, the second server using `secondKey`: how the client's connection ended.
+async fn scenario(secondKey: [u8; 32], waitMs: u64) -> Result<LossEnd, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let alpn = [Alpn.Http3];
+    let serverTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    let clientTls = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
+    let tls = match (Arc<QuicTls>.create(serverTls)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let boxed: Box<dyn QuicApplication + Send> = match (Box.create(Hold {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the server's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the server's address")); },
+    };
+    let clientSocket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the client's socket")); },
+    };
+    let clientAddress = match (clientSocket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the client's address")); },
+    };
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    let conn = ok(
+        QuicConnection.client(
+            clientTls,
+            "localhost",
+            QuicAddress.of(clientAddress),
+            QuicAddress.of(local),
+            ids,
+            Clock.monotonicNanos(),
+        ),
+        "the client",
+    )?;
+    var p = Peer {
+        socket: clientSocket,
+        conn: conn,
+        server: local,
+        buffer: Vector<u8>.create(),
+        out: Vector<u8>.create(),
+    };
+    if (p.buffer.resize(quicEventBufferSize(), 0).isErr() || p.out.resize(quicDatagramSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var first = QuicServerOptions.defaults();
+    first.resetKey = Some([7u8; 32]);
+    var second = QuicServerOptions.defaults();
+    second.resetKey = Some(secondKey);
+    // The first server, until the handshake is done; cancelled then, so it sends nothing more.
+    let one: Result<Raced<Phase>, AsyncError> = await Async.race(
+        async () => {
+            let _ = await QuicServer.serve(socket, local, tls.clone(), app.clone(), first);
+            return Ok(Phase.Server);
+        },
+        async () => {
+            match (await handshake(mut p)) {
+                Ok() => { return Ok(Phase.Done(LossEnd { draining: false, after: 0 })); }
+                Err(e) => { return Ok(Phase.Failed(e)); }
+            }
+        },
+    );
+    match (one) {
+        Ok(won) => {
+            match (won.value) {
+                Phase.Done(_) => {}
+                Phase.Failed(e) => { return Err(e); }
+                Phase.Server => { return Err(TestFailure.create("the first server ended")); }
+            }
+        }
+        Err(_) => { return Err(TestFailure.create("the first race")); }
+    }
+    // A second server on the same socket, with no connection for the client.
+    let two: Result<Raced<Phase>, AsyncError> = await Async.race(
+        async () => {
+            let _ = await QuicServer.serve(socket, local, tls.clone(), app.clone(), second);
+            return Ok(Phase.Server);
+        },
+        async () => {
+            match (await afterLoss(mut p, waitMs)) {
+                Ok(e) => { return Ok(Phase.Done(e)); }
+                Err(e) => { return Ok(Phase.Failed(e)); }
+            }
+        },
+    );
+    match (two) {
+        Ok(won) => {
+            match (won.value) {
+                Phase.Done(e) => { return Ok(e); }
+                Phase.Failed(e) => { return Err(e); }
+                Phase.Server => { return Err(TestFailure.create("the second server ended")); }
+            }
+        }
+        Err(_) => { return Err(TestFailure.create("the second race")); }
+    }
+}
+
+@test
+async fn stateless_reset_ends_a_lost_connection() -> Result<void, TestFailure> {
+    let e = await scenario([7u8; 32], 5000)?;
+    Check.isTrue(e.draining, "the client's connection ended on the stateless reset")?;
+    return Check.isTrue(e.after < 3000000000, "within 3 s, long before its idle timeout (30 s)");
+}
+
+@test
+async fn stateless_reset_needs_the_same_key() -> Result<void, TestFailure> {
+    let e = await scenario([9u8; 32], 2000)?;
+    return Check.isTrue(!e.draining, "a reset with another key's token is ignored");
+}

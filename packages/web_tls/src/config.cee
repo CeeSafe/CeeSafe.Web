@@ -11,6 +11,8 @@ public enum TlsSetupError {
     BadAlpn,
     /// OpenSSL could not make the configuration (out of memory, usually).
     Internal,
+    /// A setting was refused: a cipher suite list OpenSSL does not know, or a key log file that cannot be opened.
+    BadSetting,
 }
 
 /// A TLS configuration: TLS 1.2 (ECDHE with AEAD only) and 1.3, no renegotiation, no compression. A server's has its
@@ -57,6 +59,29 @@ public struct TlsConfig {
         return Ok();
     }
 
+    /// Restricts TLS 1.3 to the cipher suites in `list`, OpenSSL's names, colon-separated and in preference order
+    /// (`"TLS_CHACHA20_POLY1305_SHA256"`).
+    /// Safety: as `trustPem`; the shim copies the list.
+    public fn setCipherSuites13(borrow mut this, list: StringView) -> Result<void, TlsSetupError> {
+        let b = list.bytes();
+        if (unsafe { wt_cfg_cipher_suites13(this.raw, b.ptr, b.length) } != 1) {
+            return Err(TlsSetupError.BadSetting);
+        }
+        return Ok();
+    }
+
+    /// Appends this configuration's TLS secrets to the key log at `path` (NSS's key log format, the one
+    /// `SSLKEYLOGFILE` names for curl and browsers), so captures of its connections can be decrypted. For tests and
+    /// debugging only: whoever reads the file can decrypt those connections. One file per process.
+    /// Safety: as `trustPem`; the shim copies the path.
+    public fn writeKeyLog(borrow mut this, path: StringView) -> Result<void, TlsSetupError> {
+        let b = path.bytes();
+        if (unsafe { wt_cfg_key_log(this.raw, b.ptr, b.length) } != 1) {
+            return Err(TlsSetupError.BadSetting);
+        }
+        return Ok();
+    }
+
     /// Trusts the system's roots: OpenSSL's default CA locations, and on Windows the system's certificate store
     /// (OpenSSL 3.2 or later there).
     /// Safety: as `trustPem`.
@@ -77,6 +102,8 @@ public struct TlsConfig {
             let name = match (p) {
                 Alpn.Http11 => "http/1.1",
                 Alpn.Http2 => "h2",
+                Alpn.Http3 => "h3",             // a QUIC listener's configuration (Web ADR 0014 §3.1)
+                Alpn.HqInterop => "hq-interop", // QUIC interop testing (Web ADR 0014 amendment 3)
                 _ => "",
             };
             if (name.length == 0) {
@@ -199,6 +226,11 @@ public struct TlsConfig {
 
     /// The SSL_CTX, for a connection.
     fn handle(borrow this) -> *mut void => this.raw;
+
+    /// The SSL_CTX, for `web_quic`'s shim (Web ADR 0014 §3.4), which takes a reference of its own
+    /// (`SSL_CTX_up_ref`) before this call's caller returns, so the context outlives this configuration if need be.
+    /// Not for other uses: the pointer is valid only while this configuration lives.
+    public fn quicContext(borrow this) -> *mut void => this.raw;
 
     /// Safety: `raw` is this configuration's own SSL_CTX reference; connections made from it hold references of
     /// their own, so it lives on until they are freed.

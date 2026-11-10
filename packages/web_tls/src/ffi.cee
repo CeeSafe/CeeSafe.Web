@@ -14,6 +14,10 @@ extern "C" {
     @effects()
     fn wt_cfg_trust_default(cfg: *mut void) -> i32;
     @effects()
+    fn wt_cfg_cipher_suites13(cfg: *mut void, list: *u8, length: usize) -> i32;
+    @effects()
+    fn wt_cfg_key_log(cfg: *mut void, path: *u8, length: usize) -> i32;
+    @effects()
     fn wt_cfg_set_alpn(cfg: *mut void, wire: *u8, length: usize) -> i32;
     @effects()
     fn wt_cfg_add_name(

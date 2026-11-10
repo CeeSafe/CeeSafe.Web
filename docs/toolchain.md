@@ -20,7 +20,7 @@ that needs an unreleased compiler is not merged to main.
 | M7 HTTP/2 | **0.10.3** | B16 (a wake lost on kqueue past ~30 connections), fixed in 0.10.2; B17 (cancellation and the wake list quadratic in parked tasks, CeeSafe ADR 0062), fixed in 0.10.3 | gate passed, on main, released in v0.3.0 (`docs/milestones/M7.md`) |
 | M8 reverse proxy | **0.11.0** | U20 (a type that holds loans as a `borrow mut dyn I`, CeeSafe ADR 0064 §3.2) for the request-body relay; ADR 0064 §1's generic methods for `ReverseProxy.route<S>()` | gate passed, on main (#3, 2026-11-06); released with M9 in v0.4.0 (`docs/milestones/M8.md`) |
 | M9 low-level I/O | **0.22.0** | `Vector.resize` (ADR 0071, 0.15.0) for `OwnedBuffer.create`; U7 sendfile (ADR 0051); `readAt`/`length` (ADR 0075) for TLS and HTTP/2 file bodies; B19 (`sendFile` to a reset connection raised SIGPIPE on Linux) and U22 (`File.openRegular`, `f.modified()`, `f.kind()`) for `web_static`, both CeeSafe ADR 0078 | done; main's minimum, released in v0.4.0 (`docs/milestones/M9.md`) |
-| M10 HTTP/3 | 0.9.0 | U6 UDP (ADR 0050) | released |
+| M10 HTTP/3 | **0.22.0** | U6 UDP (ADR 0050, 0.9.0); nothing newer than M9's minimum | done; main's minimum, released in v0.5.0 (`docs/milestones/M10.md`) |
 
 ## Current machine (2026-11-06)
 

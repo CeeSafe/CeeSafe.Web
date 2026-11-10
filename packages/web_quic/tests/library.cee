@@ -1,0 +1,14 @@
+// The vendored libraries link and answer (Web ADR 0014 §4, stage 1). Expected values: ngtcp2's release number
+// (1.26.0, third_party/README.md) and OpenSSL 3.5's version-number encoding (OpenSSL's opensslv.h: 0xMNN00PP0L).
+
+@test
+fn ngtcp2_is_the_vendored_release() -> Result<void, TestFailure> =>
+    Check.equalU64(0x011a00, QuicLibrary.ngtcp2Version() as u64);
+
+@test
+fn openssl_is_at_least_3_5() -> Result<void, TestFailure> =>
+    Check.isTrue(QuicLibrary.opensslVersion() >= 0x30500000, "OpenSSL >= 3.5 at run time");
+
+@test
+fn the_openssl_backend_initialises() -> Result<void, TestFailure> =>
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init");

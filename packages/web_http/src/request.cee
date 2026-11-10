@@ -8,6 +8,7 @@ public struct Request<region r> {
     private pathEnd: usize;
     private ver: Version;
     private fields: HeaderList<r>;
+    private early: bool;
 
     /// A request; `target` must be ASCII (the parser checks it).
     public fn create(
@@ -32,8 +33,22 @@ public struct Request<region r> {
             pathEnd: end,
             ver: version,
             fields: headers,
+            early: false,
         };
     }
+
+    /// This request, marked as having come in TLS early data (0-RTT): `earlyData()`. Set by HTTP/3's driver (Web ADR
+    /// 0014 §3.7).
+    public fn sentEarly(this) -> Request<r> {
+        var r = this;
+        r.early = true;
+        return r;
+    }
+
+    /// Whether the request came in TLS early data (QUIC's 0-RTT, RFC 9001 §4.6.1), before the handshake proved the
+    /// client: such a request may be a replay (RFC 8470 §1). The server answers 425 Too Early to any method but GET,
+    /// HEAD and OPTIONS itself; a handler whose GET has an effect can refuse it too (`Status.tooEarly()`).
+    public fn earlyData(borrow this) -> bool => this.early;
 
     /// The method.
     public fn method(borrow this) -> Method => this.verb;

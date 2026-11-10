@@ -1,0 +1,27 @@
+// The QUIC library's versions and its one-time initialisation (Web ADR 0014 §3.3), over web_quic's shim
+// (c/quic_shim.c). The shim does no I/O and keeps no pointer, so each call is declared without effects.
+import web_core;
+
+extern "C" {
+    @effects()
+    fn qs_ngtcp2_version() -> u32;
+    @effects()
+    fn qs_openssl_version() -> u64;
+    @effects()
+    fn qs_init() -> i32;
+}
+
+/// The libraries `web_quic` runs on.
+public struct QuicLibrary {
+    /// ngtcp2's version, as `0xMMmmpp` (1.26.0 is `0x011a00`).
+    /// Safety: the call takes no arguments and returns a number; ngtcp2's static version record is read in C only.
+    public fn ngtcp2Version() -> u32 => unsafe { qs_ngtcp2_version() };
+
+    /// The OpenSSL the process runs with, as `OpenSSL_version_num()`: `0xMNN00PP0` (3.5.7 is `0x30500070`).
+    /// Safety: the call takes no arguments and returns a number.
+    public fn opensslVersion() -> u64 => unsafe { qs_openssl_version() };
+
+    /// Initialises ngtcp2's OpenSSL backend, once per process; `false` if OpenSSL refused.
+    /// Safety: the call takes no arguments; OpenSSL's one-time initialisation is thread-safe (OPENSSL_init_ssl).
+    public fn initialise() -> bool => unsafe { qs_init() } == 0;
+}
