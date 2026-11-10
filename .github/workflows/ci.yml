@@ -109,7 +109,13 @@ jobs:
       - name: Tests with ASan and UBSan, allocation-failure and cancellation sweeps
         if: matrix.sanitize
         shell: bash
-        run: python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep --exclude "${{ matrix.exclude }}"
+        run: |
+          # Ubuntu 26.04's runner was shut down partway through this step, with no output (M10.md, "Release"):
+          # on Linux, log memory and disk each minute so the next one shows which ran out.
+          if [ "$RUNNER_OS" = Linux ]; then
+            (while sleep 60; do echo "resources: $(free -m | awk '/^Mem/{print "mem used " $3 " of " $2 " MiB"}'), $(free -m | awk '/^Swap/{print "swap used " $3 " MiB"}'), $(df -m / | awk 'NR==2{print "disk free " $4 " MiB"}')"; done) &
+          fi
+          python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep --exclude "${{ matrix.exclude }}"
 
       - name: Example builds
         shell: bash

@@ -26,6 +26,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -42,6 +43,8 @@ def main() -> int:
     ap.add_argument("--exclude", default="", help="packages to leave out, comma-separated (CI's OpenSSL 3.0 job leaves"
                     " out web_quic and web_http3, which need OpenSSL 3.5: Web ADR 0014 §3.3)")
     args = ap.parse_args()
+    # One line per run as it ends, even into a pipe: a job killed partway still shows where it got to.
+    sys.stdout.reconfigure(line_buffering=True)
     if os.sep in args.ceesafec or "/" in args.ceesafec:
         args.ceesafec = os.path.abspath(args.ceesafec)  # the tests run from each package's directory
 
@@ -75,14 +78,16 @@ def main() -> int:
             command = [args.ceesafec, "test"] + flags
             if args.filter:
                 command += ["--filter", args.filter]
+            start = time.monotonic()
             r = subprocess.run(command, cwd=package, capture_output=True, text=True)
+            took = f"{time.monotonic() - start:.0f} s"
             lines = (r.stdout + r.stderr).rstrip().splitlines()
             summary = next((l for l in reversed(lines) if l.startswith("ceesafec test:")), "no summary")
             if r.returncode == 0:
-                print(f"ok   {name} ({mode}): {summary.removeprefix('ceesafec test: ')}")
+                print(f"ok   {name} ({mode}): {summary.removeprefix('ceesafec test: ')} ({took})")
             else:
                 failed += 1
-                print(f"FAIL {name} ({mode})")
+                print(f"FAIL {name} ({mode}, {took})")
                 print("  " + "\n  ".join(lines))
     print(f"run_tests: {len(packages) * len(modes) - failed - skipped} runs passed, {failed} failed, {skipped} skipped")
     return 1 if failed else 0
