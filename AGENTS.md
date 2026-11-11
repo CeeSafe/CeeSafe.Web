@@ -85,6 +85,7 @@ per layer. The section above, between the `CEESAFE` markers, is written by `cees
 
 ```sh
 python3 tools/check_layers.py                          # the dependency layering
+python3 tools/api_check.py [--write]                   # docs/api/ matches the public API (Web ADR 0015 §4)
 (cd packages/<name> && ceesafec fetch && ceesafec check)   # one package; fetch after changing dependencies
 (cd packages/<name> && ceesafec fmt --check)
 (cd packages/<name> && ceesafec test)                    # its @test functions (packages/<name>/tests/, CeeSafe ADR 0049)

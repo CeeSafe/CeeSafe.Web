@@ -1,0 +1,186 @@
+# The nightly fuzz farm (Web ADR 0015 §3; the owner's answer to Web ADR 0005 §4.1, "nightly"). One job per harness
+# under tests/fuzz/, each about 5 hours on a 4-vCPU runner: about 20 CPU-hours a night per engine.
+# - The CeeSafe harnesses (http1, h2, ws, proxy) run as 4 processes with different seeds, built with ASan and UBSan;
+#   each must end with "no invariant broken"-style success (exit 0) and `ceesafe alloc: ... live=0` (no leak).
+# - The libFuzzer harnesses (tls, h3) run with -fork=4, keep going past a crash, and keep their corpus between nights
+#   in the Actions cache.
+# A failure uploads the logs and the inputs, and on the schedule opens (or comments on) an issue. A pull request that
+# changes a harness runs each for 5 minutes, and does not touch the nightly corpus.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 21 * * *" # 00:17 at +03, after the day's pushes
+  pull_request: # a change to a harness, or to this file: 5 minutes per harness, as a smoke test
+    paths:
+      - ".github/workflows/fuzz.yml"
+      - "tests/fuzz/**"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per harness (default 18000, 5 hours)"
+        required: false
+        default: "18000"
+
+env:
+  CEESAFE_VERSION: v0.27.0 # as ci.yml: main's minimum (docs/toolchain.md)
+  FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '300' || github.event.inputs.seconds || '18000' }}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.harness }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - harness: http1
+            kind: ceesafe
+          - harness: h2
+            kind: ceesafe
+          - harness: ws
+            kind: ceesafe
+          - harness: proxy
+            kind: ceesafe
+          - harness: tls
+            kind: libfuzzer
+          - harness: h3
+            kind: libfuzzer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ceesafec
+        if: matrix.kind == 'ceesafe'
+        run: |
+          curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
+          echo "$HOME/.ceesafe/bin" >> "$GITHUB_PATH"
+
+      - name: Install clang's libFuzzer and OpenSSL's headers
+        if: matrix.kind == 'libfuzzer'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev libclang-rt-18-dev
+          clang --version | head -1
+
+      - name: Build (CeeSafe, ASan and UBSan)
+        if: matrix.kind == 'ceesafe'
+        working-directory: tests/fuzz/${{ matrix.harness }}
+        run: |
+          ceesafec --version
+          ceesafec fetch
+          ceesafec build --cflag -fsanitize=address,undefined --cflag -fno-omit-frame-pointer
+
+      - name: Build (libFuzzer, ASan and UBSan)
+        if: matrix.kind == 'libfuzzer'
+        run: |
+          mkdir -p fuzz-out
+          if [ "${{ matrix.harness }}" = tls ]; then
+            clang -g -O1 -fsanitize=fuzzer,address,undefined -DWT_STANDALONE -I. tests/fuzz/tls/fuzz_shim.c \
+              packages/web_tls/c/tls_shim.c -lssl -lcrypto -o fuzz-out/fuzz
+          else
+            N=third_party/nghttp3-1.19.0
+            clang -g -O1 -fsanitize=fuzzer,address,undefined -Itests/fuzz/h3 -I$N/config -I$N/lib/includes \
+              tests/fuzz/h3/fuzz_h3.c packages/web_http3/c/h3_shim.c packages/web_http3/c/vendor/lib_* \
+              -o fuzz-out/fuzz
+          fi
+
+      - name: Restore the corpus
+        if: matrix.kind == 'libfuzzer'
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz-out/corpus
+          key: fuzz-corpus-${{ matrix.harness }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.harness }}-
+
+      - name: Fuzz (CeeSafe, 4 seeds)
+        if: matrix.kind == 'ceesafe'
+        run: |
+          mkdir -p fuzz-out
+          bin=tests/fuzz/${{ matrix.harness }}/out/fuzz_${{ matrix.harness }}
+          base=$(( (GITHUB_RUN_ID % 100000000) * 4 ))
+          pids=()
+          for i in 0 1 2 3; do
+            CW_FUZZ_SECONDS=$FUZZ_SECONDS CW_FUZZ_SEED=$((base + i)) CEESAFE_ALLOC_REPORT=1 \
+              "$bin" > "fuzz-out/seed-$((base + i)).log" 2>&1 &
+            pids+=($!)
+          done
+          failed=0
+          for i in 0 1 2 3; do
+            log="fuzz-out/seed-$((base + i)).log"
+            if ! wait "${pids[$i]}"; then
+              echo "::error::seed $((base + i)) failed"; failed=1
+            elif ! grep -qE '^ceesafe alloc: .* live=0$' "$log"; then
+              echo "::error::seed $((base + i)) leaked (or did not report)"; failed=1
+            fi
+            echo "== seed $((base + i))"; tail -n 5 "$log"
+          done
+          exit $failed
+
+      - name: Fuzz (libFuzzer, 4 processes)
+        if: matrix.kind == 'libfuzzer'
+        working-directory: fuzz-out
+        run: |
+          mkdir -p corpus artifacts
+          if [ "${{ matrix.harness }}" = tls ]; then # its server's chain and key, and the client's CA (fuzz_shim.c)
+            C=$GITHUB_WORKSPACE/packages/web_tls/tests/certs
+            export CW_CERT=$C/server.pem CW_KEY=$C/server.key CW_CA=$C/ca.pem
+          fi
+          echo "corpus at the start: $(ls corpus | wc -l)"
+          ./fuzz -fork=4 -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1 -max_total_time=$FUZZ_SECONDS \
+            -rss_limit_mb=2048 -print_final_stats=1 -artifact_prefix=artifacts/ \
+            corpus ../tests/fuzz/${{ matrix.harness }}/seeds > fuzz.log 2>&1 || true
+          tail -n 12 fuzz.log
+          found=$(ls artifacts | wc -l)
+          echo "corpus at the end: $(ls corpus | wc -l); crash, leak, timeout and OOM inputs: $found"
+          if [ "$found" -gt 0 ]; then ls artifacts; exit 1; fi
+
+      - name: Minimise and save the corpus
+        if: always() && matrix.kind == 'libfuzzer'
+        working-directory: fuzz-out
+        run: |
+          mkdir -p corpus.min
+          if [ "${{ matrix.harness }}" = tls ]; then # its server's chain and key, and the client's CA (fuzz_shim.c)
+            C=$GITHUB_WORKSPACE/packages/web_tls/tests/certs
+            export CW_CERT=$C/server.pem CW_KEY=$C/server.key CW_CA=$C/ca.pem
+          fi
+          timeout 900 ./fuzz -merge=1 -rss_limit_mb=2048 corpus.min corpus > merge.log 2>&1 || true
+          if [ "$(ls corpus.min | wc -l)" -gt 0 ]; then rm -rf corpus && mv corpus.min corpus; fi
+          echo "corpus saved: $(ls corpus | wc -l)"
+
+      - uses: actions/cache/save@v4
+        if: always() && matrix.kind == 'libfuzzer' && github.event_name != 'pull_request'
+        with:
+          path: fuzz-out/corpus
+          key: fuzz-corpus-${{ matrix.harness }}-${{ github.run_id }}
+
+      - name: Keep the logs and inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.harness }}-${{ github.run_id }}
+          path: |
+            fuzz-out/*.log
+            fuzz-out/artifacts/
+          retention-days: 30
+
+      - name: Report on an issue
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Nightly fuzz: ${{ matrix.harness }} failed"
+          run="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          n=$(gh issue list --state open --search "\"$title\" in:title" --json number -q '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "Failed again: $run"
+          else
+            gh issue create --title "$title" --body "The nightly fuzz job for \`${{ matrix.harness }}\` failed: $run
+
+          Its logs and inputs are the run's artefact \`fuzz-${{ matrix.harness }}-${{ github.run_id }}\` (30 days).
+          Reproduce, minimise, and record the finding in the milestone's notes (Web ADR 0005 §2.5)."
+          fi

@@ -120,6 +120,10 @@ jobs:
         shell: bash
         run: python3 tools/check_layers.py
 
+      - name: Public API matches docs/api (Web ADR 0015 §4)
+        shell: bash
+        run: python3 tools/api_check.py
+
       - name: Check, format and docs of every package
         shell: bash
         run: |
