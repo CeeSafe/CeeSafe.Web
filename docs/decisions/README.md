@@ -76,3 +76,9 @@ The language facts the ADRs rely on are checked by the programs in `tests/probes
 | 0015 §7.3 | The API freeze? | committed `ceesafec doc` pages checked in CI; frozen at v1.0.0-rc.1 |
 | 0015 §7.4 | FreeBSD? | supported if U23 lands in CeeSafe before v1.0, otherwise best effort |
 | 0015 §7.5 | The benchmark machine? | alfaisal, the owner's server, once its services are moved off |
+
+## Answers (the owner, 2026-11-12)
+
+| ADR | Question | Answer |
+|---|---|---|
+| 0013 §10 | A large HTTP/1.1 body write sent without a copy? | yes, in `web_http`'s `Exchange.write` |

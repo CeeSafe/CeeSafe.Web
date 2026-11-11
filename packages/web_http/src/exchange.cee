@@ -474,13 +474,18 @@ public struct Exchange<region r> {
     /// Whether the head has been sent (or queued to send).
     public fn headSent(borrow this) -> bool => this.sent;
 
-    /// Writes body bytes. They wait in the response buffer; a full buffer sends the head and the bytes so far.
+    /// Writes body bytes. They wait in the response buffer; a full buffer sends the head and the bytes so far. Over
+    /// HTTP/1.1, what is left of a write at least as large as the buffer, once the buffer is empty, goes to the wire
+    /// as it is, without a copy.
     public async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError> {
         if (this.done) {
             return Err(HandlerError.Internal);
         }
         var at: usize = 0;
         while (at < bytes.length) {
+            if (!this.multiplexed && this.pending.isEmpty() && bytes.length - at >= this.pending.capacity()) {
+                return await this.sendDirect(bytes[at..bytes.length]);
+            }
             if (this.pending.spareLength() == 0) {
                 this.pending.compact();
             }
@@ -636,6 +641,67 @@ public struct Exchange<region r> {
         this.setStatus(status);
         this.setContentLength(body.length as u64);
         return await this.write(body);
+    }
+
+    /// HTTP/1.1, with `pending` empty: sends the head if it was not sent, then `body` with `out` in one vectored step,
+    /// framed as `sendPending` frames `pending`. `body` is not copied.
+    async fn sendDirect(borrow mut this, body: Slice<u8>) -> Result<void, HandlerError> {
+        if (!this.sent) {
+            await this.sendHead(this.response.contentLength())?;
+        }
+        let n = body.length;
+        if (n == 0) {
+            return Ok();
+        }
+        this.written += n as u64;
+        if (Methods.same(this.request.method(), Method.Head)) {
+            return Ok(); // HEAD: the length GET would send, and no content (RFC 9110 §9.3.2)
+        }
+        match (this.framing) {
+            ResponseFraming.NoContent => {
+                return Ok(); // 204, 304: counted, not sent
+            }
+            ResponseFraming.Length(total) => {
+                if (this.written > total) {
+                    this.keep = false; // more than declared: the framing would be wrong
+                    return Err(HandlerError.Internal);
+                }
+            }
+            ResponseFraming.Chunked => {
+                if (this.out.spareLength() < 18) {
+                    await this.flushOut()?;
+                }
+                match (Encoder.chunkHeader(n, this.out)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HandlerError.Internal); }
+                }
+            }
+            ResponseFraming.UntilClose => {}
+        }
+        let chunked = match (this.framing) {
+            ResponseFraming.Chunked => true,
+            _ => false,
+        };
+        let crlf = "\r\n";
+        let crlfBytes = crlf.bytes();
+        let tail = if (chunked) crlfBytes else crlfBytes[0..0];
+        let first = match (IoParts.of(this.out.readable()).then(body)) {
+            Some(p) => p,
+            null => { return Err(HandlerError.Internal); },
+        };
+        let parts = match (first.then(tail)) {
+            Some(p) => p,
+            null => { return Err(HandlerError.Internal); },
+        };
+        match (await Transports.writeAllVectoredWithin(this.conn, parts, Deadline.after(this.limits.writeTimeoutMs))) {
+            Ok() => {}
+            Err(e) => {
+                this.keep = false;
+                return Err(HandlerError.Io(e));
+            }
+        }
+        this.out.clear();
+        return Ok();
     }
 
     /// Sends the head if it was not sent, then moves `pending` to the wire: into `out` if it fits, else written with

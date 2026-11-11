@@ -375,3 +375,49 @@ from §3.5 or add to it:
    no conditionals.
 
 Tests: `packages/web_static/tests/` (units and served), and `web_http`'s `http_date_*` (M9.md, stage 4).
+
+## 10. Amendment 4 (2026-11-12: a large HTTP/1.1 body write without a copy)
+
+**Status: accepted by the owner, 2026-11-12, as recommended.** Raised by CosmoStore
+(`~/dev/CeeSafeApps/cosmostore`, its ADR-0037 and `docs/benchmarks/2026-11-11-get-1mib-profile-0.36.md`).
+
+1. **What the profile showed.** CosmoStore serves an object's body with `Exchange.write`, a 1 MiB slice at a time.
+   `write` copies every byte into `pending` (`Limits.writeBufferBytes`, 16 KiB by default) and sends it when it
+   fills: 64 copies and 64 vectored writes for 1 MiB. On the Debian host (server on two pinned cores, 60 `gdb`
+   samples, 1 MiB GETs at concurrency 32), the event loop's thread spent 15% in that copy (`OwnedBuffer.append` in
+   `Exchange.write`) and 58% in `sendmsg`; it was never idle. §3.2 asked for vectored writes "everywhere a header
+   precedes a payload, where the profile shows the copy". The HTTP/1.1 body was not among the places listed.
+2. **Proposed.** Over HTTP/1.1, when `pending` is empty and what is left of a `write` is at least `pending`'s
+   capacity, the bytes go to the wire as they are, after `out` (the head, a chunk's size line) and before a chunk's
+   CRLF, in one `Transports.writeAllVectoredWithin` (`Exchange.sendDirect`, beside `sendPending`). The framing is
+   `sendPending`'s: the head first if it was not sent, the count against a declared length, nothing sent for HEAD,
+   204 and 304, and one chunk for the whole slice when chunked. A smaller write, or a write whose start fills a
+   non-empty `pending`, is buffered as before. HTTP/2 and HTTP/3 are unchanged (their DATA frames copy into frames).
+3. **No API change.** `write`'s signature and contract are the same; only how a large slice is sent changes. A
+   chunked response's chunks differ in size (a large slice is one chunk, where it was several of 16 KiB), as RFC
+   9112 §7.1 allows. In `docs/api/web_http.md` only `write`'s doc comment changes, which says so (Web ADR 0015
+   §4: a fix, allowed under the freeze).
+4. **Measured** (Debian host, CosmoStore `fe50ca3` with ceesafec 0.36.0 and CeeSafe.Web `82a3a73` with and without
+   the change, server on cores 2 and 3, the client on 0, 1, 4 and 5, 3 alternating rounds, GETs/s of 1 MiB objects):
+
+   | Build | Concurrency 32 | Concurrency 128 |
+   |---|---:|---:|
+   | as now, a 64 KiB write buffer (CosmoStore ADR-0037) | 1,278–1,331 | 903–982 |
+   | the change, a 64 KiB write buffer | 1,329–1,354 | 1,125–1,212 |
+   | the change, the default 16 KiB | 1,314–1,344 | 1,184–1,288 |
+   | as now, the default 16 KiB (an earlier run) | 1,019–1,106 | 712–838 |
+
+   With the change the buffer's size no longer matters for large bodies, so a server need not raise
+   `writeBufferBytes` (two per connection) to serve them fast.
+5. **Tests.** `web_http1`'s `large_writes_go_out_directly`: "ab", then 40,000 bytes in one write, as a chunked
+   response (a 0x4000 chunk from the buffer, then 0x5c42 sent directly), with a declared length, and as HEAD followed
+   by a pipelined GET. The expected bytes are written out by hand from RFC 9112. The existing `large_responses`
+   (writes of 1,000 bytes) is unchanged.
+
+   Run on 2026-11-12 with ceesafec 0.36.0 (macOS): `tools/run_tests.py`, every package natively and in the
+   interpreter, 25 runs passed, 3 skipped; `web_http1`'s two large-response tests under ASan and UBSan, with 222
+   allocation-failure and 40 cancellation sweep runs, no failure; `tools/check_layers.py` ok; `tools/api_check.py
+   --write` changed only `write`'s comment.
+
+Question for the owner: accept §10 (the change in `web_http`'s `Exchange.write`, released in CeeSafe.Web's next
+version)? *Recommended: yes.* Answered 2026-11-12: yes.

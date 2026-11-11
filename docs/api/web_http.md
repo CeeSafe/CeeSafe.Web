@@ -557,7 +557,9 @@ Whether the head has been sent (or queued to send).
 public async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, HandlerError>
 ```
 
-Writes body bytes. They wait in the response buffer; a full buffer sends the head and the bytes so far.
+Writes body bytes. They wait in the response buffer; a full buffer sends the head and the bytes so far. Over
+HTTP/1.1, what is left of a write at least as large as the buffer, once the buffer is empty, goes to the wire
+as it is, without a copy.
 
 ### Exchange.sendFile
 

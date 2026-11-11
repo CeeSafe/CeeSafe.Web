@@ -92,6 +92,7 @@ impl Transport for Script {
 /// - `/ignore`: answers "ok" without reading the body;
 /// - `/fail`: fails with 404;
 /// - `/big`: 20000 bytes of `x`, length not declared; `/bigknown`: the same, declared;
+/// - `/huge`: writes "ab", then 40000 bytes of `x` in one write, length not declared; `/hugeknown`: the same, declared;
 /// - `/trailers`: reads the body, then answers `/trailers:` and each trailer as `name=value;`;
 /// - anything else: reads the body and answers `<path>:<body>`.
 /// Its hook adds `x-hook: 1` to every response.
@@ -130,6 +131,14 @@ impl Application for App {
         }
         if (Ascii.equals(p, "/fail")) {
             return Err(HandlerError.Status(Status.notFound()));
+        }
+        if (Ascii.equals(p, "/huge") || Ascii.equals(p, "/hugeknown")) {
+            if (Ascii.equals(p, "/hugeknown")) {
+                exchange.setContentLength(40002);
+            }
+            await exchange.write("ab".bytes())?;
+            let block = [120u8; 40000];
+            return await exchange.write(block[..]);
         }
         if (Ascii.equals(p, "/big") || Ascii.equals(p, "/bigknown")) {
             if (Ascii.equals(p, "/bigknown")) {
