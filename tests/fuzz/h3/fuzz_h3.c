@@ -10,7 +10,8 @@
  *   2  a response head on a request stream the peer opened, once per stream, with a body or without (h3_submit)
  *   3  body bytes for it: a length byte, an end bit (h3_send_body)
  *   4  trailers for it, which end it (h3_trailers)
- *   5  the server stops reading a stream, or closes it with a code (h3_shutdown_read, h3_close_stream)
+ *   5  the server stops reading a stream, or QUIC closes it with a code, after which nothing more happens on it
+ *      (h3_shutdown_read, h3_close_stream)
  *   6  QUIC blocks or unblocks a stream (h3_block, h3_unblock)
  *   7  GOAWAY: the notice, then the final one, each once; or whether it is drained (h3_goaway_notice, h3_goaway,
  *      h3_drained)
@@ -108,6 +109,8 @@ typedef struct {
     size_t nrequests;
     int64_t responded; /* the request stream last given a head with a body, or -1 */
     int goaway;        /* 0: none sent, 1: the notice, 2: the final one */
+    int closed[NSTREAMS]; /* QUIC closed it (h3_close_stream): stream IDs are never reused (RFC 9000 §2.1), so no
+                             more of the peer's bytes on it and no second close */
 } server;
 
 static uint8_t event_buf[1u << 17];
@@ -203,6 +206,10 @@ static void step(server *s, input *in, uint8_t op) {
         size_t want = ((size_t)hi << 8) | lo;
         size_t left = in->len - in->at;
         size_t n = want < left ? want : left;
+        if (s->closed[which % NSTREAMS]) {
+            in->at += n; /* ngtcp2 drops frames for a stream it closed; web_http3 never sees them */
+            break;
+        }
         s->now += 1000000u;
         int64_t rv = h3_read(s->c, STREAMS[which % NSTREAMS], in->data + in->at, n, fin & 1, s->now);
 #ifdef H3_TRACE
@@ -308,10 +315,14 @@ static void step(server *s, input *in, uint8_t op) {
         take(in, &a);
         take(in, &b);
         int64_t stream = STREAMS[a % NSTREAMS];
+        if (s->closed[a % NSTREAMS]) {
+            break; /* ngtcp2 reports a stream's close once, and nothing on it after (glue.cee: StreamClosed) */
+        }
 #ifdef H3_TRACE
         fprintf(stderr, "%s stream %lld\n", (b & 1u) ? "close" : "shutdown_read", (long long)stream);
 #endif
         if (b & 1u) {
+            s->closed[a % NSTREAMS] = 1;
             (void)h3_close_stream(s->c, stream, 0x100u + (b >> 1));
         } else {
             (void)h3_shutdown_read(s->c, stream);
