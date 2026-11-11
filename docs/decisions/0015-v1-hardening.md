@@ -1,6 +1,6 @@
 # Web ADR 0015 — v1.0 hardening: the audit, the fuzz farm, the API freeze, portability, the benchmark report
 
-**Status:** proposed 2026-11-11. Each part waits for the owner's answer in §7.
+**Status:** proposed 2026-11-11. The owner answered §7.5 on 2026-11-11 (§6). The other parts wait for answers.
 **Scope:** implementation plan §7 "v1.0 hardening":
 - an external audit of the parsers and of the TLS and QUIC adapters;
 - a continuous fuzz farm;
@@ -145,6 +145,24 @@ test, which is evidence the macOS runs cannot give.
 
   **Recommendation: A**, since the regression gate and a published comparison both depend on it.
 
+  **The owner's answer (2026-11-11): A, on alfaisal.** It is the owner's own machine, a Xeon E-2136 (6 cores, 12
+  threads, up to 4.5 GHz) with 31 GB, NVMe, Ubuntu 24.04 and kernel 6.8.0-146.
+  - **Not yet idle.** On the day, alfaisal still ran production containers: zatca, s3zatca, cosmoproxy,
+    CosmoProduction, sqlserver, zatca.seq and autoheal.
+  - **The order.** The owner moves them off first, and no benchmark runs there until the owner says it is clear.
+  - **Set up (2026-11-11), in `/root/cw-bench`:**
+    - ceesafec 0.27.0 (linux-x64, checked against the release's SHA256SUMS);
+    - OpenSSL 3.5.9 built into `openssl-3.5`, from the tarball checked against
+      `603f5602…b859a` (`env.sh` sets PATH, CPATH, LIBRARY_PATH and LD_LIBRARY_PATH as CI does);
+    - h2load (nghttp2 1.59.0, Ubuntu's), wrk2 (built at `44a94c1`), and a clone of the repository;
+    - clang 18 and gcc 13 from Ubuntu.
+  - **Smoke test.** `benchmarks/http`'s server builds there and answers one HTTP/1.1 and one h2c request. No load
+    has been run.
+  - **Not yet installed:**
+    - oha, which has no checksummed release to verify;
+    - the comparison servers;
+    - nginx, whose Ubuntu package would start a service on port 80, so it is to be built into the prefix instead.
+
 ## 7. Questions for the owner
 
 1. **The audit (§2):** a funded programme first (OSTIF or the Sovereign Tech Fund), a paid firm, or none for v1.0?
@@ -155,7 +173,7 @@ test, which is evidence the macOS runs cannot give.
 4. **FreeBSD (§5):** supported (needs the upstream item), best effort, or dropped? *Recommended: supported if the
    upstream item lands before v1.0, otherwise best effort.*
 5. **The benchmark machine (§6):** a dedicated rented server, or hanan with the gate advisory? *Recommended: a
-   dedicated server.*
+   dedicated server.* **Answered 2026-11-11:** alfaisal, the owner's own server, once its services are moved off.
 
 ## 8. Tests
 
