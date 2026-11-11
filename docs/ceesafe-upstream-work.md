@@ -1139,6 +1139,20 @@ by borrow. It would need:
 
 Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner decides (`docs/milestones/M0.md`).
 
+## U23 — FreeBSD: a `ceesafec` build and CI   *(found 2026-11-11, Web ADR 0015 §5; accepted by the owner; wanted before v1.0, otherwise FreeBSD is best effort)*
+
+**Gap:** CeeSafe's releases (v0.27.0) ship `ceesafec` for linux-x64, linux-arm64, osx-x64, osx-arm64, win-x64 and
+win-arm64, and a C seed, but nothing for FreeBSD, and no CeeSafe CI runs there. The runtime already takes the kqueue
+path for `__FreeBSD__` (CeeSafe `runtime/hosted/ceesafe_rt_async.c:49`), untested.
+
+**Wanted:**
+- a FreeBSD x64 build of `ceesafec` in the release (from the seed, or a release binary);
+- CeeSafe's tests on FreeBSD in its CI, for example in a VM inside an Ubuntu job;
+- `[target.freebsd]` in the manifest (CeeSafe `spec/tooling.md`, which has `linux`, `macos` and `windows`), so that
+  `web_tls` can name OpenSSL's libraries there.
+
+CeeSafe.Web then adds a FreeBSD job to its CI (Web ADR 0015 §5).
+
 ## Tooling (small, any time before M1's exit)
 
 - **T1 Sweeps on any package.** CeeSafe.Web's M1 gate reuses `tools/cancel_sweep.py` and `tools/fault_sweep.py`. Check that both accept a package directory, not only corpus files. If they don't, add a `--package <dir>` mode.

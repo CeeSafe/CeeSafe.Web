@@ -20,7 +20,7 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0012](0012-reverse-proxy.md) | The reverse proxy, and what M7 left open | Accepted 2026-11-03 | M8 |
 | [0013](0013-low-level-io.md) | Low-level I/O: profiling, buffers, vectored writes, sending files, static files | Accepted 2026-11-06 | M9 |
 | [0014](0014-quic-and-http3.md) | HTTP/3 and QUIC: ngtcp2 and nghttp3 behind a sans-I/O shim | Accepted 2026-11-09 | M10 |
-| [0015](0015-v1-hardening.md) | v1.0 hardening: the audit, the fuzz farm, the API freeze, portability, the benchmark report | Proposed 2026-11-11 | v1.0 |
+| [0015](0015-v1-hardening.md) | v1.0 hardening: the audit, the fuzz farm, the API freeze, portability, the benchmark report | Accepted 2026-11-11 | v1.0 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 
@@ -66,3 +66,13 @@ The language facts the ADRs rely on are checked by the programs in `tests/probes
 | 0013 §6.4 | Several ranges in one request? | ignored: 200 with the whole file |
 | 0013 §6.5 | The `ETag`'s form? | strong, from the size and the modification time in nanoseconds |
 | 0013 §6.6 | io_uring as the Linux default? | measured, and recommended to CeeSafe; not overridden here |
+
+## Answers (the owner, 2026-11-11)
+
+| ADR | Question | Answer |
+|---|---|---|
+| 0015 §7.1 | The external audit? | a funded programme (OSTIF or the Sovereign Tech Fund) first; a paid firm if none accepts within three months |
+| 0015 §7.2 | The fuzz farm? | a nightly GitHub Actions workflow, one job per harness |
+| 0015 §7.3 | The API freeze? | committed `ceesafec doc` pages checked in CI; frozen at v1.0.0-rc.1 |
+| 0015 §7.4 | FreeBSD? | supported if U23 lands in CeeSafe before v1.0, otherwise best effort |
+| 0015 §7.5 | The benchmark machine? | alfaisal, the owner's server, once its services are moved off |
