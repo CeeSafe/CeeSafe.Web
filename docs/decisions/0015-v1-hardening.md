@@ -154,12 +154,13 @@ test, which is evidence the macOS runs cannot give.
     - ceesafec 0.27.0 (linux-x64, checked against the release's SHA256SUMS);
     - OpenSSL 3.5.9 built into `openssl-3.5`, from the tarball checked against
       `603f5602…b859a` (`env.sh` sets PATH, CPATH, LIBRARY_PATH and LD_LIBRARY_PATH as CI does);
-    - h2load (nghttp2 1.59.0, Ubuntu's), wrk2 (built at `44a94c1`), and a clone of the repository;
+    - h2load (nghttp2 1.59.0, Ubuntu's), wrk2 (built at `44a94c1`), oha 1.16.0 (the release's `oha-linux-amd64`;
+      it has no published checksum, so its SHA-256 as downloaded is recorded: `620bb9e1…391716`), and a clone of
+      the repository;
     - clang 18 and gcc 13 from Ubuntu.
   - **Smoke test.** `benchmarks/http`'s server builds there and answers one HTTP/1.1 and one h2c request. No load
     has been run.
   - **Not yet installed:**
-    - oha, which has no checksummed release to verify;
     - the comparison servers;
     - nginx, whose Ubuntu package would start a service on port 80, so it is to be built into the prefix instead.
 
