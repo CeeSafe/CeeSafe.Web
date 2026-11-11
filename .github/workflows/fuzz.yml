@@ -126,6 +126,10 @@ jobs:
         working-directory: fuzz-out
         run: |
           mkdir -p corpus artifacts
+          if [ "${{ matrix.harness }}" = tls ]; then # its server's chain and key, and the client's CA (fuzz_shim.c)
+            C=$GITHUB_WORKSPACE/packages/web_tls/tests/certs
+            export CW_CERT=$C/server.pem CW_KEY=$C/server.key CW_CA=$C/ca.pem
+          fi
           echo "corpus at the start: $(ls corpus | wc -l)"
           ./fuzz -fork=4 -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1 -max_total_time=$FUZZ_SECONDS \
             -rss_limit_mb=2048 -print_final_stats=1 -artifact_prefix=artifacts/ \
@@ -140,6 +144,10 @@ jobs:
         working-directory: fuzz-out
         run: |
           mkdir -p corpus.min
+          if [ "${{ matrix.harness }}" = tls ]; then # its server's chain and key, and the client's CA (fuzz_shim.c)
+            C=$GITHUB_WORKSPACE/packages/web_tls/tests/certs
+            export CW_CERT=$C/server.pem CW_KEY=$C/server.key CW_CA=$C/ca.pem
+          fi
           timeout 900 ./fuzz -merge=1 -rss_limit_mb=2048 corpus.min corpus > merge.log 2>&1 || true
           if [ "$(ls corpus.min | wc -l)" -gt 0 ]; then rm -rf corpus && mv corpus.min corpus; fi
           echo "corpus saved: $(ls corpus | wc -l)"
