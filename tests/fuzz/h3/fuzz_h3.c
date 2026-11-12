@@ -140,7 +140,9 @@ static void drain_events(server *s, uint8_t first_cap) {
         fprintf(stderr, "event %u stream %lld flags %u code %llu length %zu\n", kind, (long long)stream, flags,
                 (unsigned long long)code, length);
 #endif
-        if (kind == H3_EV_FIELDS_END && (stream & 3) == 0 && s->nrequests < MAX_REQUESTS) {
+        /* A request's head, not its trailers (flags bit 0), as web_http3's server tells them apart: one request per
+           stream, so one h3_submit (the nightly run of 2026-11-12 found two, which nghttp3 asserts on). */
+        if (kind == H3_EV_FIELDS_END && (flags & 1u) == 0 && (stream & 3) == 0 && s->nrequests < MAX_REQUESTS) {
             s->requests[s->nrequests++] = stream;
         }
         cap = sizeof event_buf;
