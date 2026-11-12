@@ -1267,6 +1267,12 @@ int32_t qs_retry_check(const uint8_t *key, const uint8_t *pkt, size_t len, const
     }
     ngtcp2_cid new_scid;
     ngtcp2_cid_init(&new_scid, retry_scid, 20);
+    /* The Initial's destination ID is the peer's choice, and ngtcp2_pkt_write_retry asserts that it differs from the
+       ID the Retry gives (RFC 9000 §17.2.5.1). CeeSafe's is fresh and random, so only a guess of 160 bits could
+       match it; such an Initial is dropped rather than left to the assertion (tests/fuzz/quic, which found it). */
+    if (hd.dcid.datalen == new_scid.datalen && memcmp(hd.dcid.data, new_scid.data, new_scid.datalen) == 0) {
+        return 0;
+    }
     uint8_t token[NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2];
     ngtcp2_ssize tokenlen = ngtcp2_crypto_generate_retry_token2(token, key, 32, hd.version,
                                                                 (const ngtcp2_sockaddr *)&addr.storage, addr.length,

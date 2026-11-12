@@ -2,8 +2,8 @@
 # under tests/fuzz/, each about 5 hours on a 4-vCPU runner: about 20 CPU-hours a night per engine.
 # - The CeeSafe harnesses (http1, h2, ws, proxy) run as 4 processes with different seeds, built with ASan and UBSan;
 #   each must end with "no invariant broken"-style success (exit 0) and `ceesafe alloc: ... live=0` (no leak).
-# - The libFuzzer harnesses (tls, h3) run with -fork=4, keep going past a crash, and keep their corpus between nights
-#   in the Actions cache.
+# - The libFuzzer harnesses (tls, h3, quic) run with -fork=4, keep going past a crash, and keep their corpus between
+#   nights in the Actions cache. quic runs on 26.04, for OpenSSL 3.5 (Web ADR 0014 §3.3).
 # A failure uploads the logs and the inputs, and on the schedule opens (or comments on) an issue. A pull request that
 # changes a harness runs each for 5 minutes, and does not touch the nightly corpus.
 name: fuzz
@@ -33,7 +33,7 @@ permissions:
 jobs:
   fuzz:
     name: fuzz ${{ matrix.harness }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os || 'ubuntu-24.04' }}
     timeout-minutes: 340
     strategy:
       fail-fast: false
@@ -51,6 +51,9 @@ jobs:
             kind: libfuzzer
           - harness: h3
             kind: libfuzzer
+          - harness: quic
+            kind: libfuzzer
+            os: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
@@ -64,8 +67,10 @@ jobs:
         if: matrix.kind == 'libfuzzer'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libssl-dev libclang-rt-18-dev
-          clang --version | head -1
+          sudo apt-get install -y -qq libssl-dev clang
+          v=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
+          sudo apt-get install -y -qq "libclang-rt-$v-dev" # libFuzzer and the sanitizers' runtimes, for that clang
+          clang --version | head -1; openssl version
 
       - name: Build (CeeSafe, ASan and UBSan)
         if: matrix.kind == 'ceesafe'
@@ -82,6 +87,11 @@ jobs:
           if [ "${{ matrix.harness }}" = tls ]; then
             clang -g -O1 -fsanitize=fuzzer,address,undefined -DWT_STANDALONE -I. tests/fuzz/tls/fuzz_shim.c \
               packages/web_tls/c/tls_shim.c -lssl -lcrypto -o fuzz-out/fuzz
+          elif [ "${{ matrix.harness }}" = quic ]; then
+            T=third_party/ngtcp2-1.26.0
+            clang -g -O1 -fsanitize=fuzzer,address,undefined -DWT_STANDALONE -Itests/fuzz/quic -Ipackages/web_quic/c \
+              -I$T/config -I$T/lib/includes -I$T/crypto/includes -I$T/lib -I$T/crypto tests/fuzz/quic/fuzz_quic.c \
+              packages/web_tls/c/tls_shim.c packages/web_quic/c/vendor/*.c -lssl -lcrypto -o fuzz-out/fuzz
           else
             N=third_party/nghttp3-1.19.0
             clang -g -O1 -fsanitize=fuzzer,address,undefined -Itests/fuzz/h3 -I$N/config -I$N/lib/includes \
@@ -126,7 +136,7 @@ jobs:
         working-directory: fuzz-out
         run: |
           mkdir -p corpus artifacts
-          if [ "${{ matrix.harness }}" = tls ]; then # its server's chain and key, and the client's CA (fuzz_shim.c)
+          if [ "${{ matrix.harness }}" = tls ] || [ "${{ matrix.harness }}" = quic ]; then # certificates
             C=$GITHUB_WORKSPACE/packages/web_tls/tests/certs
             export CW_CERT=$C/server.pem CW_KEY=$C/server.key CW_CA=$C/ca.pem
           fi
@@ -144,7 +154,7 @@ jobs:
         working-directory: fuzz-out
         run: |
           mkdir -p corpus.min
-          if [ "${{ matrix.harness }}" = tls ]; then # its server's chain and key, and the client's CA (fuzz_shim.c)
+          if [ "${{ matrix.harness }}" = tls ] || [ "${{ matrix.harness }}" = quic ]; then # certificates
             C=$GITHUB_WORKSPACE/packages/web_tls/tests/certs
             export CW_CERT=$C/server.pem CW_KEY=$C/server.key CW_CA=$C/ca.pem
           fi

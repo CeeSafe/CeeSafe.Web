@@ -76,9 +76,12 @@ Each item has its date, command and result in `docs/milestones/`.
     runs are its first long ones.
   - `tests/fuzz/h3`, libFuzzer over `h3_shim.c`: 24 CPU-hours (M10, 2026-11-10 and 11). It found four misuses in
     the harness's own call order and no defect in the shim.
+  - `tests/fuzz/quic`, libFuzzer over `quic_shim.c` and ngtcp2: a client and a server in one process, with real
+    packet protection or null protection (M10, "Fuzzing the QUIC shim", 2026-11-11).
+    - It found one assertion reachable from a peer's Initial. Only a guess of 160 random bits reaches it in
+      web_quic, and the shim now guards it.
+    - Its runs so far are only 10 minutes. Its 24 CPU-hours come from the nightly job.
   - From Web ADR 0015 §3, every harness runs nightly in GitHub Actions (`.github/workflows/fuzz.yml`).
-  - `quic_shim.c` has no harness yet: its input passes packet protection first. This is a known gap, and a good
-    place for the audit to look.
 - **Conformance:**
   - h2spec 145/145 over TLS (M7);
   - Autobahn, 517 cases as server and as client: 514 OK, 3 informational, none failed (M6);
@@ -101,7 +104,8 @@ python3 tools/run_tests.py --sanitize --alloc-sweep --cancel-sweep   # every pac
 (cd tests/fuzz/http1 && ceesafec build --cflag -fsanitize=address,undefined && CW_FUZZ_SECONDS=60 ./out/fuzz_http1)
 ```
 
-The libFuzzer harnesses' build lines are at the top of `tests/fuzz/tls/fuzz_shim.c` and `tests/fuzz/h3/fuzz_h3.c`.
+The libFuzzer harnesses' build lines are at the top of `tests/fuzz/tls/fuzz_shim.c`, `tests/fuzz/h3/fuzz_h3.c` and
+`tests/fuzz/quic/fuzz_quic.c`.
 
 ## 7. What the audit returns
 
