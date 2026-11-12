@@ -80,7 +80,11 @@ Each item has its date, command and result in `docs/milestones/`.
     packet protection or null protection (M10, "Fuzzing the QUIC shim", 2026-11-11).
     - It found one assertion reachable from a peer's Initial. Only a guess of 160 random bits reaches it in
       web_quic, and the shim now guards it.
-    - Its runs so far are only 10 minutes. Its 24 CPU-hours come from the nightly job.
+    - Since 2026-11-12 it also resumes with tickets and sends 0-RTT, and checks OpenSSL's single-use tickets. It
+      found a use-after-free in the shim, which freed a reset stream's bytes before ngtcp2 was done with them, and an
+      ngtcp2 assertion reachable through `qs_ticket`. Both are fixed (M10, "Resumption and 0-RTT in the QUIC fuzzer").
+      The first is reported privately to ngtcp2.
+    - Its runs so far are only 20 minutes. Its 24 CPU-hours come from the nightly job.
   - From Web ADR 0015 §3, every harness runs nightly in GitHub Actions (`.github/workflows/fuzz.yml`).
 - **Conformance:**
   - h2spec 145/145 over TLS (M7);

@@ -439,8 +439,9 @@ Safety: as `nextTimeout`.
 public fn earlyDataAccepted(borrow this) -> bool
 ```
 
-After the handshake, whether the server accepted this client's early data. When it did not, what was sent
-early was not delivered, and must be sent again.
+After the handshake, whether the server accepted this client's early data. When it did not, the server
+ignored it, and QUIC sends those bytes again after the handshake by itself: writing them again would send them
+twice (tests/fuzz/quic's stream data check).
 Safety: as `nextTimeout`.
 
 ### QuicConnection.retried

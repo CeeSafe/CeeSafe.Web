@@ -24,7 +24,8 @@
  *
  * The input, after its first byte (bits: 0 null protection, 1 the listener requires a Retry, 2 and 3 the server's
  * and the client's stream credit given back only by qs_consume, 4 the first event of each drain read with a 16-byte
- * buffer, for QS_EV_TOO_SMALL, 5 a 2-byte number follows: that allocation fails), is a sequence of operations, each
+ * buffer, for QS_EV_TOO_SMALL, 5 a 2-byte number follows: that allocation fails, 6 the server accepts 0-RTT, as
+ * web_quic's allowEarlyData makes it), is a sequence of operations, each
  * a byte whose low 4 bits choose it and whose high 4 bits are its argument `a` (bit 0 of `a`: the direction, client
  * to server or back, or the side):
  *   0  deliver up to (a >> 1) + 1 datagrams        8  inject a datagram: a length byte, then the bytes
@@ -40,8 +41,20 @@
  *      byte, the frames), to that side's ID           byte): qs_packet_dcid, qs_version_negotiation, qs_retry_check,
  *   7  the same with a long header: a bits 1-2 its    qs_stateless_reset
  *      type (Initial, 0-RTT, Handshake), padded    15 ask a side what web_quic asks: qs_all_acked, qs_pto,
- *      to 1200 bytes                                   qs_peer_close, qs_alpn, qs_ticket and the rest
+ *      to 1200 bytes                                   qs_peer_close, qs_alpn, qs_ticket and the rest; on
+ *                                                      the client with a bit 1 set, reconnect instead (below)
  * After each operation, both sides write all they have (qs_write) and drain their events and ID changes.
+ * Reconnecting (op 15, a = 3, 7, 11 or 15) is what a client of web_quic does on its next visit: it keeps the ticket
+ * qs_ticket gives, both connections are freed, and a new client resumes with qs_resume from the newest ticket (a bit
+ * 2: the first one, again: a replay; a bit 3: none, a full handshake). Streams it opens and writes before its
+ * handshake ends go out as 0-RTT. Invariants of resumption, checked as each connection ends:
+ *   - after both handshakes, the client and the server agree on qs_resumed and on qs_early_accepted;
+ *   - a server without 0-RTT never accepts early data, and early data is accepted only on a resumed connection;
+ *   - with 0-RTT on, a ticket resumes at most one connection: OpenSSL's tickets are single-use then, its replay
+ *     protection (Web ADR 0014 §3.7 and amendment 5 item 5), and the replay gets a full handshake;
+ *   - qs_resume takes a ticket of qs_ticket's: 1 when the server allows 0-RTT, else 0.
+ * Early data the server rejects is sent again by ngtcp2 in 1-RTT, so the stream data check above holds through it.
+ * The server's session cache, where the single-use tickets are, is emptied before each input.
  * Time and randomness are the input's: the clock starts at a fixed value, and OpenSSL's random bytes (and so ngtcp2's
  * and the handshake's) come from a generator seeded the same for every input, so an input replays exactly.
  *
@@ -241,7 +254,18 @@ static side cl, sv;
 static link to_server, to_client; /* to_server: datagrams the client sent */
 static uint64_t now;
 static uint8_t retry_key[32], retry_scid[20], client_dcid[18];
-static int require_retry, small_first, server_manual;
+static int require_retry, small_first, server_manual, client_manual, server_early;
+
+/* Resumption tickets the client has been given (qs_ticket), each once; `used`: a connection resumed with it. */
+typedef struct ticket {
+    uint8_t b[16384];
+    size_t len;
+    int used;
+} ticket;
+#define TICKETS 8
+static ticket tickets[TICKETS];
+static int ntickets;
+static int cl_from; /* the ticket the client's connection resumed from, or -1 */
 static const uint8_t *in;
 static size_t in_len, at;
 static uint8_t pattern[2u * 1024u * 1024u + 64u];
@@ -672,6 +696,104 @@ static void query(side *x) {
     }
 }
 
+static void side_init(side *x, int server);
+
+/* The client's ticket, kept once (a new one, or one it already has). */
+static void keep_ticket(void) {
+    static uint8_t buf[sizeof tickets[0].b];
+    if (!cl.c) {
+        return;
+    }
+    int64_t n = qs_ticket(cl.c, buf, sizeof buf);
+    if (n < 0 || n > (int64_t)sizeof buf) {
+        broken("qs_ticket", (long)n, 0);
+    }
+    if (n == 0) {
+        return;
+    }
+    for (int i = 0; i < ntickets; i++) {
+        if (tickets[i].len == (size_t)n && memcmp(tickets[i].b, buf, (size_t)n) == 0) {
+            return;
+        }
+    }
+    if (ntickets == TICKETS) {
+        return;
+    }
+    memcpy(tickets[ntickets].b, buf, (size_t)n);
+    tickets[ntickets].len = (size_t)n;
+    tickets[ntickets].used = 0;
+    ntickets++;
+}
+
+/* The invariants of resumption, as a pair of connections ends. */
+static void settle(void) {
+    if (!sv.c) {
+        return;
+    }
+    int resumed = qs_resumed(sv.c), early = qs_early_accepted(sv.c);
+    TRACE("  settle: from ticket %d of %d, resumed %d, early data accepted %d\n", cl_from, ntickets, resumed, early);
+    if (early && (!server_early || !resumed)) {
+        broken("early data accepted without 0-RTT on, or on a full handshake", server_early, resumed);
+    }
+    if (cl.c && qs_handshake_done(cl.c) && qs_handshake_done(sv.c) &&
+        (qs_resumed(cl.c) != resumed || qs_early_accepted(cl.c) != early)) {
+        broken("the client and the server disagree on resumption or early data", qs_resumed(cl.c) * 2 + resumed,
+               qs_early_accepted(cl.c) * 2 + early);
+    }
+    if (resumed && cl_from >= 0) {
+        if (server_early && tickets[cl_from].used) {
+            broken("a single-use ticket resumed a second connection", cl_from, early);
+        }
+        tickets[cl_from].used = 1;
+    }
+}
+
+/* A new client connection, resumed from tickets[from] unless `from` is -1; 0 if it could not be made. */
+static int client_new(int from) {
+    int32_t error = 0;
+    cl.c = qs_conn_client(client_tls, (const uint8_t *)"localhost", 9, cl.local, sv.local, client_dcid,
+                          sizeof client_dcid, cl.scid, sizeof cl.scid, cl.secret, now, &error);
+    if (!cl.c) {
+        if (error >= 0 && error != -1) {
+            broken("qs_conn_client failed without an error", error, 0);
+        }
+        return 0;
+    }
+    if (client_manual) {
+        qs_set_manual_credit(cl.c);
+    }
+    cl_from = -1;
+    if (from >= 0) {
+        int32_t r = qs_resume(cl.c, tickets[from].b, tickets[from].len);
+        if (r < -1 || r > 1 || (fz_fail_at == 0 && r != server_early)) {
+            broken("qs_resume on a ticket of qs_ticket's", r, server_early);
+        }
+        if (r >= 0) {
+            cl_from = from;
+        }
+    }
+    TRACE("  client: new connection, from ticket %d\n", cl_from);
+    pump(&cl);
+    return 1;
+}
+
+/* The client comes back: both connections go, and a new client resumes (a bit 2: from the first ticket; a bit 3:
+   from none). */
+static void reconnect(unsigned a) {
+    keep_ticket();
+    settle();
+    qs_conn_free(cl.c);
+    qs_conn_free(sv.c);
+    link_clear(&to_server);
+    link_clear(&to_client);
+    side_init(&cl, 0);
+    side_init(&sv, 1);
+    RAND_bytes(client_dcid, sizeof client_dcid);
+    cl.pn = sv.pn = 1u << 20;
+    int from = (a & 8u) || ntickets == 0 ? -1 : (a & 4u) ? 0 : ntickets - 1;
+    (void)client_new(from);
+}
+
 static void step(void) {
     unsigned op = take();
     unsigned a = op >> 4;
@@ -873,7 +995,11 @@ static void step(void) {
         break;
     }
     default:
-        query(x);
+        if (x == &cl && (a & 2u)) {
+            reconnect(a);
+        } else {
+            query(x);
+        }
         break;
     }
     pump(&cl);
@@ -910,6 +1036,14 @@ static void run(const uint8_t *data, size_t size) {
     side_init(&cl, 0);
     side_init(&sv, 1);
     server_manual = (mode & 4u) != 0;
+    client_manual = (mode & 8u) != 0;
+    server_early = (mode & 64u) != 0;
+    ntickets = 0;
+    cl_from = -1;
+    SSL_CTX_flush_sessions_ex(server_cfg, 0); /* the single-use tickets of the last input */
+    if (SSL_CTX_sess_number(server_cfg) != 0) {
+        broken("the server's session cache did not empty", SSL_CTX_sess_number(server_cfg), 0);
+    }
     RAND_bytes(retry_key, sizeof retry_key);
     RAND_bytes(retry_scid, sizeof retry_scid);
     RAND_bytes(client_dcid, sizeof client_dcid);
@@ -918,20 +1052,15 @@ static void run(const uint8_t *data, size_t size) {
     server_tls = qs_tls_new(server_cfg, 1);
     client_tls = qs_tls_new(client_cfg, 0);
     if (server_tls && client_tls) {
-        int32_t error = 0;
-        cl.c = qs_conn_client(client_tls, (const uint8_t *)"localhost", 9, cl.local, sv.local, client_dcid,
-                              sizeof client_dcid, cl.scid, sizeof cl.scid, cl.secret, now, &error);
-        if (cl.c) {
-            if (mode & 8u) {
-                qs_set_manual_credit(cl.c);
-            }
-            pump(&cl);
+        if (server_early) {
+            qs_tls_allow_early(server_tls);
+        }
+        if (client_new(-1)) {
             for (int steps = 0; more() && steps < 4096; steps++) {
                 step();
             }
-        } else if (error >= 0 && error != -1) {
-            broken("qs_conn_client failed without an error", error, 0);
         }
+        settle();
     }
     qs_conn_free(cl.c);
     qs_conn_free(sv.c);
@@ -1020,6 +1149,16 @@ static const uint8_t MIGRATE[] = {OP(12, 0), 0x07,      TO_SERVER, TO_CLIENT, TO
                                   OP(9, 1),  OP(10, 1), 0x02,      0x05,      TO_SERVER, TO_CLIENT,
                                   OP(5, 0),  0x40,      TO_SERVER, TO_CLIENT};
 static const uint8_t CLOSE[] = {OP(13, 3), 0x2A, TO_SERVER, TO_CLIENT, OP(5, 2), 0x40, TO_SERVER, TO_CLIENT};
+/* After STREAMS_ (the ticket has come): the client comes back with it and writes 1 KiB and FIN before its handshake
+   ends, in 0-RTT if the server allows it; then once more with the first ticket, a replay, which writes early too. */
+static const uint8_t RESUME[] = {
+    OP(15, 3), OP(9, 1),  OP(10, 3), 0x00,      0x0F, /* the newest ticket; a stream, 1 KiB and FIN, early */
+    TO_SERVER, TO_CLIENT, TO_SERVER, TO_CLIENT, TO_SERVER, TO_CLIENT, OP(5, 0), 0x10, TO_SERVER, TO_CLIENT,
+    OP(10, 2), 0x00,      0x01,      TO_SERVER, TO_CLIENT, TO_SERVER, TO_CLIENT, /* the server answers on it */
+    OP(15, 7), OP(9, 1),  OP(10, 3), 0x00,      0x0F, /* the first ticket again: a replay */
+    TO_SERVER, TO_CLIENT, TO_SERVER, TO_CLIENT, TO_SERVER, TO_CLIENT, OP(5, 0), 0x10, TO_SERVER, TO_CLIENT,
+    TO_SERVER, TO_CLIENT, OP(15, 0),  OP(15, 1),
+};
 /* With null protection: a short-header packet to the server with PING, MAX_DATA, a STREAM frame with FIN on stream
    8, RESET_STREAM and STOP_SENDING on stream 12, and DATA_BLOCKED. */
 static const uint8_t FRAMES[] = {0x01, 0x10, 0x44, 0x00, 0x0B, 0x08, 0x04, 'a', 'b', 'c', 'd',
@@ -1061,6 +1200,10 @@ static void seeds(const char *dir) {
     seed(dir, "credit", 0x0C, STREAMS_, sizeof STREAMS_, LOSS, sizeof LOSS);
     seed(dir, "null-streams", 0x01, STREAMS_, sizeof STREAMS_, none, 0);
     seed(dir, "null-frames", 0x11, craft_short, sizeof craft_short, STREAMS_, sizeof STREAMS_);
+    seed(dir, "resume", 0x00, STREAMS_, sizeof STREAMS_, RESUME, sizeof RESUME);
+    seed(dir, "early", 0x40, STREAMS_, sizeof STREAMS_, RESUME, sizeof RESUME);
+    seed(dir, "early-retry", 0x42, STREAMS_, sizeof STREAMS_, RESUME, sizeof RESUME);
+    seed(dir, "early-null", 0x41, STREAMS_, sizeof STREAMS_, RESUME, sizeof RESUME);
 }
 
 int main(int argc, char **argv) {
