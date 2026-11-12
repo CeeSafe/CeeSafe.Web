@@ -259,6 +259,39 @@ async fn large_responses() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// A write at least as large as the 16 KiB buffer goes out without a copy once the buffer is empty, framed as a
+/// buffered one. `/huge` writes "ab", then 40000 bytes: the first fills the buffer with "ab" and 16382 of them, sent
+/// as one chunk of 0x4000; the other 23618 (0x5c42) go out directly as the next chunk.
+@test
+async fn large_writes_go_out_directly() -> Result<void, TestFailure> {
+    var x = Vector<u8>.create();
+    for (i in 0..40000) {
+        match (x.push(120)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("x")); }
+        }
+    }
+    let xs = x.view();
+    var chunked = Vector<u8>.create();
+    Check.isTrue(pushText(mut chunked, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ntransfer-encoding: chunked\r\n\r\n4000\r\nab") &&
+        pushBytes(mut chunked, xs[0..16382]) && pushText(mut chunked, "\r\n5c42\r\n") &&
+        pushBytes(mut chunked, xs[16382..]) && pushText(mut chunked, "\r\n0\r\n\r\n"), "e")?;
+    let huge = await run("GET /huge HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    Check.equalBytes(chunked.view(), huge.output.view())?;
+    var known = Vector<u8>.create();
+    Check.isTrue(pushText(mut known, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 40002\r\n\r\nab") &&
+        pushBytes(mut known, xs), "e")?;
+    let declared = await run("GET /hugeknown HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    Check.equalBytes(known.view(), declared.output.view())?;
+    // HEAD: the head GET would send, and no content (RFC 9110 §9.3.2), then the next request's response.
+    var headed = Vector<u8>.create();
+    Check.isTrue(pushText(mut headed, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 40002\r\n\r\n"), "e")?;
+    echoed("/a", "", mut headed)?;
+    let head = await run("HEAD /hugeknown HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    Check.equalBytes(headed.view(), head.output.view())?;
+    return Ok();
+}
+
 /// With the default limits every response carries `Date` (RFC 9110 §6.6.1) right after the status line: an
 /// IMF-fixdate of a second of the wall clock while the requests were served. The rejection carries it too.
 @test
