@@ -72,10 +72,11 @@ Each item has its date, command and result in `docs/milestones/`.
   - `tests/fuzz/h2`, server and client roles with HPACK: 24 CPU-hours twice, clean (M8).
   - `tests/fuzz/proxy`: 24 CPU-hours, 1.1 billion cases, clean (M8).
   - `tests/fuzz/tls`, libFuzzer over `tls_shim.c`: 2 workers × 12 h, clean (M4).
-  - `tests/fuzz/ws`: only a 120-second run is recorded (M6). It never had its 24 CPU-hours, so the first nightly
-    runs are its first long ones.
+  - `tests/fuzz/ws`: a 120-second run (M6), then the first nightly run: 4 seeds × 5 h, about 20 CPU-hours and 21
+    million cases, clean and with no leak (M10, "The first nightly fuzz run", 2026-11-12).
   - `tests/fuzz/h3`, libFuzzer over `h3_shim.c`: 24 CPU-hours (M10, 2026-11-10 and 11). It found four misuses in
-    the harness's own call order and no defect in the shim.
+    the harness's own call order and no defect in the shim. The first nightly run found a fifth, the second head
+    of a request with trailers (M10, "The first nightly fuzz run").
   - `tests/fuzz/quic`, libFuzzer over `quic_shim.c` and ngtcp2: a client and a server in one process, with real
     packet protection or null protection (M10, "Fuzzing the QUIC shim", 2026-11-11).
     - It found one assertion reachable from a peer's Initial. Only a guess of 160 random bits reaches it in
