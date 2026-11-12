@@ -612,8 +612,9 @@ public struct QuicConnection {
     /// Safety: as `nextTimeout`.
     public fn resumed(borrow this) -> bool => unsafe { qs_resumed(this.raw) } == 1;
 
-    /// After the handshake, whether the server accepted this client's early data. When it did not, what was sent
-    /// early was not delivered, and must be sent again.
+    /// After the handshake, whether the server accepted this client's early data. When it did not, the server
+    /// ignored it, and QUIC sends those bytes again after the handshake by itself: writing them again would send them
+    /// twice (tests/fuzz/quic's stream data check).
     /// Safety: as `nextTimeout`.
     public fn earlyDataAccepted(borrow this) -> bool => unsafe { qs_early_accepted(this.raw) } == 1;
 

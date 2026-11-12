@@ -338,6 +338,7 @@ typedef struct qs_stream {
     uint64_t sent;         /* stream offset handed to ngtcp2 so far */
     int fin;               /* the application ended the stream */
     int fin_sent;
+    int reset;             /* our sending side was reset: nothing more is taken or sent, but the bytes stay */
     struct qs_stream *next;
 } qs_stream;
 
@@ -683,7 +684,10 @@ void qs_tls_allow_early(qs_tls *t) {
    §7.4.1). Its length, or 0 when there is no resumable session yet (the server's NewSessionTicket comes after the
    handshake). */
 int64_t qs_ticket(qs_conn *c, uint8_t *out, size_t cap) {
-    if (!c->ssl || cap < 4) {
+    /* Not before the handshake ends: a resumed connection's session is resumable from qs_resume on, but this
+       connection's transport parameters from the server, which the ticket carries, come later, and ngtcp2 asserts
+       that it has them (tests/fuzz/quic, which found it). */
+    if (!c->ssl || cap < 4 || !ngtcp2_conn_get_handshake_completed(c->conn)) {
         return 0;
     }
     SSL_SESSION *session = SSL_get1_session(c->ssl);
@@ -748,6 +752,9 @@ int32_t qs_resume(qs_conn *c, const uint8_t *ticket, size_t len) {
    amendment 5 item 6). */
 int32_t qs_all_acked(qs_conn *c) {
     for (qs_stream *s = c->streams; s; s = s->next) {
+        if (s->reset) {
+            continue; /* its bytes are never to arrive; the RESET_STREAM is in bytes_in_flight below */
+        }
         if (s->acked < s->end || s->sent < s->end || (s->fin && !s->fin_sent)) {
             return 0;
         }
@@ -980,7 +987,7 @@ static int64_t qs_write_one(qs_conn *c, uint8_t *out, size_t cap, uint64_t now, 
     ngtcp2_pkt_info pi;
     memset(&pi, 0, sizeof pi);
     for (qs_stream *s = c->streams; s; s = s->next) {
-        if (s->sent == s->end && !(s->fin && !s->fin_sent)) {
+        if (s->reset || (s->sent == s->end && !(s->fin && !s->fin_sent))) {
             continue;
         }
         /* The unsent bytes, from the chunk holding `sent`, up to QS_VECS chunks. */
@@ -1139,7 +1146,7 @@ void qs_consume(qs_conn *c, int64_t stream, uint64_t n) {
    qs_write. A FIN is taken only with the last byte. */
 int64_t qs_stream_write(qs_conn *c, int64_t stream, const uint8_t *bytes, size_t len, int32_t fin) {
     qs_stream *s = qs_stream_get(c, stream);
-    if (!s || s->fin) {
+    if (!s || s->fin || s->reset) {
         return -1;
     }
     uint64_t held = s->end - s->base;
@@ -1182,18 +1189,28 @@ int64_t qs_stream_write(qs_conn *c, int64_t stream, const uint8_t *bytes, size_t
     return (int64_t)take;
 }
 
+/* After a reset, our bytes on `stream` are held, not freed, until ngtcp2 closes the stream (cb_stream_close) or the
+   connection goes. ngtcp2_conn_writev_stream's documentation asks for that: the data is kept until it is
+   acknowledged or the stream is closed, and a reset closes neither. Freed at the reset, they could be read after
+   free (tests/fuzz/quic, which found it). */
+static void qs_stream_mark_reset(qs_conn *c, int64_t stream) {
+    qs_stream *s = qs_find(c, stream);
+    if (s) {
+        s->reset = 1;
+    }
+}
+
 /* Resets our sending side of `stream` with the application's `code`, and asks the peer to stop sending. */
 int32_t qs_stream_reset(qs_conn *c, int64_t stream, uint64_t code) {
-    /* ngtcp2 first, then the bytes: after the reset it sends none of them again. */
     int rv = ngtcp2_conn_shutdown_stream(c->conn, 0, stream, code);
-    qs_stream_drop(c, stream);
+    qs_stream_mark_reset(c, stream);
     return rv;
 }
 
 /* Resets only our sending side of `stream` (RESET_STREAM), leaving its receiving side open. */
 int32_t qs_stream_reset_sending(qs_conn *c, int64_t stream, uint64_t code) {
     int rv = ngtcp2_conn_shutdown_stream_write(c->conn, 0, stream, code);
-    qs_stream_drop(c, stream);
+    qs_stream_mark_reset(c, stream);
     return rv;
 }
 
