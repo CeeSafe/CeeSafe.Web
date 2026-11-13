@@ -11,6 +11,9 @@
 //   - Without the connection's keeping (`QuicLink.take`), ngtcp2 discards them: they are released after the first
 //     Initial datagram, before the second has completed the ClientHello and given the 0-RTT keys.
 // Either way the client sends their bytes again after the handshake, in 1-RTT, where they are not early.
+// These expectations need a path that loses none of the client's first datagrams, as loopback is. A lost 0-RTT
+// datagram is sent again after the handshake, and its bytes and every byte after them on the stream are then
+// delivered as not early (docs/milestones/M10.md, "Amendment 9 under netem").
 // It uses `Peer`, `step` and `handshake` from reset.cee and `pattern` from serve.cee.
 import web_core;
 
