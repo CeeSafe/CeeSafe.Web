@@ -707,7 +707,8 @@ package's own client.
      the connection.
    - So the released datagrams were discarded, and the client sent their bytes again after the handshake, in 1-RTT.
      Nothing was lost, but nothing held came early: of 4,000 early bytes, about 3,600 arrived late.
-   - The same happens without any reordering of the 0-RTT, when the second Initial datagram is lost or late.
+   - The same happens without any reordering of the 0-RTT, when the second Initial datagram is lost or late: the
+     test's third order.
 2. **Fix: the connection keeps 0-RTT datagrams until the handshake is done** (`QuicLink.take`).
    - A 0-RTT datagram that comes before the handshake is done is read, and also kept: at most 32 (`heldMost`), per
      connection.

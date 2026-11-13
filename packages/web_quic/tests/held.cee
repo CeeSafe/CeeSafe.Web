@@ -1,11 +1,12 @@
 // 0-RTT that arrives before its Initial (RFC 9000 §5.2.2, Web ADR 0014 amendment 6 item 4 and amendment 9) over real
 // UDP. A client takes a ticket from a QuicServer that allows early data, then resumes with 4,000 bytes written on a
 // stream before its first datagram. Its datagrams are the Initial (two datagrams when the ClientHello is long) and,
-// after it, 0-RTT packets alone. It does this twice: once sending them in that order, and once sending the 0-RTT
-// datagrams first and the Initial 50 ms later, as a path that reorders them would.
+// after it, 0-RTT packets alone. It does this three times: sending them in that order; sending the 0-RTT datagrams
+// first and the Initial 50 ms later, as a path that reorders them would; and sending the Initial's last datagram 50 ms
+// after everything else, as when it is lost and sent again.
 // The server's application counts the bytes that came as early data (`QuicEvent.EarlyData`) and those that did not,
 // and answers with the counts on the same stream.
-// Expected, in either order: every byte came early, and the client sees its early data accepted.
+// Expected, in every order: every byte came early, and the client sees its early data accepted.
 //   - Without the listener's holding, it drops the 0-RTT datagrams that come first (no connection has their ID yet).
 //   - Without the connection's keeping (`QuicLink.take`), ngtcp2 discards them: they are released after the first
 //     Initial datagram, before the second has completed the ClientHello and given the 0-RTT keys.
@@ -76,6 +77,16 @@ fn getU64(bytes: Slice<u8>) -> u64 {
     return v;
 }
 
+/// The order the resumed client's first datagrams are sent in.
+enum Order {
+    /// The client's: the Initial, then the 0-RTT.
+    AsSent,
+    /// The 0-RTT, and the Initial 50 ms later.
+    EarlyFirst,
+    /// The Initial's last datagram 50 ms after everything else. With an Initial of one datagram, this is `EarlyFirst`.
+    LastInitialLate,
+}
+
 /// What the resumed connection learned.
 struct Tallied {
     /// The server's answer, null if none came within 5 s.
@@ -115,7 +126,7 @@ fn startsWithZeroRtt(datagram: Slice<u8>) -> bool =>
 
 /// The resumed connection: the early write, its datagrams sent with the Initial last, then turns until the server's
 /// answer has come.
-async fn resumedWith(p: borrow mut Peer, ticket: Slice<u8>, reordered: bool) -> Result<Tallied, TestFailure> {
+async fn resumedWith(p: borrow mut Peer, ticket: Slice<u8>, order: Order) -> Result<Tallied, TestFailure> {
     Check.isTrue(ok(p.conn.resume(ticket), "the resumption")?, "the ticket offers 0-RTT")?;
     var data = Vector<u8>.create();
     if (data.resize(heldBytes(), 0).isErr()) {
@@ -155,16 +166,23 @@ async fn resumedWith(p: borrow mut Peer, ticket: Slice<u8>, reordered: bool) -> 
     }
     Check.isTrue(initials.length >= 1, "the client's Initial")?;
     Check.isTrue(early.length >= 2, "the early write needs 0-RTT datagrams after the Initial")?;
-    if (reordered) {
-        await sendAll(p, early.view())?;
-        match (await Timer.sleep(50)) {
-            Ok() => {}
-            Err(_) => { return Err(TestFailure.create("waiting")); }
+    match (order) {
+        Order.AsSent => {
+            await sendAll(p, initials.view())?;
+            await sendAll(p, early.view())?;
         }
-        await sendAll(p, initials.view())?;
-    } else {
-        await sendAll(p, initials.view())?;
-        await sendAll(p, early.view())?;
+        Order.EarlyFirst => {
+            await sendAll(p, early.view())?;
+            await pause(50)?;
+            await sendAll(p, initials.view())?;
+        }
+        Order.LastInitialLate => {
+            let last = initials.length - 1;
+            await sendAll(p, initials.view()[0..last])?;
+            await sendAll(p, early.view())?;
+            await pause(50)?;
+            await sendAll(p, initials.view()[last..])?;
+        }
     }
     var answer = Vector<u8>.create();
     var ended = false;
@@ -196,6 +214,13 @@ async fn resumedWith(p: borrow mut Peer, ticket: Slice<u8>, reordered: bool) -> 
         accepted: accepted,
         before: early.length,
     });
+}
+
+async fn pause(ms: u64) -> Result<void, TestFailure> {
+    match (await Timer.sleep(ms)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(TestFailure.create("waiting")); }
+    }
 }
 
 async fn sendAll(p: borrow Peer, datagrams: Slice<Vector<u8>>) -> Result<void, TestFailure> {
@@ -245,26 +270,28 @@ fn peerTo(clientTls: borrow QuicTls, server: SocketAddress) -> Result<Peer, Test
 }
 
 /// A connection for a ticket, then the resumed one.
-async fn heldClient(clientTls: borrow QuicTls, server: SocketAddress, reordered: bool) -> Result<Tallied, TestFailure> {
+async fn heldClient(clientTls: borrow QuicTls, server: SocketAddress, order: Order) -> Result<Tallied, TestFailure> {
     var one = peerTo(clientTls, server)?;
     let ticket = await ticketOver(mut one)?;
     var two = peerTo(clientTls, server)?;
-    return await resumedWith(mut two, ticket.view(), reordered);
+    return await resumedWith(mut two, ticket.view(), order);
 }
 
-/// What the server answered with the datagrams in the client's order, and with the 0-RTT first.
+/// What the server answered for each order.
 struct Both {
-    inOrder: Tallied;
-    reordered: Tallied;
+    asSent: Tallied;
+    earlyFirst: Tallied;
+    lastInitialLate: Tallied;
 }
 
 async fn bothClients(clientTls: borrow QuicTls, server: SocketAddress) -> Result<Both, TestFailure> {
-    let inOrder = await heldClient(clientTls, server, false)?;
-    let reordered = await heldClient(clientTls, server, true)?;
-    return Ok(Both { inOrder: inOrder, reordered: reordered });
+    let asSent = await heldClient(clientTls, server, Order.AsSent)?;
+    let earlyFirst = await heldClient(clientTls, server, Order.EarlyFirst)?;
+    let lastInitialLate = await heldClient(clientTls, server, Order.LastInitialLate)?;
+    return Ok(Both { asSent: asSent, earlyFirst: earlyFirst, lastInitialLate: lastInitialLate });
 }
 
-/// Expected of either order: every byte early and right, and the early data accepted.
+/// Expected of every order: every byte early and right, and the early data accepted.
 fn allEarly(t: borrow Tallied) -> Result<void, TestFailure> {
     let early = match (t.early) {
         Some(n) => n,
@@ -331,7 +358,8 @@ async fn early_data_before_its_initial_is_held() -> Result<void, TestFailure> {
         },
         Err(_) => { return Err(TestFailure.create("the race")); },
     };
-    Check.isTrue(allEarly(both.inOrder).isOk(), "in the client's order, every byte came early")?;
-    allEarly(both.reordered)?;
+    Check.isTrue(allEarly(both.asSent).isOk(), "in the client's order, every byte came early")?;
+    Check.isTrue(allEarly(both.lastInitialLate).isOk(), "with the Initial's last datagram late, every byte came early")?;
+    allEarly(both.earlyFirst)?;
     return Ok();
 }
