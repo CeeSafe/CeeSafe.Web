@@ -1089,6 +1089,7 @@ int32_t qs_error_kind(int32_t code) {
     case NGTCP2_ERR_NOMEM: return 4;
     case NGTCP2_ERR_STREAM_ID_BLOCKED: return 5;
     case NGTCP2_ERR_INVALID_ARGUMENT: return 6;
+    case NGTCP2_ERR_RETRY: return 7;
     default: return 0;
     }
 }

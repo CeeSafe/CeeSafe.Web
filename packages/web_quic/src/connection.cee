@@ -154,6 +154,11 @@ public enum QuicError {
     Failed(i32),
     /// A certificate, key, trust list or ALPN list was refused (`QuicTls.serverFromPem`, `clientFromPem`).
     Tls,
+    /// A server connection's first datagram does not begin the client's ClientHello (its start was lost, or comes
+    /// later), and no token has validated the client's address: answer the Initial with a Retry
+    /// (`QuicRetry.check` with `require`) and drop the connection, which keeps nothing of an unvalidated client
+    /// (RFC 9000 §8.1). The client then sends its whole Initial again at once, not at its probe timeout.
+    RetryWanted,
 }
 
 /// What happened on a connection, from `nextEvent`.
@@ -469,7 +474,8 @@ public struct QuicConnection {
         return Ok(QuicConnection { raw: raw });
     }
 
-    /// Feeds one datagram from `remote`, with its ECN mark.
+    /// Feeds one datagram from `remote`, with its ECN mark. `QuicError.RetryWanted` comes only from a server
+    /// connection's first datagram.
     /// Safety: the shim reads the datagram and the address during the call only.
     public fn feed(
         borrow mut this,
@@ -747,6 +753,7 @@ struct QuicErrors {
         4 => QuicError.NoMemory,
         5 => QuicError.StreamsBlocked,
         6 => QuicError.NotInitial,
+        7 => QuicError.RetryWanted,
         _ => QuicError.Failed(code),
     };
 

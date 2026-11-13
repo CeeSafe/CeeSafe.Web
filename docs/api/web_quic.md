@@ -32,6 +32,7 @@ public enum QuicError {
     BufferTooSmall(usize),
     Failed(i32),
     Tls,
+    RetryWanted,
 }
 ```
 
@@ -298,7 +299,8 @@ public fn feed(
 ) -> Result<void, QuicError>
 ```
 
-Feeds one datagram from `remote`, with its ECN mark.
+Feeds one datagram from `remote`, with its ECN mark. `QuicError.RetryWanted` comes only from a server
+connection's first datagram.
 Safety: the shim reads the datagram and the address during the call only.
 
 ### QuicConnection.datagram

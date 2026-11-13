@@ -88,6 +88,10 @@ enum Order {
     EarlyFirst,
     /// The Initial's last datagram 50 ms after everything else. With an Initial of one datagram, this is `EarlyFirst`.
     LastInitialLate,
+    /// Everything but the Initial's first datagram, which is never sent: lost. It needs an Initial of two datagrams.
+    FirstInitialLost,
+    /// The Initial's first datagram 50 ms after everything else. It needs an Initial of two datagrams.
+    FirstInitialLate,
 }
 
 /// What the resumed connection learned.
@@ -100,6 +104,10 @@ struct Tallied {
     accepted: bool;
     /// How many datagrams the client sent before its Initial.
     before: usize;
+    /// Whether the server sent the client a Retry (`QuicConnection.retried`).
+    retried: bool;
+    /// Milliseconds from the client's first datagram to the server's answer, or to giving up.
+    ms: u64;
 }
 
 /// The first connection: a handshake, then turns until the server's ticket has come.
@@ -169,7 +177,20 @@ async fn resumedWith(p: borrow mut Peer, ticket: Slice<u8>, order: Order) -> Res
     }
     Check.isTrue(initials.length >= 1, "the client's Initial")?;
     Check.isTrue(early.length >= 2, "the early write needs 0-RTT datagrams after the Initial")?;
+    let began = Clock.monotonicNanos();
     match (order) {
+        Order.FirstInitialLost => {
+            Check.isTrue(initials.length >= 2, "an Initial of two datagrams")?;
+            await sendAll(p, initials.view()[1..])?;
+            await sendAll(p, early.view())?;
+        }
+        Order.FirstInitialLate => {
+            Check.isTrue(initials.length >= 2, "an Initial of two datagrams")?;
+            await sendAll(p, initials.view()[1..])?;
+            await sendAll(p, early.view())?;
+            await pause(50)?;
+            await sendAll(p, initials.view()[0..1])?;
+        }
         Order.AsSent => {
             await sendAll(p, initials.view())?;
             await sendAll(p, early.view())?;
@@ -206,8 +227,18 @@ async fn resumedWith(p: borrow mut Peer, ticket: Slice<u8>, order: Order) -> Res
         }
     }
     let accepted = p.conn.earlyDataAccepted();
+    let retried = p.conn.retried();
+    let ms = (Clock.monotonicNanos() - began) / 1000000;
     if (!ended || answer.length != 24) {
-        return Ok(Tallied { early: null, late: 0, wrong: 0, accepted: accepted, before: early.length });
+        return Ok(Tallied {
+            early: null,
+            late: 0,
+            wrong: 0,
+            accepted: accepted,
+            before: early.length,
+            retried: retried,
+            ms: ms,
+        });
     }
     let a = answer.view();
     return Ok(Tallied {
@@ -216,6 +247,8 @@ async fn resumedWith(p: borrow mut Peer, ticket: Slice<u8>, order: Order) -> Res
         wrong: getU64(a[16..24]),
         accepted: accepted,
         before: early.length,
+        retried: retried,
+        ms: ms,
     });
 }
 
@@ -280,18 +313,22 @@ async fn heldClient(clientTls: borrow QuicTls, server: SocketAddress, order: Ord
     return await resumedWith(mut two, ticket.view(), order);
 }
 
-/// What the server answered for each order.
-struct Both {
-    asSent: Tallied;
-    earlyFirst: Tallied;
-    lastInitialLate: Tallied;
+/// What the server answered for each of three orders.
+struct Three {
+    first: Tallied;
+    second: Tallied;
+    third: Tallied;
 }
 
-async fn bothClients(clientTls: borrow QuicTls, server: SocketAddress) -> Result<Both, TestFailure> {
-    let asSent = await heldClient(clientTls, server, Order.AsSent)?;
-    let earlyFirst = await heldClient(clientTls, server, Order.EarlyFirst)?;
-    let lastInitialLate = await heldClient(clientTls, server, Order.LastInitialLate)?;
-    return Ok(Both { asSent: asSent, earlyFirst: earlyFirst, lastInitialLate: lastInitialLate });
+async fn threeClients(
+    clientTls: borrow QuicTls,
+    server: SocketAddress,
+    orders: [Order; 3],
+) -> Result<Three, TestFailure> {
+    let first = await heldClient(clientTls, server, orders[0])?;
+    let second = await heldClient(clientTls, server, orders[1])?;
+    let third = await heldClient(clientTls, server, orders[2])?;
+    return Ok(Three { first: first, second: second, third: third });
 }
 
 /// Expected of every order: every byte early and right, and the early data accepted.
@@ -309,12 +346,12 @@ fn allEarly(t: borrow Tallied) -> Result<void, TestFailure> {
 
 enum HeldEnding {
     Server,
-    Done(Both),
+    Done(Three),
     Failed(TestFailure),
 }
 
-@test
-async fn early_data_before_its_initial_is_held() -> Result<void, TestFailure> {
+/// A QuicServer that allows early data, and three resumed clients over real UDP, one for each of `orders`.
+async fn heldOver(orders: [Order; 3]) -> Result<Three, TestFailure> {
     Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
     let alpn = [Alpn.Http3];
     var serverTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
@@ -347,22 +384,60 @@ async fn early_data_before_its_initial_is_held() -> Result<void, TestFailure> {
             return Ok(HeldEnding.Server);
         },
         async () => {
-            match (await bothClients(clientTls, local)) {
+            match (await threeClients(clientTls, local, orders)) {
                 Ok(t) => { return Ok(HeldEnding.Done(t)); }
                 Err(e) => { return Ok(HeldEnding.Failed(e)); }
             }
         },
     );
-    let both = match (raced) {
+    return match (raced) {
         Ok(won) => match (won.value) {
-            HeldEnding.Done(b) => b,
-            HeldEnding.Failed(e) => { return Err(e); },
-            HeldEnding.Server => { return Err(TestFailure.create("the server ended")); },
+            HeldEnding.Done(t) => Ok(t),
+            HeldEnding.Failed(e) => Err(e),
+            HeldEnding.Server => Err(TestFailure.create("the server ended")),
         },
-        Err(_) => { return Err(TestFailure.create("the race")); },
+        Err(_) => Err(TestFailure.create("the race")),
     };
-    Check.isTrue(allEarly(both.asSent).isOk(), "in the client's order, every byte came early")?;
-    Check.isTrue(allEarly(both.lastInitialLate).isOk(), "with the Initial's last datagram late, every byte came early")?;
-    allEarly(both.earlyFirst)?;
+}
+
+@test
+async fn early_data_before_its_initial_is_held() -> Result<void, TestFailure> {
+    let both = await heldOver([Order.AsSent, Order.EarlyFirst, Order.LastInitialLate])?;
+    Check.isTrue(allEarly(both.first).isOk(), "in the client's order, every byte came early")?;
+    Check.isTrue(allEarly(both.third).isOk(), "with the Initial's last datagram late, every byte came early")?;
+    allEarly(both.second)?;
+    return Ok();
+}
+
+/// Expected when the server's first datagram of a connection does not begin the ClientHello: a Retry, and then
+/// every byte, right, early or not.
+fn retriedAndWhole(t: borrow Tallied) -> Result<void, TestFailure> {
+    Check.isTrue(t.retried, "the server sent a Retry")?;
+    let early = match (t.early) {
+        Some(n) => n,
+        null => { return Err(TestFailure.create("the server's answer, within 5 s")); },
+    };
+    Check.equalU64(0, t.wrong)?;
+    Check.equalU64(heldBytes() as u64, early + t.late)?;
+    return Ok();
+}
+
+// A ClientHello whose first datagram is lost or late (RFC 9000 §8.1; Web ADR 0014 amendment 10). The resumed
+// client's Initial is two datagrams. A server whose first datagram of a connection is the second cannot begin the
+// handshake, and ngtcp2 keeps nothing of a client whose address is not validated: it asks for a Retry
+// (`QuicError.RetryWanted`).
+// Expected: the client sees a Retry (`retried()`: the server's transport parameters carry its ID, §7.3), and the
+// server answers with all 4,000 bytes counted and right. Whether they are early is the client's choice after a Retry
+// (§8.1.2: it may send 0-RTT again), so only their sum is expected. With the Initial sent whole, no Retry: the
+// default options ask for one only from 500 live connections on.
+// Without the Retry the connection ends silently and the client sends its Initial again at its probe timeout, about
+// a second later (docs/milestones/M10.md, "Amendment 9 under netem: the traces"); the server sends no Retry.
+@test
+async fn a_clienthello_without_its_start_gets_a_retry() -> Result<void, TestFailure> {
+    let three = await heldOver([Order.FirstInitialLost, Order.FirstInitialLate, Order.AsSent])?;
+    Check.isTrue(retriedAndWhole(three.first).isOk(), "with the Initial's first datagram lost: a Retry, every byte")?;
+    Check.isTrue(retriedAndWhole(three.second).isOk(), "with the Initial's first datagram late: a Retry, every byte")?;
+    Check.isTrue(!three.third.retried, "an Initial sent whole gets no Retry")?;
+    allEarly(three.third)?;
     return Ok();
 }
