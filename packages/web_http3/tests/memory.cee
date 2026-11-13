@@ -150,6 +150,9 @@ struct Pair {
     server: Side?;
     serverTls: QuicTls;
     now: u64;
+    /// The server's datagrams counted since `lose` was set, and the one of them the client never gets (-1: none).
+    serverSent: i64;
+    lost: i64;
 }
 
 fn pair() -> Result<Pair, TestFailure> {
@@ -172,7 +175,7 @@ fn pair() -> Result<Pair, TestFailure> {
         closeWith: null,
         closed: false,
     };
-    return Ok(Pair { client: client, server: null, serverTls: serverTls, now: 1000000000 });
+    return Ok(Pair { client: client, server: null, serverTls: serverTls, now: 1000000000, serverSent: 0, lost: -1 });
 }
 
 /// One round: the client's datagrams to the server, then the server's to the client, each side processed; then the
@@ -228,6 +231,11 @@ fn round(p: borrow mut Pair, buffer: SliceMut<u8>, out: SliceMut<u8>) -> Result<
                     Some(d) => d,
                     null => { break; },
                 };
+                let n = p.serverSent;
+                p.serverSent += 1;
+                if (n == p.lost) {
+                    continue; // lost on the way
+                }
                 ok(p.client.quic.feed(serverAddress(), sent.ecn, out[0..sent.length], p.now), "the client's read")?;
             }
         }
@@ -573,6 +581,72 @@ fn reserved_frame_flood_closes() -> Result<void, TestFailure> {
     match (p.client.quic.peerApplicationClose()) {
         Some(code) => { Check.equalU64(0x107, code)?; }
         null => { return Err(TestFailure.create("the flood closes the connection")); }
+    }
+    return Ok();
+}
+
+/// One GET whose answer's head refers to the server's QPACK dynamic table, with the server's `lost`-th datagram after
+/// the answer lost. Expected: the client gets the answer's head as sent, its body and its end, whatever was lost.
+fn answer_with_one_loss(lost: i64) -> Result<void, TestFailure> {
+    var p = pair()?;
+    var b = buffers()?;
+    connect(mut p, mut b)?;
+    let stream = ok(p.client.quic.openStream(), "a request stream")?;
+    p.client.got.stream = stream;
+    let names = [":method", "GET", ":scheme", "https", ":authority", "localhost", ":path", "/q"];
+    let request = fields(names[..])?;
+    h3(p.client.h3.request(stream, request, false), "the request")?;
+    var rounds = 0;
+    while (rounds < 30 && !server(mut p)?.got.ended) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    let s = server(mut p)?;
+    Check.isTrue(s.got.ended, "the request ended")?;
+    // Names nghttp3's encoder indexes (it sends fields with names it does not know as literals,
+    // `qpack_encoder_decide_indexing_mode`) with values not in QPACK's static table (RFC 9204 Appendix A): it inserts
+    // them in its dynamic table and sends the inserts on its encoder stream. About 2,500 bytes of them, more than one
+    // datagram holds (1,452), so a loss can take some of the inserts and leave the HEADERS frame that refers to them.
+    var long = Vector<u8>.create();
+    mem(long.resize(600, 0x76))?; // "vvv…"
+    var answer = H3Fields.create();
+    mem(answer.add(":status".bytes(), "200".bytes()))?;
+    mem(answer.add("server".bytes(), long.view()))?;
+    mem(answer.add("date".bytes(), long.view()))?;
+    mem(answer.add("cache-control".bytes(), long.view()))?;
+    mem(answer.add("last-modified".bytes(), long.view()))?;
+    h3(s.h3.respond(stream, answer, true), "the answer's head")?;
+    let _ = h3(s.h3.sendBody(stream, "answer".bytes(), true), "the answer body")?;
+    p.serverSent = 0;
+    p.lost = lost;
+    rounds = 0;
+    while (rounds < 3000 && !p.client.got.ended) {
+        round(mut p, b.buffer.viewMut(), b.out.viewMut())?;
+        rounds += 1;
+    }
+    Check.isTrue(p.client.got.ended, "the answer ended")?;
+    var want = Vector<u8>.create();
+    mem(want.extend(":status: 200\n".bytes()))?;
+    for (name in ["server", "date", "cache-control", "last-modified"]) {
+        mem(want.extend(name.bytes()))?;
+        mem(want.extend(": ".bytes()))?;
+        mem(want.extend(long.view()))?;
+        mem(want.push(10))?;
+    }
+    Check.equalBytes(want.view(), p.client.got.fields.view())?;
+    Check.equalBytes("answer".bytes(), p.client.got.data.view())?;
+    return Ok();
+}
+
+/// A header block blocked on QPACK instructions that are lost and sent again, on a stream QUIC has closed (Web ADR
+/// 0014 amendment 6 item 1, RFC 9204 §2.1.2): each of the server's first four datagrams after its answer is lost in
+/// turn. Losing the first or the second takes some of the encoder stream's inserts while the answer, with its end,
+/// arrives: QUIC closes the stream before the client's nghttp3 can read the head, and the h3 shim must hold the close
+/// until the inserts come again. Without that (`h3_close_stream`'s deferral), the answer never ends (2026-11-13).
+@test
+fn a_blocked_answer_survives_its_stream_closing() -> Result<void, TestFailure> {
+    for (lost in 0..4) {
+        answer_with_one_loss(lost as i64)?;
     }
     return Ok();
 }

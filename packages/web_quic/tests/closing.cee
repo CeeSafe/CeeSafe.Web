@@ -1,0 +1,170 @@
+// The closing state (RFC 9000 §10.2.1, Web ADR 0014 amendment 6 item 3) over real UDP. A QuicServer's application
+// ends its connection a second after the handshake, so the server sends CONNECTION_CLOSE with code 0. The client
+// loses that datagram: it reads it from its socket and drops it. Then it sends on a stream.
+// Expected: the server, still closing, answers with the CONNECTION_CLOSE again, and the client's connection ends
+// with the application's code 0 (`peerApplicationClose`), at once. Without the closing state the server would have
+// forgotten the connection, and the listener's stateless reset (§10.3) carries no code.
+// It uses `Peer`, `step` and `handshake` from reset.cee.
+import web_core;
+
+/// An application that ends each connection a second after its handshake.
+struct CloseLater {}
+
+impl QuicApplication for CloseLater {
+    async fn connection(borrow this, link: borrow mut QuicLink) -> Result<void, QuicError> {
+        var buffer = Vector<u8>.create();
+        if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+            return Err(QuicError.NoMemory);
+        }
+        loop {
+            match (await link.next(buffer.viewMut())?) {
+                QuicEvent.HandshakeDone => { break; }
+                _ => {}
+            }
+        }
+        let _ = await Timer.sleep(1000);
+        return Ok(); // QuicServer closes with code 0, then lingers
+    }
+}
+
+/// Reads one datagram from the client's socket without giving it to the connection, waiting up to `capMs`: whether
+/// one came.
+async fn lose(p: borrow mut Peer, capMs: u64) -> Result<bool, TestFailure> {
+    let raced: Result<Raced<bool>, AsyncError> = await Async.race(
+        async () => {
+            let _ = await p.socket.recvFrom(p.buffer.viewMut())?;
+            return Ok(true);
+        },
+        async () => {
+            await Timer.sleep(capMs)?;
+            return Ok(false);
+        },
+    );
+    match (raced) {
+        Ok(won) => { return Ok(won.winner == 0 || won.value); }
+        Err(_) => { return Err(TestFailure.create("waiting")); }
+    }
+}
+
+/// How the client's connection ended.
+struct Closed {
+    /// Ns from the client's send after the loss to its connection's end; 0 if it did not end within 3 s.
+    after: u64;
+    code: u64?;
+}
+
+/// The client's part: the handshake; then, once 300 ms have passed with nothing from the server, the next datagram
+/// (the CONNECTION_CLOSE) is lost; then bytes on a stream, and turns until the connection ends.
+async fn client(p: borrow mut Peer) -> Result<Closed, TestFailure> {
+    await handshake(p)?;
+    // Whatever comes in the next 300 ms is the handshake's tail (acknowledgements); the first datagram after it is
+    // the CONNECTION_CLOSE, which the server sends a second after its handshake. All of them are lost.
+    let quiet = Clock.monotonicNanos() + 300000000;
+    loop {
+        Check.isTrue(await lose(p, 3000)?, "the server's CONNECTION_CLOSE, within 3 s")?;
+        if (Clock.monotonicNanos() >= quiet) {
+            break;
+        }
+    }
+    Check.isTrue(p.conn.peerApplicationClose().isNull(), "nothing of the close reached the connection")?;
+    let stream = ok(p.conn.openStream(), "a stream")?;
+    let _ = ok(p.conn.writeStream(stream, "after the lost close".bytes(), false), "a write")?;
+    let start = Clock.monotonicNanos();
+    while (Clock.monotonicNanos() < start + 3000000000) {
+        if (await step(p, 10)?) {
+            return Ok(Closed { after: Clock.monotonicNanos() - start, code: p.conn.peerApplicationClose() });
+        }
+    }
+    return Ok(Closed { after: 0, code: null });
+}
+
+enum Ending {
+    Server,
+    Done(Closed),
+    Failed(TestFailure),
+}
+
+@test
+async fn a_lost_close_is_sent_again() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let alpn = [Alpn.Http3];
+    let serverTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    let clientTls = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
+    let tls = match (Arc<QuicTls>.create(serverTls)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(CloseLater {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send + Share>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the server's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the server's address")); },
+    };
+    let clientSocket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the client's socket")); },
+    };
+    let clientAddress = match (clientSocket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the client's address")); },
+    };
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    let conn = ok(
+        QuicConnection.client(
+            clientTls,
+            "localhost",
+            QuicAddress.of(clientAddress),
+            QuicAddress.of(local),
+            ids,
+            Clock.monotonicNanos(),
+        ),
+        "the client",
+    )?;
+    var p = Peer {
+        socket: clientSocket,
+        conn: conn,
+        server: local,
+        buffer: Vector<u8>.create(),
+        out: Vector<u8>.create(),
+    };
+    if (p.buffer.resize(quicEventBufferSize(), 0).isErr() || p.out.resize(quicDatagramSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    let raced: Result<Raced<Ending>, AsyncError> = await Async.race(
+        async () => {
+            let _ = await QuicServer.serve(socket, local, tls.clone(), app.clone(), QuicServerOptions.defaults());
+            return Ok(Ending.Server);
+        },
+        async () => {
+            match (await client(mut p)) {
+                Ok(c) => { return Ok(Ending.Done(c)); }
+                Err(e) => { return Ok(Ending.Failed(e)); }
+            }
+        },
+    );
+    let closed = match (raced) {
+        Ok(won) => match (won.value) {
+            Ending.Done(c) => c,
+            Ending.Failed(e) => { return Err(e); },
+            Ending.Server => { return Err(TestFailure.create("the server ended")); },
+        },
+        Err(_) => { return Err(TestFailure.create("the race")); },
+    };
+    Check.isTrue(closed.after > 0, "the client's connection ended within 3 s of its send")?;
+    match (closed.code) {
+        Some(code) => { Check.equalU64(0, code)?; }
+        null => { return Err(TestFailure.create("ended by the server's CONNECTION_CLOSE, with its code")); }
+    }
+    return Ok();
+}
