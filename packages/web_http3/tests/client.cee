@@ -51,6 +51,11 @@ struct TestClient {
     /// The server closed the connection: with this HTTP/3 code, if it gave one.
     closed: bool;
     closeCode: u64?;
+    /// The server's datagrams read since a test last set this to 0.
+    received: i64;
+    /// The datagram with this number (`received` when it comes) is lost: read and not given to the connection. -1
+    /// loses none.
+    lost: i64;
 
     /// A client connected (once `started`) to `server`.
     async fn connect(tls: borrow QuicTls, server: SocketAddress) -> Result<TestClient, TestFailure> {
@@ -101,6 +106,8 @@ struct TestClient {
             goAway: null,
             closed: false,
             closeCode: null,
+            received: 0,
+            lost: -1,
         };
         mem(c.buffer.resize(65536, 0))?;
         mem(c.out.resize(quicDatagramSize(), 0))?;
@@ -343,6 +350,11 @@ struct TestClient {
         };
         match (datagram) {
             Some(d) => {
+                let number = this.received;
+                this.received += 1;
+                if (number == this.lost) {
+                    return Ok();
+                }
                 let from = QuicAddress.of(d.from);
                 match (this.conn.feed(from, 0, this.buffer.view()[0..d.length], Clock.monotonicNanos())) {
                     Ok() => {}

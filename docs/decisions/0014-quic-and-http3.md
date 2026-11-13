@@ -635,6 +635,7 @@ Two improvements to 0-RTT came with them:
 4. **0-RTT packets that arrive before their Initial are held** (RFC 9000 §5.2.2): at most 32, for up to 3 s, then
    handed to the connection that Initial makes. Before, losing or reordering the Initial cost the client all its early
    data.
+   - Amendment 9 completes this for a ClientHello that spans two Initial datagrams.
 5. **`CW_NGTCP2_LOG`:** set in the environment, it turns on ngtcp2's own log, to stderr. It is how the cases above
    were found.
 
@@ -690,3 +691,31 @@ Two improvements to 0-RTT came with them:
    data ignored. `early_data_once_per_ticket` now shows it. What remains is RFC 9001 §9.2's: a replay that arrives
    before the client's own copy runs once, and the client's request is then sent again after the handshake, so it
    runs twice. That is why only safe methods run early. `packages/web_http3/README.md` says so.
+
+## 16. Amendment 9 (2026-11-13: held 0-RTT and a ClientHello in two datagrams)
+
+A test for amendment 6 item 4 (`packages/web_quic/tests/held.cee`) showed that the holding did not work with this
+package's own client.
+
+1. **What went wrong.**
+   - A resuming client's ClientHello does not fit one datagram here: its Initial is two datagrams, and 0-RTT
+     datagrams follow.
+   - The listener released the held 0-RTT datagrams as soon as the first Initial datagram made the connection.
+   - ngtcp2 discards a 0-RTT packet that comes after the first Initial and before the 0-RTT keys, which need the
+     whole ClientHello (`ngtcp2_conn.c`, `case NGTCP2_PKT_0RTT`: "Discard 0-RTT packet if we don't have a key to
+     decrypt it"). It buffers 0-RTT only before the first Initial, which never happens here: the first Initial makes
+     the connection.
+   - So the released datagrams were discarded, and the client sent their bytes again after the handshake, in 1-RTT.
+     Nothing was lost, but nothing held came early: of 4,000 early bytes, about 3,600 arrived late.
+   - The same happens without any reordering of the 0-RTT, when the second Initial datagram is lost or late: the
+     test's third order.
+2. **Fix: the connection keeps 0-RTT datagrams until the handshake is done** (`QuicLink.take`).
+   - A 0-RTT datagram that comes before the handshake is done is read, and also kept: at most 32 (`heldMost`), per
+     connection.
+   - After each later Initial datagram, the kept ones are read again. One that was already read is a duplicate
+     packet number, which ngtcp2 ignores.
+   - When the handshake is done, they are dropped.
+   - The listener's holding (amendment 6 item 4) stays: it covers the time before any connection exists.
+3. **The cost** is up to 32 datagrams (about 46 KiB) per connection, for the length of its handshake, and only for
+   connections that are sent 0-RTT.
+4. **Accepted by the owner** on 2026-11-13, with this bound and this cost.
