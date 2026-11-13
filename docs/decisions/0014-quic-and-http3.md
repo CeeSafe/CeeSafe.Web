@@ -718,3 +718,4 @@ package's own client.
    - The listener's holding (amendment 6 item 4) stays: it covers the time before any connection exists.
 3. **The cost** is up to 32 datagrams (about 46 KiB) per connection, for the length of its handshake, and only for
    connections that are sent 0-RTT.
+4. **Accepted by the owner** on 2026-11-13, with this bound and this cost.
