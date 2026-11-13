@@ -6,6 +6,7 @@
 //   GET /big       200 and 3 MiB written in pieces
 //   GET /trailers  200 "t" and the trailer `x-check: ok`
 //   GET /slow      200 "slow", after 300 ms
+//   GET /wide      200 "wide", after 300 ms, with four 600-byte fields (lossy.cee)
 //   GET /early     200 "early" if the request came in 0-RTT (`request.earlyData()`), else "late"
 //   GET /fail      the handler fails: 500
 //   anything else  404
@@ -61,6 +62,19 @@ impl Application for TestApp {
                 Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
             }
             return await exchange.send(Status.ok(), "slow".bytes());
+        }
+        if (same(path, "/wide")) {
+            // After 300 ms, a head whose four long fields nghttp3's encoder puts in its dynamic table (lossy.cee):
+            // it indexes these names (`qpack_encoder_decide_indexing_mode`).
+            match (await Timer.sleep(300)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+            let long = [0x76u8; 600];
+            for (name in ["server", "date", "cache-control", "last-modified"]) {
+                exchange.header(name, long[..])?;
+            }
+            return await exchange.send(Status.ok(), "wide".bytes());
         }
         if (same(path, "/early")) {
             return await exchange.send(Status.ok(), if (request.earlyData()) "early".bytes() else "late".bytes());

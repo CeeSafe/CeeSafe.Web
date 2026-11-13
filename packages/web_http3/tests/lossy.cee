@@ -1,0 +1,119 @@
+// The drain with a loss (Web ADR 0014 amendment 6 item 2) over real UDP. A client asks for `/wide`, whose answer
+// comes 300 ms later with four 600-byte fields that the server's QPACK encoder puts in its dynamic table: about
+// 2,500 bytes of inserts on the encoder stream, in datagrams of their own, and a small HEADERS frame that refers to
+// them. The drain starts while the handler waits, so both GOAWAYs are out before the answer. Then the client loses
+// one of the server's datagrams: the first, second, third or fourth that comes from 230 ms after the request.
+// When the lost datagram held inserts, the answer's stream still arrives whole and is acknowledged, so every stream
+// is done and nghttp3 is drained while the inserts wait to be sent again.
+// Expected, whichever is lost: the answer with its head as sent (RFC 9204 §2.1.2) and its body, then the close with
+// H3_NO_ERROR (RFC 9114 §5.2). Without `allAcknowledged` in the drain's condition, the server closes before the
+// inserts are sent again, and the client's answer never ends.
+// It uses `setup`, `Ended`, `outcome` and `startsWith` from serve.cee.
+import web_core;
+import web_http;
+import web_quic;
+
+/// Whether `hay` holds `needle`.
+fn holds(hay: Slice<u8>, needle: Slice<u8>) -> bool {
+    if (hay.length < needle.length) {
+        return false;
+    }
+    for (i in 0..hay.length - needle.length + 1) {
+        var all = true;
+        for (j in 0..needle.length) {
+            if (hay[i + j] != needle[j]) {
+                all = false;
+                break;
+            }
+        }
+        if (all) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The client's part: the request, the drain, the loss of datagram `lost`, then turns until the connection closes.
+async fn drainedWithLoss(
+    tls: borrow QuicTls,
+    server: SocketAddress,
+    drain: borrow Drain,
+    lost: i64,
+) -> Result<void, TestFailure> {
+    var c = await TestClient.connect(tls, server)?;
+    let asked = Clock.monotonicNanos();
+    let wide = c.request("GET", "/wide", "".bytes())?;
+    var turns = 0;
+    while (turns < 5) {
+        await c.turn(10)?; // the request reaches the server, and its handler starts
+        turns += 1;
+    }
+    drain.start();
+    // The GOAWAYs come within about 150 ms of the request; the answer, 300 ms after it.
+    while (Clock.monotonicNanos() < asked + 230000000) {
+        await c.turn(10)?;
+    }
+    c.received = 0;
+    c.lost = lost;
+    let deadline = Clock.monotonicNanos() + 10000000000;
+    while (!c.closed) {
+        if (Clock.monotonicNanos() > deadline) {
+            return Err(TestFailure.create("the connection did not close in 10 s"));
+        }
+        await c.turn(10)?;
+    }
+    Check.isTrue(c.received > lost, "the datagram to lose came")?;
+    let all = c.answers.view();
+    Check.isTrue(all[0].stream == wide && all[0].ended && !all[0].reset, "the request in flight was answered")?;
+    Check.isTrue(startsWith(all[0].fields.view(), ":status: 200\n"), "with 200")?;
+    let long = [0x76u8; 600];
+    for (name in ["server", "date", "cache-control", "last-modified"]) {
+        var line = Vector<u8>.create();
+        mem(line.extend(name.bytes()))?;
+        mem(line.extend(": ".bytes()))?;
+        mem(line.extend(long[..]))?;
+        mem(line.push(10))?;
+        Check.isTrue(holds(all[0].fields.view(), line.view()), "each long field as sent")?;
+    }
+    Check.equalBytes("wide".bytes(), all[0].data.view())?;
+    match (c.closeCode) {
+        Some(code) => { Check.equalU64(0x100, code)?; }
+        null => { return Err(TestFailure.create("the close carried H3_NO_ERROR")); }
+    }
+    return Ok();
+}
+
+/// One server, drained, and one client that loses datagram `lost`.
+async fn drainLosing(lost: i64) -> Result<void, TestFailure> {
+    let s = setup()?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let shared = drain.share();
+    let socket = s.socket;
+    let local = s.local;
+    let tls = s.tls;
+    let app = s.app;
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await Http3Server.serve(socket, local, tls, app, Limits.defaults(), drain, Http3Options.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await drainedWithLoss(s.clientTls, local, shared, lost)) {
+                Ok() => { return Ok(Ended.Client); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    return outcome(raced);
+}
+
+@test
+async fn the_drain_waits_for_what_was_lost() -> Result<void, TestFailure> {
+    for (lost in 0..4) {
+        await drainLosing(lost as i64)?;
+    }
+    return Ok();
+}

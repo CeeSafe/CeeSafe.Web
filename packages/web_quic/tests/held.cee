@@ -1,0 +1,337 @@
+// 0-RTT that arrives before its Initial (RFC 9000 §5.2.2, Web ADR 0014 amendment 6 item 4 and amendment 9) over real
+// UDP. A client takes a ticket from a QuicServer that allows early data, then resumes with 4,000 bytes written on a
+// stream before its first datagram. Its datagrams are the Initial (two datagrams when the ClientHello is long) and,
+// after it, 0-RTT packets alone. It does this twice: once sending them in that order, and once sending the 0-RTT
+// datagrams first and the Initial 50 ms later, as a path that reorders them would.
+// The server's application counts the bytes that came as early data (`QuicEvent.EarlyData`) and those that did not,
+// and answers with the counts on the same stream.
+// Expected, in either order: every byte came early, and the client sees its early data accepted.
+//   - Without the listener's holding, it drops the 0-RTT datagrams that come first (no connection has their ID yet).
+//   - Without the connection's keeping (`QuicLink.take`), ngtcp2 discards them: they are released after the first
+//     Initial datagram, before the second has completed the ClientHello and given the 0-RTT keys.
+// Either way the client sends their bytes again after the handshake, in 1-RTT, where they are not early.
+// It uses `Peer`, `step` and `handshake` from reset.cee and `pattern` from serve.cee.
+import web_core;
+
+/// How many bytes the client writes early.
+fn heldBytes() -> usize => 4000;
+
+/// An application that counts each stream's bytes as early or not, checks them against `pattern`, and answers at
+/// the stream's end with three big-endian u64: early, not early, wrong.
+struct Tally {}
+
+impl QuicApplication for Tally {
+    async fn connection(borrow this, link: borrow mut QuicLink) -> Result<void, QuicError> {
+        var buffer = Vector<u8>.create();
+        if (buffer.resize(quicEventBufferSize(), 0).isErr()) {
+            return Err(QuicError.NoMemory);
+        }
+        var early: u64 = 0;
+        var late: u64 = 0;
+        var wrong: u64 = 0;
+        var nextIsEarly = false;
+        loop {
+            match (await link.next(buffer.viewMut())?) {
+                QuicEvent.EarlyData(_) => { nextIsEarly = true; }
+                QuicEvent.StreamData(stream, n, fin) => {
+                    let data = buffer.view();
+                    for (i in 0..n) {
+                        if (data[i] != pattern(early + late + i as u64)) {
+                            wrong += 1;
+                        }
+                    }
+                    if (nextIsEarly) {
+                        early += n as u64;
+                    } else {
+                        late += n as u64;
+                    }
+                    nextIsEarly = false;
+                    if (fin) {
+                        var answer = [0u8; 24];
+                        putU64(mut answer[0..8], early);
+                        putU64(mut answer[8..16], late);
+                        putU64(mut answer[16..24], wrong);
+                        let _ = link.writeStream(stream, answer[..], true)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn putU64(out: SliceMut<u8>, value: u64) {
+    var v = value;
+    for (i in 0..8usize) {
+        out[7 - i] = truncate<u8>(v);
+        v = v >> 8;
+    }
+}
+
+fn getU64(bytes: Slice<u8>) -> u64 {
+    var v: u64 = 0;
+    for (i in 0..8usize) {
+        v = (v << 8) | bytes[i] as u64;
+    }
+    return v;
+}
+
+/// What the resumed connection learned.
+struct Tallied {
+    /// The server's answer, null if none came within 5 s.
+    early: u64?;
+    late: u64;
+    wrong: u64;
+    /// Whether the client's early data was accepted.
+    accepted: bool;
+    /// How many datagrams the client sent before its Initial.
+    before: usize;
+}
+
+/// The first connection: a handshake, then turns until the server's ticket has come.
+async fn ticketOver(p: borrow mut Peer) -> Result<Vector<u8>, TestFailure> {
+    await handshake(p)?;
+    var t = Vector<u8>.create();
+    if (t.resize(8192, 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    let deadline = Clock.monotonicNanos() + 3000000000;
+    loop {
+        let n = p.conn.ticket(t.viewMut());
+        if (n > 0) {
+            t.truncate(n);
+            return Ok(t);
+        }
+        if (Clock.monotonicNanos() > deadline) {
+            return Err(TestFailure.create("no ticket within 3 s of the handshake"));
+        }
+        let _ = await step(p, 10)?;
+    }
+}
+
+/// Whether `datagram` starts with a version 1 0-RTT packet (a long header of type 1; RFC 9000 §17.2.3).
+fn startsWithZeroRtt(datagram: Slice<u8>) -> bool =>
+    datagram.length > 0 && (datagram[0] & 0x80) != 0 && ((datagram[0] & 0x30) >> 4) == 1;
+
+/// The resumed connection: the early write, its datagrams sent with the Initial last, then turns until the server's
+/// answer has come.
+async fn resumedWith(p: borrow mut Peer, ticket: Slice<u8>, reordered: bool) -> Result<Tallied, TestFailure> {
+    Check.isTrue(ok(p.conn.resume(ticket), "the resumption")?, "the ticket offers 0-RTT")?;
+    var data = Vector<u8>.create();
+    if (data.resize(heldBytes(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    let bytes = data.viewMut();
+    for (i in 0..bytes.length) {
+        bytes[i] = pattern(i as u64);
+    }
+    let stream = ok(p.conn.openStream(), "an early stream")?;
+    let wrote = ok(p.conn.writeStream(stream, data.view(), true), "the early write")?;
+    Check.isTrue(wrote == heldBytes(), "the whole early write was taken")?;
+    // Every datagram the connection has now: its Initial (two datagrams when the ClientHello is long), then 0-RTT
+    // alone.
+    var initials = Vector<Vector<u8>>.create();
+    var early = Vector<Vector<u8>>.create();
+    loop {
+        let d = match (ok(p.conn.datagram(p.out.viewMut(), Clock.monotonicNanos()), "a datagram")?) {
+            Some(d) => d,
+            null => { break; },
+        };
+        let datagram = p.out.view()[0..d.length];
+        let initial = match (QuicHeader.of(datagram)) {
+            Some(h) => h.initial,
+            null => false,
+        };
+        Check.isTrue(initial || startsWithZeroRtt(datagram), "each datagram is an Initial or 0-RTT alone")?;
+        Check.isTrue(!initial || early.length == 0, "the Initial comes before the 0-RTT")?;
+        var copy = Vector<u8>.create();
+        if (copy.extend(datagram).isErr()) {
+            return Err(TestFailure.create("out of memory"));
+        }
+        let pushed = if (initial) initials.push(copy) else early.push(copy);
+        if (pushed.isErr()) {
+            return Err(TestFailure.create("out of memory"));
+        }
+    }
+    Check.isTrue(initials.length >= 1, "the client's Initial")?;
+    Check.isTrue(early.length >= 2, "the early write needs 0-RTT datagrams after the Initial")?;
+    if (reordered) {
+        await sendAll(p, early.view())?;
+        match (await Timer.sleep(50)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("waiting")); }
+        }
+        await sendAll(p, initials.view())?;
+    } else {
+        await sendAll(p, initials.view())?;
+        await sendAll(p, early.view())?;
+    }
+    var answer = Vector<u8>.create();
+    var ended = false;
+    let deadline = Clock.monotonicNanos() + 5000000000;
+    while (!ended && Clock.monotonicNanos() < deadline) {
+        let _ = await step(p, 10)?; // its events are read below, before the next step discards them
+        loop {
+            match (ok(p.conn.nextEvent(p.buffer.viewMut()), "an event")?) {
+                Some(QuicEvent.StreamData(_, n, fin)) => {
+                    if (answer.extend(p.buffer.view()[0..n]).isErr()) {
+                        return Err(TestFailure.create("out of memory"));
+                    }
+                    ended = ended || fin;
+                }
+                Some(_) => {}
+                null => { break; }
+            }
+        }
+    }
+    let accepted = p.conn.earlyDataAccepted();
+    if (!ended || answer.length != 24) {
+        return Ok(Tallied { early: null, late: 0, wrong: 0, accepted: accepted, before: early.length });
+    }
+    let a = answer.view();
+    return Ok(Tallied {
+        early: Some(getU64(a[0..8])),
+        late: getU64(a[8..16]),
+        wrong: getU64(a[16..24]),
+        accepted: accepted,
+        before: early.length,
+    });
+}
+
+async fn sendAll(p: borrow Peer, datagrams: Slice<Vector<u8>>) -> Result<void, TestFailure> {
+    for (i in 0..datagrams.length) {
+        match (await p.socket.sendTo(datagrams[i].view(), p.server)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("sending")); }
+        }
+    }
+    return Ok();
+}
+
+/// A client's socket and connection to the server at `server`.
+fn peerTo(clientTls: borrow QuicTls, server: SocketAddress) -> Result<Peer, TestFailure> {
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the client's socket")); },
+    };
+    let address = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the client's address")); },
+    };
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    let conn = ok(
+        QuicConnection.client(
+            clientTls,
+            "localhost",
+            QuicAddress.of(address),
+            QuicAddress.of(server),
+            ids,
+            Clock.monotonicNanos(),
+        ),
+        "the client",
+    )?;
+    var p = Peer {
+        socket: socket,
+        conn: conn,
+        server: server,
+        buffer: Vector<u8>.create(),
+        out: Vector<u8>.create(),
+    };
+    if (p.buffer.resize(quicEventBufferSize(), 0).isErr() || p.out.resize(quicDatagramSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    return Ok(p);
+}
+
+/// A connection for a ticket, then the resumed one.
+async fn heldClient(clientTls: borrow QuicTls, server: SocketAddress, reordered: bool) -> Result<Tallied, TestFailure> {
+    var one = peerTo(clientTls, server)?;
+    let ticket = await ticketOver(mut one)?;
+    var two = peerTo(clientTls, server)?;
+    return await resumedWith(mut two, ticket.view(), reordered);
+}
+
+/// What the server answered with the datagrams in the client's order, and with the 0-RTT first.
+struct Both {
+    inOrder: Tallied;
+    reordered: Tallied;
+}
+
+async fn bothClients(clientTls: borrow QuicTls, server: SocketAddress) -> Result<Both, TestFailure> {
+    let inOrder = await heldClient(clientTls, server, false)?;
+    let reordered = await heldClient(clientTls, server, true)?;
+    return Ok(Both { inOrder: inOrder, reordered: reordered });
+}
+
+/// Expected of either order: every byte early and right, and the early data accepted.
+fn allEarly(t: borrow Tallied) -> Result<void, TestFailure> {
+    let early = match (t.early) {
+        Some(n) => n,
+        null => { return Err(TestFailure.create("the server's answer, within 5 s")); },
+    };
+    Check.equalU64(0, t.wrong)?;
+    Check.equalU64(0, t.late)?;
+    Check.equalU64(heldBytes() as u64, early)?;
+    Check.isTrue(t.accepted, "the client's early data was accepted")?;
+    return Ok();
+}
+
+enum HeldEnding {
+    Server,
+    Done(Both),
+    Failed(TestFailure),
+}
+
+@test
+async fn early_data_before_its_initial_is_held() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let alpn = [Alpn.Http3];
+    var serverTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    serverTls.allowEarlyData();
+    let clientTls = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
+    let tls = match (Arc<QuicTls>.create(serverTls)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Tally {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send + Share>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the server's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the server's address")); },
+    };
+    let raced: Result<Raced<HeldEnding>, AsyncError> = await Async.race(
+        async () => {
+            let _ = await QuicServer.serve(socket, local, tls.clone(), app.clone(), QuicServerOptions.defaults());
+            return Ok(HeldEnding.Server);
+        },
+        async () => {
+            match (await bothClients(clientTls, local)) {
+                Ok(t) => { return Ok(HeldEnding.Done(t)); }
+                Err(e) => { return Ok(HeldEnding.Failed(e)); }
+            }
+        },
+    );
+    let both = match (raced) {
+        Ok(won) => match (won.value) {
+            HeldEnding.Done(b) => b,
+            HeldEnding.Failed(e) => { return Err(e); },
+            HeldEnding.Server => { return Err(TestFailure.create("the server ended")); },
+        },
+        Err(_) => { return Err(TestFailure.create("the race")); },
+    };
+    Check.isTrue(allEarly(both.inOrder).isOk(), "in the client's order, every byte came early")?;
+    allEarly(both.reordered)?;
+    return Ok();
+}

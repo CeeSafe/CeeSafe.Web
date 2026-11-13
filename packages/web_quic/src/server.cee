@@ -93,6 +93,41 @@ public struct QuicLink {
     private out: Vector<u8>;
     /// The CONNECTION_CLOSE this side sent, kept to send again while the connection is closing (RFC 9000 §10.2.1).
     private closing: Vector<u8>;
+    /// 0-RTT datagrams that came before the handshake was done, kept to be read again (`take`).
+    private early: Vector<Inbound>;
+
+    /// Gives the connection datagram `d`. ngtcp2 discards a 0-RTT packet that comes after the first Initial and before
+    /// the keys for it, which need the whole ClientHello (`ngtcp2_conn.c`, "Discard 0-RTT packet if we don't have a
+    /// key to decrypt it"), and a ClientHello may span two Initial datagrams. So until the handshake is done, 0-RTT
+    /// datagrams are kept, at most `heldMost`, and read again after each later Initial; one already read is a
+    /// duplicate, which ngtcp2 ignores.
+    private fn take(borrow mut this, d: Inbound) -> Result<void, QuicError> {
+        let now = Clock.monotonicNanos();
+        this.conn.feed(QuicAddress.of(d.from), d.ecn as u32, d.bytes.view(), now)?;
+        if (this.conn.handshakeDone()) {
+            if (this.early.length > 0) {
+                this.early.clear();
+            }
+            return Ok();
+        }
+        let first: u8 = if (d.bytes.length > 0) d.bytes.view()[0] else 0;
+        let long = (first & 0x80) != 0;
+        let kind = (first & 0x30) >> 4;
+        if (long && kind == 1) {
+            if (this.early.length < heldMost()) {
+                match (this.early.push(d)) {
+                    Ok() => {}
+                    Err(_) => { return Err(QuicError.NoMemory); }
+                }
+            }
+        } else if (long && kind == 0) {
+            for (i in 0..this.early.length) {
+                let all = this.early.view();
+                this.conn.feed(QuicAddress.of(all[i].from), all[i].ecn as u32, all[i].bytes.view(), now)?;
+            }
+        }
+        return Ok();
+    }
 
     /// The connection's next event, its data (for `StreamData`, and the connection-ID events, which are handled here)
     /// in `buffer` (`quicEventBufferSize()` bytes). It sends what the connection has first, then waits for a datagram
@@ -118,10 +153,7 @@ public struct QuicLink {
                 continue;
             }
             match (await wake(this.inbound, waitMs)?) {
-                Wake.Datagram(d) => {
-                    let from = QuicAddress.of(d.from);
-                    this.conn.feed(from, d.ecn as u32, d.bytes.view(), Clock.monotonicNanos())?;
-                }
+                Wake.Datagram(d) => { this.take(d)?; }
                 Wake.Timer => { this.conn.onTimeout(Clock.monotonicNanos())?; }
                 Wake.Gone => { return Err(QuicError.Draining); }
             }
@@ -207,10 +239,7 @@ public struct QuicLink {
             current = later;
             later = null;
             match (w) {
-                Woke.Quic(Wake.Datagram(d)) => {
-                    let from = QuicAddress.of(d.from);
-                    this.conn.feed(from, d.ecn as u32, d.bytes.view(), Clock.monotonicNanos())?;
-                }
+                Woke.Quic(Wake.Datagram(d)) => { this.take(d)?; }
                 Woke.Quic(Wake.Timer) => {
                     let t = Clock.monotonicNanos();
                     match (this.conn.nextTimeout()) {
@@ -900,6 +929,7 @@ async fn connectionTask(
         id: id,
         out: out,
         closing: Vector<u8>.create(),
+        early: Vector<Inbound>.create(),
     };
     let result = match (fed) {
         Ok() => await app.get().connection(mut link),
