@@ -28,7 +28,8 @@ that needs an unreleased compiler is not merged to main.
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`) | 0.20.0 (release, osx-arm64; found 2026-11-06) | checks every manifest; not yet tested |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`) | 0.45.1 (byte-identical to `ceesafec-0.45.1`, 2026-11-14) | everyday checks |
+| `~/.ceesafe/bin/ceesafec-0.45.1` | 0.45.1 (release, tag `v0.45.1` = CeeSafe `7c20ac5`, osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, 2026-11-14; no signature checked) | tested on main; not main's minimum |
 | `~/.ceesafe/bin/ceesafec-0.44.0` | **0.44.0** (release, tag `v0.44.0`, osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, 2026-11-14; no signature checked) | main's minimum from 2026-11-14 (the `AsyncError.Closed` change, CeeSafe ADR 0128) |
 | `~/.ceesafe/bin/ceesafec-0.27.0` | 0.27.0 (release, tag `v0.27.0` = CeeSafe `405dc50`, osx-arm64; the archive matches the release's `SHA256SUMS`, 2026-11-10; no signature checked) | the `Share` change (CeeSafe ADR 0084), branch `toolchain-0.27` |
 | `~/.ceesafe/bin/ceesafec-0.22.0` | **0.22.0** (release, tag `v0.22.0` = CeeSafe `f225f7a`, osx-arm64; the archive matches the release's `SHA256SUMS`, signature checked, 2026-11-08) | M9's minimum: B19 and U22 (CeeSafe ADR 0078) |
@@ -104,6 +105,22 @@ Run 2026-11-14 on macOS arm64, branch `toolchain-0.44` (the fix on main at `dab9
   is ADR 0128 §2.1's definition, not this code's.
 - Before the fix, CI's non-blocking `ceesafe-main` job failed with the same N0256 on pull request #20 and on main
   after #18 and #19 merged; the blocking jobs, pinned to v0.27.0, passed.
+
+0.45.1 (released 2026-11-14; its release notes are a changelog link only) needs no change in CeeSafe.Web. Run
+2026-11-14 on macOS arm64, main at `9592f2d` (the code of `53ef2e6`; that commit changes one ADR only):
+- every manifest (33) checks with no diagnostic, `fmt --check` lists no file, `tools/check_layers.py` passes, and
+  `tools/api_check.py --ceesafec ceesafec-0.45.1` matches without `--write`;
+- `python3 tools/run_tests.py --ceesafec ceesafec-0.45.1 --sanitize --alloc-sweep --cancel-sweep`: 53 runs passed,
+  0 failed, 3 skipped (web_tls, web_quic and web_http3 in the interpreter). No sweep failure in any package.
+
+Main's minimum stays 0.44.0, and CI pins v0.44.0: nothing needs 0.45.
+
+CI's non-blocking `ceesafe-main` job (CeeSafe main, reporting 0.45.0) failed on pull request #22: web_ws's
+`sha1_rfc3174_vectors` (RFC 3174's million-byte vector) timed out in the interpreter, past `run_tests.py`'s 120 s
+per test. The same job passed on main at `d3bc9de` with the same 0.45.0, web_ws's interpreter run taking 361 s
+(282 s with 0.44.1 on #21). The test run alone on this machine, alternating, with another session's builds
+running: 70 s and 69 s with 0.44.0, 84 s and 72 s with 0.45.1. That shows no clear slowdown, only that the test
+uses over half of its limit here, and less of its margin on a CI runner. Not changed: the limit, the test.
 
 0.22.0 (CeeSafe ADR 0078, written from this project's B19 and U22) is M9's minimum from 2026-11-08 (the owner's
 choice). On Linux, `sendFile` to a reset connection is an error, not SIGPIPE, and an open file's time and kind and
