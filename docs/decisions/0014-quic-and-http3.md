@@ -757,8 +757,8 @@ The traces of amendment 9 under netem (`docs/milestones/M10.md`, "Amendment 9 un
      client is back to its probe timeout. Not seen; it needs both reorderings at once.
    - *`NGTCP2_ERR_DROP_CONN`* (a first Initial with no CRYPTO data at all) is still `QuicError.Failed`. Not
      examined here.
-6. **Asked for by the owner** on 2026-11-13 ("Please fix"). The design is the Retry ngtcp2 asks for; the owner has
-   not yet read this amendment.
+6. **Asked for by the owner** on 2026-11-13 ("Please fix"). The design is the Retry ngtcp2 asks for.
+7. **Accepted by the owner** on 2026-11-14.
 
 ## 18. Amendment 11 (2026-11-14: a token counts only when it was checked)
 
@@ -789,4 +789,4 @@ The traces of amendment 9 under netem (`docs/milestones/M10.md`, "Amendment 9 un
    - A Retry token that verifies but holds an empty original ID is admitted as if it had none, and is now not
      validated either. Whether such a token can be had was not examined.
 6. **Asked for by the owner** on 2026-11-14 ("Yes, fix it next"), after the finding in `docs/milestones/M10.md`.
-   The owner has not yet read this amendment.
+7. **Accepted by the owner** on 2026-11-14.
