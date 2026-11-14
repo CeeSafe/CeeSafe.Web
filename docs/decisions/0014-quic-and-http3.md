@@ -759,3 +759,34 @@ The traces of amendment 9 under netem (`docs/milestones/M10.md`, "Amendment 9 un
      examined here.
 6. **Asked for by the owner** on 2026-11-13 ("Please fix"). The design is the Retry ngtcp2 asks for; the owner has
    not yet read this amendment.
+
+## 18. Amendment 11 (2026-11-14: a token counts only when it was checked)
+
+1. **What was wrong.**
+   - `qs_conn_server` gave ngtcp2 the Initial's token whatever it was (`packages/web_quic/c/quic_shim.c`).
+   - ngtcp2 takes the token it is given as proof of the client's address: "Server sets this field if it received
+     the token in Client Initial packet and successfully validated" (`ngtcp2_settings.token`,
+     `third_party/ngtcp2-1.26.0/lib/includes/ngtcp2/ngtcp2.h`), and with one set it lifts the limit of three
+     times what the client sent (`third_party/ngtcp2-1.26.0/lib/ngtcp2_conn.c:1724`).
+   - `QuicRetry.check` verifies only tokens that begin with ngtcp2's Retry mark (amendment 5). An Initial with
+     any other bytes in its token field is admitted as it is when no Retry is required, and so was
+     `QuicConnection.server` for any caller that made no check at all.
+   - So a client that filled the token field with bytes of its own was sent more than three times what it sent
+     (RFC 9000 §8.1), from an address nobody had validated.
+2. **Fix.** `qs_conn_server` gives ngtcp2 the token only when the caller names the original destination ID, which
+   it has only from a token that verified (`QuicRetryCheck.AdmitRetried`, `QuicConnection.serverAfterRetry`). The
+   token is then marked as a Retry's (`NGTCP2_TOKEN_TYPE_RETRY`).
+3. **Any other token is ignored,** and the connection goes on with an address that is not validated, as RFC 9000
+   §8.1.3 has it for a token that cannot be used. It is held to three times what it sent, and a ClientHello
+   without its start gets a Retry (amendment 10).
+   - This server sends no NEW_TOKEN frames, so no token of that kind is its own.
+   - A token with the Retry mark that does not verify still drops its Initial (amendment 5).
+4. **The public API** is unchanged. `QuicConnection.server` now does what its name says for an Initial with a
+   token: a connection for an address that is not validated.
+5. **Not covered.**
+   - Over the listener, an Initial whose token lacks the Retry mark: no client in this repository can send one.
+     The test makes the same connection without the listener (`QuicConnection.server`).
+   - A Retry token that verifies but holds an empty original ID is admitted as if it had none, and is now not
+     validated either. Whether such a token can be had was not examined.
+6. **Asked for by the owner** on 2026-11-14 ("Yes, fix it next"), after the finding in `docs/milestones/M10.md`.
+   The owner has not yet read this amendment.

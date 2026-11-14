@@ -847,8 +847,14 @@ qs_conn *qs_conn_server(qs_tls *t, const uint8_t *pkt, size_t len, const uint8_t
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now;
     qs_log_if_asked(&settings);
-    settings.token = hd.token;
-    settings.tokenlen = hd.tokenlen;
+    if (odcid_len > 0) {
+        /* Only a token that was checked (qs_retry_check gave `odcid`) is given to ngtcp2, which takes any token it
+           is given as proof of the client's address and lifts the limit of three times what the client sent
+           (RFC 9000 §8.1). Any other token is the client's own bytes: the address stays unvalidated (§8.1.3). */
+        settings.token = hd.token;
+        settings.tokenlen = hd.tokenlen;
+        settings.token_type = NGTCP2_TOKEN_TYPE_RETRY;
+    }
     ngtcp2_transport_params params;
     qs_params(&params);
     params.original_dcid = hd.dcid;
