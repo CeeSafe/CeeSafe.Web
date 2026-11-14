@@ -773,8 +773,7 @@ public struct Client {
         );
         let addresses = net(resolved)?;
         let ordered = net(interleave(addresses))?;
-        let sendable: borrow dyn Dialer + Send + Share = borrow this.dialer;
-        let dialer: borrow dyn Dialer = sendable; // in two steps: upstream U19
+        let dialer: borrow dyn Dialer = borrow this.dialer;
         let stream = net(await happyEyeballs(ordered, dialer, this.options.connectionAttemptDelayMs, deadline))?;
         match (borrow this.tls) {
             Some(c) => {

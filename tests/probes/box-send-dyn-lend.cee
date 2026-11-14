@@ -1,4 +1,6 @@
-// U19 repro (ceesafec 0.10.1): line 'describe(s)' is N0205; through sendable() it prints 16.
+// U19 repro (ceesafec 0.10.1): `describe(s)` was N0205; through a `borrow dyn Shape + Send` it printed 16.
+// Fixed in 0.42.0 (CeeSafe 54d131d0): a marked box lends `borrow dyn Shape` in one step. Expected: 9, 16, 16.
+// Since 0.25.0 (CeeSafe ADR 0084) an `Arc<T>` needs `T: Share`, so the shared box is `dyn Shape + Send + Share`.
 interface Shape {
     fn area(borrow this) -> u64;
 }
@@ -16,6 +18,7 @@ fn main() {
     describe(b);
     let s: Box<dyn Shape + Send> = Box.create(Square { side: 4 })!;
     describe(s);
-    let a = Arc<Box<dyn Shape + Send>>.create(s)!;
+    let t: Box<dyn Shape + Send + Share> = Box.create(Square { side: 4 })!;
+    let a = Arc<Box<dyn Shape + Send + Share>>.create(t)!;
     describe(a.get());
 }

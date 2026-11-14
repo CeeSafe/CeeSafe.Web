@@ -840,11 +840,9 @@ async fn serveStream(
         Err(_) => { return; },
     };
     var date = DateCache.create(limits.sendDate);
-    // Box<dyn Application + Send + Share> lends a `dyn Application + Send + Share`, which lends a `dyn Application`: no
-    // wrapper, so the handler's call is a plain dyn await, not a stacked one through a wrapper that may hold itself
-    // (ADR 0056).
-    let sendable: borrow dyn Application + Send + Share = app.get();
-    let application: borrow dyn Application = sendable;
+    // Box<dyn Application + Send + Share> lends a `dyn Application` (ceesafec 0.42.0): no wrapper, so the handler's call
+    // is a plain dyn await, not a stacked one through a wrapper that may hold itself (ADR 0056).
+    let application: borrow dyn Application = app.get();
     var ex = Exchange.forStream(
         mut port,
         mut none,
