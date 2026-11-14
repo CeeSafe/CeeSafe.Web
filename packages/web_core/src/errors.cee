@@ -36,11 +36,13 @@ public enum NetError {
 
 /// Conversions to NetError and its descriptions. (An enum has no functions of its own, type-system.md §15.1.)
 public struct NetErrors {
-    /// The NetError for an async operation's failure.
+    /// The NetError for an async operation's failure. `AsyncError.Closed` (CeeSafe ADR 0128 §2.1, ceesafec 0.43.0):
+    /// the other side, or this endpoint, was closed, so the operation can never succeed; that is `Closed`.
     public fn fromAsync(e: AsyncError) -> NetError => match (e) {
         AsyncError.Cancelled => NetError.Cancelled,
         AsyncError.TimedOut => NetError.TimedOut,
         AsyncError.Io(io) => NetErrors.fromIo(io),
+        AsyncError.Closed => NetError.Closed,
     };
 
     /// The NetError for a platform I/O error (CeeSafe ADR 0044 §3.4). A broken pipe means the peer is gone, so the

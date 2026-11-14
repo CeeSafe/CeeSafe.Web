@@ -548,7 +548,8 @@ Conversions to NetError and its descriptions. (An enum has no functions of its o
 public fn fromAsync(e: AsyncError) -> NetError
 ```
 
-The NetError for an async operation's failure.
+The NetError for an async operation's failure. `AsyncError.Closed` (CeeSafe ADR 0128 §2.1, ceesafec 0.43.0):
+the other side, or this endpoint, was closed, so the operation can never succeed; that is `Closed`.
 
 ### NetErrors.fromIo
 

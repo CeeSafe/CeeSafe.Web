@@ -21,13 +21,15 @@ that needs an unreleased compiler is not merged to main.
 | M8 reverse proxy | **0.11.0** | U20 (a type that holds loans as a `borrow mut dyn I`, CeeSafe ADR 0064 §3.2) for the request-body relay; ADR 0064 §1's generic methods for `ReverseProxy.route<S>()` | gate passed, on main (#3, 2026-11-06); released with M9 in v0.4.0 (`docs/milestones/M8.md`) |
 | M9 low-level I/O | **0.22.0** | `Vector.resize` (ADR 0071, 0.15.0) for `OwnedBuffer.create`; U7 sendfile (ADR 0051); `readAt`/`length` (ADR 0075) for TLS and HTTP/2 file bodies; B19 (`sendFile` to a reset connection raised SIGPIPE on Linux) and U22 (`File.openRegular`, `f.modified()`, `f.kind()`) for `web_static`, both CeeSafe ADR 0078 | done; main's minimum, released in v0.4.0 (`docs/milestones/M9.md`) |
 | M10 HTTP/3 | **0.22.0** | U6 UDP (ADR 0050, 0.9.0); nothing newer than M9's minimum | done; main's minimum, released in v0.5.0 (`docs/milestones/M10.md`) |
-| After v0.5: `Share` | **0.27.0** | CeeSafe ADR 0084 (0.25.0): `Share` is no longer every `Send` type, and `Arc<T>` needs `T: Share`. What a server or proxy shares across requests is bounded `Send + Share`: `Server<S: Send + Share>`, `Box<dyn Handler<S> + Send + Share>`, `Box<dyn Middleware<S> + Send + Share>`, `Box<dyn Application + Send + Share>`, `Box<dyn QuicApplication + Send + Share>`, and the client's connector, resolver and dialer. `dyn … + Share` exists from 0.25.0, so 0.22.0 cannot build it; 0.27.0 is the newest release (2026-11-10) | main's minimum from 2026-11-10 (#8; implementation plan §11.13) |
+| After v0.5: `Share` | **0.27.0** | CeeSafe ADR 0084 (0.25.0): `Share` is no longer every `Send` type, and `Arc<T>` needs `T: Share`. What a server or proxy shares across requests is bounded `Send + Share`: `Server<S: Send + Share>`, `Box<dyn Handler<S> + Send + Share>`, `Box<dyn Middleware<S> + Send + Share>`, `Box<dyn Application + Send + Share>`, `Box<dyn QuicApplication + Send + Share>`, and the client's connector, resolver and dialer. `dyn … + Share` exists from 0.25.0, so 0.22.0 cannot build it; 0.27.0 is the newest release (2026-11-10) | main's minimum from 2026-11-10 to 2026-11-14 (#8; implementation plan §11.13) |
+| After v0.5: `AsyncError.Closed` | **0.44.0** | CeeSafe ADR 0128 (0.43.0): `AsyncError` gained `Closed`, and `NetErrors.fromAsync` (`packages/web_core/src/errors.cee`) matched it without a `_` arm, so 0.43.0 and later did not check `web_core` or anything that depends on it. The new arm does not compile before 0.43.0. 0.43.0 was not tested; 0.44.0, the newest release (2026-11-14), was | proposed on branch `toolchain-0.44`; the owner has not decided (implementation plan §11) |
 
 ## Current machine (2026-11-06)
 
 | Binary | Version | Use |
 |---|---|---|
 | `~/.ceesafe/bin/ceesafec` (on `PATH`) | 0.20.0 (release, osx-arm64; found 2026-11-06) | checks every manifest; not yet tested |
+| `~/.ceesafe/bin/ceesafec-0.44.0` | **0.44.0** (release, tag `v0.44.0`, osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, 2026-11-14; no signature checked) | the `AsyncError.Closed` change (CeeSafe ADR 0128), branch `toolchain-0.44` |
 | `~/.ceesafe/bin/ceesafec-0.27.0` | 0.27.0 (release, tag `v0.27.0` = CeeSafe `405dc50`, osx-arm64; the archive matches the release's `SHA256SUMS`, 2026-11-10; no signature checked) | the `Share` change (CeeSafe ADR 0084), branch `toolchain-0.27` |
 | `~/.ceesafe/bin/ceesafec-0.22.0` | **0.22.0** (release, tag `v0.22.0` = CeeSafe `f225f7a`, osx-arm64; the archive matches the release's `SHA256SUMS`, signature checked, 2026-11-08) | M9's minimum: B19 and U22 (CeeSafe ADR 0078) |
 | `~/.ceesafe/bin/ceesafec-0.19.1` | 0.19.1 (release, tag `v0.19.1` = CeeSafe `619145e`, osx-arm64) | `File.readAt`, `length` (CeeSafe ADR 0075), for M9 stage 3 |
@@ -79,6 +81,29 @@ still N0205), U21, and U22 (an open file's modification time and kind), which `w
 is 0.19.1 from stage 2 (the owner's choice, 2026-11-06): `OwnedBuffer.create` fills with `Vector.resize`, and
 stage 3 uses `readAt`. CI pins v0.19.1 on `m9-io`. 0.20.0 checks every manifest (27, the benchmark included) with no
 diagnostic; its tests have not been run.
+
+0.43.0 (CeeSafe ADR 0128 §2.1) adds a fourth variant to `AsyncError`, `Closed`: "the other side of this channel, or
+this endpoint, was closed, so the operation can never succeed". ADR 0128 §5 says the change breaks a `match` over
+`AsyncError` that has no `_` arm. `NetErrors.fromAsync` in `web_core` was such a match, so with 0.43.0 and 0.44.0
+every package, example and benchmark that depends on `web_core` stopped checking (N0256 at
+`packages/web_core/src/errors.cee:40`, then N0364 in each dependent). The fix is one arm, `AsyncError.Closed =>
+NetError.Closed`, which is what `NetError.Closed` already meant ("the stream has ended"); 0.27.0 rejects it
+(N0200: no variant named `Closed`). No other `match` in the repository needed a change: each other one has a `_`
+arm. ADR 0128 §5 also says that no library operation returned `Closed` before 0.43.0, and that only
+`SendError.reason` produces it now, so no existing program sees a different value at run time.
+Run 2026-11-14 on macOS arm64, branch `toolchain-0.44` (the fix on main at `dab9a35`, then at `fe3ae27`):
+- every manifest (33) checks with no diagnostic, `fmt --check` lists no file, `tools/check_layers.py` passes, and
+  `tools/api_check.py` matches after `--write` (the doc comment of `NetErrors.fromAsync` only);
+- `python3 tools/run_tests.py --ceesafec ceesafec-0.44.0 --sanitize --alloc-sweep --cancel-sweep`, on `dab9a35`
+  plus the fix: 53 runs passed, 0 failed, 3 skipped (web_tls, web_quic and web_http3 in the interpreter: they
+  call C). No sweep failure in any package.
+- On `fe3ae27` (pull request #20 merged: `quic_shim.c` and one new web_quic test), web_quic again with
+  `--no-interp --sanitize --alloc-sweep --cancel-sweep`: 23 passed (0 failures
+  in 3,830 allocation-sweep and 1,169 cancellation-sweep runs).
+- `web_core`'s `errors_from_async` now checks that `AsyncError.Closed` becomes `NetError.Closed`; the expected value
+  is ADR 0128 §2.1's definition, not this code's.
+- Before the fix, CI's non-blocking `ceesafe-main` job failed with the same N0256 on pull request #20 and on main
+  after #18 and #19 merged; the blocking jobs, pinned to v0.27.0, passed.
 
 0.22.0 (CeeSafe ADR 0078, written from this project's B19 and U22) is M9's minimum from 2026-11-08 (the owner's
 choice). On Linux, `sendFile` to a reset connection is an error, not SIGPIPE, and an open file's time and kind and
