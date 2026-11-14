@@ -857,8 +857,12 @@ async fn admit(
     let from = got.from;
     let creditOnRead = options.creditOnRead;
     let firstId = copied(retriedFrom[0..retriedLength])?;
+    let retryKey = match (options.retryKey) {
+        Some(k) => k,
+        null => [0u8; 32],
+    };
     let started = set.trySpawn(async move () =>
-        await connectionTask(t, a, i, o, id, local, from, initial, ids, creditOnRead, firstId));
+        await connectionTask(t, a, i, o, id, local, from, initial, ids, creditOnRead, firstId, retryKey));
     if (!started) {
         return Ok(); // the set is full: the Initial is dropped, and the client tries again
     }
@@ -879,7 +883,8 @@ async fn admit(
 }
 
 /// One connection's task: makes the connection from its Initial, runs the application, then closes and tells the
-/// listener.
+/// listener. An Initial that does not begin the ClientHello is answered with a Retry made with `retryKey`, and the
+/// connection ends there (`QuicError.RetryWanted`; Web ADR 0014 amendment 10).
 async fn connectionTask(
     tls: Arc<QuicTls>,
     app: Arc<Box<dyn QuicApplication + Send + Share>>,
@@ -892,6 +897,7 @@ async fn connectionTask(
     ids: QuicIds,
     creditOnRead: bool,
     retriedFrom: Vector<u8>,
+    retryKey: [u8; 32],
 ) -> Result<void, QuicError> {
     let here = QuicAddress.of(local);
     let there = QuicAddress.of(from);
@@ -921,6 +927,14 @@ async fn connectionTask(
         Err(_) => { return Err(QuicError.NoMemory); }
     }
     let fed = conn.feed(there, 0, initial.view(), now);
+    match (fed) {
+        Err(QuicError.RetryWanted) => {
+            await retryInstead(toListener, retryKey, initial.view(), from, mut out);
+            let _ = await toListener.sendAsync(ToListener.Ended(id));
+            return Ok();
+        }
+        _ => {}
+    }
     var link = QuicLink {
         conn: conn,
         inbound: inbound,
@@ -944,6 +958,27 @@ async fn connectionTask(
     await link.linger();
     let _ = await link.toListener.sendAsync(ToListener.Ended(id));
     return Ok();
+}
+
+/// Answers `initial`, a client Initial from `from` that did not begin its ClientHello, with a Retry
+/// (`QuicError.RetryWanted`). Nothing is kept: the client's next Initial carries the token, and is admitted whole or
+/// in parts. When no Retry can be made, nothing is sent, and the client sends its Initial again at its probe timeout.
+async fn retryInstead(
+    toListener: borrow Channel<ToListener>,
+    key: [u8; 32],
+    initial: Slice<u8>,
+    from: SocketAddress,
+    out: borrow mut Vector<u8>,
+) {
+    let n = match (QuicRetry.check(key, initial, QuicAddress.of(from), true, Clock.monotonicNanos(), out.viewMut())) {
+        QuicRetryCheck.SendRetry(n) => n,
+        _ => { return; },
+    };
+    let retry = match (copied(out.view()[0..n])) {
+        Ok(r) => r,
+        Err(_) => { return; },
+    };
+    let _ = await toListener.sendAsync(ToListener.Send(retry, from));
 }
 
 /// The connection a connection ID routes to.

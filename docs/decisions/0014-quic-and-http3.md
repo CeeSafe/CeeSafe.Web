@@ -719,3 +719,43 @@ package's own client.
 3. **The cost** is up to 32 datagrams (about 46 KiB) per connection, for the length of its handshake, and only for
    connections that are sent 0-RTT.
 4. **Accepted by the owner** on 2026-11-13, with this bound and this cost.
+
+## 17. Amendment 10 (2026-11-13: a ClientHello whose first datagram is lost or late gets a Retry)
+
+The traces of amendment 9 under netem (`docs/milestones/M10.md`, "Amendment 9 under netem: the traces") found it.
+
+1. **What went wrong.**
+   - A ClientHello may span two Initial datagrams (a resuming client's does here). When the first is lost, or the
+     second overtakes it, the listener makes the connection from the second.
+   - ngtcp2 cannot begin the handshake from it, and keeps nothing of a client whose address is not validated: it
+     returns `NGTCP2_ERR_RETRY` (`third_party/ngtcp2-1.26.0/lib/ngtcp2_conn.c:10426`, "perform address validation
+     in order to buffer validated data only").
+   - The shim had no case for that code. It became `QuicError.Failed`: the connection ended, nothing was sent, and
+     the 0-RTT datagrams held for it went with it.
+   - The client sent its Initial again at its first probe timeout, about a second later, and its early bytes in
+     1-RTT. Nothing was lost; the handshake took a second longer than it had to.
+2. **Fix: the Retry ngtcp2 asks for.**
+   - `QuicError.RetryWanted` is that code, from a server connection's first `feed`
+     (`packages/web_quic/src/connection.cee`; `qs_error_kind` in `quic_shim.c`).
+   - The connection's task answers it with a Retry for the Initial (`QuicRetry.check` with `require`, the
+     listener's `retryKey`), sent through the listener, and ends without a close or a linger (`retryInstead` in
+     `packages/web_quic/src/server.cee`).
+   - The client sends its whole Initial again at once, with the token. The listener admits it as it admits any
+     Initial after a Retry (amendment 5), and a token lets ngtcp2 keep a ClientHello that comes in parts.
+   - The server keeps nothing between the two: the Retry is smaller than the Initial it answers, and the token is
+     the state (RFC 9000 §8.1.2).
+3. **The alternative, not taken:** keeping the datagram until the ClientHello's start comes. It would save the
+   round trip, and it is state held for an address nobody has validated, which is what ngtcp2 refuses.
+4. **What it adds to the public API:** one variant, `QuicError.RetryWanted`. A `match` on `QuicError` without a `_`
+   arm no longer compiles; none in this repository needed more than the new arm (`tests/loopback.cee`).
+5. **What remains.**
+   - *The late first datagram makes a second connection.* When the first datagram comes after the Retry was sent,
+     it begins a connection of its own, which waits for a ClientHello that will not come and ends at its idle
+     timeout. It is what any lone Initial costs, and `maxConnections` and `retryAbove` bound it.
+   - *A reply that overtakes the Retry.* A client that has processed an Initial from the server discards a later
+     Retry (RFC 9000 §17.2.5.2). If the late first datagram's connection answers before the Retry arrives, the
+     client is back to its probe timeout. Not seen; it needs both reorderings at once.
+   - *`NGTCP2_ERR_DROP_CONN`* (a first Initial with no CRYPTO data at all) is still `QuicError.Failed`. Not
+     examined here.
+6. **Asked for by the owner** on 2026-11-13 ("Please fix"). The design is the Retry ngtcp2 asks for; the owner has
+   not yet read this amendment.
