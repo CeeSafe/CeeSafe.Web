@@ -7,6 +7,7 @@ usage: python3 tools/run_tests.py [--ceesafec PATH] [--filter TEXT] [--no-interp
 
 Tests are `@test` functions in packages/<name>/tests/*.cee, part of their package. Each runs as its own process,
 natively, and must pass with no allocation left live (a leak fails it); a test past --timeout (default 120 s) fails.
+In the interpreter a package may have a longer limit (INTERP_TIMEOUTS: web_ws, 300 s).
 By default every package is run twice, natively and in the interpreter (`--interp`: virtual clock, fixed order). A
 package with C of its own (`c = [...]`), or depending on web_tls, is not interpreted: the interpreter runs no C
 (CeeSafe spec §28.6; Web ADR 0002 §4).
@@ -29,6 +30,11 @@ import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# A package's least --timeout in the interpreter, where one of its tests needs more than the default.
+# web_ws: sha1_rfc3174_vectors hashes RFC 3174's million-byte vector, 69-84 s alone on macOS arm64 and past 120 s on
+# a CI runner once (pull request #22's ceesafe-main job, 2026-11-14; docs/toolchain.md).
+INTERP_TIMEOUTS = {"web_ws": 300}
 
 
 def main() -> int:
@@ -60,7 +66,7 @@ def main() -> int:
         native += ["--cflag", "-fsanitize=address,undefined", "--cflag", "-fno-omit-frame-pointer"]
     modes = [("native", native)]
     if not args.no_interp:
-        modes.append(("interp", ["--interp", "--timeout", str(args.timeout)]))  # SHA-1's 1M-byte vector: ~60 s
+        modes.append(("interp", ["--interp"]))  # its --timeout is per package: interp_timeout
     if args.alloc_sweep:
         modes.append(("alloc sweep", native + ["--sweep", "alloc"]))
     if args.cancel_sweep:
@@ -76,6 +82,8 @@ def main() -> int:
                 print(f"skip {name} ({mode}): it runs C, which the interpreter cannot")
                 continue
             command = [args.ceesafec, "test"] + flags
+            if mode == "interp":
+                command += ["--timeout", str(max(args.timeout, INTERP_TIMEOUTS.get(name, 0)))]
             if args.filter:
                 command += ["--filter", args.filter]
             start = time.monotonic()
