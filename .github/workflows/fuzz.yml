@@ -23,7 +23,7 @@ on:
         default: "18000"
 
 env:
-  CEESAFE_VERSION: v0.27.0 # as ci.yml: main's minimum (docs/toolchain.md)
+  CEESAFE_VERSION: v0.44.0 # as ci.yml: main's minimum (docs/toolchain.md)
   FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '300' || github.event.inputs.seconds || '18000' }}
 
 permissions:

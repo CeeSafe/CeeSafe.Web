@@ -19,6 +19,12 @@ fn errors_from_async() -> Result<void, TestFailure> {
         NetError.Reset => true,
         _ => false,
     }, "aborted is Reset")?;
+    // CeeSafe ADR 0128 §2.1: "the other side of this channel, or this endpoint, was closed, so the operation can
+    // never succeed".
+    Check.isTrue(match (NetErrors.fromAsync(AsyncError.Closed)) {
+        NetError.Closed => true,
+        _ => false,
+    }, "closed is Closed")?;
     return Ok();
 }
 
