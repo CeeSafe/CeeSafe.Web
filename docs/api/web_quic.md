@@ -7,6 +7,7 @@
 - [struct QuicAddress](#struct-quicaddress)
 - [struct QuicTls](#struct-quictls)
 - [fn quicDatagramSize](#fn-quicdatagramsize)
+- [fn quicTokenSize](#fn-quictokensize)
 - [fn quicEventBufferSize](#fn-quiceventbuffersize)
 - [struct QuicIds](#struct-quicids)
 - [struct QuicConnection](#struct-quicconnection)
@@ -196,6 +197,15 @@ public fn quicDatagramSize() -> usize
 The buffer `datagram` writes into: 1452 bytes, ngtcp2's default largest datagram (`max_tx_udp_payload_size`,
 1500 - 48, `ngtcp2_settings.c`), which fits IPv6 under a 1500-byte MTU.
 
+## fn quicTokenSize
+
+```ceesafe
+public fn quicTokenSize() -> usize
+```
+
+The longest token a client sends (`QuicConnection.clientWithToken`), and the room `newToken` needs: ngtcp2's
+limit (`NGTCP2_MAX_TOKENLEN`; the shim's `QS_MAX_TOKEN`).
+
 ## fn quicEventBufferSize
 
 ```ceesafe
@@ -252,6 +262,26 @@ public fn client(
 A client connection to `remote` from `local`, for `host` (its SNI, and the name its certificate is verified
 against).
 Safety: the shim copies every byte it is given and keeps no pointer to them; it returns a fresh handle or null.
+
+### QuicConnection.clientWithToken
+
+```ceesafe
+public fn clientWithToken(
+    tls: borrow QuicTls,
+    host: StringView,
+    local: borrow QuicAddress,
+    remote: borrow QuicAddress,
+    ids: borrow QuicIds,
+    token: Slice<u8>,
+    now: u64,
+) -> Result<QuicConnection, QuicError>
+```
+
+As `client`, with `token` in the Token field of its Initials until a Retry replaces it (RFC 9000 §8.1.3,
+§17.2.5.2): a token from a NEW_TOKEN frame (`newToken`) of an earlier connection to a server it applies to.
+Keeping tokens, and choosing the server one applies to, is the caller's (§8.1.3: a token is not reused). At
+most `quicTokenSize()` bytes; with a longer one the connection cannot be made (`NoMemory`).
+Safety: as `client`; the shim's ngtcp2 copies the token.
 
 ### QuicConnection.server
 
@@ -396,6 +426,17 @@ public fn ticket(borrow this, out: SliceMut<u8>) -> usize
 
 A ticket for resuming with the same server later (`resume`), into `out`: its length, or 0 while there is none
 (the server's ticket comes after the handshake). A client's.
+Safety: the shim writes at most `out.length` bytes.
+
+### QuicConnection.newToken
+
+```ceesafe
+public fn newToken(borrow this, out: SliceMut<u8>) -> usize
+```
+
+The most recent token the server sent in a NEW_TOKEN frame (RFC 9000 §19.7), for a later connection
+(`clientWithToken`), into `out`: its length, or 0 while there is none or when it does not fit (`out` of
+`quicTokenSize()` bytes always fits). A client's.
 Safety: the shim writes at most `out.length` bytes.
 
 ### QuicConnection.resume

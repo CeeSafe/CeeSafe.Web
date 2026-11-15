@@ -21,6 +21,8 @@ extern "C" {
         scid: *u8,
         scidLength: usize,
         secret: *u8,
+        token: *u8,
+        tokenLength: usize,
         now: u64,
         error: *mut i32,
     ) -> *mut void;
@@ -62,6 +64,8 @@ extern "C" {
     fn qs_tls_allow_early(tls: *mut void);
     @effects()
     fn qs_ticket(conn: *mut void, out: *mut u8, capacity: usize) -> i64;
+    @effects()
+    fn qs_new_token(conn: *mut void, out: *mut u8, capacity: usize) -> i64;
     @effects()
     fn qs_resume(conn: *mut void, ticket: *u8, length: usize) -> i32;
     @effects()
@@ -350,6 +354,10 @@ public struct QuicTls {
 /// 1500 - 48, `ngtcp2_settings.c`), which fits IPv6 under a 1500-byte MTU.
 public fn quicDatagramSize() -> usize => 1452;
 
+/// The longest token a client sends (`QuicConnection.clientWithToken`), and the room `newToken` needs: ngtcp2's
+/// limit (`NGTCP2_MAX_TOKENLEN`; the shim's `QS_MAX_TOKEN`).
+public fn quicTokenSize() -> usize => 512;
+
 /// The buffer `nextEvent` takes, which every event's data fits: the largest UDP payload over IPv4, since a peer's
 /// datagram, and the stream data in it, may be larger than ours.
 public fn quicEventBufferSize() -> usize => 65527;
@@ -395,6 +403,27 @@ public struct QuicConnection {
         ids: borrow QuicIds,
         now: u64,
     ) -> Result<QuicConnection, QuicError> {
+        let none = [0u8; 1];
+        return QuicConnection.clientWithToken(tls, host, local, remote, ids, none[0..0], now);
+    }
+
+    /// As `client`, with `token` in the Token field of its Initials until a Retry replaces it (RFC 9000 §8.1.3,
+    /// §17.2.5.2): a token from a NEW_TOKEN frame (`newToken`) of an earlier connection to a server it applies to.
+    /// Keeping tokens, and choosing the server one applies to, is the caller's (§8.1.3: a token is not reused). At
+    /// most `quicTokenSize()` bytes; with a longer one the connection cannot be made (`NoMemory`).
+    /// Safety: as `client`; the shim's ngtcp2 copies the token.
+    public fn clientWithToken(
+        tls: borrow QuicTls,
+        host: StringView,
+        local: borrow QuicAddress,
+        remote: borrow QuicAddress,
+        ids: borrow QuicIds,
+        token: Slice<u8>,
+        now: u64,
+    ) -> Result<QuicConnection, QuicError> {
+        if (token.length > quicTokenSize()) {
+            return Err(QuicError.NoMemory);
+        }
         var error: i32 = 0;
         let raw = unsafe { qs_conn_client(
             tls.handle(),
@@ -407,6 +436,8 @@ public struct QuicConnection {
             ids.scid[..].ptr,
             20,
             ids.resetSecret[..].ptr,
+            token.ptr,
+            token.length,
             now,
             borrow mut error as *mut i32,
         ) };
@@ -592,6 +623,15 @@ public struct QuicConnection {
     /// Safety: the shim writes at most `out.length` bytes.
     public fn ticket(borrow this, out: SliceMut<u8>) -> usize {
         let n = unsafe { qs_ticket(this.raw, out.ptr, out.length) };
+        return if (n > 0) truncate<usize>(n) else 0;
+    }
+
+    /// The most recent token the server sent in a NEW_TOKEN frame (RFC 9000 §19.7), for a later connection
+    /// (`clientWithToken`), into `out`: its length, or 0 while there is none or when it does not fit (`out` of
+    /// `quicTokenSize()` bytes always fits). A client's.
+    /// Safety: the shim writes at most `out.length` bytes.
+    public fn newToken(borrow this, out: SliceMut<u8>) -> usize {
+        let n = unsafe { qs_new_token(this.raw, out.ptr, out.length) };
         return if (n > 0) truncate<usize>(n) else 0;
     }
 
