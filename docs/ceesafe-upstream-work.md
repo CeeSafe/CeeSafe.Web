@@ -799,7 +799,7 @@ failing it and the ADR says so: a library's tests then show where a stacked awai
 **Effect on CeeSafe.Web until then:** none. The driver no longer stacks the call (U19's two-step lend), and the
 strict sweep is useful here: it found the wrapper.
 
-## U19 — `Box<dyn I + Send>` does not lend a `borrow dyn I` in one step   *(found 2026-11-03, M7, ceesafec 0.10.1; wanted, not blocking)*
+## U19 — `Box<dyn I + Send>` does not lend a `borrow dyn I` in one step   *(found 2026-11-03, M7, ceesafec 0.10.1; wanted, not blocking; fixed in 0.42.0)*
 
 **Gap:** a `Box<dyn I>` converts to `borrow dyn I`, and a `borrow dyn I + Send` converts to `borrow dyn I`. But
 `Box<dyn I + Send>` (or `Arc<Box<dyn I + Send>>.get()`) to `borrow dyn I` is N0205 ("expected 'borrow dyn Shape',
@@ -812,6 +812,14 @@ prints the area.
 **Effect on CeeSafe.Web until then:** `web_http2/src/serve.cee` binds `let sendable: borrow dyn Application + Send =
 app.get();` and then `let application: borrow dyn Application = sendable;`. That is two lines, not a workaround: no
 wrapper, no `unsafe`.
+
+**Fixed in 0.42.0** (CeeSafe `54d131d0`, 2026-11-13: "check: a Box<dyn I + Send> lends as borrow dyn I"). Checked
+2026-11-15 with `tests/probes/box-send-dyn-lend.cee`, which since CeeSafe ADR 0084 needs `+ Share` for its `Arc`:
+- 0.27.0 still gives N0205 for both calls;
+- 0.42.1, 0.44.0 and 0.46.1 check it and print 9, 16 and 16 in the interpreter.
+
+The four two-step lends are one step since then: `web_client/src/client.cee` (the dialer), `web_http2/src/serve.cee`,
+`web_http3/src/server.cee` and `web_server/src/server.cee` (the application).
 
 ## U21 — Timers on Windows keep the 15.6 ms tick   *(found 2026-11-05, M8, ceesafec 0.11.0, Windows 11 ARM64; wanted, not blocking)*
 

@@ -108,8 +108,7 @@ impl ConnectionHandler for HttpService {
             }
             n += got;
         }
-        let sendable: borrow dyn Application + Send + Share = this.app.get();
-        let app: borrow dyn Application = sendable;
+        let app: borrow dyn Application = this.app.get();
         if (n == first.length && prefixOf(first[..], preface)) {
             return await serveH2(conn, ctx, this.app, this.httpLimits, first[..]);
         }

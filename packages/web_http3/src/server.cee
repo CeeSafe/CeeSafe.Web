@@ -871,8 +871,7 @@ async fn serveRequest(
         Err(_) => { return; },
     };
     var date = DateCache.create(limits.sendDate);
-    let sendable: borrow dyn Application + Send + Share = app.get();
-    let application: borrow dyn Application = sendable;
+    let application: borrow dyn Application = app.get();
     var ex = Exchange.forStream(
         mut port,
         mut none,
