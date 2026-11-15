@@ -551,6 +551,15 @@ public fn headSent(borrow this) -> bool
 
 Whether the head has been sent (or queued to send).
 
+### Exchange.status
+
+```ceesafe
+public fn status(borrow this) -> StatusCode
+```
+
+The response's status as set so far (200 until `setStatus` or `send`), and the one sent once the head was sent:
+what an application's metrics and access log record after its handler returns.
+
 ### Exchange.write
 
 ```ceesafe

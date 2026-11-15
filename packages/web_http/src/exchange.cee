@@ -474,6 +474,10 @@ public struct Exchange<region r> {
     /// Whether the head has been sent (or queued to send).
     public fn headSent(borrow this) -> bool => this.sent;
 
+    /// The response's status as set so far (200 until `setStatus` or `send`), and the one sent once the head was sent:
+    /// what an application's metrics and access log record after its handler returns.
+    public fn status(borrow this) -> StatusCode => this.response.status();
+
     /// Writes body bytes. They wait in the response buffer; a full buffer sends the head and the bytes so far. Over
     /// HTTP/1.1, what is left of a write at least as large as the buffer, once the buffer is empty, goes to the wire
     /// as it is, without a copy.
