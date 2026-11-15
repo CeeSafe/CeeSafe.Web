@@ -194,6 +194,8 @@ jobs:
             s=$(dirname "$(find seed -name main.c | head -1)")
             cc -std=c11 -O2 -ffp-contract=off -fno-math-errno -I "$s" "$s"/*.c -o diag/local -lm -lpthread
             (diag/local --version; echo "built on 15.1: status $?") || true
+            fetch -qo install.sh https://ceesafe.github.io/CeeSafe/install.sh
+            (sh -x install.sh 2>&1 | tail -30) || true
             exit 1
             fetch -qo - https://ceesafe.github.io/CeeSafe/install.sh | sh
             export PATH="$HOME/.ceesafe/bin:$PATH"
