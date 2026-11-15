@@ -122,6 +122,16 @@ default certificate. Adding a name already present replaces its certificate, for
 Safety: the shim copies the bytes and changes its table under OpenSSL's lock, so `borrow this` is enough while
 connections are being made from this configuration.
 
+### TlsConfig.removeName
+
+```ceesafe
+public fn removeName(borrow this, name: StringView) -> bool
+```
+
+Takes `name` out of a server's SNI table, as `addName` wrote it: clients asking for it get a wildcard that covers
+it, or the default certificate, from their next handshake. Whether it was there.
+Safety: as `addName`.
+
 ### TlsConfig.reload
 
 ```ceesafe

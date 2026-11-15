@@ -57,8 +57,9 @@ enum {
 #define WT_ALPN_MAX 64
 /* The longest certificate list a peer may send (SSL_CTX_set_max_cert_list). */
 #define WT_MAX_CERT_LIST (64 * 1024)
-/* The most names a server's SNI table holds. */
-#define WT_NAMES_MAX 64
+/* The most names a server's SNI table holds: a proxy's certificate store, every SAN of every certificate. The table
+   grows as names are added, so this only bounds the memory a configuration can take. */
+#define WT_NAMES_MAX 65536
 
 typedef struct wt_alpn_list {
     unsigned char bytes[WT_ALPN_MAX];
@@ -84,8 +85,9 @@ typedef struct wt_name {
 typedef struct wt_front {
     CRYPTO_RWLOCK *lock;
     SSL_CTX *current; /* the default certificate after a reload; NULL: the front configuration's own */
-    wt_name names[WT_NAMES_MAX];
+    wt_name *names;   /* `count` in use of `capacity`, grown by add_name */
     int count;
+    int capacity;
     wt_ticket_key keys[2]; /* [0] issues and accepts; [1], the previous, only accepts */
     X509_STORE *client_roots;
     STACK_OF(X509_NAME) *client_names;
@@ -127,6 +129,7 @@ static void front_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, lon
     for (int i = 0; i < f->count; i++) {
         SSL_CTX_free(f->names[i].ctx);
     }
+    OPENSSL_free(f->names);
     SSL_CTX_free(f->current);
     X509_STORE_free(f->client_roots);
     sk_X509_NAME_pop_free(f->client_names, X509_NAME_free);
@@ -664,7 +667,17 @@ int32_t wt_cfg_add_name(SSL_CTX *front, const uint8_t *name, size_t name_len, co
             at = i;
         }
     }
-    int ok = at < WT_NAMES_MAX;
+    int ok = at < f->count || at < WT_NAMES_MAX;
+    if (ok && at == f->capacity) {
+        int grown = f->capacity == 0 ? 8 : (f->capacity > WT_NAMES_MAX / 2 ? WT_NAMES_MAX : f->capacity * 2);
+        wt_name *more = OPENSSL_realloc(f->names, (size_t)grown * sizeof *more);
+        if (more == NULL) {
+            ok = 0;
+        } else {
+            f->names = more;
+            f->capacity = grown;
+        }
+    }
     SSL_CTX *old = NULL;
     if (ok) {
         old = at < f->count ? f->names[at].ctx : NULL;
@@ -677,6 +690,27 @@ int32_t wt_cfg_add_name(SSL_CTX *front, const uint8_t *name, size_t name_len, co
     CRYPTO_THREAD_unlock(f->lock);
     SSL_CTX_free(ok ? old : ctx);
     return ok;
+}
+
+/* Takes `name` out of the SNI table: clients asking for it get what another entry (a wildcard) or the default gives
+   them, from the next handshake. 1 if it was there. */
+int32_t wt_cfg_remove_name(SSL_CTX *front, const uint8_t *name, size_t name_len) {
+    wt_front *f = front_of(front);
+    char host[256];
+    if (f == NULL || !host_name(name, name_len, host, sizeof host) || !CRYPTO_THREAD_write_lock(f->lock)) {
+        return 0;
+    }
+    SSL_CTX *old = NULL;
+    for (int i = 0; i < f->count && old == NULL; i++) {
+        if (OPENSSL_strcasecmp(f->names[i].name, host) == 0) {
+            old = f->names[i].ctx;
+            f->names[i] = f->names[f->count - 1];
+            f->count--;
+        }
+    }
+    CRYPTO_THREAD_unlock(f->lock);
+    SSL_CTX_free(old);
+    return old != NULL;
 }
 
 /* Replaces the default certificate: handshakes from now on present it; connections already made keep theirs. 1 on

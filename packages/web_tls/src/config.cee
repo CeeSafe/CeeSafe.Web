@@ -157,6 +157,16 @@ public struct TlsConfig {
         return Ok();
     }
 
+    /// Takes `name` out of a server's SNI table, as `addName` wrote it: clients asking for it get a wildcard that covers
+    /// it, or the default certificate, from their next handshake. Whether it was there.
+    /// Safety: as `addName`.
+    public fn removeName(borrow this, name: StringView) -> bool {
+        if (!this.serverSide) {
+            return false;
+        }
+        return unsafe { wt_cfg_remove_name(this.raw, name.ptr, name.length) } == 1;
+    }
+
     /// Replaces a server's default certificate (hot reload): handshakes from now on present it, connections already
     /// made keep theirs. On failure the old one stays.
     /// Safety: as `addName`.

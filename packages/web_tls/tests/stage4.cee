@@ -196,6 +196,34 @@ async fn sni_picks_the_certificate() -> Result<void, TestFailure> {
         _ => false,
     };
     Check.isTrue(bad, "a name that is not a host name is refused")?;
+    // Removed, a name gets the default again; a wildcard that covers it still applies.
+    Check.isTrue(server.removeName("api.test"), "api.test was there")?;
+    Check.isTrue(!server.removeName("api.test"), "and is gone")?;
+    let removed = await connectOnce(server, client, "api.test", null)?;
+    Check.isTrue(isTls(removed.client, TlsReason.Certificate), "api.test: the default, not valid for it")?;
+    setupDone(server.addName("api.wild.test", apiPem().bytes(), apiKey().bytes()))?;
+    Check.isTrue(server.removeName("API.WILD.TEST"), "removal ignores case")?;
+    let covered = await connectOnce(server, client, "api.wild.test", null)?;
+    Check.isTrue(ok(covered) && subjectIs(covered, "CN=*.wild.test"), "the wildcard covers it again")?;
+    return Ok();
+}
+
+@test
+async fn the_sni_table_grows_past_64_names() -> Result<void, TestFailure> {
+    let server = serverConfig()?;
+    for (k in 0..300u32) {
+        var name = [0u8; 24];
+        var w = TextWriter.create(mut name[..]);
+        w.text("n");
+        w.decimal(k as u64);
+        w.text(".wild.test");
+        let n = w.written().length;
+        setupDone(server.addName(StringView.fromUtf8(name[0..n]) ?? "", wildPem().bytes(), wildKey().bytes()))?;
+    }
+    setupDone(server.addName("api.test", apiPem().bytes(), apiKey().bytes()))?;
+    let client = clientConfig()?;
+    let api = await connectOnce(server, client, "api.test", null)?;
+    Check.isTrue(ok(api) && subjectIs(api, "CN=api.test"), "the 301st name still selects its certificate")?;
     return Ok();
 }
 

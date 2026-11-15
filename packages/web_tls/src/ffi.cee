@@ -30,6 +30,8 @@ extern "C" {
         keyLength: usize,
     ) -> i32;
     @effects()
+    fn wt_cfg_remove_name(cfg: *mut void, name: *u8, nameLength: usize) -> i32;
+    @effects()
     fn wt_cfg_reload(cfg: *mut void, chain: *u8, chainLength: usize, key: *u8, keyLength: usize) -> i32;
     @effects()
     fn wt_cfg_rotate_tickets(cfg: *mut void) -> i32;
