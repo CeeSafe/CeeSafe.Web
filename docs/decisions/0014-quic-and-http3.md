@@ -791,10 +791,11 @@ The traces of amendment 9 under netem (`docs/milestones/M10.md`, "Amendment 9 un
 6. **Asked for by the owner** on 2026-11-14 ("Yes, fix it next"), after the finding in `docs/milestones/M10.md`.
 7. **Accepted by the owner** on 2026-11-14.
 
-## 19. Amendment 12 (2026-11-15, proposed: a client's token for its Initial)
+## 19. Amendment 12 (2026-11-15: a client's token for its Initial)
 
-**Proposed, not accepted.** Nothing below is built. Asked for by the owner on 2026-11-15 ("Yes, go ahead"), when
-offered as an amendment to decide on.
+**Accepted by the owner** on 2026-11-15, with item 5's answers: "1. yes, 2. later." Asked for by the owner on
+2026-11-15 ("Yes, go ahead"), when offered as an amendment to decide on. Items 1 to 5 are the proposal as written;
+item 6 is what was built, and where it differs.
 
 1. **Why.**
    - Amendment 11 item 5 left one case untested: over the listener, an Initial whose token lacks the Retry mark.
@@ -823,7 +824,8 @@ offered as an amendment to decide on.
      (`tools/api_check.py`).
 3. **Tests, proposed:**
    - **Amendment 11 over UDP.** A client made with `clientWithToken` sends a 32-byte token that has neither mark
-     (Retry `0x02`, regular `0x36`) to a `QuicServer`. It then reads what comes back and sends nothing more.
+     (Retry `0xb7`, regular `0x36`: `NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2` and `_REGULAR`; first written here as `0x02`,
+     corrected when built) to a `QuicServer`. It then reads what comes back and sends nothing more.
      - Expected (RFC 9000 §8.1): the server sends that address at most three times what the client sent.
      - With amendment 11's condition made always true for one run, the test should fail, as
        `an_unchecked_token_validates_nothing` did.
@@ -850,3 +852,29 @@ offered as an amendment to decide on.
       client, and it is the only way to test amendment 11 over the listener.
    2. The server's half: later, in its own amendment, or not at all? Recommended: later. Nothing here needs it
       now, and it brings the replay state of §8.1.4.
+   - **Answered by the owner** on 2026-11-15: 1, yes; 2, later.
+6. **As built** (2026-11-15).
+   - **API and shim as in item 2,** and one function more: `quicTokenSize()` (512), the longest token
+     `clientWithToken` takes and the room `newToken` needs, as `quicDatagramSize()` is for datagrams.
+     - A longer token is refused before the shim, as `QuicError.NoMemory` ("the connection could not be made").
+     - The shim's limit is its own `QS_MAX_TOKEN`, since `NGTCP2_MAX_TOKENLEN` is internal to ngtcp2
+       (`lib/ngtcp2_conn.h:98`).
+     - `qs_conn_client`'s two new arguments reach `tests/fuzz/quic/fuzz_quic.c` too, which passes none.
+     - `qs_retry_check`'s comment now says "no Retry token", as the code does (item 3).
+   - **The test of amendment 11 over UDP differs from item 3,** in `packages/web_quic/tests/token.cee`.
+     - Item 3's limit of three times what the client sent cannot tell the two cases apart over UDP in a test's
+       time. Measured with the condition of amendment 11 made always true for the run: the client sent 2,400 bytes,
+       and in 3.5 s the server sent 5,687 bytes with the fix and 5,687 and 5,688 without it. Both are under the
+       7,200-byte limit. The sans-I/O test needed six probe timeouts to pass it, about a minute of real time.
+     - **What the test checks instead** is the other thing a validated address changes: ngtcp2 keeps a ClientHello
+       that comes in parts only when a token has validated the address (`ngtcp2_conn.c:10428`, "Address has been
+       validated with token"). The client sends its flight's first datagram 50 ms late.
+     - **Expected:** a Retry (amendment 10), because an unchecked token validates nothing.
+     - **Measured:** without the fix, 3 of 3 runs failed ("a ClientHello in parts, with an unchecked token: a
+       Retry"). With the fix, 3 of 3 passed.
+     - The three-times limit is still checked there, and `an_unchecked_token_validates_nothing` still shows it.
+   - **Item 3's second test** is `a_token_nobody_checked_gets_a_retry_when_one_is_required`, with
+     `a_token_nobody_checked_is_answered_without_a_retry` as its counterpart: a whole ClientHello below
+     `retryAbove` is answered, with no Retry.
+   - **`newToken` is not tested.** ngtcp2's example server was not built. Whether it sends NEW_TOKEN with the
+     OpenSSL backend is still not checked.

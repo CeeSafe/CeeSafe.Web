@@ -353,6 +353,10 @@ static void qs_chunks_free(qs_stream *s) {
 
 /* ---- Connections ---- */
 
+/* The longest token a client may send: ngtcp2 drops a longer one from its settings (NGTCP2_MAX_TOKENLEN, internal to
+   it: third_party/ngtcp2-1.26.0/lib/ngtcp2_conn.h:98). */
+#define QS_MAX_TOKEN 512u
+
 typedef struct qs_conn {
     ngtcp2_conn *conn;
     ngtcp2_crypto_conn_ref ref;
@@ -368,6 +372,10 @@ typedef struct qs_conn {
        it sends the datagram that announces it, which it could not do in the events' order. */
     qs_queue ids;
     int manual_credit; /* stream data's credit goes back on qs_consume, not when CeeSafe takes the event */
+    /* A client's most recent token from a NEW_TOKEN frame (RFC 9000 §19.7), for qs_new_token. One longer than a
+       client may send (QS_MAX_TOKEN) is not kept. */
+    uint8_t new_token[QS_MAX_TOKEN];
+    size_t new_token_len;
 } qs_conn;
 
 static ngtcp2_conn *qs_get_conn(ngtcp2_crypto_conn_ref *ref) {
@@ -559,6 +567,18 @@ static int cb_extend_bidi(ngtcp2_conn *conn, uint64_t max, void *ud) {
     return qs_push(&c->queue, QS_EV_STREAMS_BIDI, 0, -1, max, NULL, 0) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
+/* A client's NEW_TOKEN token (RFC 9000 §8.1.3): kept in place of the one before ("the most recent unused token is
+   most likely to be effective"). */
+static int cb_new_token(ngtcp2_conn *conn, const uint8_t *token, size_t len, void *ud) {
+    (void)conn;
+    qs_conn *c = ud;
+    if (len > 0 && len <= sizeof c->new_token) {
+        memcpy(c->new_token, token, len);
+        c->new_token_len = len;
+    }
+    return 0;
+}
+
 static void qs_callbacks(ngtcp2_callbacks *cb, int server) {
     memset(cb, 0, sizeof *cb);
     if (server) {
@@ -566,6 +586,7 @@ static void qs_callbacks(ngtcp2_callbacks *cb, int server) {
     } else {
         cb->client_initial = ngtcp2_crypto_client_initial_cb;
         cb->recv_retry = ngtcp2_crypto_recv_retry_cb;
+        cb->recv_new_token = cb_new_token;
     }
     cb->recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
     cb->encrypt = ngtcp2_crypto_encrypt_cb;
@@ -777,19 +798,31 @@ int32_t qs_resumed(qs_conn *c) {
 }
 
 /* After the handshake, whether the server accepted the early data this client sent: 1, or 0. */
+/* A client's most recent NEW_TOKEN token, into `out` (`cap` bytes): its length, or 0 while there is none or when it
+   does not fit. */
+int64_t qs_new_token(qs_conn *c, uint8_t *out, size_t cap) {
+    if (c->new_token_len == 0 || c->new_token_len > cap) {
+        return 0;
+    }
+    memcpy(out, c->new_token, c->new_token_len);
+    return (int64_t)c->new_token_len;
+}
+
 int32_t qs_early_accepted(qs_conn *c) {
     return c->ssl && SSL_get_early_data_status(c->ssl) == SSL_EARLY_DATA_ACCEPTED ? 1 : 0;
 }
 
 /* A client connection to `remote` from `local`, for `host` (its SNI and the name verified). `dcid` and `scid` are
-   CeeSafe's random IDs; `secret` (32 bytes) derives the stateless-reset tokens of the IDs it issues. Null on failure,
-   with ngtcp2's error (or -1) in *error. */
+   CeeSafe's random IDs; `secret` (32 bytes) derives the stateless-reset tokens of the IDs it issues. `token`
+   (`token_len` bytes, at most QS_MAX_TOKEN; none when 0) goes in the Token field of its Initials until a
+   Retry replaces it (RFC 9000 §8.1.3; ngtcp2 copies it). Null on failure, with ngtcp2's error (or -1) in *error. */
 qs_conn *qs_conn_client(qs_tls *t, const uint8_t *host, size_t host_len, const uint8_t *local, const uint8_t *remote,
                         const uint8_t *dcid, size_t dcid_len, const uint8_t *scid, size_t scid_len,
-                        const uint8_t *secret, uint64_t now, int32_t *error) {
+                        const uint8_t *secret, const uint8_t *token, size_t token_len, uint64_t now,
+                        int32_t *error) {
     *error = -1;
     if (!t || t->server || dcid_len < NGTCP2_MIN_INITIAL_DCIDLEN || dcid_len > NGTCP2_MAX_CIDLEN ||
-        scid_len > NGTCP2_MAX_CIDLEN) {
+        scid_len > NGTCP2_MAX_CIDLEN || token_len > QS_MAX_TOKEN) {
         return NULL;
     }
     qs_conn *c = qs_conn_alloc(local, remote, secret);
@@ -801,6 +834,10 @@ qs_conn *qs_conn_client(qs_tls *t, const uint8_t *host, size_t host_len, const u
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now;
+    if (token_len > 0) {
+        settings.token = token;
+        settings.tokenlen = token_len;
+    }
     qs_log_if_asked(&settings);
     ngtcp2_transport_params params;
     qs_params(&params);
@@ -1254,7 +1291,8 @@ int32_t qs_packet_dcid(const uint8_t *pkt, size_t len, uint8_t *out, int32_t *in
 
 /* What the listener does with a client's Initial (RFC 9000 §8.1), with Retry tokens from `key` (32 bytes):
      - 1: a Retry was written to `out` (*outlen bytes): send it, and nothing more. When `require` is set and the
-          Initial has no token; its new ID is `retry_scid` (20 bytes);
+          Initial has no Retry token (none, or one of another kind: RFC 9000 §8.1.3); its new ID is `retry_scid`
+          (20 bytes);
      - 2: the Initial carries a Retry token that is valid (ours, for this address and this destination ID, under 10 s
           old): admit it, with the original destination ID in `odcid` (*odcidlen bytes);
      - 3: no Retry token, and none required: admit it as it is;

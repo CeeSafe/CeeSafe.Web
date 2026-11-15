@@ -752,7 +752,7 @@ static void settle(void) {
 static int client_new(int from) {
     int32_t error = 0;
     cl.c = qs_conn_client(client_tls, (const uint8_t *)"localhost", 9, cl.local, sv.local, client_dcid,
-                          sizeof client_dcid, cl.scid, sizeof cl.scid, cl.secret, now, &error);
+                          sizeof client_dcid, cl.scid, sizeof cl.scid, cl.secret, NULL, 0, now, &error);
     if (!cl.c) {
         if (error >= 0 && error != -1) {
             broken("qs_conn_client failed without an error", error, 0);

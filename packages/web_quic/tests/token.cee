@@ -1,0 +1,218 @@
+// A client's token over real UDP (Web ADR 0014 amendments 11 and 12). A client made with `clientWithToken` puts a
+// token in its Initial that the listener cannot check: neither a Retry token (ngtcp2's mark 0xb7) nor a NEW_TOKEN
+// one (0x36), and this server issues no NEW_TOKEN. It sends its first flight to a QuicServer, then only listens.
+// RFC 9000 §8.1.3: "If the token is invalid, then the server SHOULD proceed as if the client did not have a
+// validated address, including potentially sending a Retry packet."
+// Expected:
+//   - with the flight's first datagram late, so the ClientHello comes in parts: a Retry (amendment 10). ngtcp2 keeps
+//     such a ClientHello only when a token has validated the address ("Address has been validated with token",
+//     third_party/ngtcp2-1.26.0/lib/ngtcp2_conn.c:10428), so a token taken as validation gets no Retry here;
+//   - with the flight in order, below `retryAbove`: an answer, and no Retry;
+//   - with `retryAbove` 0: a Retry, as for an Initial without a token.
+// The limit of three times what the client sent (§8.1) is checked too, but in 300 ms the server sends less than
+// that with or without a validated address; `an_unchecked_token_validates_nothing` (loopback.cee) shows the limit.
+import web_core;
+
+/// What came back to a client that sent its first flight and then nothing.
+struct Answered {
+    sent: usize;
+    received: usize;
+    retries: u32;
+}
+
+/// What a race between the server and the client gave.
+enum Listened {
+    Server,
+    Done(Answered),
+    Failed(TestFailure),
+}
+
+/// A token of 32 bytes that is no token of ngtcp2's.
+fn foreignToken() -> [u8; 32] => [0x5au8; 32];
+
+/// The client's side: its first flight, then `listenMs` of reading without answering. With `firstLate`, the flight's
+/// first datagram goes 50 ms after the others, as a reordered or late one would.
+async fn silentAfterTheFirstFlight(
+    socket: borrow AsyncUdpSocket,
+    conn: borrow mut QuicConnection,
+    server: SocketAddress,
+    firstLate: bool,
+    listenMs: u64,
+) -> Result<Answered, TestFailure> {
+    var out = Vector<u8>.create();
+    var first = Vector<u8>.create();
+    var buffer = Vector<u8>.create();
+    if (out.resize(quicDatagramSize(), 0).isErr() || buffer.resize(quicEventBufferSize(), 0).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var heard = Answered { sent: 0, received: 0, retries: 0 };
+    var count: u32 = 0;
+    loop {
+        let d = match (conn.datagram(out.viewMut(), Clock.monotonicNanos())) {
+            Ok(Some(d)) => d,
+            Ok(null) => { break; },
+            Err(_) => { return Err(TestFailure.create("the client's datagram")); },
+        };
+        count += 1;
+        heard.sent += d.length;
+        if (firstLate && count == 1) {
+            if (first.extend(out.view()[0..d.length]).isErr()) {
+                return Err(TestFailure.create("out of memory"));
+            }
+            continue;
+        }
+        match (await socket.sendTo(out.view()[0..d.length], server)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("sending")); }
+        }
+    }
+    if (firstLate) {
+        // The test needs a ClientHello in parts: without its first datagram, the rest does not begin it.
+        Check.isTrue(count >= 2, "a first flight of two datagrams or more")?;
+        match (await Timer.sleep(50)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("sleeping")); }
+        }
+        match (await socket.sendTo(first.view(), server)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("sending")); }
+        }
+    }
+    let end = Clock.monotonicNanos() + listenMs * 1000000;
+    loop {
+        let now = Clock.monotonicNanos();
+        if (now >= end) {
+            break;
+        }
+        let waitMs = (end - now) / 1000000 + 1;
+        let raced: Result<Raced<Datagram?>, AsyncError> = await Async.race(
+            async () => {
+                let d = await socket.recvFrom(buffer.viewMut())?;
+                return Ok(Some(d));
+            },
+            async () => {
+                await Timer.sleep(waitMs)?;
+                return Ok(null);
+            },
+        );
+        let won: Raced<Datagram?> = match (raced) {
+            Ok(w) => w,
+            Err(_) => { return Err(TestFailure.create("waiting")); },
+        };
+        let datagram: Datagram? = if (won.winner == 0) won.value else match (won.other) {
+            Some(d) => d,
+            null => won.value,
+        };
+        match (datagram) {
+            Some(d) => {
+                heard.received += d.length;
+                // A long header's type in bits 4 and 5: 3 is a Retry (RFC 9000 §17.2).
+                if (d.length > 0 && (buffer.view()[0] & 0xf0) == 0xf0) {
+                    heard.retries += 1;
+                }
+            }
+            null => {}
+        }
+    }
+    return Ok(heard);
+}
+
+/// A QuicServer with `retryAbove`, and a client with `token` (or none) that goes silent after its first flight
+/// (`firstLate`: as `silentAfterTheFirstFlight`): what came back in `listenMs`.
+async fn tokenScenario(
+    token: [u8; 32],
+    withToken: bool,
+    retryAbove: u32,
+    firstLate: bool,
+    listenMs: u64,
+) -> Result<Answered, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "ngtcp2_crypto_ossl_init")?;
+    let alpn = [Alpn.Http3];
+    let serverTls = ok(QuicTls.serverFromPem(serverPem().bytes(), serverKey().bytes(), alpn[..]), "server TLS")?;
+    let clientTls = ok(QuicTls.clientFromPem(caPem().bytes(), alpn[..]), "client TLS")?;
+    let tls = match (Arc<QuicTls>.create(serverTls)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Hold {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send + Share>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the server's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the server's address")); },
+    };
+    let clientSocket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the client's socket")); },
+    };
+    let clientAddress = match (clientSocket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the client's address")); },
+    };
+    let ids = ok(QuicIds.random(), "random IDs")?;
+    let length: usize = if (withToken) 32 else 0;
+    var conn = ok(
+        QuicConnection.clientWithToken(
+            clientTls,
+            "localhost",
+            QuicAddress.of(clientAddress),
+            QuicAddress.of(local),
+            ids,
+            token[0..length],
+            Clock.monotonicNanos(),
+        ),
+        "the client",
+    )?;
+    var options = QuicServerOptions.defaults();
+    options.retryAbove = retryAbove;
+    let raced: Result<Raced<Listened>, AsyncError> = await Async.race(
+        async () => {
+            let _ = await QuicServer.serve(socket, local, tls.clone(), app.clone(), options);
+            return Ok(Listened.Server);
+        },
+        async () => {
+            match (await silentAfterTheFirstFlight(clientSocket, mut conn, local, firstLate, listenMs)) {
+                Ok(h) => { return Ok(Listened.Done(h)); }
+                Err(e) => { return Ok(Listened.Failed(e)); }
+            }
+        },
+    );
+    return match (raced) {
+        Ok(won) => match (won.value) {
+            Listened.Done(h) => Ok(h),
+            Listened.Failed(e) => Err(e),
+            Listened.Server => Err(TestFailure.create("the server ended")),
+        },
+        Err(_) => Err(TestFailure.create("the race")),
+    };
+}
+
+@test
+async fn a_token_nobody_checked_validates_nothing_over_udp() -> Result<void, TestFailure> {
+    let h = await tokenScenario(foreignToken(), true, 500, true, 300)?;
+    Check.isTrue(h.retries >= 1, "a ClientHello in parts, with an unchecked token: a Retry")?;
+    return Check.isTrue(h.received <= 3 * h.sent, "at most three times what the client sent");
+}
+
+@test
+async fn a_token_nobody_checked_gets_a_retry_when_one_is_required() -> Result<void, TestFailure> {
+    let h = await tokenScenario(foreignToken(), true, 0, false, 300)?;
+    return Check.isTrue(h.retries >= 1, "a Retry, as for an Initial without a token");
+}
+
+@test
+async fn a_token_nobody_checked_is_answered_without_a_retry() -> Result<void, TestFailure> {
+    let h = await tokenScenario(foreignToken(), true, 500, false, 300)?;
+    Check.isTrue(h.retries == 0, "a whole ClientHello below retryAbove: no Retry")?;
+    return Check.isTrue(h.received > 0, "the server answers");
+}
