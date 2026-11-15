@@ -801,7 +801,7 @@ strict sweep is useful here: it found the wrapper.
 
 **Fixed in 0.53.0** (CeeSafe ADR 0147, released 2026-11-15; the owner chose "Count apart"): `--sweep alloc` counts
 such a run apart, "(N stopped by a stacked await out of memory)" and `sweepFrameStackOutOfMemory` in the JSON, as the
-fault script does; `--sweep-strict` fails it. Main's minimum stays 0.44.0 here, so nothing in CeeSafe.Web relies on it.
+fault script does; `--sweep-strict` fails it. Main's minimum is 0.53.0 since 2026-11-15 (implementation plan §11.16).
 
 ## U19 — `Box<dyn I + Send>` does not lend a `borrow dyn I` in one step   *(found 2026-11-03, M7, ceesafec 0.10.1; wanted, not blocking; fixed in 0.42.0)*
 
@@ -1173,7 +1173,8 @@ CeeSafe.Web then adds a FreeBSD job to its CI (Web ADR 0015 §5).
 **Released in 0.53.0** (CeeSafe ADR 0149, 2026-11-15): `ceesafec-freebsd-x64.tar.gz` (FreeBSD 14.4 or later) in the
 release, built and checked in a FreeBSD VM (`vmactions/freebsd-vm`); CeeSafe's `freebsd.yml` runs its tests there;
 `[target.freebsd]` in the manifest; `install.sh` knows FreeBSD. Not done yet here: CeeSafe.Web's own FreeBSD job and
-`web_tls`'s `[target.freebsd]`, which need main's minimum raised to 0.53.0, the owner's call.
+`web_tls`'s `[target.freebsd]`. Main's minimum is 0.53.0 since 2026-11-15 (implementation plan §11.16), which they
+need.
 
 ## Tooling (small, any time before M1's exit)
 
