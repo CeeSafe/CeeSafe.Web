@@ -790,3 +790,63 @@ The traces of amendment 9 under netem (`docs/milestones/M10.md`, "Amendment 9 un
      validated either. Whether such a token can be had was not examined.
 6. **Asked for by the owner** on 2026-11-14 ("Yes, fix it next"), after the finding in `docs/milestones/M10.md`.
 7. **Accepted by the owner** on 2026-11-14.
+
+## 19. Amendment 12 (2026-11-15, proposed: a client's token for its Initial)
+
+**Proposed, not accepted.** Nothing below is built. Asked for by the owner on 2026-11-15 ("Yes, go ahead"), when
+offered as an amendment to decide on.
+
+1. **Why.**
+   - Amendment 11 item 5 left one case untested: over the listener, an Initial whose token lacks the Retry mark.
+     Such an Initial reaches `QuicConnection.server` with its token (`qs_retry_check`,
+     `packages/web_quic/c/quic_shim.c:1277`: only a token with the Retry mark is checked).
+   - No client here can send one. `qs_conn_client` sets no token, and ngtcp2 takes a client's token only when the
+     connection is made (`ngtcp2_settings.token`, copied at `third_party/ngtcp2-1.26.0/lib/ngtcp2_conn.c:1429`).
+     So a token cannot be added after `QuicConnection.client`, as `resume` adds a ticket.
+   - RFC 9000 §8.1.3 also asks it of a client: "When connecting to a server for which the client retains an
+     applicable and unused token, it SHOULD include that token in the Token field of its Initial packet." This
+     client cannot, with any server.
+2. **Proposed: the client's half of NEW_TOKEN** (`packages/web_quic/src/connection.cee`).
+   - **`QuicConnection.clientWithToken(tls, host, local, remote, ids, token, now)`** works as `client`, and puts
+     `token` (at most 512 bytes, ngtcp2's `NGTCP2_MAX_TOKENLEN`) in the Token field of its Initials. A Retry
+     replaces it, as RFC 9000 §17.2.5.2 has it.
+     - `client` stays as it is, so no caller changes.
+     - In the shim, `qs_conn_client` gains the token and its length, and sets `settings.token`.
+   - **`QuicConnection.newToken(out)`** works as `ticket` does: the length of the most recent token from a
+     NEW_TOKEN frame (RFC 9000 §19.7), written to `out`, or 0 while there is none.
+     - The token is kept from ngtcp2's `recv_new_token` callback, the most recent only ("sending the most recent
+       unused token is most likely to be effective", §8.1.3).
+   - **The caller keeps the tokens,** as it keeps tickets: web_quic stores none. §8.1.3's rules stay with the
+     caller: a token applies only to the server the connection was authoritative for, and "SHOULD NOT [be reused]
+     for different connection attempts".
+   - **The public API** gains these two methods; nothing that exists changes. `docs/api/` follows
+     (`tools/api_check.py`).
+3. **Tests, proposed:**
+   - **Amendment 11 over UDP.** A client made with `clientWithToken` sends a 32-byte token that has neither mark
+     (Retry `0x02`, regular `0x36`) to a `QuicServer`. It then reads what comes back and sends nothing more.
+     - Expected (RFC 9000 §8.1): the server sends that address at most three times what the client sent.
+     - With amendment 11's condition made always true for one run, the test should fail, as
+       `an_unchecked_token_validates_nothing` did.
+   - **The same token under `retryAbove: 0`** gets a Retry. That is §8.1.3's "If the token is invalid, then the
+     server SHOULD proceed as if the client did not have a validated address, including potentially sending a
+     Retry packet".
+     - Read from the source, `qs_retry_check` already does this: any token without the Retry mark falls through to
+       the Retry when `require` is set. Its comment says "has no token" (`quic_shim.c:1257`), which is narrower
+       than the code; the comment would be corrected with the test.
+   - **`newToken`:** no server in this repository sends NEW_TOKEN.
+     - The oracle would be ngtcp2's example server (`examples/server.cc` in the release tarball), built by hand on
+       macOS like amendment 3's client.
+     - Not checked yet: that the example server sends NEW_TOKEN with the OpenSSL backend.
+4. **Not proposed: the server's half.** That half would issue NEW_TOKEN frames (`ngtcp2_crypto_generate_regular_token`,
+   `ngtcp2_conn_submit_new_token`) and validate them in the listener.
+   - **What it would give:** a client returning under load would skip the Retry. Its address would be validated
+     from its first Initial, so amendment 10's Retry for a ClientHello in parts would not be needed either.
+   - **What it costs:** state. "Servers MUST ensure that replay of tokens is prevented or limited", and NEW_TOKEN
+     tokens "SHOULD NOT be accepted multiple times" (§8.1.4). That needs a record of used tokens for a token's
+     lifetime, kept across every connection the listener has.
+   - If wanted, it would be an amendment of its own.
+5. **Questions for the owner.**
+   1. Build the client's half as in item 2? Recommended: yes. It is two methods, it is what §8.1.3 asks of a
+      client, and it is the only way to test amendment 11 over the listener.
+   2. The server's half: later, in its own amendment, or not at all? Recommended: later. Nothing here needs it
+      now, and it brings the replay state of §8.1.4.
