@@ -195,6 +195,11 @@ Exceeding any limit closes the connection with an alert where possible.
    ("*.example.com"), case-insensitive, with an exact name winning over a wildcard. Any other name, or none, gets the
    default certificate. The shim's servername callback (`pick_certificate`) switches the connection to the entry's
    `SSL_CTX`. A dynamic resolver (ACME) may come later, as an addition.
+   *Addendum (2026-11-15, for cee-proxy's certificate store):* the table grows as names are added (up to 65,536, a
+   memory bound, where it held 64), and `TlsConfig.removeName(name)` takes a name out, so a store reloaded without a
+   certificate stops presenting it. A reload adds the new names first (`addName` replaces in place) and then removes
+   the ones that are gone, so no name is ever missing in between. Tests: `stage4.cee`'s `sni_picks_the_certificate`
+   (removal, case, a wildcard covering a removed name) and `the_sni_table_grows_past_64_names` (301 names).
 2. **Hot reload swaps inside the shim**, not through `Arc<CertSet>`. `TlsConfig.reload(chain, key)` builds a new
    `SSL_CTX` and swaps it in under OpenSSL's own lock (`CRYPTO_THREAD_lock`). New handshakes present it; connections
    already made keep theirs (OpenSSL counts references). This needs no Send/Share from CeeSafe, and it works across
