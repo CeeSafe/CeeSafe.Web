@@ -157,6 +157,41 @@ jobs:
         shell: bash
         run: (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
 
+  freebsd:
+    # FreeBSD (Web ADR 0015 §5, option A, accepted): GitHub has no FreeBSD runner, so FreeBSD 15.1 (amd64) runs in a VM
+    # inside an Ubuntu job (vmactions/freebsd-vm, pinned to v1.6.0's commit, as CeeSafe's own workflows pin it). The
+    # released ceesafec (0.53.0 is the first with a FreeBSD build, CeeSafe ADR 0149), the base system's OpenSSL (3.5 on
+    # 15.x, so the QUIC packages run too), and the matrix's steps: a kqueue that is not macOS's under test.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+      - name: In FreeBSD
+        uses: vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b # v1.6.0
+        with:
+          release: "15.1"
+          usesh: true
+          copyback: false
+          envs: "CEESAFE_VERSION"
+          prepare: |
+            pkg install -y python3
+          run: |
+            set -e
+            freebsd-version
+            openssl version
+            cc --version | head -1
+            fetch -qo - https://ceesafe.github.io/CeeSafe/install.sh | sh
+            export PATH="$HOME/.ceesafe/bin:$PATH"
+            ceesafec --version
+            python3 tools/check_layers.py
+            python3 tools/api_check.py
+            for p in packages/*/; do
+              (cd "$p" && ceesafec fetch --offline && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
+            done
+            python3 tools/run_tests.py --timeout 600
+            python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep
+            (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
+
   probes:
     # The design probes and bug repros (tests/probes/README.md): informational, so a changed outcome is visible
     # without blocking a merge.
