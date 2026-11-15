@@ -784,7 +784,7 @@ else, and route every later allocation through `CEE_ALLOC_FOREIGN`.
 **Effect on CeeSafe.Web until then:** OpenSSL keeps its own allocator (Web ADR 0002 amendment 2.1); the routing waits
 on the branch `u14-openssl-alloc`.
 
-## U18 — `ceesafec test --sweep alloc` fails the frame-stack panic that ADR 0056 §3.3 defines   *(found 2026-11-03, M7, ceesafec 0.10.1; wanted, not blocking)*
+## U18 — `ceesafec test --sweep alloc` fails the frame-stack panic that ADR 0056 §3.3 defines   *(found 2026-11-03, M7, ceesafec 0.10.1; wanted, not blocking; fixed in 0.53.0)*
 
 **Gap:** ADR 0056 §3.3 makes `async frame stack: out of memory` the outcome when a stacked await's chunk cannot be
 allocated, and `tools/fault_injection.py:68` accepts that panic. `ceesafec test --sweep alloc` counts every panic as
@@ -798,6 +798,10 @@ failing it and the ADR says so: a library's tests then show where a stacked awai
 
 **Effect on CeeSafe.Web until then:** none. The driver no longer stacks the call (U19's two-step lend), and the
 strict sweep is useful here: it found the wrapper.
+
+**Fixed in 0.53.0** (CeeSafe ADR 0147, released 2026-11-15; the owner chose "Count apart"): `--sweep alloc` counts
+such a run apart, "(N stopped by a stacked await out of memory)" and `sweepFrameStackOutOfMemory` in the JSON, as the
+fault script does; `--sweep-strict` fails it. Main's minimum stays 0.44.0 here, so nothing in CeeSafe.Web relies on it.
 
 ## U19 — `Box<dyn I + Send>` does not lend a `borrow dyn I` in one step   *(found 2026-11-03, M7, ceesafec 0.10.1; wanted, not blocking; fixed in 0.42.0)*
 
@@ -821,7 +825,7 @@ wrapper, no `unsafe`.
 The four two-step lends are one step since then: `web_client/src/client.cee` (the dialer), `web_http2/src/serve.cee`,
 `web_http3/src/server.cee` and `web_server/src/server.cee` (the application).
 
-## U21 — Timers on Windows keep the 15.6 ms tick   *(found 2026-11-05, M8, ceesafec 0.11.0, Windows 11 ARM64; wanted, not blocking)*
+## U21 — Timers on Windows keep the 15.6 ms tick   *(found 2026-11-05, M8, ceesafec 0.11.0, Windows 11 ARM64; wanted, not blocking; fixed in 0.53.0)*
 
 **Gap:** `Timer.now()` on Windows is `GetTickCount64()` (CeeSafe `runtime/hosted/ceesafe_rt_async.c:826`), which
 advances once a system tick, about 15.6 ms. A short sleep wakes, finds the clock unmoved, and waits again.
@@ -835,6 +839,11 @@ advances once a system tick, about 15.6 ms. A short sleep wakes, finds the clock
 **Wanted:** a millisecond clock on Windows (`QueryPerformanceCounter`, or `QueryUnbiasedInterruptTimePrecise`), and
 waits that end on time (a high-resolution waitable timer, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`), so a 1 ms sleep
 lasts about 1 ms as on Linux and macOS.
+
+**Fixed in 0.53.0** (CeeSafe ADR 0148, released 2026-11-15): `Timer.now()` reads `QueryPerformanceCounter`, and each
+deadline ends the executor's wait through a high-resolution waitable timer (on the completion port, by a thread-pool
+wait that posts to it). On the loaded Windows VM, 200 `Timer.sleep(1)` took 692 to 1,127 ms, against 6,850 to
+10,460 ms with 0.46.0 in the same minutes (ADR 0148 §4).
 
 ## U22 — An open file's modification time and kind   *(found 2026-11-06 designing M9, Web ADR 0013 §3.4; accepted by the owner; needed for M9's stage 4; released in 0.22.0, CeeSafe ADR 0078)*
 
@@ -1147,7 +1156,7 @@ by borrow. It would need:
 
 Without it, M1 and M7 use the worker pattern. **Status:** proposed; the owner decides (`docs/milestones/M0.md`).
 
-## U23 — FreeBSD: a `ceesafec` build and CI   *(found 2026-11-11, Web ADR 0015 §5; accepted by the owner; wanted before v1.0, otherwise FreeBSD is best effort)*
+## U23 — FreeBSD: a `ceesafec` build and CI   *(found 2026-11-11, Web ADR 0015 §5; accepted by the owner; wanted before v1.0, otherwise FreeBSD is best effort; released in 0.53.0)*
 
 **Gap:** CeeSafe's releases (v0.27.0) ship `ceesafec` for linux-x64, linux-arm64, osx-x64, osx-arm64, win-x64 and
 win-arm64, and a C seed, but nothing for FreeBSD, and no CeeSafe CI runs there. The runtime already takes the kqueue
@@ -1160,6 +1169,11 @@ path for `__FreeBSD__` (CeeSafe `runtime/hosted/ceesafe_rt_async.c:49`), unteste
   `web_tls` can name OpenSSL's libraries there.
 
 CeeSafe.Web then adds a FreeBSD job to its CI (Web ADR 0015 §5).
+
+**Released in 0.53.0** (CeeSafe ADR 0149, 2026-11-15): `ceesafec-freebsd-x64.tar.gz` (FreeBSD 14.4 or later) in the
+release, built and checked in a FreeBSD VM (`vmactions/freebsd-vm`); CeeSafe's `freebsd.yml` runs its tests there;
+`[target.freebsd]` in the manifest; `install.sh` knows FreeBSD. Not done yet here: CeeSafe.Web's own FreeBSD job and
+`web_tls`'s `[target.freebsd]`, which need main's minimum raised to 0.53.0, the owner's call.
 
 ## Tooling (small, any time before M1's exit)
 
