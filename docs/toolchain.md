@@ -28,7 +28,8 @@ that needs an unreleased compiler is not merged to main.
 
 | Binary | Version | Use |
 |---|---|---|
-| `~/.ceesafe/bin/ceesafec` (on `PATH`) | 0.45.1 (byte-identical to `ceesafec-0.45.1`, 2026-11-14) | everyday checks |
+| `~/.ceesafe/bin/ceesafec` (on `PATH`) | 0.46.1 (byte-identical to `ceesafec-0.46.1`, 2026-11-15) | everyday checks |
+| `~/.ceesafe/bin/ceesafec-0.46.1` | 0.46.1 (release, tag `v0.46.1` = CeeSafe `8c2d818`, osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, 2026-11-15; no signature checked) | tested on main; not main's minimum |
 | `~/.ceesafe/bin/ceesafec-0.45.1` | 0.45.1 (release, tag `v0.45.1` = CeeSafe `7c20ac5`, osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, 2026-11-14; no signature checked) | tested on main; not main's minimum |
 | `~/.ceesafe/bin/ceesafec-0.44.0` | **0.44.0** (release, tag `v0.44.0`, osx-arm64; the archive matches the release's `SHA256SUMS` and the binary is byte-identical to the archive's, 2026-11-14; no signature checked) | main's minimum from 2026-11-14 (the `AsyncError.Closed` change, CeeSafe ADR 0128) |
 | `~/.ceesafe/bin/ceesafec-0.27.0` | 0.27.0 (release, tag `v0.27.0` = CeeSafe `405dc50`, osx-arm64; the archive matches the release's `SHA256SUMS`, 2026-11-10; no signature checked) | the `Share` change (CeeSafe ADR 0084), branch `toolchain-0.27` |
@@ -121,6 +122,19 @@ per test. The same job passed on main at `d3bc9de` with the same 0.45.0, web_ws'
 (282 s with 0.44.1 on #21). The test run alone on this machine, alternating, with another session's builds
 running: 70 s and 69 s with 0.44.0, 84 s and 72 s with 0.45.1. That shows no clear slowdown, only that the test
 uses over half of its limit here, and less of its margin on a CI runner. Not changed: the limit, the test.
+Changed since: pull request #24 gives web_ws's interpreter run 300 s per test (`tools/run_tests.py`,
+`INTERP_TIMEOUTS`); alone on an Intel Mac mini the test takes 126 s.
+
+0.46.0 adds a window's native handles (CeeSafe ADR 0137), which nothing here uses. 0.46.1 changes the runtime: a
+wait walks the wake list only after a wake (CeeSafe `686ca808`). Every async package runs on that code. Neither
+needs a change in CeeSafe.Web. Run 2026-11-15 on macOS arm64, main at `0d56f46` (pull request #24 merged):
+- every manifest (33) checks with no diagnostic, `fmt --check` lists no file, `tools/check_layers.py` passes, and
+  `tools/api_check.py --ceesafec ceesafec-0.46.1` matches without `--write`;
+- `python3 tools/run_tests.py --ceesafec ceesafec-0.46.1 --sanitize --alloc-sweep --cancel-sweep`: 53 runs passed,
+  0 failed, 3 skipped (web_tls, web_quic and web_http3 in the interpreter). No sweep failure in any package;
+  the cancellation sweeps ran 8,542 runs in all.
+
+Main's minimum stays 0.44.0, and CI pins v0.44.0.
 
 0.22.0 (CeeSafe ADR 0078, written from this project's B19 and U22) is M9's minimum from 2026-11-08 (the owner's
 choice). On Linux, `sendFile` to a reset connection is an error, not SIGPIPE, and an open file's time and kind and
