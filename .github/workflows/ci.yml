@@ -194,6 +194,13 @@ jobs:
             done
             # web_ws runs natively only here: in FreeBSD's interpreter its tests grew past 11.4 GB and were killed (3.35 GB
             # on macOS), CeeSafe's U24 (docs/ceesafe-upstream-work.md).
+            # DIAGNOSIS (temporary): web_quic's allocation sweep timed out at allocations 2916 and 2923 of these two.
+            ex=$(ls -d packages/*/tests | cut -d/ -f2 | grep -vx web_quic | paste -sd, -)
+            for t in early_data_before_its_initial_is_held hq_interop_transfer_over_udp; do
+              echo "== $t"
+              /usr/bin/time python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --timeout 600 --filter "$t" --exclude "$ex" 2>&1 | tail -8 || true
+            done
+            exit 1
             python3 tools/run_tests.py --timeout 600 --exclude web_ws
             (cd packages/web_ws && ceesafec test --timeout 600)
             python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep
