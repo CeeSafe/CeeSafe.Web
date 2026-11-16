@@ -180,23 +180,7 @@ jobs:
             freebsd-version
             openssl version
             cc --version | head -1
-            # DIAGNOSIS (temporary): the released 0.53.0 binary segfaulted here on 15.1.
-            fetch -qo ceesafec.tar.gz https://github.com/CeeSafe/CeeSafe/releases/download/v0.53.0/ceesafec-freebsd-x64.tar.gz
-            mkdir -p diag && tar -xzf ceesafec.tar.gz -C diag
-            file diag/ceesafec || true
-            ldd diag/ceesafec || true
-            ulimit -a || true
-            (diag/ceesafec --version; echo "status $?") || true
-            (truss diag/ceesafec --version 2>&1 | tail -25) || true
-            (ulimit -s unlimited; diag/ceesafec --version; echo "unlimited stack: status $?") || true
-            fetch -qo seed.tar.gz https://github.com/CeeSafe/CeeSafe/releases/download/v0.53.0/ceesafec-0.53.0-seed.tar.gz
-            mkdir -p seed && tar -xzf seed.tar.gz -C seed
-            s=$(dirname "$(find seed -name main.c | head -1)")
-            cc -std=c11 -O2 -ffp-contract=off -fno-math-errno -I "$s" "$s"/*.c -o diag/local -lm -lpthread
-            (diag/local --version; echo "built on 15.1: status $?") || true
-            fetch -qo install.sh https://ceesafe.github.io/CeeSafe/install.sh
-            (sh -x install.sh 2>&1 | tail -30) || true
-            exit 1
+            # install.sh as fixed by CeeSafe b7a631d8: before it, its fetch() called itself on FreeBSD.
             fetch -qo - https://ceesafe.github.io/CeeSafe/install.sh | sh
             export PATH="$HOME/.ceesafe/bin:$PATH"
             ceesafec --version
