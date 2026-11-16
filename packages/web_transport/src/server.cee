@@ -1,6 +1,10 @@
 // The connection server (implementation plan M1, docs/milestones/M1.md): a fixed set of connection workers, each
 // looping accept → handshake → serve on one shared source. A CeeSafe scope spawns only in its body (spec §40.5), so
 // the workers are the admission limit: when all are busy, nobody accepts and the kernel's backlog holds the rest.
+// One idle worker at a time waits for the next connection (`Turns`), and the turn passes to the worker idle the
+// shortest time: a worker's frame is allocated whole at spawn, and its pages become resident when it first serves,
+// so taking turns oldest-first (as the accepts queued in the kernel would) touched every worker's frame and made the
+// resident size follow the limit, not the connections served at once (cee-proxy's soak: 2,048 workers, +22 MB).
 // A drain stops the accepting workers at once, lets connections in flight finish for a grace period, then cancels.
 import web_core;
 
@@ -73,6 +77,8 @@ public struct ServerReport {
     public failed: u64;
     /// Failed accepts (the worker paused and tried again).
     public acceptErrors: u64;
+    /// Workers that took at least one connection: the ones whose frames became resident (`Turns`).
+    public workersUsed: u64;
     /// Whether the grace period ran out and connections in flight were cancelled.
     public forced: bool;
 }
@@ -84,6 +90,7 @@ struct Counters {
     served: AtomicU64;
     failed: AtomicU64;
     acceptErrors: AtomicU64;
+    workersUsed: AtomicU64;
 
     fn create() -> Counters => Counters {
         accepted: AtomicU64.create(0),
@@ -91,6 +98,7 @@ struct Counters {
         served: AtomicU64.create(0),
         failed: AtomicU64.create(0),
         acceptErrors: AtomicU64.create(0),
+        workersUsed: AtomicU64.create(0),
     };
 
     fn report(borrow this, forced: bool) -> ServerReport => ServerReport {
@@ -99,11 +107,122 @@ struct Counters {
         served: this.served.load(),
         failed: this.failed.load(),
         acceptErrors: this.acceptErrors.load(),
+        workersUsed: this.workersUsed.load(),
         forced: forced,
     };
 }
 
 /// Runs connection servers.
+/// Whose turn it is to wait for the next connection: one idle worker at a time; the others wait on their own
+/// channel, last in first out, so the workers that serve are the ones that served last.
+struct Turns {
+    state: AsyncMutex<TurnState>; // held for a few instructions, never across another await
+    wake: Vector<Channel<bool>>;  // a worker's: `true` hands it the turn, `false` (or closed) ends it
+}
+
+struct TurnState {
+    free: bool;        // nobody holds the turn: the next worker to want it takes it
+    idle: Vector<u32>; // the workers waiting for it, the latest last
+    ended: bool;       // the source ended: no more turns
+}
+
+impl Turns {
+    fn create(workers: u32) -> Result<Turns, NetError> {
+        var idle = Vector<u32>.create();
+        match (idle.reserve(workers as usize)) {
+            Ok() => {}
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+        }
+        var wake = Vector<Channel<bool>>.create();
+        for (k in 0..workers) {
+            match (Channel<bool>.create(1)) {
+                Ok(c) => {
+                    match (wake.push(c)) {
+                        Ok() => {}
+                        Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+                    }
+                }
+                Err(e) => { return Err(NetErrors.fromAlloc(e)); }
+            }
+        }
+        let state = match (AsyncMutex<TurnState>.create(TurnState { free: true, idle: idle, ended: false })) {
+            Ok(m) => m,
+            Err(e) => { return Err(NetErrors.fromAlloc(e)); },
+        };
+        return Ok(Turns { state: state, wake: wake });
+    }
+
+    /// Takes the turn, at once when it is free, else when a worker passes it: `true`. `false` once the source has
+    /// ended. `Err(Cancelled)` when the drain starts first (or the task is cancelled).
+    async fn take(borrow this, me: u32, drain: borrow Drain) -> Result<bool, NetError> {
+        {
+            var guard = await this.locked()?;
+            let s = guard.data();
+            if (s.ended) {
+                return Ok(false);
+            }
+            if (s.free) {
+                s.free = false;
+                return Ok(true);
+            }
+            match (s.idle.push(me)) {
+                Ok() => {} // reserved for every worker: never allocates
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+        let channel = borrow this.wake[me as usize];
+        let r: Result<Raced<bool>, NetError> = await Async.race(
+            async () => await turnGiven(channel),
+            async () => await drainStarted<bool>(drain),
+        );
+        return match (r) {
+            Ok(raced) => Ok(raced.value),
+            Err(e) => Err(e),
+        };
+    }
+
+    /// Passes the turn to the worker idle the shortest time, or leaves it free when none is.
+    async fn pass(borrow this) -> Result<void, NetError> {
+        var guard = await this.locked()?;
+        let s = guard.data();
+        match (s.idle.pop()) {
+            Some(w) => { let sent = this.wake[w as usize].trySend(true); }
+            null => { s.free = true; }
+        }
+        return Ok();
+    }
+
+    /// The source has ended: no worker will take the turn again, and the idle ones end now.
+    async fn end(borrow this) -> Result<void, NetError> {
+        var guard = await this.locked()?;
+        let s = guard.data();
+        s.ended = true;
+        loop {
+            match (s.idle.pop()) {
+                Some(w) => { let sent = this.wake[w as usize].trySend(false); }
+                null => { break; }
+            }
+        }
+        return Ok();
+    }
+
+    async fn locked(borrow this) -> Result<AsyncMutexGuard<TurnState>, NetError> {
+        return match (await this.state.lock()) {
+            Ok(g) => Ok(g),
+            Err(e) => Err(NetErrors.fromAsync(e)),
+        };
+    }
+}
+
+/// Waits on a worker's channel: what it is sent, or `false` when it is closed.
+async fn turnGiven(channel: borrow Channel<bool>) -> Result<bool, NetError> {
+    return match (await channel.recvAsync()) {
+        Ok(Some(given)) => Ok(given),
+        Ok(null) => Ok(false),
+        Err(e) => Err(NetErrors.fromAsync(e)),
+    };
+}
+
 public struct ConnectionServer {
     /// Serves connections from `incoming` with `limits.workers` workers until the drain finishes, or until `incoming`
     /// ends and every connection is done. Once `drain` starts, idle workers stop at once and connections in flight
@@ -117,11 +236,14 @@ public struct ConnectionServer {
         drain: borrow Drain,
     ) -> Result<ServerReport, NetError> {
         let counters = Counters.create();
+        let turns = Turns.create(limits.workers)?;
         let r: Result<Raced<bool>, NetError> = await Async.race(
             async () => {
                 await Async.scope(NetError.OutOfMemory, (s) => {
                     for (k in 0..limits.workers) {
-                        s.spawn(async () => await worker(incoming, acceptor, handler, limits, drain, counters));
+                        s.spawn(
+                            async () => await worker(incoming, acceptor, handler, limits, drain, counters, turns, k),
+                        );
                     }
                 })?;
                 return Ok(false);
@@ -150,36 +272,64 @@ async fn worker(
     limits: borrow ConnectionLimits,
     drain: borrow Drain,
     counters: borrow Counters,
+    turns: borrow Turns,
+    me: u32,
 ) -> Result<void, NetError> {
     var scratch = [0u8; 64];
+    var used = false;
     loop {
         if (drain.isDraining()) {
             return Ok();
         }
-        let next: Result<Raced<PlainStream>, NetError> = await Async.race(
-            async () => await incoming.next(),
-            async () => await drainStarted<PlainStream>(drain),
-        );
-        var stream = match (next) {
-            Ok(raced) => raced.value,
-            Err(NetError.Closed) => { return Ok(); } // the source ended
+        match (await turns.take(me, drain)) {
+            Ok(true) => {}
+            Ok(false) => { return Ok(); } // the source ended
             Err(NetError.Cancelled) => {
                 if (drain.isDraining()) {
                     return Ok();
                 }
                 return Err(NetError.Cancelled);
             }
-            Err(NetError.OutOfMemory) => { return Err(NetError.OutOfMemory); }
+            Err(e) => { return Err(e); }
+        }
+        let next: Result<Raced<PlainStream>, NetError> = await Async.race(
+            async () => await incoming.next(),
+            async () => await drainStarted<PlainStream>(drain),
+        );
+        var stream = match (next) {
+            Ok(raced) => {
+                await turns.pass()?; // before the handshake, which may take its whole deadline
+                raced.value
+            },
+            Err(NetError.Closed) => {
+                await turns.end()?; // the source ended
+                return Ok();
+            }
+            Err(NetError.Cancelled) => {
+                if (drain.isDraining()) {
+                    return Ok();
+                }
+                return Err(NetError.Cancelled);
+            }
+            Err(NetError.OutOfMemory) => {
+                let passed = await turns.pass();
+                return Err(NetError.OutOfMemory);
+            }
             Err(_) => {
                 let failed = counters.acceptErrors.fetchAdd(1);
                 match (await Timer.sleep(limits.acceptBackoffMs)) {
                     Ok() => {}
                     Err(e) => { return Err(NetErrors.fromAsync(e)); }
                 }
+                await turns.pass()?;
                 continue;
             }
         };
         let id = counters.accepted.fetchAdd(1);
+        if (!used) {
+            used = true;
+            let first = counters.workersUsed.fetchAdd(1);
+        }
         let handshake = Deadline.after(limits.handshakeMs);
         // Behind a balancer that speaks the PROXY protocol (Web ADR 0012 §3.6, amendment 2): from a source it lists,
         // the header first, read exactly, within the handshake's time; any other source is closed unread.
