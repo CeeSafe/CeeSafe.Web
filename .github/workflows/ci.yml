@@ -177,7 +177,7 @@ jobs:
           copyback: false
           envs: "CEESAFE_VERSION"
           prepare: |
-            pkg install -y python3
+            pkg install -y python3 perl5 gmake
           run: |
             set -e
             freebsd-version
@@ -194,24 +194,26 @@ jobs:
             done
             # web_ws runs natively only here: in FreeBSD's interpreter its tests grew past 11.4 GB and were killed (3.35 GB
             # on macOS), CeeSafe's U24 (docs/ceesafe-upstream-work.md).
-            # DIAGNOSIS (temporary): web_quic's allocation sweep timed out at allocations 2916 and 2923 of these two.
-            # It hangs with 600 s too. Where: the sanitized harness run with allocation 2916 failing, then its threads.
-            t=early_data_before_its_initial_is_held
-            cd packages/web_quic
-            ceesafec test --cflag -fsanitize=address,undefined --cflag -fno-omit-frame-pointer --filter "$t" 2>&1 | tail -1
-            ls -la out/ | grep tests || true
-            ./out/web_quic-tests --ceesafe-test "$t" 2916 0 120000 > hang.out 2>&1 &
-            sleep 40
-            pid=$(pgrep -f 'web_quic-tests --ceesafe-test' | head -1)
-            echo "pid $pid"; cat hang.out | tail -5
-            procstat -kk "$pid" || true
-            which lldb gdb || true
-            lldb -p "$pid" --batch -o 'thread backtrace all' 2>&1 | grep -E '^\* thread|^  thread|frame #' | head -80 || true
-            kill "$pid" || true
-            cd ../..
-            exit 1
             python3 tools/run_tests.py --timeout 600 --exclude web_ws
             (cd packages/web_ws && ceesafec test --timeout 600)
+            # The sweeps link OpenSSL 3.5.9, built here, as the Linux sweep job does: with the base system's 3.5.6, a failed
+            # allocation left a lock of OpenSSL's decoder cache held, and web_quic's early_data_before_its_initial_is_held
+            # then waited for it for ever at allocation 2916 (lldb: OSSL_DECODER_CTX_new_for_pkey in
+            # CRYPTO_THREAD_read_lock, under PEM_ASN1_read_bio of the test's CA). The other steps keep the base system's.
+            v=3.5.9
+            fetch -qo openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-$v/openssl-$v.tar.gz"
+            test "$(sha256 -q openssl.tar.gz)" = 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+            tar -xzf openssl.tar.gz
+            (cd "openssl-$v" && ./Configure --prefix="$HOME/openssl-$v" --libdir=lib no-docs no-tests > /dev/null &&
+              gmake -j"$(sysctl -n hw.ncpu)" > /dev/null && gmake install_sw > /dev/null)
+            o="$HOME/openssl-$v"
+            export CPATH="$o/include" LIBRARY_PATH="$o/lib" LD_LIBRARY_PATH="$o/lib"
+            "$o/bin/openssl" version
+            # First the case that hung with 3.5.6 (bring-up only; removed once the whole job passes).
+            t=early_data_before_its_initial_is_held
+            (cd packages/web_quic && ceesafec test --cflag -fsanitize=address,undefined --cflag -fno-omit-frame-pointer --filter "$t" | tail -1 &&
+              ldd out/web_quic-tests | grep -E 'ssl|crypto' &&
+              timeout 300 ./out/web_quic-tests --ceesafe-test "$t" 2916 0 120000 | tail -3; echo "allocation 2916 with $v: status $?")
             python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep
             (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
 
