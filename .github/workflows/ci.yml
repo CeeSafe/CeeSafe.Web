@@ -8,6 +8,12 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a pull request's branch cancels that branch's older runs, which otherwise held runners for hours
+# (each run is eight jobs, the sweeps among them); main's runs are each kept.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CEESAFE_VERSION: v0.53.0 # main's minimum from 2026-11-15 (docs/toolchain.md)
 
