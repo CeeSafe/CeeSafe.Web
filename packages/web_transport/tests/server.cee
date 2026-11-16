@@ -230,6 +230,7 @@ fn emptyReport() -> ServerReport => ServerReport {
     served: 0,
     failed: 0,
     acceptErrors: 0,
+    workersUsed: 0,
     forced: false,
 };
 
@@ -470,6 +471,58 @@ async fn resetOverTcpChecks() -> Result<void, TestFailure> {
     }))?;
     Check.isTrue(sawReading && h.resets.load() == 1, "a peer's RST fails the read with Reset")?;
     Check.isTrue(r.accepted == 1 && r.failed == 1 && r.served == 0, "the reset connection counts as failed")?;
+    return Ok();
+}
+
+/// 20 TCP clients one after another through 64 workers: the turn goes to the worker idle the shortest time, so the
+/// two that take turns serve them all, and the other 62 frames are never touched (`Turns`). Taken oldest first, as
+/// before, each client had a worker of its own.
+async fn sequentialOverTcpChecks() -> Result<void, TestFailure> {
+    let listener = net(Listener.bind("127.0.0.1", 0))?;
+    let port = net(listener.port())?;
+    let drain = net(Drain.create())?;
+    let h = echoHandler();
+    let a = PlainAcceptor {};
+    let l = serverLimits(64, 1000);
+    var r = emptyReport();
+    var good: u32 = 0;
+    netDone(await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            r = await ConnectionServer.run(listener, a, h, l, drain)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            for (k in 0..20) {
+                match (await echoClient(port)) {
+                    Ok(true) => { good += 1; }
+                    _ => {}
+                }
+                // until the server has closed its side, so that worker is idle again before the next client
+                for (i in 0..200) {
+                    if (h.matched.load() >= good as u64) {
+                        break;
+                    }
+                    await nap(1)?;
+                }
+                await nap(2)?;
+            }
+            drain.start();
+            return Ok();
+        });
+    }))?;
+    Check.isTrue(good == 20 && r.served == 20, "20 sequential clients served")?;
+    Check.isTrue(r.workersUsed >= 1 && r.workersUsed <= 2, "at most 2 of 64 workers took a connection")?;
+    return Ok();
+}
+
+@test
+fn server_reuses_the_last_idle_worker() -> Result<void, TestFailure> {
+    let before = openDescriptors();
+    match (Async.run(sequentialOverTcpChecks())) {
+        Ok() => {}
+        Err(failure) => { return Err(failure); }
+    }
+    Check.isTrue(descriptorsBackTo(before), "descriptors back to the baseline")?;
     return Ok();
 }
 
