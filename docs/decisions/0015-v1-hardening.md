@@ -186,5 +186,14 @@ gives 248 top-level public items (`## ` headings) across them.
 - `tools/api_check.py` in CI: the committed pages match a regeneration.
 - The nightly fuzz workflow, whose first night must find no crash on main. Its runs are recorded as Web ADR 0005
   §2.5 asks.
-- A FreeBSD job, if §5 is A.
+- A FreeBSD job, if §5 is A. *Done 2026-11-16* (pull request #30): CI's `freebsd` job runs FreeBSD 15.1 (amd64) in a
+  VM inside an Ubuntu job (`vmactions/freebsd-vm`, pinned), with the released ceesafec (0.53.0, CeeSafe ADR 0149)
+  and the base system's OpenSSL 3.5.6; `web_tls` and `web_quic` name it with `[target.freebsd]`. The matrix's steps
+  pass there, with three differences:
+  - the VM has 12 GB: with the default 6 GB, three packages' interpreter runs were killed for memory;
+  - `web_ws` runs natively only: in FreeBSD's interpreter it grew past 11.4 GB (3.35 GB on macOS), CeeSafe's U24;
+  - the sweeps link OpenSSL 3.5.9, built in the job, as the Linux sweep job does: with 3.5.6 a failed allocation
+    left a lock of OpenSSL's decoder cache held, and `web_quic`'s `early_data_before_its_initial_is_held` waited for
+    ever at allocation 2916 (reproduced on the owner's FreeBSD 15.1 PC; with 3.5.9 its sweep passes, and so do
+    `web_quic`'s, `web_http3`'s and `web_tls`'s whole sweeps there).
 - The comparison benchmarks, run twice on the chosen machine to measure noise before the 5 % gate is applied.
