@@ -57,8 +57,9 @@ compiler's checks do not apply.
 
 ## 4. Out of scope
 
-- The vendored ngtcp2 1.26.0 and nghttp3 1.19.0 (`third_party/`), and OpenSSL. They are fuzzed upstream (OSS-Fuzz),
-  but their use by the shims is in scope.
+- The vendored ngtcp2 1.26.0 and nghttp3 1.19.0 (CeeSafeLibs' `ngtcp2` and `nghttp3` packages, `upstream/`), and
+  OpenSSL. They are fuzzed upstream (OSS-Fuzz), but their use by the shims (now in those packages, `c/`) is in
+  scope.
 - `web_core`, `web_transport`, `web_server`, `web_client` and `web_sse`, except where a finding in scope runs
   through them. They hold the connection drivers and the API rather than the parsing.
 - Examples, benchmarks and tests.

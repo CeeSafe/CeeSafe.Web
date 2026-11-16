@@ -18,8 +18,8 @@
  * After each, every event is drained, the first with a buffer of 1 to 64 bytes so H3_EV_TOO_SMALL is exercised.
  *
  * Linux (libFuzzer):
- *   N=third_party/nghttp3-1.19.0; clang -g -O1 -fsanitize=fuzzer,address,undefined -Itests/fuzz/h3 -I$N/config \
- *     -I$N/lib/includes tests/fuzz/h3/fuzz_h3.c packages/web_http3/c/h3_shim.c $(ls packages/web_http3/c/vendor/lib_*) \
+ *   L=<CeeSafeLibs at web_http3's pinned rev>/nghttp3; N=$L/upstream; clang -g -O1 -fsanitize=fuzzer,address,undefined \
+ *     -Itests/fuzz/h3 -I$N/config -I$N/lib/includes tests/fuzz/h3/fuzz_h3.c $L/c/h3_shim.c $(ls $L/c/vendor/lib_*) \
  *     -o fuzz_h3
  *   ./fuzz_h3 corpus/ tests/fuzz/h3/seeds/
  * Elsewhere (no libFuzzer): add -DH3_REPLAY and drop "fuzzer," from -fsanitize: the binary replays the files named

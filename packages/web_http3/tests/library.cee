@@ -1,5 +1,5 @@
 // The vendored nghttp3 links and answers (Web ADR 0014 §4, stage 1). Expected value: its release number (1.19.0,
-// third_party/README.md).
+// CeeSafeLibs' nghttp3/upstream/README.md).
 
 @test
 fn nghttp3_is_the_vendored_release() -> Result<void, TestFailure> =>

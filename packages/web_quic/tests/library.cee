@@ -1,5 +1,5 @@
 // The vendored libraries link and answer (Web ADR 0014 §4, stage 1). Expected values: ngtcp2's release number
-// (1.26.0, third_party/README.md) and OpenSSL 3.5's version-number encoding (OpenSSL's opensslv.h: 0xMNN00PP0L).
+// (1.26.0, CeeSafeLibs' ngtcp2/upstream/README.md) and OpenSSL 3.5's version-number encoding (OpenSSL's opensslv.h: 0xMNN00PP0L).
 
 @test
 fn ngtcp2_is_the_vendored_release() -> Result<void, TestFailure> =>

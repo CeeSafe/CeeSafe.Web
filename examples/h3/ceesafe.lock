@@ -1,6 +1,20 @@
 # Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
 
 [[package]]
+name = "nghttp3"
+source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
+commit = "b1791218f2e1a0f269eced073f21ab89f2a7ce59"
+dir = "nghttp3"
+hash = "sha256:84c6229dc30c2860b16d0674ecbd9f857923d6d6aa47156400de9fbfdc17ef11"
+
+[[package]]
+name = "ngtcp2"
+source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
+commit = "b1791218f2e1a0f269eced073f21ab89f2a7ce59"
+dir = "ngtcp2"
+hash = "sha256:f18368962ec8fbbef56ff9b9becec926d395ef5722b7c5c84066905d257331f3"
+
+[[package]]
 name = "web_core"
 source = "path+../../packages/web_core"
 
