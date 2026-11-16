@@ -1206,6 +1206,11 @@ FreeBSD job can run `web_ws` in the interpreter again.
 
 **Released in 0.57.1** (2026-11-16). Main's minimum is 0.57.1 since then (implementation plan §11.17), and the FreeBSD
 job runs `web_ws` in the interpreter again.
+- **On FreeBSD 15.1** (the owner's PC, 4 GB), `ceesafec test --interp --jobs 1` in `packages/web_ws`: with 0.57.1 (installed by
+  `install.sh` through `fetch`), 26 passed, peak 222 MB; with 0.53.0 under a 3 GB limit (`ulimit -v`), 23 passed and 3
+  failed, each at the interpreter's own allocation record (`memory.cee:168`), peak 1.86 GB.
+- **CI** (pull request #32's `freebsd` job, 0.57.1): `web_ws` in the interpreter, 26 passed; the whole job passed with
+  #34's fix.
 
 ## Tooling (small, any time before M1's exit)
 
