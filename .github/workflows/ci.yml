@@ -192,12 +192,10 @@ jobs:
             for p in packages/*/; do
               (cd "$p" && ceesafec fetch --offline && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
             done
-            # DIAGNOSIS (temporary): web_ws's interpreter run failed with no message, with 12 GB.
-            sysctl hw.physmem hw.ncpu
-            (cd packages/web_ws && /usr/bin/time -l ceesafec test --interp --jobs 1 --timeout 600 2>&1 | grep -v ' \.\.\. ok$' | tail -25) || true
-            dmesg | grep -i -E 'kill|swap|memory' | tail -10 || true
-            exit 1
-            python3 tools/run_tests.py --timeout 600
+            # web_ws runs natively only here: in FreeBSD's interpreter its tests grew past 11.4 GB and were killed (3.35 GB
+            # on macOS), CeeSafe's U24 (docs/ceesafe-upstream-work.md).
+            python3 tools/run_tests.py --timeout 600 --exclude web_ws
+            (cd packages/web_ws && ceesafec test --timeout 600)
             python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep
             (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
 
