@@ -170,6 +170,9 @@ jobs:
         uses: vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b # v1.6.0
         with:
           release: "15.1"
+          # The default 6 GB, with no swap, let the system kill three packages' interpreter runs (one test process per
+          # CPU); the runner has 16 GB.
+          mem: 12288
           usesh: true
           copyback: false
           envs: "CEESAFE_VERSION"
@@ -189,12 +192,6 @@ jobs:
             for p in packages/*/; do
               (cd "$p" && ceesafec fetch --offline && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
             done
-            # DIAGNOSIS (temporary): the interpreter's runs of these three failed with no message.
-            for p in web_transport web_server web_ws; do
-              echo "== $p (interp)"
-              (cd "packages/$p" && ceesafec test --interp --timeout 600 2>&1 | grep -v '^test .* ok$' | tail -30) || true
-            done
-            exit 1
             python3 tools/run_tests.py --timeout 600
             python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep
             (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
