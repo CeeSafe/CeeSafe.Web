@@ -1073,6 +1073,40 @@ HTTP/1.1 on the same server at 100 connections is 42 076 req/s, with the longest
 - Past ~20 connections, requests stall up to 1 s.
 - Not worked around: the 1 s timer stays as the backstop it was meant to be.
 
+## B20 — Bug: a wait blocks after a full kqueue change queue's early send readied tasks   *(found 2026-11-16 by cosmohttp's benchmark of web_client, ceesafec 0.57.1 and 0.60.0, macOS (kqueue); fixed in 0.61.0)*
+
+**Symptom:** `web_client` dialing 64 connections at once (64 tasks, each its first request, one `Client`): about one
+run in three ended with `ClientError` "timed out" after exactly `connectMs` (10 s), with no CPU used meanwhile. At 16,
+32 and 48 tasks no run failed. In the failing runs every connection attempt that was still in `happyEyeballs`
+timed out together.
+
+**Cause (found 2026-11-16, in the CeeSafe repo):** B16's other half.
+- 64 connects armed at once fill the kqueue change queue exactly (`cee_exec.changes[64]`).
+- `cee_wait_reactor` registers the wake pipe the first time the executor waits with one open. That is the 65th
+  change, so `cee_kqueue_change` sends the 64 early with a non-blocking `cee_kqueue_call`.
+- On loopback the connects have finished by then: the early send takes their events (one-shot, so they do not come
+  again) and readies their tasks. `cee_kqueue_change` dropped the call's result.
+- `cee_wait_reactor` then called `kevent` to block until the next deadline, with the readied tasks on the ready
+  list and no event left to end the wait.
+- B16's fix covered a wake's byte drained by the early send (`pipe_drained`), not tasks it readied.
+- A wake pipe exists only once a task was woken the slow way (`cee_poke`), which `happyEyeballs`' task set and
+  channels do; a plain `await TcpTransport.connectTo(…)` in 64 tasks never met it. Only kqueue has the change queue.
+
+**Reduced** to lib/std alone (no web_client): 64 tasks, each racing a task set whose one child connects and reports on
+a channel against that channel's receive. It hangs in about one run in seven at 64 and at 128 tasks, never at 8, 32,
+60, 63, 65 or 70 (30 runs each).
+
+**Fix (CeeSafe, `runtime/hosted/ceesafe_rt_async.c`):** `cee_kqueue_change` records that an early send readied a task
+(`early_ready`), and `cee_wait_reactor` does not block when one did, or when it drained a wake. Regression test:
+CeeSafe's corpus `run-pass/async-early-send-ready.cee` (a listener and 63 connects in that shape: 2 of 40 runs waited
+out the deadline before the fix, 0 of 40 after).
+
+**Measured, 2026-11-16, macOS arm64:** the reduction, 60 runs each at 64, 128 and 192 tasks with the fix: none hung.
+web_client at 64 connections, 30 runs each: 11 timed out built with 0.57.1, none built with the fix.
+
+**For CeeSafe.Web:** nothing to change. With a ceesafec older than 0.61.0, a program that opens its first 64
+connections (or a multiple) in one turn of the executor may wait out a deadline on macOS and the BSDs.
+
 ## B17 — Performance: every finished race walks every parked task   *(found 2026-11-03, M7, ceesafec 0.10.1 with B16's fix; fixed in 0.10.3 by CeeSafe ADR 0062)*
 
 **Symptom:** after B16's fix, HTTP/2 throughput falls with the number of concurrent streams. `h2load -n 20000`

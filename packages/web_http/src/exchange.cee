@@ -274,9 +274,7 @@ public struct Exchange<region r> {
                     };
                     let to = borrow mut buffer[0..step.dataLength];
                     to.copyFrom(input[step.dataStart..step.dataStart + step.dataLength]);
-                    for (i in 0..step.trailerLength) {
-                        grown(this.trailerLines.push(input[step.trailerStart + i]))?;
-                    }
+                    grown(this.trailerLines.extend(input[step.trailerStart..step.trailerStart + step.trailerLength]))?;
                     this.consumeCarry(step.consumed)?;
                     if (step.finished) {
                         this.body = BodyState.Done;

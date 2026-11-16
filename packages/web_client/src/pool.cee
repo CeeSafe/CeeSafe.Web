@@ -1,6 +1,9 @@
-// The connection pool (Web ADR 0009 §3.4): per origin, idle connections and a semaphore of slots. A connection holds
-// one of its origin's slots from its connect until it is closed, idle or not; `maxPerOrigin` slots exist. Behind an
-// AsyncMutex, so concurrent requests share it (the connections are `Send`, §2).
+// The connection pool (Web ADR 0009 §3.4): per origin, idle connections and a semaphore of slots. A request holds one
+// of its origin's `maxPerOrigin` slots from before it has a connection until its response gives the connection back
+// or closes it; an idle connection holds none. A request takes an idle connection before it makes a new one, so an
+// origin never has more than `maxPerOrigin` connections, and a request that waits for a slot gets the connection
+// that the request before it gave back. Behind an AsyncMutex, so concurrent requests share it (the connections are
+// `Send`, §2).
 import web_core;
 import web_transport;
 import web_http;
@@ -8,6 +11,8 @@ import web_http;
 struct Idle {
     conn: Box<dyn Transport + Send>;
     since: u64;
+    /// The read buffer the connection's last response used, empty: the next response on it reads into it again.
+    carry: OwnedBuffer;
 }
 
 struct Origin {
@@ -27,9 +32,9 @@ struct PoolState {
     closed: bool;
 }
 
-/// A taken connection: a pooled one (a reuse race is possible) or a slot for a new one.
+/// A taken connection: a pooled one with its read buffer (a reuse race is possible), or a slot for a new one.
 enum Taken {
-    Reused(Box<dyn Transport + Send>),
+    Reused(Box<dyn Transport + Send>, OwnedBuffer),
     Slot,
 }
 
@@ -54,29 +59,72 @@ struct ConnectionPool {
         }
     }
 
-    /// The origin's slot semaphore (made on first use), its newest idle connection if one is fresh enough, and the
-    /// request counted for the retry budget. Idle connections past the timeout are closed and their slots freed.
-    async fn idleFor(borrow this, url: borrow Url) -> Result<Box<dyn Transport + Send>?, ClientError> {
-        var guard = locked(await this.state.lock())?;
-        let s = guard.data();
-        if (s.closed) {
-            return Err(ClientError.Shutdown);
+    /// A place among the origin's requests, with a connection for it: the origin's newest idle connection that is
+    /// fresh enough (`Reused`), or none (`Slot`: the caller makes one, and frees the slot if it cannot). With every
+    /// slot taken the request waits, until `total`, and takes the connection a finished request gives back. The
+    /// request is counted for the retry budget.
+    async fn acquire(borrow this, url: borrow Url, total: Deadline) -> Result<Taken, ClientError> {
+        var slots: Channel<u8>? = null;
+        {
+            var guard = locked(await this.state.lock())?;
+            let s = guard.data();
+            if (s.closed) {
+                return Err(ClientError.Shutdown);
+            }
+            let i = this.originIndex(s, url)?;
+            let o = borrow mut s.origins[i];
+            o.requests += 1;
+            match (o.slots.tryRecv()) {
+                Some(_) => { return Ok(this.newestIdle(o)); }
+                null => { slots = Some(o.slots.clone()); }
+            }
         }
-        let i = this.originIndex(s, url)?;
-        let o = borrow mut s.origins[i];
-        o.requests += 1;
+        let waiting = match (slots) {
+            Some(c) => c,
+            null => { return Err(ClientError.Shutdown); },
+        };
+        let got = if (total.isNever()) await waiting.recvAsync() else await Async.deadline(
+            total.instant(),
+            AsyncError.TimedOut,
+            async () => await waiting.recvAsync(),
+        );
+        match (got) {
+            Ok(Some(_)) => {}
+            Ok(null) => { return Err(ClientError.Shutdown); }
+            Err(e) => { return Err(ClientError.Net(NetErrors.fromAsync(e))); }
+        }
+        // The slot is this request's now. Whoever freed it may have left its connection in the pool.
+        var guard = match (await this.state.lock()) {
+            Ok(g) => g,
+            Err(e) => {
+                let freed = waiting.trySend(0);
+                return Err(ClientError.Net(NetErrors.fromAsync(e)));
+            },
+        };
+        let s = guard.data();
+        let i = match (this.originIndex(s, url)) {
+            Ok(i) => i,
+            Err(e) => {
+                let freed = waiting.trySend(0);
+                return Err(e);
+            },
+        };
+        return Ok(this.newestIdle(borrow mut s.origins[i]));
+    }
+
+    /// The origin's newest idle connection within the idle timeout, the older ones closed; `Slot` if there is none.
+    /// An idle connection holds no slot: its request gave the slot back with it.
+    fn newestIdle(borrow this, o: borrow mut Origin) -> Taken {
         let now = Timer.now();
-        while (o.idle.length > 0) {
+        loop {
             let idle = match (o.idle.pop()) {
                 Some(x) => x,
-                null => { break; },
+                null => { return Taken.Slot; },
             };
             if (now - idle.since <= this.idleTimeoutMs) {
-                return Ok(Some(idle.conn));
+                return Taken.Reused(idle.conn, idle.carry);
             }
-            let freed = o.slots.trySend(0); // the expired connection closes here
         }
-        return Ok(null);
     }
 
     /// A clone of the origin's slot semaphore.
@@ -90,8 +138,9 @@ struct ConnectionPool {
         return Ok(s.origins[i].slots.clone());
     }
 
-    /// Returns a reusable connection; closed instead (its slot freed) when the pool is shut down or full of idle ones.
-    async fn give(borrow this, url: borrow Url, conn: Box<dyn Transport + Send>) {
+    /// Returns a reusable connection and frees its request's slot; the connection is closed instead when the pool is
+    /// shut down or full of idle ones.
+    async fn give(borrow this, url: borrow Url, conn: Box<dyn Transport + Send>, carry: OwnedBuffer) {
         var guard = match (await this.state.lock()) {
             Ok(g) => g,
             Err(_) => { return; },
@@ -106,10 +155,9 @@ struct ConnectionPool {
             let freed = o.slots.trySend(0);
             return;
         }
-        match (o.idle.push(Idle { conn: conn, since: Timer.now() })) {
-            Ok() => {}
-            Err(_) => { let freed = o.slots.trySend(0); }
-        }
+        // The connection first, then the slot: a request that the slot wakes finds the connection.
+        let pushed = o.idle.push(Idle { conn: conn, since: Timer.now(), carry: carry });
+        let freed = o.slots.trySend(0);
     }
 
     /// Whether the origin's retry budget allows one more retry; it is spent if so.
@@ -144,7 +192,6 @@ struct ConnectionPool {
             let o = borrow mut s.origins[i];
             while (o.idle.length > 0) {
                 let dropped = o.idle.pop();
-                let freed = o.slots.trySend(0);
             }
             o.slots.close(); // waiters for a slot wake and see the shutdown
         }
@@ -166,11 +213,9 @@ struct ConnectionPool {
             let filled = slots.trySend(0);
         }
         var host = Vector<u8>.create();
-        for (b in url.host()) {
-            match (host.push(b)) {
-                Ok() => {}
-                Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
-            }
+        match (host.extend(url.host())) {
+            Ok() => {}
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
         }
         let o = Origin {
             secure: url.isSecure(),

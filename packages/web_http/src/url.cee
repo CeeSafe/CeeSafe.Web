@@ -350,13 +350,10 @@ fn startsWithIgnoringCase(text: Slice<u8>, prefix: StringView) -> bool {
 }
 
 fn push(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, UrlError> {
-    for (b in bytes) {
-        match (out.push(b)) {
-            Ok() => {}
-            Err(_) => { return Err(UrlError.OutOfMemory); }
-        }
+    match (out.extend(bytes)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(UrlError.OutOfMemory); }
     }
-    return Ok();
 }
 
 /// `v` in decimal at the end of `out`; the index of its first digit.

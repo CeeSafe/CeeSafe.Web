@@ -513,3 +513,50 @@ async fn request_trailers_in_the_last_chunk() -> Result<void, TestFailure> {
     return Check.isTrue(holds(sent.view(), "\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-sum: 42\r\n\r\n") &&
         !holds(sent.view(), "content-length"), "the trailers in the last chunk, and no framing field");
 }
+
+/// One GET through `client`, its response held for `holdMs` before it is finished; `order` records the turn.
+async fn heldGet(client: borrow Client, order: borrow AtomicU64, mark: u64, holdMs: u64) -> Result<void, TestFailure> {
+    var response = match (await client.get("http://pool.test/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(TestFailure.create(ClientErrors.describe(e))); },
+    };
+    order.store(order.load() * 10 + mark);
+    if (holdMs > 0) {
+        match (await Timer.sleep(holdMs)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("the sleep")); }
+        }
+    }
+    var content = Vector<u8>.create();
+    match (await response.readToEnd(mut content, 1024)) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(ClientErrors.describe(e))); }
+    }
+    match (await response.finish(client)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(TestFailure.create(ClientErrors.describe(e))); }
+    }
+}
+
+// Web ADR 0009 §3.4: with every slot of an origin taken, a request waits, and goes on as soon as a connection is free
+// again: the one the first request gives back to the pool, not a new one.
+@test
+async fn a_waiting_request_takes_the_connection_given_back() -> Result<void, TestFailure> {
+    let scripts = scriptsOf(2)?;
+    let text = "HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\naHTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\nb";
+    // Two responses of 39 bytes on one connection, a read giving one at a time.
+    queue(scripts, script(text)?.withChunk(39))?;
+    queue(scripts, script("HTTP/1.1 500 Unused\r\ncontent-length: 0\r\n\r\n")?)?; // a second dial would get this
+    var options = quick();
+    options.maxPerOrigin = 1;
+    options.totalMs = 2000;
+    let client = mockClient(options, scripts, v4(1), null, null, null, false)?;
+    let order = AtomicU64.create(0);
+    await Async.scope(TestFailure.create("out of memory"), (s) => {
+        s.spawn(async () => await heldGet(client, order, 1, 40));
+        s.spawn(async () => await heldGet(client, order, 2, 0));
+    })?;
+    Check.equalU64(12, order.load())?;
+    Check.equalU64(1, await left(scripts))?; // the second script was never dialed
+    return Ok();
+}

@@ -203,14 +203,9 @@ public struct RequestWriter {
         if (this.failed) {
             return;
         }
-        for (b in bytes) {
-            match (out.push(b)) {
-                Ok() => {}
-                Err(_) => {
-                    this.failed = true;
-                    return;
-                }
-            }
+        match (out.extend(bytes)) {
+            Ok() => {}
+            Err(_) => { this.failed = true; }
         }
     }
 }

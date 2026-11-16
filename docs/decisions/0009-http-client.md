@@ -192,3 +192,42 @@ A POST without `Idempotency-Key` is never retried, whatever failed. The transpor
 
    nginx is not installed on the test machines. `examples/fetch` is the client example.
 4. **The system's roots on Windows** needed a change in web_tls (Web ADR 0002 amendment 4).
+
+## 8. Amendment 2 (2026-11-16, after cosmohttp's benchmark of web_client)
+
+Three findings of `~/dev/CeeSafeApps/httpclient/CEESAFE_FINDINGS.md` (F3, F4 and F5), fixed on branch
+`fix/web-client-findings`. No public API changed (`tools/api_check.py`: the 14 packages match).
+
+1. **A slot is a request's, not a connection's (§3.4).** As built, a connection held its origin's slot from its
+   connect until it closed, idle or not, and a request that found no idle connection waited for a slot. A connection
+   given back to the pool freed no slot, so with every slot taken the waiting request slept until a connection
+   closed, or until `totalMs`: with `maxPerOrigin` 1, the second of two requests never ran. Now a request takes a
+   slot first (`ConnectionPool.acquire`), then the newest idle connection, or makes one; `give` puts the connection
+   back and then frees the slot, so the request it wakes finds the connection. An idle connection holds no slot. An
+   origin still never has more than `maxPerOrigin` connections: a request makes one only when none is idle, so there
+   are never more connections than requests that held slots at once. Tested by
+   `a_waiting_request_takes_the_connection_given_back` (it timed out before).
+2. **The timeout at 64 connections** was not web_client's: CeeSafe's B20 (`docs/ceesafe-upstream-work.md`).
+3. **Bytes are copied whole.** `copyBytes`, `Url`'s `push` and `RequestWriter.put` appended one byte at a time; they
+   use `Vector.extend`. `readToEnd` reads into the vector's own room (as large as a `content-length` says, else
+   doubling), not through an 8 KiB stack buffer, and `read` with nothing buffered reads a body with a length, or one
+   that ends with the connection, straight into a caller's buffer of 1 KiB or more.
+4. **Fewer allocations for a request.** The request's URL is no longer copied for each `send` (only a redirect's
+   target is owned); the request head is reserved once; the response holds its connection as an optional, not a
+   vector of one (amendment 1's item 2); and a pooled connection keeps the 16 KiB read buffer of its last response
+   for the next.
+
+Measured with cosmohttp's `bench/` (a keep-alive loopback server in another process, one request at a time, Apple
+M1, ceesafec 0.57.1, 2026-11-16), before and after:
+
+| Body | Allocations a request | User CPU a request | Requests a second |
+|---|---|---|---|
+| 1 KiB | 32 → 10 | 9 µs → 5.5 µs | 15,785 → 28,776 |
+| 64 KiB | 33 → 10 | 51 µs → 7.5 µs | 7,291 → 15,527 |
+| 1 KiB chunked | 35 → 10 | 8.5 µs → 6.5 µs | 16,806 → 25,220 |
+
+The allocation counts are after all four items; the times and rates were taken after item 3 alone (17 allocations),
+on a machine shared with other work, so they show the direction, not a figure to hold. What is left for a request:
+its URL parsed (`ClientRequest.create`) and copied once more for the response, the authority, the request head and
+the response head. Removing those needs a response that borrows its connection's buffers, which is another API.
+
