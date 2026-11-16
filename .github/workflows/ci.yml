@@ -207,14 +207,12 @@ jobs:
             (cd "openssl-$v" && ./Configure --prefix="$HOME/openssl-$v" --libdir=lib no-docs no-tests > /dev/null &&
               gmake -j"$(sysctl -n hw.ncpu)" > /dev/null && gmake install_sw > /dev/null)
             o="$HOME/openssl-$v"
-            export CPATH="$o/include" LIBRARY_PATH="$o/lib" LD_LIBRARY_PATH="$o/lib"
-            "$o/bin/openssl" version
-            # First the case that hung with 3.5.6 (bring-up only; removed once the whole job passes).
-            t=early_data_before_its_initial_is_held
-            (cd packages/web_quic && ceesafec test --cflag -fsanitize=address,undefined --cflag -fno-omit-frame-pointer --filter "$t" | tail -1 &&
-              ldd out/web_quic-tests | grep -E 'ssl|crypto' &&
-              timeout 300 ./out/web_quic-tests --ceesafe-test "$t" 2916 0 120000 | tail -3; echo "allocation 2916 with $v: status $?")
-            python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep
+            LD_LIBRARY_PATH="$o/lib" "$o/bin/openssl" version
+            # FreeBSD's clang reads CPATH but not LIBRARY_PATH: the libraries are named with -L, and found again at run
+            # time by the rpath (without them -lssl took the base system's /usr/lib/libssl.so.35).
+            export CPATH="$o/include"
+            python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep \
+              --cflag="-L$o/lib" --cflag="-Wl,-rpath,$o/lib"
             (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
 
   probes:
