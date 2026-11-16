@@ -737,6 +737,15 @@ public fn create() -> HeaderBlock
 
 An empty list.
 
+### HeaderBlock.withCapacity
+
+```ceesafe
+public fn withCapacity(bytes: usize, fields: usize) -> Result<HeaderBlock, AllocError>
+```
+
+An empty list with room for `bytes` bytes of names and values and `fields` fields, so filling it allocates
+no more until it outgrows them.
+
 ### HeaderBlock.clear
 
 ```ceesafe

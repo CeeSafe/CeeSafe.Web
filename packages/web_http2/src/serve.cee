@@ -23,8 +23,51 @@ enum Outgoing {
     /// Push a GET for this path.
     Push(u32, Vector<u8>),
     Reset(u32, u32),
-    /// The stream's task is done.
-    Done(u32),
+    /// The stream's task is done: its kit back, for the next stream.
+    Done(u32, StreamKit),
+}
+
+/// A stream task's buffers: the request's fields and the exchange's buffers and head. A connection keeps a few
+/// that its streams gave back, so a stream reuses them: made afresh, they were most of a request's allocations, and
+/// a 20 KB fill each.
+struct StreamKit {
+    fields: HeaderBlock;
+    carry: OwnedBuffer;
+    out: OwnedBuffer;
+    pending: OwnedBuffer;
+    response: ResponseHead;
+}
+
+/// The most kits a connection keeps for its next streams.
+const KITS_KEPT: usize = 16;
+
+fn makeKit(limits: Limits) -> Result<StreamKit, NetError> {
+    let carry = match (OwnedBuffer.create(16)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    let out = match (OwnedBuffer.create(16)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    let pending = match (OwnedBuffer.create(limits.writeBufferBytes)) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    let response = match (ResponseHead.create(4096)) {
+        Ok(h) => h,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    return Ok(StreamKit { fields: HeaderBlock.create(), carry: carry, out: out, pending: pending, response: response });
+}
+
+/// A kit as a new stream needs it: everything empty, the capacity kept.
+fn clearKit(kit: borrow mut StreamKit) {
+    kit.fields.clear();
+    kit.carry.clear();
+    kit.out.clear();
+    kit.pending.clear();
+    kit.response.reset();
 }
 
 /// Request body for a stream's task.
@@ -39,7 +82,7 @@ struct Link {
     body: Channel<BodyPart>;
     credit: Channel<u32>;
     reset: Channel<u8>;
-    replies: Channel<u8>;
+    replies: Channel<u32>;
     backlog: Vector<u8>;
     ended: bool;
     endSent: bool;
@@ -119,6 +162,7 @@ async fn run(
 ) -> Result<void, NetError> {
     var head = HeaderBlock.create();
     var data = Vector<u8>.create();
+    var kits = Vector<StreamKit>.create();
     var total: i64 = 0; // credit granted and not yet used, across streams
     var lastActive = Timer.now();
     var leaving = false;
@@ -146,8 +190,11 @@ async fn run(
                 H2Event.NeedMore => { break; }
                 H2Event.Request(id, end) => {
                     let taken = head;
-                    head = HeaderBlock.create();
-                    startStream(set, connection, app, limits, engine, links, outgoing, id, taken, !end)?;
+                    head = match (HeaderBlock.withCapacity(512, 16)) {
+                        Ok(h) => h,
+                        Err(_) => { return Err(NetError.OutOfMemory); },
+                    };
+                    startStream(set, connection, app, limits, engine, links, outgoing, mut kits, id, taken, !end)?;
                 }
                 H2Event.Data(id, end) => {
                     let n = data.length;
@@ -197,7 +244,9 @@ async fn run(
         // What the streams queued, as long as there is any.
         loop {
             match (outgoing.tryRecv()) {
-                Some(m) => { await handle(set, connection, app, limits, engine, links, outgoing, m, mut total)?; }
+                Some(m) => {
+                    await handle(set, connection, app, limits, engine, links, outgoing, mut kits, m, mut total)?;
+                }
                 null => { break; }
             }
         }
@@ -257,7 +306,7 @@ async fn run(
                 }
                 Wake.Read(n) => { input.commit(n)?; }
                 Wake.Message(m) => {
-                    await handle(set, connection, app, limits, engine, links, outgoing, m, mut total)?;
+                    await handle(set, connection, app, limits, engine, links, outgoing, mut kits, m, mut total)?;
                 }
                 Wake.Timer => {
                     if (peerDone && links.length() > 0) {
@@ -278,17 +327,24 @@ fn startStream(
     engine: borrow mut H2Connection,
     links: borrow mut HashMap<u32, Link>,
     outgoing: borrow Channel<Outgoing>,
+    kits: borrow mut Vector<StreamKit>,
     id: u32,
     head: HeaderBlock,
     hasBody: bool,
 ) -> Result<void, NetError> {
+    let kit = match (kits.pop()) {
+        Some(k) => k,
+        null => makeKit(limits)?,
+    };
     let body = channel<BodyPart>(4)?;
     let credit = channel<u32>(1)?;
     let reset = channel<u8>(1)?;
-    let replies = channel<u8>(1)?;
+    // A push's answer comes on the credit channel: a stream waits for credit or for that answer, never both at once
+    let replies = credit.clone();
+    // kept for a push's request, so only when the client takes pushes
     var scheme = Vector<u8>.create();
     var authority = Vector<u8>.create();
-    for (i in 0..head.count()) {
+    for (i in 0..(if (engine.peerSettings().enablePush) head.count() else 0)) {
         if (named(head.name(i), ":scheme")) {
             copyInto(mut scheme, head.value(i))?;
         } else if (named(head.name(i), ":authority")) {
@@ -313,7 +369,7 @@ fn startStream(
     let rs = reset.clone();
     let rp = replies.clone();
     let started = set.trySpawn(async move () =>
-        await streamTask(a, context, id, head, hasBody, b, o, c, rp, rs, limits));
+        await streamTask(a, context, id, head, hasBody, b, o, c, rp, rs, limits, kit));
     if (!started) {
         engineOk(engine.resetStream(id, ErrorCodes.refusedStream()))?;
         return Ok();
@@ -354,6 +410,7 @@ async fn handle(
     engine: borrow mut H2Connection,
     links: borrow mut HashMap<u32, Link>,
     outgoing: borrow Channel<Outgoing>,
+    kits: borrow mut Vector<StreamKit>,
     m: Outgoing,
     total: borrow mut i64,
 ) -> Result<void, NetError> {
@@ -394,14 +451,26 @@ async fn handle(
                 }
                 null => {}
             }
-            if (request.count() > 0) {
+            if (request.count() > 0 && request.value(1).length > 0) { // a stream begun before pushes were taken has no scheme
                 match (engine.promise(id, request)) {
                     Ok(Some(promised)) => {
                         var head = HeaderBlock.create();
                         for (i in 0..request.count()) {
                             alloc(head.push(request.name(i), request.value(i), false))?;
                         }
-                        startStream(set, connection, app, limits, engine, links, outgoing, promised, head, false)?;
+                        startStream(
+                            set,
+                            connection,
+                            app,
+                            limits,
+                            engine,
+                            links,
+                            outgoing,
+                            kits,
+                            promised,
+                            head,
+                            false,
+                        )?;
                         answer = 1;
                     }
                     _ => {}
@@ -409,7 +478,7 @@ async fn handle(
             }
             match (links.get(id)) {
                 Some(link) => {
-                    match (link.replies.trySend(answer)) {
+                    match (link.replies.trySend(answer as u32)) {
                         Ok() => {}
                         Err(_) => {}
                     }
@@ -421,7 +490,10 @@ async fn handle(
             engineOk(engine.resetStream(id, code))?;
             endLink(links, id, total);
         }
-        Outgoing.Done(id) => {
+        Outgoing.Done(id, kit) => {
+            if (kits.length < KITS_KEPT) {
+                let kept = kits.push(kit); // out of memory: the kit goes, as one not kept would
+            }
             if (engine.remoteOpen(id)) {
                 // The response is complete; the client need not send the rest of its request (RFC 9113 §8.1).
                 engineOk(engine.resetStream(id, ErrorCodes.noError()))?;
@@ -599,7 +671,7 @@ struct StreamPort {
     body: Channel<BodyPart>;
     outgoing: Channel<Outgoing>;
     credit: Channel<u32>;
-    replies: Channel<u8>;
+    replies: Channel<u32>;
     current: Vector<u8>;
     at: usize;
     ended: bool;
@@ -706,13 +778,15 @@ async fn streamTask(
     body: borrow Channel<BodyPart>,
     outgoing: borrow Channel<Outgoing>,
     credit: borrow Channel<u32>,
-    replies: borrow Channel<u8>,
+    replies: borrow Channel<u32>,
     reset: borrow Channel<u8>,
     limits: Limits,
+    given: StreamKit,
 ) -> Result<void, NetError> {
+    var kit = given;
     let r: Result<Raced<u8>, NetError> = await Async.race(
         async () => {
-            await serveStream(app, context, id, head, hasBody, body, outgoing, credit, replies, limits);
+            await serveStream(app, context, id, head, hasBody, body, outgoing, credit, replies, limits, mut kit);
             return Ok(0u8);
         },
         async () => {
@@ -726,7 +800,8 @@ async fn streamTask(
         Ok(_) => {}
         Err(_) => {}
     }
-    match (outgoing.trySend(Outgoing.Done(id))) {
+    clearKit(mut kit);
+    match (outgoing.trySend(Outgoing.Done(id, kit))) {
         Ok() => {}
         Err(_) => {}
     }
@@ -743,11 +818,12 @@ async fn serveStream(
     body: borrow Channel<BodyPart>,
     outgoing: borrow Channel<Outgoing>,
     credit: borrow Channel<u32>,
-    replies: borrow Channel<u8>,
+    replies: borrow Channel<u32>,
     limits: Limits,
+    kit: borrow mut StreamKit,
 ) {
     // The request: its regular fields, and `host` from `:authority` when the client sent none (RFC 9113 §8.3.1).
-    var fields = HeaderBlock.create();
+    let fields = borrow mut kit.fields;
     var method = Method.Get;
     var methodAt: usize = 0;
     var hasHost = false;
@@ -823,22 +899,6 @@ async fn serveStream(
         trailers: HeaderBlock.create(),
     };
     var none = NoTransport {};
-    var carry = match (OwnedBuffer.create(16)) {
-        Ok(b) => b,
-        Err(_) => { return; },
-    };
-    var out = match (OwnedBuffer.create(16)) {
-        Ok(b) => b,
-        Err(_) => { return; },
-    };
-    var pending = match (OwnedBuffer.create(limits.writeBufferBytes)) {
-        Ok(b) => b,
-        Err(_) => { return; },
-    };
-    var response = match (ResponseHead.create(4096)) {
-        Ok(h) => h,
-        Err(_) => { return; },
-    };
     var date = DateCache.create(limits.sendDate);
     // Box<dyn Application + Send + Share> lends a `dyn Application` (ceesafec 0.42.0): no wrapper, so the handler's call
     // is a plain dyn await, not a stacked one through a wrapper that may hold itself (ADR 0056).
@@ -846,10 +906,10 @@ async fn serveStream(
     var ex = Exchange.forStream(
         mut port,
         mut none,
-        mut carry,
-        mut out,
-        mut pending,
-        mut response,
+        mut kit.carry,
+        mut kit.out,
+        mut kit.pending,
+        mut kit.response,
         application,
         request,
         limits,

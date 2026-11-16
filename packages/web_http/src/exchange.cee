@@ -798,13 +798,22 @@ public struct Exchange<region r> {
         if (hooks) {
             await this.app.beforeHead(this.request, this.response)?;
         }
-        var fields = HeaderBlock.create();
+        let all = this.response.fieldBytes();
+        var lines: usize = 0;
+        for (c in all) {
+            if (c == 10) {
+                lines += 1;
+            }
+        }
+        // room for every field and the ones added below, so the block is two allocations however many it holds
+        var fields = match (HeaderBlock.withCapacity(all.length + 64, lines + 4)) {
+            Ok(f) => f,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
         let status = this.response.status();
         let code = status.code();
         var digits = [48 + truncate<u8>(code / 100), 48 + truncate<u8>(code / 10 % 10), 48 + truncate<u8>(code % 10)];
         grown(fields.push(":status".bytes(), digits[..], false))?;
-        let all = this.response.fieldBytes();
-        var lower = Vector<u8>.create();
         var start: usize = 0;
         for (i in 0..all.length) {
             if (all[i] != 10) {
@@ -816,12 +825,7 @@ public struct Exchange<region r> {
             while (colon < line.length && line[colon] != 58) {
                 colon += 1;
             }
-            lower.clear();
-            for (c in line[0..colon]) {
-                grown(lower.push(if (c >= 65 && c <= 90) c + 32 else c))?;
-            }
-            let name = lower.view();
-            grown(fields.push(name, line[colon + 2..], HeaderBlock.sensitiveByDefault(name)))?;
+            grown(fields.pushLowered(line[0..colon], line[colon + 2..]))?;
         }
         match (length) {
             Some(n) => {

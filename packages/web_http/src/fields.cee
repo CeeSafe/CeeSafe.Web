@@ -22,6 +22,14 @@ public struct HeaderBlock {
     public fn create() -> HeaderBlock =>
         HeaderBlock { bytes: Vector<u8>.create(), spans: Vector<FieldSpan>.create(), listSize: 0 };
 
+    /// An empty list with room for `bytes` bytes of names and values and `fields` fields, so filling it allocates
+    /// no more until it outgrows them.
+    public fn withCapacity(bytes: usize, fields: usize) -> Result<HeaderBlock, AllocError> {
+        let b = Vector<u8>.withCapacity(bytes)?;
+        let s = Vector<FieldSpan>.withCapacity(fields)?;
+        return Ok(HeaderBlock { bytes: b, spans: s, listSize: 0 });
+    }
+
     /// Empties the list, keeping its memory.
     public fn clear(borrow mut this) {
         this.bytes.clear();
@@ -110,6 +118,29 @@ public struct HeaderBlock {
     public fn push(borrow mut this, name: Slice<u8>, value: Slice<u8>, sensitive: bool) -> Result<void, AllocError> {
         let nameAt = this.bytes.length;
         appendBytes(mut this.bytes, name)?;
+        let valueAt = this.bytes.length;
+        appendBytes(mut this.bytes, value)?;
+        this.spans.push(FieldSpan {
+            nameAt: truncate<u32>(nameAt),
+            nameLength: truncate<u32>(name.length),
+            valueAt: truncate<u32>(valueAt),
+            valueLength: truncate<u32>(value.length),
+            sensitive: sensitive,
+        })?;
+        this.listSize += name.length as u64 + value.length as u64 + 32;
+        return Ok();
+    }
+}
+
+impl HeaderBlock {
+    /// Appends a field with its name in lower case (as HTTP/2 sends names, RFC 9113 §8.2.1), sensitive when
+    /// `sensitiveByDefault` says so of the lowered name.
+    public fn pushLowered(borrow mut this, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+        let nameAt = this.bytes.length;
+        for (c in name) {
+            this.bytes.push(if (c >= 65 && c <= 90) c + 32 else c)?;
+        }
+        let sensitive = HeaderBlock.sensitiveByDefault(this.bytes[nameAt..]);
         let valueAt = this.bytes.length;
         appendBytes(mut this.bytes, value)?;
         this.spans.push(FieldSpan {
