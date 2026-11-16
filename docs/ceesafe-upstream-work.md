@@ -1174,7 +1174,24 @@ CeeSafe.Web then adds a FreeBSD job to its CI (Web ADR 0015 §5).
 release, built and checked in a FreeBSD VM (`vmactions/freebsd-vm`); CeeSafe's `freebsd.yml` runs its tests there;
 `[target.freebsd]` in the manifest; `install.sh` knows FreeBSD. Not done yet here: CeeSafe.Web's own FreeBSD job and
 `web_tls`'s `[target.freebsd]`. Main's minimum is 0.53.0 since 2026-11-15 (implementation plan §11.16), which they
-need.
+need. Since then, CeeSafe.Web's CI has a FreeBSD job, and `web_tls` and `web_quic` have `[target.freebsd]` (#30).
+CeeSafe's `install.sh` called itself on FreeBSD (its `fetch()` named after the command), fixed on CeeSafe's main
+(`b7a631d8`, 2026-11-16), no release needed: it is the site's.
+
+## U24 — The interpreter's memory on FreeBSD   *(found 2026-11-16, CeeSafe.Web's FreeBSD CI job, ceesafec 0.53.0; wanted, not blocking)*
+
+**Gap:** `ceesafec test --interp --jobs 1` in `packages/web_ws` grew past 11.4 GB of resident memory on FreeBSD 15.1
+(amd64, 12 GB, the CI VM) and the kernel killed it ("failed to reclaim memory"); on macOS arm64 the same command peaks
+at 3.35 GB (`/usr/bin/time -l`), and its largest test, `sha1_rfc3174_vectors` (RFC 3174's million-byte vector, hashed
+in the interpreter), alone at 2.15 GB. With 6 GB, `web_server`'s and `web_transport`'s interpreter runs were killed
+too; with 12 GB they pass. Natively every package passes on FreeBSD.
+- Not known: whether it is the interpreter's own allocation, or FreeBSD's allocator keeping what the interpreter
+  frees (macOS returns it). A FreeBSD machine with more memory, or `procstat`/jemalloc's statistics in the job, would
+  tell.
+
+**Wanted:** the interpreter's peak on FreeBSD near macOS's for the same program.
+
+**Effect on CeeSafe.Web until then:** the FreeBSD job runs `web_ws`'s tests natively only (`.github/workflows/ci.yml`).
 
 ## Tooling (small, any time before M1's exit)
 

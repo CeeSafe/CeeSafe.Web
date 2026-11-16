@@ -3,7 +3,7 @@
 that has a tests/ directory.
 
 usage: python3 tools/run_tests.py [--ceesafec PATH] [--filter TEXT] [--no-interp] [--sanitize] [--alloc-sweep]
-                                  [--cancel-sweep] [--timeout SECONDS]
+                                  [--cancel-sweep] [--timeout SECONDS] [--cflag FLAG]...
 
 Tests are `@test` functions in packages/<name>/tests/*.cee, part of their package. Each runs as its own process,
 natively, and must pass with no allocation left live (a leak fails it); a test past --timeout (default 120 s) fails.
@@ -46,6 +46,9 @@ def main() -> int:
     ap.add_argument("--alloc-sweep", action="store_true", help="fail each allocation in turn")
     ap.add_argument("--cancel-sweep", action="store_true", help="cancel at each suspension point in turn")
     ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--cflag", action="append", default=[], metavar="FLAG",
+                    help="an extra C flag for every native build, repeatable (FreeBSD's sweeps link an OpenSSL of their"
+                    " own with -L and -Wl,-rpath: its clang does not read LIBRARY_PATH)")
     ap.add_argument("--exclude", default="", help="packages to leave out, comma-separated (CI's OpenSSL 3.0 job leaves"
                     " out web_quic and web_http3, which need OpenSSL 3.5: Web ADR 0014 §3.3)")
     args = ap.parse_args()
@@ -64,6 +67,8 @@ def main() -> int:
     native = ["--timeout", str(args.timeout)]
     if args.sanitize:
         native += ["--cflag", "-fsanitize=address,undefined", "--cflag", "-fno-omit-frame-pointer"]
+    for flag in args.cflag:
+        native += ["--cflag", flag]
     modes = [("native", native)]
     if not args.no_interp:
         modes.append(("interp", ["--interp"]))  # its --timeout is per package: interp_timeout

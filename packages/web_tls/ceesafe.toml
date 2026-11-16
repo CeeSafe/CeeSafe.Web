@@ -23,6 +23,10 @@ links = ["libssl", "libcrypto"]
 lib-dirs = ["$OPENSSL_LIB_DIR"]
 include-dirs = ["$OPENSSL_DIR/include"]
 
+[target.freebsd]
+# The base system's OpenSSL (3.0 on FreeBSD 14, 3.5 on 15), in /usr/lib and /usr/include (ceesafec 0.53.0, CeeSafe ADR 0149).
+links = ["ssl", "crypto"]
+
 [dependencies]
 web_core = { path = "../web_core" }
 web_transport = { path = "../web_transport" }

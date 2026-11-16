@@ -8,6 +8,12 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a pull request's branch cancels that branch's older runs, which otherwise held runners for hours
+# (each run is eight jobs, the sweeps among them); main's runs are each kept.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CEESAFE_VERSION: v0.53.0 # main's minimum from 2026-11-15 (docs/toolchain.md)
 
@@ -156,6 +162,64 @@ jobs:
       - name: Example builds
         shell: bash
         run: (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
+
+  freebsd:
+    # FreeBSD (Web ADR 0015 §5, option A, accepted): GitHub has no FreeBSD runner, so FreeBSD 15.1 (amd64) runs in a VM
+    # inside an Ubuntu job (vmactions/freebsd-vm, pinned to v1.6.0's commit, as CeeSafe's own workflows pin it). The
+    # released ceesafec (0.53.0 is the first with a FreeBSD build, CeeSafe ADR 0149), the base system's OpenSSL (3.5 on
+    # 15.x, so the QUIC packages run too), and the matrix's steps: a kqueue that is not macOS's under test.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+      - name: In FreeBSD
+        uses: vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b # v1.6.0
+        with:
+          release: "15.1"
+          # The default 6 GB, with no swap, let the system kill three packages' interpreter runs (one test process per
+          # CPU); the runner has 16 GB.
+          mem: 12288
+          usesh: true
+          copyback: false
+          envs: "CEESAFE_VERSION"
+          prepare: |
+            pkg install -y python3 perl5 gmake
+          run: |
+            set -e
+            freebsd-version
+            openssl version
+            cc --version | head -1
+            # install.sh as fixed by CeeSafe b7a631d8: before it, its fetch() called itself on FreeBSD.
+            fetch -qo - https://ceesafe.github.io/CeeSafe/install.sh | sh
+            export PATH="$HOME/.ceesafe/bin:$PATH"
+            ceesafec --version
+            python3 tools/check_layers.py
+            python3 tools/api_check.py
+            for p in packages/*/; do
+              (cd "$p" && ceesafec fetch --offline && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
+            done
+            # web_ws runs natively only here: in FreeBSD's interpreter its tests grew past 11.4 GB and were killed (3.35 GB
+            # on macOS), CeeSafe's U24 (docs/ceesafe-upstream-work.md).
+            python3 tools/run_tests.py --timeout 600 --exclude web_ws
+            (cd packages/web_ws && ceesafec test --timeout 600)
+            # The sweeps link OpenSSL 3.5.9, built here, as the Linux sweep job does: with the base system's 3.5.6, a failed
+            # allocation left a lock of OpenSSL's decoder cache held, and web_quic's early_data_before_its_initial_is_held
+            # then waited for it for ever at allocation 2916 (lldb: OSSL_DECODER_CTX_new_for_pkey in
+            # CRYPTO_THREAD_read_lock, under PEM_ASN1_read_bio of the test's CA). The other steps keep the base system's.
+            v=3.5.9
+            fetch -qo openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-$v/openssl-$v.tar.gz"
+            test "$(sha256 -q openssl.tar.gz)" = 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+            tar -xzf openssl.tar.gz
+            (cd "openssl-$v" && ./Configure --prefix="$HOME/openssl-$v" --libdir=lib no-docs no-tests > /dev/null &&
+              gmake -j"$(sysctl -n hw.ncpu)" > /dev/null && gmake install_sw > /dev/null)
+            o="$HOME/openssl-$v"
+            LD_LIBRARY_PATH="$o/lib" "$o/bin/openssl" version
+            # FreeBSD's clang reads CPATH but not LIBRARY_PATH: the libraries are named with -L, and found again at run
+            # time by the rpath (without them -lssl took the base system's /usr/lib/libssl.so.35).
+            export CPATH="$o/include"
+            python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep \
+              --cflag="-L$o/lib" --cflag="-Wl,-rpath,$o/lib"
+            (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
 
   probes:
     # The design probes and bug repros (tests/probes/README.md): informational, so a changed outcome is visible
