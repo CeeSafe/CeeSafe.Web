@@ -263,6 +263,10 @@ static void h3_body_free(h3_body *b) {
     h3_free_mem(b, NULL);
 }
 
+/* Frees a stream's body. Only once nghttp3 can hold no vector into it: when the stream is closed (cb_stream_close,
+   h3_close_now) or the connection freed. Its data reader hands out vectors over the body's own chunks (cb_read_data),
+   and nghttp3 keeps those it has queued until they are written and acknowledged, whatever is done to the stream
+   meanwhile (h3_body_end). */
 static void h3_body_drop(h3_conn *c, int64_t id) {
     for (h3_body **p = &c->bodies; *p; p = &(*p)->next) {
         if ((*p)->id == id) {
@@ -271,6 +275,17 @@ static void h3_body_drop(h3_conn *c, int64_t id) {
             h3_body_free(b);
             return;
         }
+    }
+}
+
+/* No more bytes for a stream's body (h3_send_body refuses them), its chunks kept until h3_body_drop. Freeing them
+   here was a use-after-free: after nghttp3_conn_shutdown_stream_write a frame queued later (trailers) schedules the
+   stream again, and h3_pull copied DATA that nghttp3 had queued from the freed chunks (found by FreeBSD's allocation
+   sweep of six_requests_over_udp, under ASan). */
+static void h3_body_end(h3_conn *c, int64_t id) {
+    h3_body *b = h3_find(c, id);
+    if (b) {
+        b->ended = 1;
     }
 }
 
@@ -438,7 +453,7 @@ static int cb_reset_stream(nghttp3_conn *conn, int64_t stream, uint64_t code, vo
     (void)conn;
     (void)sud;
     h3_conn *c = ud;
-    h3_body_drop(c, stream);
+    h3_body_end(c, stream); /* freed when the stream closes: nghttp3 may still hold vectors into it */
     return h3_push(&c->queue, H3_EV_RESET, 0, stream, code) ? 0 : NGHTTP3_ERR_CALLBACK_FAILURE;
 }
 
@@ -733,15 +748,21 @@ int32_t h3_submit(h3_conn *c, int64_t stream, int32_t request, const uint8_t *fi
     if (!nva) {
         return len ? NGHTTP3_ERR_INVALID_ARGUMENT : NGHTTP3_ERR_NOMEM;
     }
-    if (has_body && !h3_find(c, stream) && !h3_body_new(c, stream)) {
-        h3_free_mem(nva, NULL);
-        return NGHTTP3_ERR_NOMEM;
+    /* A body made here is freed again if the submission fails (nghttp3 holds nothing of it then); one that was there
+       already is not this call's to free (h3_body_drop). */
+    int made = 0;
+    if (has_body && !h3_find(c, stream)) {
+        if (!h3_body_new(c, stream)) {
+            h3_free_mem(nva, NULL);
+            return NGHTTP3_ERR_NOMEM;
+        }
+        made = 1;
     }
     const nghttp3_data_reader *dr = has_body ? &h3_reader : NULL;
     int rv = request ? nghttp3_conn_submit_request(c->conn, stream, nva, n, dr, NULL)
                      : nghttp3_conn_submit_response(c->conn, stream, nva, n, dr);
     h3_free_mem(nva, NULL);
-    if (rv != 0 && has_body) {
+    if (rv != 0 && made) {
         h3_body_drop(c, stream);
     }
     return rv;
@@ -820,10 +841,11 @@ int32_t h3_trailers(h3_conn *c, int64_t stream, const uint8_t *fields, size_t le
     return nghttp3_conn_resume_stream(c->conn, stream);
 }
 
-/* Our side of `stream` is reset (web_quic's resetSending): nghttp3 sends nothing more on it. */
+/* Our side of `stream` is reset (web_quic's resetSending): nghttp3 sends nothing more on it. The body takes no more
+   bytes, and is freed when the stream closes (h3_body_end). */
 void h3_shutdown_write(h3_conn *c, int64_t stream) {
     nghttp3_conn_shutdown_stream_write(c->conn, stream);
-    h3_body_drop(c, stream);
+    h3_body_end(c, stream);
 }
 
 /* GOAWAY: first a notice (the largest ID, RFC 9114 §5.2), then, once in-flight requests have had time to arrive, the
