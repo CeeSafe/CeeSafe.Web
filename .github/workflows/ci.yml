@@ -195,12 +195,20 @@ jobs:
             # web_ws runs natively only here: in FreeBSD's interpreter its tests grew past 11.4 GB and were killed (3.35 GB
             # on macOS), CeeSafe's U24 (docs/ceesafe-upstream-work.md).
             # DIAGNOSIS (temporary): web_quic's allocation sweep timed out at allocations 2916 and 2923 of these two.
-            ex=$(ls -d packages/*/tests | cut -d/ -f2 | grep -vx web_quic | paste -sd, -)
-            for t in early_data_before_its_initial_is_held; do
-              echo "== $t"
-              python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --timeout 600 --filter "$t" --exclude "$ex" > d.log 2>&1 || true
-              grep -E '^(ok|FAIL) |allocation [0-9]+|timed out|panicked|crashed|leaked|sweep failure' d.log | head -30
-            done
+            # It hangs with 600 s too. Where: the sanitized harness run with allocation 2916 failing, then its threads.
+            t=early_data_before_its_initial_is_held
+            cd packages/web_quic
+            ceesafec test --cflag -fsanitize=address,undefined --cflag -fno-omit-frame-pointer --filter "$t" 2>&1 | tail -1
+            ls -la out/ | grep tests || true
+            ./out/web_quic-tests --ceesafe-test "$t" 2916 0 120000 > hang.out 2>&1 &
+            sleep 40
+            pid=$(pgrep -f 'web_quic-tests --ceesafe-test' | head -1)
+            echo "pid $pid"; cat hang.out | tail -5
+            procstat -kk "$pid" || true
+            which lldb gdb || true
+            lldb -p "$pid" --batch -o 'thread backtrace all' 2>&1 | grep -E '^\* thread|^  thread|frame #' | head -80 || true
+            kill "$pid" || true
+            cd ../..
             exit 1
             python3 tools/run_tests.py --timeout 600 --exclude web_ws
             (cd packages/web_ws && ceesafec test --timeout 600)
