@@ -12,4 +12,4 @@ trusted = true
 [dependencies]
 web_core = { path = "../web_core" }
 web_tls = { path = "../web_tls" }
-ngtcp2 = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "b1791218f2e1a0f269eced073f21ab89f2a7ce59", dir = "ngtcp2" }
+ngtcp2 = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "ngtcp2" }

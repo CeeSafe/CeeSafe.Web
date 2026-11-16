@@ -3,7 +3,7 @@
 [[package]]
 name = "ngtcp2"
 source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
-commit = "b1791218f2e1a0f269eced073f21ab89f2a7ce59"
+commit = "ca0a13fec248bbe192f0b61b930c8b8259175eed"
 dir = "ngtcp2"
 hash = "sha256:f18368962ec8fbbef56ff9b9becec926d395ef5722b7c5c84066905d257331f3"
 

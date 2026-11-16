@@ -9,4 +9,4 @@ kind = "library"
 web_core = { path = "../web_core" }
 web_http = { path = "../web_http" }
 web_quic = { path = "../web_quic" }
-nghttp3 = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "b1791218f2e1a0f269eced073f21ab89f2a7ce59", dir = "nghttp3" }
+nghttp3 = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "nghttp3" }

@@ -55,9 +55,15 @@ def read_manifest(path: pathlib.Path):
                 name = m.group(1)
         elif section == "dependencies":
             m = re.fullmatch(r'([A-Za-z0-9_]+)\s*=\s*\{\s*path\s*=\s*"([^"]+)"\s*\}', line)
-            if not m:
-                raise ValueError(f"{path}: unsupported dependency form (only path dependencies): {raw}")
-            deps[m.group(1)] = m.group(2)
+            if m:
+                deps[m.group(1)] = m.group(2)
+                continue
+            # a pinned package from another repository (CeeSafeLibs' ngtcp2 and nghttp3: C the layers bind to), which
+            # is outside the layering: it depends on no package here
+            if re.fullmatch(r'[A-Za-z0-9_]+\s*=\s*\{\s*git\s*=\s*"[^"]+"\s*,\s*rev\s*=\s*"[0-9a-f]{40}"'
+                            r'(\s*,\s*dir\s*=\s*"[^"]+")?\s*\}', line):
+                continue
+            raise ValueError(f"{path}: unsupported dependency form (path, or git pinned by rev): {raw}")
     if name is None:
         raise ValueError(f"{path}: no [package] name")
     return name, deps
