@@ -495,6 +495,7 @@ public struct ServerReport {
     public served: u64;
     public failed: u64;
     public acceptErrors: u64;
+    public workersUsed: u64;
     public forced: bool;
 }
 ```

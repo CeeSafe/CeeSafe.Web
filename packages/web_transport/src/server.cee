@@ -112,7 +112,6 @@ struct Counters {
     };
 }
 
-/// Runs connection servers.
 /// Whose turn it is to wait for the next connection: one idle worker at a time; the others wait on their own
 /// channel, last in first out, so the workers that serve are the ones that served last.
 struct Turns {
@@ -223,6 +222,7 @@ async fn turnGiven(channel: borrow Channel<bool>) -> Result<bool, NetError> {
     };
 }
 
+/// Runs connection servers.
 public struct ConnectionServer {
     /// Serves connections from `incoming` with `limits.workers` workers until the drain finishes, or until `incoming`
     /// ends and every connection is done. Once `drain` starts, idle workers stop at once and connections in flight
