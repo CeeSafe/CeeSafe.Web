@@ -1178,7 +1178,7 @@ need. Since then, CeeSafe.Web's CI has a FreeBSD job, and `web_tls` and `web_qui
 CeeSafe's `install.sh` called itself on FreeBSD (its `fetch()` named after the command), fixed on CeeSafe's main
 (`b7a631d8`, 2026-11-16), no release needed: it is the site's.
 
-## U24 — The interpreter's memory on FreeBSD   *(found 2026-11-16, CeeSafe.Web's FreeBSD CI job, ceesafec 0.53.0; wanted, not blocking; fixed on CeeSafe's main, not released yet)*
+## U24 — The interpreter's memory on FreeBSD   *(found 2026-11-16, CeeSafe.Web's FreeBSD CI job, ceesafec 0.53.0; wanted, not blocking; released in 0.57.1)*
 
 **Gap:** `ceesafec test --interp --jobs 1` in `packages/web_ws` grew past 11.4 GB of resident memory on FreeBSD 15.1
 (amd64, 12 GB, the CI VM) and the kernel killed it ("failed to reclaim memory"); on macOS arm64 the same command peaks
@@ -1203,6 +1203,9 @@ so a dangling reference is still caught. With that build on macOS: `sha1_rfc3174
 whole interpreter run 115 MB (3.35 GB), and CeeSafe.Web's `run_tests.py` 25 runs passed, 0 failed, 3 skipped. Not
 measured on FreeBSD yet (the owner's PC was unreachable). When a release has it, main's minimum can rise to it and the
 FreeBSD job can run `web_ws` in the interpreter again.
+
+**Released in 0.57.1** (2026-11-16). Main's minimum is 0.57.1 since then (implementation plan §11.17), and the FreeBSD
+job runs `web_ws` in the interpreter again.
 
 ## Tooling (small, any time before M1's exit)
 
