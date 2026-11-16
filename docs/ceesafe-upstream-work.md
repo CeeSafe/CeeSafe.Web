@@ -1178,7 +1178,7 @@ need. Since then, CeeSafe.Web's CI has a FreeBSD job, and `web_tls` and `web_qui
 CeeSafe's `install.sh` called itself on FreeBSD (its `fetch()` named after the command), fixed on CeeSafe's main
 (`b7a631d8`, 2026-11-16), no release needed: it is the site's.
 
-## U24 — The interpreter's memory on FreeBSD   *(found 2026-11-16, CeeSafe.Web's FreeBSD CI job, ceesafec 0.53.0; wanted, not blocking)*
+## U24 — The interpreter's memory on FreeBSD   *(found 2026-11-16, CeeSafe.Web's FreeBSD CI job, ceesafec 0.53.0; wanted, not blocking; fixed on CeeSafe's main, not released yet)*
 
 **Gap:** `ceesafec test --interp --jobs 1` in `packages/web_ws` grew past 11.4 GB of resident memory on FreeBSD 15.1
 (amd64, 12 GB, the CI VM) and the kernel killed it ("failed to reclaim memory"); on macOS arm64 the same command peaks
@@ -1192,6 +1192,17 @@ too; with 12 GB they pass. Natively every package passes on FreeBSD.
 **Wanted:** the interpreter's peak on FreeBSD near macOS's for the same program.
 
 **Effect on CeeSafe.Web until then:** the FreeBSD job runs `web_ws`'s tests natively only (`.github/workflows/ci.yml`).
+
+**Fixed on CeeSafe's main** (`1f2896db`, 2026-11-16, the owner: "First fix CeeSafe crash"; not in a release yet). The
+growth was the interpreter's own, on every system, not FreeBSD's allocator: each incarnation of a local after
+`StorageDead`, and each call's frame, was a new allocation of its memory model whose record lasted the whole run.
+Found by bisecting small programs on macOS: a loop of 320,000 `s += t % 5` peaked at 69 MB and one of array reads
+with a computed index at 113 MB (23 MB without either). A local whose address is never taken now revives its ended
+allocation, for a new incarnation and for the function's next frame; one whose address is taken still gets a new one,
+so a dangling reference is still caught. With that build on macOS: `sha1_rfc3174_vectors` 156 MB (2.15 GB), web_ws's
+whole interpreter run 115 MB (3.35 GB), and CeeSafe.Web's `run_tests.py` 25 runs passed, 0 failed, 3 skipped. Not
+measured on FreeBSD yet (the owner's PC was unreachable). When a release has it, main's minimum can rise to it and the
+FreeBSD job can run `web_ws` in the interpreter again.
 
 ## Tooling (small, any time before M1's exit)
 
