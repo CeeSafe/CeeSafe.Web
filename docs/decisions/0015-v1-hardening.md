@@ -191,7 +191,8 @@ gives 248 top-level public items (`## ` headings) across them.
   and the base system's OpenSSL 3.5.6; `web_tls` and `web_quic` name it with `[target.freebsd]`. The matrix's steps
   pass there, with three differences:
   - the VM has 12 GB: with the default 6 GB, three packages' interpreter runs were killed for memory;
-  - `web_ws` runs natively only: in FreeBSD's interpreter it grew past 11.4 GB (3.35 GB on macOS), CeeSafe's U24;
+  - `web_ws` ran natively only until main's minimum was 0.57.1 (2026-11-16, #32): in FreeBSD's interpreter it grew
+    past 11.4 GB (3.35 GB on macOS), CeeSafe's U24; with 0.57.1 its 26 tests pass there in the interpreter;
   - the sweeps link OpenSSL 3.5.9, built in the job, as the Linux sweep job does: with 3.5.6 a failed allocation
     left a lock of OpenSSL's decoder cache held, and `web_quic`'s `early_data_before_its_initial_is_held` waited for
     ever at allocation 2916 (reproduced on the owner's FreeBSD 15.1 PC; with 3.5.9 its sweep passes, and so do
