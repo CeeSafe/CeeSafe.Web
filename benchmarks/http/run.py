@@ -9,7 +9,7 @@ For each mode (HTTP/1.1 and h2c in clear, HTTP/1.1 and h2 over TLS), route and c
 `duration` seconds after a one-second warm-up, one request at a time on each connection (`-m 1`, so HTTP/2 is not
 favoured by multiplexing). Every request's latency comes from h2load's `--log-file`, so the percentiles are this
 script's own, from the raw samples. Reported:
-- requests a second, and latency p50, p99 and p99.9 in microseconds;
+- requests a second, and latency p50, p95, p99 and p99.9 in microseconds;
 - the server's peak RSS during the run (`ps`, polled every 100 ms);
 - allocations per request: two runs of the server at 10 connections, a warm-up's requests and the warm-up's plus a
   count's (`COUNTS`), each ending with the server's `CEESAFE_ALLOC_REPORT` line; the difference divided by the count.
@@ -34,8 +34,15 @@ left out. Allocations do not apply to them; the peak RSS does.
 Before any load, `benchmarks/servers/conform.py` checks the server (CeeSafe.Web's too) on every route over HTTP/1.1
 and h2c, against bodies that script builds itself; a server that fails it is not measured (plan §8: correctness
 first). `/json` serialises `{"message":"Hello, World!"}` for each request.
+
+`--json` writes `{"environment": …, "results": […]}`. The environment is what Web ADR 0005 §2.4 asks each run to
+record: the machine (CPU, threads, memory), the OS and kernel, the load average before the run, the compiler and its
+flags (ceesafec, the C compiler, or the comparison server's toolchain and pinned versions), the reactor, the
+concurrency, the payloads, the TLS settings, the warm-up and the load generator. `benchmarks/report.py` writes the
+report from these files (Web ADR 0015 §6).
 """
-import argparse, json, os, pathlib, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
+import argparse, datetime, json, os, pathlib, platform, re, shutil, socket, ssl, subprocess, sys, tempfile
+import threading, time
 
 HERE = pathlib.Path(__file__).resolve().parent
 SERVER = HERE / "out" / "bench_http"
@@ -64,6 +71,9 @@ SERVER_ENV = {"relic": {"CW_ADAPTER": "io"}, "relic-native": {"CW_ADAPTER": "nat
 NO_H2C = {"relic", "relic-native"}
 COMPARISON_MODES = ("h1", "h2c")
 COMPARISON_ROUTES = ("small", "4k", "64k", "stream", "json", "echo")
+PAYLOADS = {"small": "13 bytes", "4k": "4096 bytes", "64k": "65536 bytes",
+            "stream": "16 KiB written 64 times, no length", "json": "27 bytes, serialised for each request",
+            "echo": "a 4096-byte request body, sent back", "file": "1 MiB by sendfile", "file1g": "1 GiB by sendfile"}
 GIBIBYTE = 1 << 30
 REACTOR = "io_uring" if os.environ.get("CEESAFE_REACTOR_URING") == "1" else "default"
 
@@ -175,10 +185,16 @@ def h2load(mode, path, conns, duration, scratch, body):
         args += ["-d", str(body)]
     r = subprocess.run(args + [base_url(mode) + path], capture_output=True, text=True)
     done = failed = 0
+    negotiated = {}
     for line in r.stdout.splitlines():
         if line.startswith("requests:"):
             parts = line.replace(",", "").split()
             done, failed = int(parts[parts.index("succeeded") - 1]), int(parts[parts.index("failed") - 1])
+        # Over TLS, h2load prints what it negotiated: these are the run's TLS settings.
+        for field, key in (("TLS Protocol:", "tls_protocol"), ("Cipher:", "tls_cipher"),
+                           ("Server Temp Key:", "tls_key_exchange"), ("Application protocol:", "alpn")):
+            if line.startswith(field):
+                negotiated[key] = line[len(field):].strip()
     samples = []
     if log.exists():
         for line in log.read_text().splitlines():
@@ -191,7 +207,8 @@ def h2load(mode, path, conns, duration, scratch, body):
     def pct(q):
         return samples[min(len(samples) - 1, int(q * len(samples)))] if samples else None
     return {"requests_per_s": round(done / duration), "succeeded": done, "failed": failed,
-            "p50_us": pct(0.50), "p99_us": pct(0.99), "p999_us": pct(0.999), "samples": len(samples)}
+            "p50_us": pct(0.50), "p95_us": pct(0.95), "p99_us": pct(0.99), "p999_us": pct(0.999),
+            "samples": len(samples), **(negotiated if mode.startswith("tls") else {})}
 
 
 def allocations(mode, route, tls, scratch, body):
@@ -262,13 +279,21 @@ def main():
     if "file1g" in routes:
         gibibyte(scratch / "file1g")
     results = []
+    name = "nginx" if args.nginx else args.server or "ceesafe.web"
+    if args.server:
+        run_modes = [m for m in modes if m in COMPARISON_MODES and not (m == "h2c" and name in NO_H2C)]
+        run_routes = [r for r in routes if r in COMPARISON_ROUTES]
+    else:
+        run_modes, run_routes = modes, [r for r in routes if not (args.nginx and r == "echo")]
+    if name == "ceesafe.web":
+        build(args.ceesafec)  # first, so the environment reads the library the server links
+    env = environment(args, name, run_modes, run_routes, conns)
     try:
         if args.nginx:
             run_nginx(args, modes, routes, conns, scratch, results)
         elif args.server:
             run_comparison(args, modes, routes, conns, scratch, body, results)
         else:
-            build(args.ceesafec)
             s = Server(None, scratch)
             ok = conform("ceesafe.web", PORT, PORT)
             s.stop(base_url("h1"))
@@ -299,7 +324,148 @@ def main():
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     if args.json:
-        pathlib.Path(args.json).write_text(json.dumps(results, indent=1))
+        pathlib.Path(args.json).write_text(json.dumps({"environment": env, "results": results}, indent=1))
+
+
+def first_line(command):
+    """The first line `command` prints (standard output, else standard error), or None if it cannot run."""
+    try:
+        r = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = (r.stdout.strip() or r.stderr.strip()).splitlines()
+    return lines[0].strip() if lines else None
+
+
+def sysctl(name):
+    return first_line(["sysctl", "-n", name])
+
+
+def machine():
+    """The CPU's model, its logical CPUs and the memory in MiB, from /proc on Linux and sysctl elsewhere."""
+    cpu = memory = None
+    if platform.system() == "Linux":
+        info = pathlib.Path("/proc/cpuinfo").read_text()
+        m = re.search(r"^(model name|Model)\s*:\s*(.+)$", info, re.M)
+        cpu = m.group(2).strip() if m else None
+        m = re.search(r"^MemTotal:\s*(\d+) kB", pathlib.Path("/proc/meminfo").read_text(), re.M)
+        memory = int(m.group(1)) // 1024 if m else None
+    elif platform.system() == "Darwin":
+        cpu = sysctl("machdep.cpu.brand_string")
+        size = sysctl("hw.memsize")
+        memory = int(size) // 1048576 if size and size.isdigit() else None
+    else:
+        cpu = sysctl("hw.model")
+        size = sysctl("hw.physmem")
+        memory = int(size) // 1048576 if size and size.isdigit() else None
+    return {"cpu": cpu, "logical_cpus": os.cpu_count(), "memory_mib": memory, "arch": platform.machine()}
+
+
+def operating_system():
+    if platform.system() == "Linux":
+        try:
+            m = re.search(r'^PRETTY_NAME="?([^"\n]+)', pathlib.Path("/etc/os-release").read_text(), re.M)
+            return m.group(1) if m else "Linux"
+        except OSError:
+            return "Linux"
+    if platform.system() == "Darwin":
+        return "macOS " + (first_line(["sw_vers", "-productVersion"]) or "")
+    return platform.system() + " " + platform.release()
+
+
+def lock_version(lock, package):
+    """`package`'s version in a Cargo.lock or pubspec.lock, or None."""
+    try:
+        text = lock.read_text()
+    except OSError:
+        return None
+    m = re.search(r'name = "' + re.escape(package) + r'"\nversion = "([^"]+)"', text)  # Cargo.lock
+    if not m:
+        m = re.search(r"^  " + re.escape(package) + r":\n(?:    .*\n)*?    version: \"([^\"]+)\"", text, re.M)
+    return m.group(1) if m else None
+
+
+def toolchain(args, name):
+    """What built the measured server, and with what flags."""
+    if name == "ceesafe.web":
+        cc = os.environ.get("CC", "cc")
+        return {"ceesafec": first_line([args.ceesafec, "--version"]), "cc": cc, "cc_version": first_line([cc, "--version"]),
+                "flags": "ceesafec build's defaults: -std=c11, -O2, -ffp-contract=off -fno-math-errno "
+                         "(CeeSafe tooling.md §8.3)"}
+    if name in ("hyper", "axum", "actix"):
+        lock = SERVERS / "rust" / "Cargo.lock"
+        crate = {"hyper": "hyper", "axum": "axum", "actix": "actix-web"}[name]
+        return {"rustc": first_line(["rustc", "--version"]), crate: lock_version(lock, crate),
+                "tokio": lock_version(lock, "tokio"), "hyper": lock_version(lock, "hyper"),
+                "flags": "cargo build --release: opt-level 3, fat LTO, codegen-units 1, panic abort "
+                         "(benchmarks/servers/rust/Cargo.toml)"}
+    if name == "kestrel":
+        return {"dotnet": first_line(["dotnet", "--version"]), "flags": "dotnet publish -c Release"}
+    if name == "h2o":
+        h2o = os.environ.get("CW_H2O") or str(SERVERS / "h2o" / "out" / "bin" / "h2o")
+        commit = re.search(r"^COMMIT=(\w+)", (SERVERS / "h2o" / "build.sh").read_text(), re.M)
+        return {"h2o": first_line([h2o, "--version"]), "commit": commit.group(1) if commit else None,
+                "flags": "cmake -DCMAKE_BUILD_TYPE=Release -DWITH_MRUBY=ON"}
+    if name in ("relic", "relic-native"):
+        return {"dart": first_line(["dart", "--version"]),
+                "relic": lock_version(SERVERS / "relic" / "pubspec.lock", "relic"),
+                "adapter": SERVER_ENV[name]["CW_ADAPTER"], "flags": "dart build cli (AOT)"}
+    if name == "nginx":
+        return {"nginx": first_line(["nginx", "-v"]), "flags": "the distribution's build"}
+    return {}
+
+
+def environment(args, name, modes, routes, conns):
+    """Web ADR 0005 §2.4's record of a run."""
+    commit = first_line(["git", "-C", str(HERE), "rev-parse", "HEAD"])
+    dirty = subprocess.run(["git", "-C", str(HERE), "status", "--porcelain"], capture_output=True, text=True).stdout
+    return {
+        "date_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "commit": (commit or "unknown") + (" (with uncommitted changes)" if dirty.strip() else ""),
+        "machine": machine(),
+        "os": operating_system(),
+        "kernel": " ".join(platform.uname()[i] for i in (0, 2, 3)),
+        "load_average_before": [round(x, 2) for x in os.getloadavg()],
+        "server": name,
+        "toolchain": toolchain(args, name),
+        "reactor": REACTOR if name == "ceesafe.web" else None,
+        "load_generator": first_line(["h2load", "--version"]),
+        "method": "h2load, one request at a time on each connection (-m 1), latency from its --log-file",
+        "duration_s": args.duration,
+        "warm_up_s": 1,
+        "conns": conns,
+        "modes": modes,
+        "routes": routes,
+        "payloads": {route: PAYLOADS[route] for route in routes if route in PAYLOADS},
+        "tls": ({"server_library": linked_openssl(name), "certificate": "self-signed ECDSA P-256",
+                 "settings": "the server's defaults; each TLS row records what h2load negotiated"}
+                if any(m.startswith("tls") for m in modes) else None),
+    }
+
+
+def linked_openssl(name):
+    """The version of the libcrypto CeeSafe.Web's server links (`ldd`, or `otool -L` on macOS), asked of the
+    library itself: the `openssl` on PATH may be another (macOS's is LibreSSL). nginx's is `nginx -V`'s."""
+    if name == "nginx":
+        r = subprocess.run(["nginx", "-V"], capture_output=True, text=True)
+        m = re.search(r"built with (.+)", r.stderr + r.stdout)
+        return m.group(1).strip() if m else None
+    if name != "ceesafe.web":
+        return None
+    import ctypes
+    darwin = platform.system() == "Darwin"
+    r = subprocess.run(["otool", "-L", str(SERVER)] if darwin else ["ldd", str(SERVER)], capture_output=True,
+                       text=True)
+    for line in r.stdout.splitlines():
+        if "libcrypto" in line:
+            path = line.split()[0] if darwin else line.split("=>")[-1].split("(")[0].strip()
+            try:
+                version = ctypes.CDLL(path).OpenSSL_version
+                version.restype = ctypes.c_char_p
+                return version(0).decode() + f" ({path})"
+            except (OSError, AttributeError):
+                return path
+    return None
 
 
 def conform(name, port, h2c_port):
@@ -401,7 +567,8 @@ def run_nginx(args, modes, routes, conns, scratch, results):
 
 def row(r):
     return (f"| {r['server']} | {r.get('reactor', '')} | {r['mode']} | {r['route']} | {r['conns']} | "
-            f"{r['requests_per_s']} | {r.get('mib_per_s', '')} | {r['p50_us']} | {r['p99_us']} | {r['p999_us']} | "
+            f"{r['requests_per_s']} | {r.get('mib_per_s', '')} | {r['p50_us']} | {r['p95_us']} | {r['p99_us']} | "
+            f"{r['p999_us']} | "
             f"{r.get('peak_rss_kib', '')} | {r['failed']} |")
 
 
