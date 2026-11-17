@@ -6,6 +6,7 @@
 //   GET  /4k       4 KiB
 //   GET  /64k      64 KiB
 //   GET  /stream   1 MiB, written 16 KiB at a time with no declared length
+//   GET  /json     {"message":"Hello, World!"}, written for each request, as `application/json` (Web ADR 0015 §6)
 //   POST /echo     the request body back (at most 1 MiB)
 //   POST /stop     starts the drain
 //   GET  /file     the file named by CW_FILE, with `Exchange.sendFile` (Web ADR 0013 §3.3); 404 without CW_FILE
@@ -14,6 +15,7 @@ import web_transport;
 import web_http;
 import web_server;
 import web_tls;
+import json.JsonWriter;
 
 struct App {}
 
@@ -49,6 +51,31 @@ impl Handler<App> for Stream {
             await exchange.write(this.piece.view())?;
         }
         return Ok();
+    }
+}
+
+/// A small object serialised for each request, as TechEmpower's JSON test asks: the writer's cost is measured.
+struct JsonRoute {}
+
+impl Handler<App> for JsonRoute {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<App>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        var w = JsonWriter.compact();
+        let written = w.beginObject().isOk() && w.key("message").isOk() && w.string("Hello, World!").isOk() &&
+            w.endObject().isOk();
+        if (!written) {
+            return Err(HandlerError.Internal);
+        }
+        let body = match (w.finish()) {
+            Ok(b) => b,
+            Err(_) => { return Err(HandlerError.Internal); },
+        };
+        exchange.header("content-type", "application/json".bytes())?;
+        return await exchange.send(Status.ok(), body.view());
     }
 }
 
@@ -161,6 +188,7 @@ fn application() -> Result<Server<App>, RouteError> {
     server.router().get("/4k", handler(Box.create(Fixed { body: filled(4096)? }))?)?;
     server.router().get("/64k", handler(Box.create(Fixed { body: filled(65536)? }))?)?;
     server.router().get("/stream", handler(Box.create(Stream { piece: filled(16384)? }))?)?;
+    server.router().get("/json", handler(Box.create(JsonRoute {}))?)?;
     server.router().post("/echo", handler(Box.create(Echo {}))?)?;
     server.router().post("/stop", handler(Box.create(Stop {}))?)?;
     var served: String? = null;

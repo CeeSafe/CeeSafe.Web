@@ -2,7 +2,8 @@
 """M9's request-rate benchmark (Web ADR 0013 §3.1), against benchmarks/http's server.
 
 usage: python3 benchmarks/http/run.py [--duration 10] [--conns 1,10,100] [--modes h1,h2c,tls-h1,tls-h2]
-                                      [--routes small,4k,64k,stream,echo,file] [--json out.json] [--nginx]
+                                      [--routes small,4k,64k,stream,json,echo,file] [--json out.json]
+                                      [--nginx | --server hyper|axum|actix|kestrel|h2o]
 
 For each mode (HTTP/1.1 and h2c in clear, HTTP/1.1 and h2 over TLS), route and connection count, h2load runs for
 `duration` seconds after a one-second warm-up, one request at a time on each connection (`-m 1`, so HTTP/2 is not
@@ -24,6 +25,14 @@ environment, which the server inherits. Each row records which (`reactor`).
 
 `--nginx` runs the same routes against nginx (on PATH), one worker per core, `sendfile on`, the bodies as files
 (`/stream` as a 1 MiB file, `/echo` left out): a reference, not a target. Allocations do not apply to it.
+
+`--server` runs them against one of the comparison servers of Web ADR 0015 §6 (`benchmarks/servers/`, built first
+as its README says): Hyper, Axum, Actix Web, Kestrel or h2o. They serve HTTP/1.1 and h2c, not TLS, and have no
+`/file`; the modes and routes they lack are left out. Allocations do not apply to them; the peak RSS does.
+
+Before any load, `benchmarks/servers/conform.py` checks the server (CeeSafe.Web's too) on every route over HTTP/1.1
+and h2c, against bodies that script builds itself; a server that fails it is not measured (plan §8: correctness
+first). `/json` serialises `{"message":"Hello, World!"}` for each request.
 """
 import argparse, json, os, pathlib, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
 
@@ -32,9 +41,23 @@ SERVER = HERE / "out" / "bench_http"
 PORT = 18190
 # The allocation runs: (warm-up, counted) requests per route; the large bodies need fewer.
 COUNTS = {"small": (2000, 20000), "4k": (2000, 20000), "64k": (500, 5000), "stream": (100, 1000),
-          "echo": (2000, 20000), "file": (100, 1000), "file1g": (2, 10)}
-ROUTES = {"small": "/small", "4k": "/4k", "64k": "/64k", "stream": "/stream", "echo": "/echo", "file": "/file",
-          "file1g": "/file"}
+          "json": (2000, 20000), "echo": (2000, 20000), "file": (100, 1000), "file1g": (2, 10)}
+ROUTES = {"small": "/small", "4k": "/4k", "64k": "/64k", "stream": "/stream", "json": "/json", "echo": "/echo",
+          "file": "/file", "file1g": "/file"}
+SERVERS = HERE.parent / "servers"
+CONFORM = SERVERS / "conform.py"
+# The comparison servers (Web ADR 0015 §6): the command that runs each, and its h2c port's offset from PORT when it
+# cannot serve h2c on the HTTP/1.1 port (Kestrel). Each listens on 127.0.0.1:CW_PORT.
+COMPARISON = {
+    "hyper": [str(SERVERS / "rust" / "target" / "release" / "bench_hyper")],
+    "axum": [str(SERVERS / "rust" / "target" / "release" / "bench_axum")],
+    "actix": [str(SERVERS / "rust" / "target" / "release" / "bench_actix")],
+    "kestrel": [str(SERVERS / "kestrel" / "out" / "bench_kestrel")],
+    "h2o": [sys.executable, str(SERVERS / "h2o" / "start.py")],
+}
+H2C_OFFSET = {"kestrel": 1}
+COMPARISON_MODES = ("h1", "h2c")
+COMPARISON_ROUTES = ("small", "4k", "64k", "stream", "json", "echo")
 GIBIBYTE = 1 << 30
 REACTOR = "io_uring" if os.environ.get("CEESAFE_REACTOR_URING") == "1" else "default"
 
@@ -220,6 +243,7 @@ def main():
     ap.add_argument("--ceesafec", default="ceesafec")
     ap.add_argument("--json")
     ap.add_argument("--nginx", action="store_true")
+    ap.add_argument("--server", choices=sorted(COMPARISON))
     ap.add_argument("--no-alloc", action="store_true")
     args = ap.parse_args()
     conns = [int(c) for c in args.conns.split(",")]
@@ -235,8 +259,15 @@ def main():
     try:
         if args.nginx:
             run_nginx(args, modes, routes, conns, scratch, results)
+        elif args.server:
+            run_comparison(args, modes, routes, conns, scratch, body, results)
         else:
             build(args.ceesafec)
+            s = Server(None, scratch)
+            ok = conform("ceesafe.web", PORT, PORT)
+            s.stop(base_url("h1"))
+            if not ok:
+                sys.exit("run: ceesafe.web failed the conformance check; nothing measured")
             for mode in modes:
                 for route in routes:
                     posted = body if route == "echo" else None
@@ -263,6 +294,66 @@ def main():
         shutil.rmtree(scratch, ignore_errors=True)
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps(results, indent=1))
+
+
+def conform(name, port, h2c_port):
+    """benchmarks/servers/conform.py against the running server: True if every check passes."""
+    r = subprocess.run([sys.executable, str(CONFORM), "--port", str(port), "--h2c-port", str(h2c_port),
+                        "--name", name], capture_output=True, text=True)
+    print(r.stdout.strip(), flush=True)
+    return r.returncode == 0
+
+
+class Comparison:
+    """One comparison server, started with CW_PORT=PORT; stopped with SIGTERM."""
+
+    def __init__(self, name, scratch):
+        self.h2c_port = PORT + H2C_OFFSET.get(name, 0)
+        env = dict(os.environ, CW_PORT=str(PORT), CW_H2C_PORT=str(self.h2c_port))
+        self.log = open(scratch / f"{name}.log", "ab")
+        self.p = subprocess.Popen(COMPARISON[name], env=env, stdout=self.log, stderr=subprocess.STDOUT)
+        wait_port(PORT)
+        wait_port(self.h2c_port)
+
+    def stop(self):
+        self.p.terminate()
+        try:
+            self.p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+        self.log.close()
+
+
+def run_comparison(args, modes, routes, conns, scratch, body, results):
+    global PORT
+    name = args.server
+    if not os.path.exists(COMPARISON[name][-1]):
+        sys.exit(f"run: {COMPARISON[name][-1]} is not built (benchmarks/servers/README.md)")
+    s = Comparison(name, scratch)
+    ok = conform(name, PORT, s.h2c_port)
+    s.stop()
+    if not ok:
+        sys.exit(f"run: {name} failed the conformance check; nothing measured")
+    plain = PORT
+    try:
+        for mode in [m for m in modes if m in COMPARISON_MODES]:
+            for route in [r for r in routes if r in COMPARISON_ROUTES]:
+                posted = body if route == "echo" else None
+                for c in conns:
+                    s = Comparison(name, scratch)
+                    PORT = s.h2c_port if mode == "h2c" else plain
+                    peak = Peak(s.p.pid)
+                    peak.start()
+                    r = h2load(mode, ROUTES[route], c, args.duration, scratch, posted)
+                    peak.done = True
+                    PORT = plain
+                    s.stop()
+                    r.update(server=name, mode=mode, route=route, conns=c, peak_rss_kib=peak.peak)
+                    results.append(r)
+                    print(row(r), flush=True)
+    finally:
+        PORT = plain
 
 
 def run_nginx(args, modes, routes, conns, scratch, results):
