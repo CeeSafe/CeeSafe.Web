@@ -88,14 +88,14 @@ jobs:
             clang -g -O1 -fsanitize=fuzzer,address,undefined -DWT_STANDALONE -I. tests/fuzz/tls/fuzz_shim.c \
               packages/web_tls/c/tls_shim.c -lssl -lcrypto -o fuzz-out/fuzz
           elif [ "${{ matrix.harness }}" = quic ]; then
-            T=third_party/ngtcp2-1.26.0
-            clang -g -O1 -fsanitize=fuzzer,address,undefined -DWT_STANDALONE -Itests/fuzz/quic -Ipackages/web_quic/c \
+            L=$(sh tools/ceesafelibs.sh packages/web_quic ngtcp2); T=$L/upstream
+            clang -g -O1 -fsanitize=fuzzer,address,undefined -DWT_STANDALONE -Itests/fuzz/quic -I$L/c \
               -I$T/config -I$T/lib/includes -I$T/crypto/includes -I$T/lib -I$T/crypto tests/fuzz/quic/fuzz_quic.c \
-              packages/web_tls/c/tls_shim.c packages/web_quic/c/vendor/*.c -lssl -lcrypto -o fuzz-out/fuzz
+              packages/web_tls/c/tls_shim.c $L/c/vendor/*.c -lssl -lcrypto -o fuzz-out/fuzz
           else
-            N=third_party/nghttp3-1.19.0
+            L=$(sh tools/ceesafelibs.sh packages/web_http3 nghttp3); N=$L/upstream
             clang -g -O1 -fsanitize=fuzzer,address,undefined -Itests/fuzz/h3 -I$N/config -I$N/lib/includes \
-              tests/fuzz/h3/fuzz_h3.c packages/web_http3/c/h3_shim.c packages/web_http3/c/vendor/lib_* \
+              tests/fuzz/h3/fuzz_h3.c $L/c/h3_shim.c $L/c/vendor/lib_* \
               -o fuzz-out/fuzz
           fi
 

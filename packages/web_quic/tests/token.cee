@@ -6,7 +6,7 @@
 // Expected:
 //   - with the flight's first datagram late, so the ClientHello comes in parts: a Retry (amendment 10). ngtcp2 keeps
 //     such a ClientHello only when a token has validated the address ("Address has been validated with token",
-//     third_party/ngtcp2-1.26.0/lib/ngtcp2_conn.c:10428), so a token taken as validation gets no Retry here;
+//     CeeSafeLibs' ngtcp2/upstream/lib/ngtcp2_conn.c:10428), so a token taken as validation gets no Retry here;
 //   - with the flight in order, below `retryAbove`: an answer, and no Retry;
 //   - with `retryAbove` 0: a Retry, as for an Initial without a token.
 // The limit of three times what the client sent (§8.1) is checked too, but in 300 ms the server sends less than

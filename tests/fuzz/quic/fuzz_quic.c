@@ -59,9 +59,9 @@
  * and the handshake's) come from a generator seeded the same for every input, so an input replays exactly.
  *
  * Linux (libFuzzer), with OpenSSL 3.5 or later:
- *   T=third_party/ngtcp2-1.26.0; clang -g -O1 -fsanitize=fuzzer,address,undefined -DWT_STANDALONE \
- *     -Itests/fuzz/quic -Ipackages/web_quic/c -I$T/config -I$T/lib/includes -I$T/crypto/includes -I$T/lib -I$T/crypto \
- *     tests/fuzz/quic/fuzz_quic.c packages/web_tls/c/tls_shim.c packages/web_quic/c/vendor/[a-z]*.c -lssl -lcrypto \
+ *   L=<CeeSafeLibs at web_quic's pinned rev>/ngtcp2; T=$L/upstream; clang -g -O1 -fsanitize=fuzzer,address,undefined \
+ *     -DWT_STANDALONE -Itests/fuzz/quic -I$L/c -I$T/config -I$T/lib/includes -I$T/crypto/includes -I$T/lib -I$T/crypto \
+ *     tests/fuzz/quic/fuzz_quic.c packages/web_tls/c/tls_shim.c $L/c/vendor/[a-z]*.c -lssl -lcrypto \
  *     -o fuzz_quic
  *   C=packages/web_tls/tests/certs; CW_CERT=$C/server.pem CW_KEY=$C/server.key CW_CA=$C/ca.pem \
  *     ./fuzz_quic corpus/ tests/fuzz/quic/seeds/

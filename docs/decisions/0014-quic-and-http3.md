@@ -108,6 +108,9 @@ Both libraries report what happened through C callbacks, called during `ngtcp2_c
 
 ### 3.2 Vendoring
 
+(Amendment 13, §20: the vendored libraries, their wrappers and the shims are now CeeSafeLibs' `ngtcp2` and
+`nghttp3` packages, and `tools/vendor_quic.py` is there. What follows is as first built.)
+
 - **`third_party/ngtcp2-1.26.0/` and `third_party/nghttp3-1.19.0/` hold only the sources that are compiled:**
   - ngtcp2's `lib/`, `crypto/shared.c` and `crypto/ossl/`;
   - nghttp3's `lib/` and its bundled `sfparse`;
@@ -878,3 +881,19 @@ item 6 is what was built, and where it differs.
      `retryAbove` is answered, with no Retry.
    - **`newToken` is not tested.** ngtcp2's example server was not built. Whether it sends NEW_TOKEN with the
      OpenSSL backend is still not checked.
+
+## 20. Amendment 13 (2026-11-17: the vendored C moves to CeeSafeLibs)
+
+The owner's decision: ngtcp2 and nghttp3 are packages of their own in CeeSafeLibs, not a `third_party/` here.
+
+- **What moved:** each library as released (`upstream/`, unchanged), its wrappers (`c/vendor/`), and the shim that
+  includes its headers (`c/quic_shim.c`, `c/h3_shim.c`), with the include directories they need, into CeeSafeLibs'
+  `ngtcp2` and `nghttp3`. The shims had to go with the libraries: a package puts only its own directories on the C
+  include path (CeeSafe ADRs 0047, 0120), so `web_quic` could not compile a shim that includes a dependency's headers.
+- **What stayed:** `web_quic` and `web_http3` keep their CeeSafe sources, the shims' `extern` declarations among them
+  (their symbols are the CeeSafeLibs packages' C, met at link time), `trusted`, and their tests. Each depends on its
+  library's package by git commit.
+- **`tools/vendor_quic.py`** is CeeSafeLibs' now. Its `--regenerate` rebuilds the wrappers and the manifests' `c` lines
+  from `upstream/`; run on the moved files, it reproduced them byte for byte.
+- **The fuzz harnesses** build from CeeSafeLibs at the pinned commit (`tools/ceesafelibs.sh`).
+- **Checked:** `web_quic`'s 26 tests and `web_http3`'s 13; `examples/h3` answered curl over HTTP/3.

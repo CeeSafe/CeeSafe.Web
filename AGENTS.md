@@ -100,5 +100,5 @@ docs/           implementation plan, ADRs (decisions/), toolchain, upstream work
 tools/          check_layers.py; later the test runner and sweeps
 packages/<name>/tests/   the package's @test functions (`ceesafec test`)
 tests/probes/   design probes and CeeSafe bug repros
-examples/ benchmarks/ third_party/
+examples/ benchmarks/
 ```
