@@ -136,7 +136,7 @@ jobs:
           set -e
           for p in packages/*/; do
             case ",${{ matrix.exclude }}," in *",$(basename "$p"),"*) echo "skip $p (OpenSSL 3.0)"; continue ;; esac
-            (cd "$p" && ceesafec fetch --offline && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
+            (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
           done
 
       - name: Tests (ceesafec test, native and interpreter, leak check)
@@ -161,7 +161,7 @@ jobs:
 
       - name: Example builds
         shell: bash
-        run: (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
+        run: (cd examples/echo && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec build -o out/echo)
 
   freebsd:
     # FreeBSD (Web ADR 0015 §5, option A, accepted): GitHub has no FreeBSD runner, so FreeBSD 15.1 (amd64) runs in a VM
@@ -196,7 +196,7 @@ jobs:
             python3 tools/check_layers.py
             python3 tools/api_check.py
             for p in packages/*/; do
-              (cd "$p" && ceesafec fetch --offline && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
+              (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
             done
             # web_ws in the interpreter too: before 0.57.1 its tests grew past 11.4 GB here and were killed (CeeSafe's
             # U24, docs/ceesafe-upstream-work.md); 115 MB on macOS since.
@@ -218,7 +218,7 @@ jobs:
             export CPATH="$o/include"
             python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep \
               --cflag="-L$o/lib" --cflag="-Wl,-rpath,$o/lib"
-            (cd examples/echo && ceesafec fetch --offline && ceesafec check && ceesafec build -o out/echo)
+            (cd examples/echo && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec build -o out/echo)
 
   probes:
     # The design probes and bug repros (tests/probes/README.md): informational, so a changed outcome is visible
