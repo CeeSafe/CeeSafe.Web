@@ -160,6 +160,44 @@ test, which is evidence the macOS runs cannot give.
 - The report is `docs/benchmarks/v1.0.md`. It is made by a script from the recorded JSON, with every field Web ADR
   0005 §2.4 lists (hardware, kernel, compilers and flags, reactor, concurrency, payload, TLS settings, warm-up) and
   the raw results beside it.
+  - **Written (2026-11-17), on branch `bench-report`:**
+    - **`run.py --json`** writes `{"environment", "results"}`. The environment records:
+      - the machine: CPU, logical CPUs, memory and architecture;
+      - the OS, the kernel, the commit, and the load average before the run;
+      - the compiler and flags: ceesafec and the C compiler with `ceesafec build`'s `-O2`, or the comparison
+        server's toolchain and its pinned versions from `Cargo.lock`, `pubspec.lock` or `build.sh`;
+      - the reactor, the load generator, the duration and warm-up, the connections, the modes, the routes and their
+        payloads;
+      - for TLS, the libcrypto the server links, as reported by the library itself. The `openssl` on PATH may be a
+        different one (macOS's is LibreSSL).
+
+      Each TLS row records what h2load negotiated: the protocol, cipher, key exchange and ALPN. Each row also gains
+      a p95.
+    - **`benchmarks/report.py`** writes the report from those files:
+      - the sources, with their SHA-256;
+      - the environments side by side, with a warning when the runs were not on one machine and kernel;
+      - each mode and route's rows for every server;
+      - the allocations per request.
+
+      Files from before the environment was recorded still read, marked "not recorded".
+    - **The regression gate:** `--baseline <previous release's files>` sets each CeeSafe.Web row against the
+      baseline's. A fall in requests a second, or a rise in p99, of more than `--gate` (5 %) is a regression, and
+      the script exits 1. It exits 2 when the baseline was not on the same machine and kernel, because the gate
+      cannot be judged. `--advisory` reports the same and exits 0.
+  - **Run (2026-11-17, the M1 laptop, 2 s at 10 connections):**
+    - `run.py` ran CeeSafe.Web over h1, h2c, tls-h1 and tls-h2, and Hyper over h1 and h2c.
+    - Every TLS row negotiated TLSv1.3, `TLS_AES_256_GCM_SHA384` and X25519, with ALPN `http/1.1` or `h2` as the
+      mode asks. The library read was OpenSSL 3.6.4, where the `openssl` on PATH is LibreSSL 3.3.6.
+    - `report.py` read those files and the 2026-11-07 ones.
+    - Against a copy of a run with one row's requests a second raised by 20 %, the gate exited 1 and marked that row
+      alone. Against the run itself, it exited 0. With `--advisory`, it exited 0. Against the 2026-11-06 file,
+      which recorded no environment, it exited 2.
+    - The laptop's load average was 42 during the run, so the numbers are not results.
+  - **Not yet in it**, of Web ADR 0005 §2.4:
+    - load at a constant rate (`wrk2`), and requests a second at a fixed p99;
+    - CPU time;
+    - bytes per idle connection;
+    - TLS handshakes (`oha`).
 - **The machine (the owner's choice):**
   - **A.** A dedicated bare-metal server, rented by the month (for example a Hetzner AX-line machine, or similar),
     used for nothing else. The load generator runs on a second machine or on pinned cores.

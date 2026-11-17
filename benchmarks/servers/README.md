@@ -56,8 +56,12 @@ TLS is not part of the comparison yet.
 
 ```sh
 python3 benchmarks/servers/conform.py --port 8090 [--h2c-port 8091] --name axum   # a server already running
-python3 benchmarks/http/run.py --server axum --modes h1,h2c --routes small,4k,64k,stream,json,echo --no-alloc
+python3 benchmarks/http/run.py --server axum --modes h1,h2c --routes small,4k,64k,stream,json,echo --json axum.json
+python3 benchmarks/report.py ceesafe-web.json axum.json hyper.json -o docs/benchmarks/v1.0.md   # the report
+python3 benchmarks/report.py ceesafe-web.json --baseline previous-release.json      # the 5 % regression gate
 ```
+
+Each `--json` file records its run's environment (Web ADR 0005 §2.4), which the report prints beside the rows.
 
 The results belong to the benchmark machine (Web ADR 0015 §6: alfaisal, once the owner says it is clear). A run on a
 laptop with the load generator beside the server checks the pipeline only.
