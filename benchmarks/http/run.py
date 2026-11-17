@@ -400,7 +400,12 @@ def toolchain(args, name):
                 "flags": "cargo build --release: opt-level 3, fat LTO, codegen-units 1, panic abort "
                          "(benchmarks/servers/rust/Cargo.toml)"}
     if name == "kestrel":
-        return {"dotnet": first_line(["dotnet", "--version"]), "flags": "dotnet publish -c Release"}
+        runtimes = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, text=True).stdout
+        aspnet = re.findall(r"^Microsoft\.AspNetCore\.App (10\.0\.\d+) ", runtimes, re.M)
+        return {"dotnet sdk": first_line(["dotnet", "--version"]),
+                # what LatestPatch runs on (BenchKestrel.csproj)
+                "aspnetcore runtime": max(aspnet, key=lambda v: int(v.split(".")[2])) if aspnet else None,
+                "flags": "dotnet publish -c Release"}
     if name == "h2o":
         h2o = os.environ.get("CW_H2O") or str(SERVERS / "h2o" / "out" / "bin" / "h2o")
         commit = re.search(r"^COMMIT=(\w+)", (SERVERS / "h2o" / "build.sh").read_text(), re.M)

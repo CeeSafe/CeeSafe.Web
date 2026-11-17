@@ -7,6 +7,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <InvariantGlobalization>true</InvariantGlobalization>
     <AssemblyName>bench_kestrel</AssemblyName>
-    <RollForward>Disable</RollForward>
+    <!-- The newest installed 10.0 patch: the SDK that global.json pins brings it (10.0.401: runtime 10.0.12). Disable
+         would ask for exactly 10.0.0, which a machine with only that SDK lacks. run.py records the runtime. -->
+    <RollForward>LatestPatch</RollForward>
   </PropertyGroup>
 </Project>
