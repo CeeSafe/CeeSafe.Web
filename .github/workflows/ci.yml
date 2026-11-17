@@ -183,7 +183,7 @@ jobs:
           copyback: false
           envs: "CEESAFE_VERSION"
           prepare: |
-            pkg install -y python3 perl5 gmake
+            pkg install -y python3 perl5 gmake git
           run: |
             set -e
             freebsd-version
