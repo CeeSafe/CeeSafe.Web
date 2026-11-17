@@ -196,7 +196,7 @@ jobs:
             python3 tools/check_layers.py
             python3 tools/api_check.py
             for p in packages/*/; do
-              (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
+              (cd "$p" && cp ceesafe.lock /tmp/lock.before && ceesafec fetch && cmp ceesafe.lock /tmp/lock.before && ceesafec check && ceesafec fmt --check && ceesafec doc --missing)
             done
             # web_ws in the interpreter too: before 0.57.1 its tests grew past 11.4 GB here and were killed (CeeSafe's
             # U24, docs/ceesafe-upstream-work.md); 115 MB on macOS since.
@@ -218,7 +218,7 @@ jobs:
             export CPATH="$o/include"
             python3 tools/run_tests.py --no-interp --sanitize --alloc-sweep --cancel-sweep \
               --cflag="-L$o/lib" --cflag="-Wl,-rpath,$o/lib"
-            (cd examples/echo && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec build -o out/echo)
+            (cd examples/echo && cp ceesafe.lock /tmp/lock.before && ceesafec fetch && cmp ceesafe.lock /tmp/lock.before && ceesafec check && ceesafec build -o out/echo)
 
   probes:
     # The design probes and bug repros (tests/probes/README.md): informational, so a changed outcome is visible
