@@ -3,7 +3,7 @@
 
 usage: python3 benchmarks/http/run.py [--duration 10] [--conns 1,10,100] [--modes h1,h2c,tls-h1,tls-h2]
                                       [--routes small,4k,64k,stream,json,echo,file] [--json out.json]
-                                      [--nginx | --server hyper|axum|actix|kestrel|h2o]
+                                      [--nginx | --server hyper|axum|actix|kestrel|h2o|relic|relic-native]
 
 For each mode (HTTP/1.1 and h2c in clear, HTTP/1.1 and h2 over TLS), route and connection count, h2load runs for
 `duration` seconds after a one-second warm-up, one request at a time on each connection (`-m 1`, so HTTP/2 is not
@@ -27,8 +27,9 @@ environment, which the server inherits. Each row records which (`reactor`).
 (`/stream` as a 1 MiB file, `/echo` left out): a reference, not a target. Allocations do not apply to it.
 
 `--server` runs them against one of the comparison servers of Web ADR 0015 §6 (`benchmarks/servers/`, built first
-as its README says): Hyper, Axum, Actix Web, Kestrel or h2o. They serve HTTP/1.1 and h2c, not TLS, and have no
-`/file`; the modes and routes they lack are left out. Allocations do not apply to them; the peak RSS does.
+as its README says): Hyper, Axum, Actix Web, Kestrel, h2o, or Relic 2.0 on either adapter (`relic`, `relic-native`).
+They serve HTTP/1.1 and h2c (Relic HTTP/1.1 only), not TLS, and have no `/file`; the modes and routes they lack are
+left out. Allocations do not apply to them; the peak RSS does.
 
 Before any load, `benchmarks/servers/conform.py` checks the server (CeeSafe.Web's too) on every route over HTTP/1.1
 and h2c, against bodies that script builds itself; a server that fails it is not measured (plan §8: correctness
@@ -54,8 +55,13 @@ COMPARISON = {
     "actix": [str(SERVERS / "rust" / "target" / "release" / "bench_actix")],
     "kestrel": [str(SERVERS / "kestrel" / "out" / "bench_kestrel")],
     "h2o": [sys.executable, str(SERVERS / "h2o" / "start.py")],
+    "relic": [str(SERVERS / "relic" / "out" / "bundle" / "bin" / "main")],
+    "relic-native": [str(SERVERS / "relic" / "out" / "bundle" / "bin" / "main")],
 }
 H2C_OFFSET = {"kestrel": 1}
+# Relic 2.0's two adapters, one binary: relic_io (dart:io) and relic_native (its Zig server). Neither has HTTP/2.
+SERVER_ENV = {"relic": {"CW_ADAPTER": "io"}, "relic-native": {"CW_ADAPTER": "native"}}
+NO_H2C = {"relic", "relic-native"}
 COMPARISON_MODES = ("h1", "h2c")
 COMPARISON_ROUTES = ("small", "4k", "64k", "stream", "json", "echo")
 GIBIBYTE = 1 << 30
@@ -298,8 +304,9 @@ def main():
 
 def conform(name, port, h2c_port):
     """benchmarks/servers/conform.py against the running server: True if every check passes."""
-    r = subprocess.run([sys.executable, str(CONFORM), "--port", str(port), "--h2c-port", str(h2c_port),
-                        "--name", name], capture_output=True, text=True)
+    h2c = ["--no-h2c"] if name in NO_H2C else ["--h2c-port", str(h2c_port)]
+    r = subprocess.run([sys.executable, str(CONFORM), "--port", str(port), *h2c, "--name", name],
+                       capture_output=True, text=True)
     print(r.stdout.strip(), flush=True)
     return r.returncode == 0
 
@@ -309,11 +316,12 @@ class Comparison:
 
     def __init__(self, name, scratch):
         self.h2c_port = PORT + H2C_OFFSET.get(name, 0)
-        env = dict(os.environ, CW_PORT=str(PORT), CW_H2C_PORT=str(self.h2c_port))
+        env = dict(os.environ, CW_PORT=str(PORT), CW_H2C_PORT=str(self.h2c_port), **SERVER_ENV.get(name, {}))
         self.log = open(scratch / f"{name}.log", "ab")
         self.p = subprocess.Popen(COMPARISON[name], env=env, stdout=self.log, stderr=subprocess.STDOUT)
         wait_port(PORT)
-        wait_port(self.h2c_port)
+        if name not in NO_H2C:
+            wait_port(self.h2c_port)
 
     def stop(self):
         self.p.terminate()
@@ -337,7 +345,7 @@ def run_comparison(args, modes, routes, conns, scratch, body, results):
         sys.exit(f"run: {name} failed the conformance check; nothing measured")
     plain = PORT
     try:
-        for mode in [m for m in modes if m in COMPARISON_MODES]:
+        for mode in [m for m in modes if m in COMPARISON_MODES and not (m == "h2c" and name in NO_H2C)]:
             for route in [r for r in routes if r in COMPARISON_ROUTES]:
                 posted = body if route == "echo" else None
                 for c in conns:

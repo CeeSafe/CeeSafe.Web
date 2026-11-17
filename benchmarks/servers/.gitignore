@@ -2,3 +2,4 @@
 rust/target/
 kestrel/bin/
 kestrel/obj/
+relic/.dart_tool/

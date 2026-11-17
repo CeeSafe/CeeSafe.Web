@@ -141,17 +141,21 @@ test, which is evidence the macOS runs cannot give.
       pins ngtcp2).
     - **The servers:** Hyper 1.12.0, Axum 0.8.9 and Actix Web 4.20.0 (one Cargo workspace, `Cargo.lock` committed);
       Kestrel on .NET 10 (SDK 10.0.401 by `global.json`); h2o master `d3e43fcf`, which has had no release since 2.2.6
-      (2019).
+      (2019). Relic 2.0.0 was added at the owner's request ("Can you add Relic 2.0 into the servers."). It is
+      Serverpod's Dart server (Dart 3.14.1, `pubspec.lock` committed), on both of its adapters: `relic_io` and
+      `relic_native` (2.0's server in Zig). Both speak HTTP/1.1 only.
     - **`benchmarks/http/run.py --server <name>`** measures any of them. It runs `conform.py` first, CeeSafe.Web's
       server included, and measures nothing from a server that fails it (plan §8).
     - **Not yet in it:** TLS, and Kestrel's h2c on the HTTP/1.1 port. Kestrel cannot serve h2c on a cleartext
       endpoint that also speaks HTTP/1.1, so its h2c has a port of its own.
   - **Run (2026-11-17, macOS 27.0.1 on an Apple M1, Rust 1.99.1, .NET SDK 10.0.401, h2load from nghttp2):**
     - `conform.py` passes on all six servers: 12 HTTP/1.1 requests on one kept-alive connection and 6 h2c requests
-      each, 0 problems.
+      each, 0 problems. It passes on both Relic adapters over HTTP/1.1 (`--no-h2c`), with Dart 3.14.1 (the SDK
+      checked against its published SHA-256).
     - It failed where it should: on CeeSafe.Web's server built before `/json` (404), and on Kestrel with both
       protocols on one cleartext port (no h2c response).
-    - `run.py` ran each server, 2 s at 10 connections on four routes over h1 and h2c, with 0 failed requests. That
+    - `run.py` ran each server, 2 s at 10 connections on four routes over h1 and h2c (Relic h1 only), with 0
+      failed requests. That
       checks the pipeline only; the numbers are not results (a laptop, the load generator beside the server).
 - The report is `docs/benchmarks/v1.0.md`. It is made by a script from the recorded JSON, with every field Web ADR
   0005 §2.4 lists (hardware, kernel, compilers and flags, reactor, concurrency, payload, TLS settings, warm-up) and

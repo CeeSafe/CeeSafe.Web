@@ -2,10 +2,10 @@
 """The comparison servers' contract (Web ADR 0015 §6, plan §8): every server answers the same routes with the same
 bytes, over HTTP/1.1 and h2c, before any load is run against it.
 
-usage: python3 benchmarks/servers/conform.py --port 18190 [--h2c-port 18191] [--name axum]
+usage: python3 benchmarks/servers/conform.py --port 18190 [--h2c-port 18191 | --no-h2c] [--name axum]
 
 The server must already listen on 127.0.0.1:PORT, for HTTP/1.1 and h2c alike, or for h2c on H2C_PORT when it cannot
-serve both on one cleartext port (Kestrel). The expected bodies are built here, from the contract below, not
+serve both on one cleartext port (Kestrel). `--no-h2c` checks HTTP/1.1 alone, for a server without HTTP/2 (Relic). The expected bodies are built here, from the contract below, not
 taken from any server:
 
   GET  /small    200, "hello, world\\n" (13 bytes)
@@ -107,14 +107,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--h2c-port", type=int, help="h2c's port, when it is not --port")
+    ap.add_argument("--no-h2c", action="store_true", help="the server has no HTTP/2: check HTTP/1.1 alone")
     ap.add_argument("--name", default="server")
     a = ap.parse_args()
-    if shutil.which("nghttp") is None:
+    if not a.no_h2c and shutil.which("nghttp") is None:
         sys.exit("conform: nghttp (nghttp2) is not on PATH")
     problems = []
     check_h1(a.port, problems)
-    check_h2c(a.h2c_port or a.port, problems)
-    print(f"conform {a.name}: {len(GETS) * 2 + 2} HTTP/1.1 requests on one connection, {len(GETS) + 1} h2c; "
+    if not a.no_h2c:
+        check_h2c(a.h2c_port or a.port, problems)
+    h2c = "no h2c (--no-h2c)" if a.no_h2c else f"{len(GETS) + 1} h2c"
+    print(f"conform {a.name}: {len(GETS) * 2 + 2} HTTP/1.1 requests on one connection, {h2c}; "
           f"{len(problems)} problems")
     for p in problems:
         print("  FAIL " + p)

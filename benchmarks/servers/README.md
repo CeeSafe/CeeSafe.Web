@@ -18,9 +18,13 @@ and measures nothing from a server that fails it.
 | `POST /echo` | 200, the request body back (at most 1 MiB) |
 
 Every server listens on `127.0.0.1:$CW_PORT` (8090 by default) for HTTP/1.1 and h2c (HTTP/2 with prior knowledge),
-with a worker per core, and keeps connections alive. Kestrel is the exception on one point: it cannot serve both
-protocols on one cleartext endpoint, so its h2c is on `$CW_H2C_PORT` (`CW_PORT` + 1 by default). TLS is not part of
-the comparison yet.
+with a worker per core, and keeps connections alive. Two exceptions:
+- **Kestrel** cannot serve both protocols on one cleartext endpoint, so its h2c is on `$CW_H2C_PORT` (`CW_PORT` + 1
+  by default).
+- **Relic** has no HTTP/2 on either adapter, so it is checked and measured over HTTP/1.1 only (`conform.py
+  --no-h2c`).
+
+TLS is not part of the comparison yet.
 
 ## The servers
 
@@ -31,6 +35,8 @@ the comparison yet.
 | `actix` | Actix Web 4.20.0 (actix-http 3.22.0) | `rust/Cargo.lock` | the same |
 | `kestrel` | ASP.NET Core 10 minimal APIs on Kestrel | `kestrel/global.json` (SDK 10.0.401, no roll-forward) | `dotnet publish -c Release -o out` in `kestrel/` |
 | `h2o` | h2o master `d3e43fcf` (2026-11-14), with mruby | `h2o/build.sh` | `sh h2o/build.sh` (needs cmake, ruby, bison, OpenSSL 3) |
+| `relic` | Serverpod's Relic 2.0.0 on Dart, `relic_io` (dart:io's server; `app.serve`) | `relic/pubspec.lock` | `dart pub get && dart build cli -o out` in `relic/` (Dart 3.14.1) |
+| `relic-native` | Relic 2.0.0 on `relic_native` 2.0.0 (its HTTP server in Zig; `app.serveNative`) | the same | the same binary, `CW_ADAPTER=native` |
 
 - **The Rust servers** share `rust/common`: the address, the bodies made once, and `/json`'s object. They run on
   Tokio 1.54.1, or Actix's own workers, a worker per core. The release profile is opt-level 3, one codegen unit, LTO.
@@ -39,6 +45,12 @@ the comparison yet.
   handler for bytes held in memory, so `start.py` writes `/small`, `/4k` and `/64k` as files for its file handler.
   `/stream`, `/json` (mruby-json, bundled with h2o) and `/echo` are mruby handlers. `start.py` writes the
   configuration for `$CW_PORT` and replaces itself with h2o; `$CW_H2O` names another h2o binary.
+- **Relic** is one program for both adapters, chosen by `$CW_ADAPTER` (`io` or `native`), with an isolate per core
+  (`noOfIsolates`). `dart build cli` compiles it ahead of time and puts `relic_native`'s prebuilt library
+  (`lib/librelic_native.dylib` or `.so`) beside `out/bundle/bin/main`, so no Zig toolchain is needed. Its fixed
+  bodies are byte arrays made once, given a MIME type so Relic does not sniff each one. The Dart SDK is pinned by
+  this README, not by a file: 3.14.1 (`pubspec.lock` needs 3.13 or later), from Google's archive, checked against
+  its `.sha256sum`.
 
 ## Run
 
