@@ -181,6 +181,9 @@ impl BodySource for BytesBody {
     fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> => Ok();
 }
 
+/// A read of a body with nothing buffered goes straight into a caller's buffer of at least this size.
+const DIRECT_READ: usize = 1024;
+
 /// A failed attempt, and whether sending it again is safe as far as the connection goes (§3.8 rule 2).
 struct Failure {
     error: ClientError;
@@ -239,7 +242,8 @@ public struct Client {
         body: borrow mut dyn BodySource,
     ) -> Result<ClientResponse, ClientError> {
         let total = if (this.options.totalMs == 0) Deadline.never() else Deadline.after(this.options.totalMs);
-        var url = urlCopy(request.url())?;
+        // The URL the request goes to: the request's own, until a redirect gives another (which is then owned here).
+        var moved: Url? = null;
         var method = request.method();
         var withBody = true;
         var strip = false;
@@ -248,6 +252,10 @@ public struct Client {
         var none = NoBody {};
         loop {
             attempts += 1;
+            let url: borrow Url = match (borrow moved) {
+                Some(u) => u,
+                null => request.url(),
+            };
             let r = if (withBody) await this.attempt(
                 url,
                 method,
@@ -290,7 +298,7 @@ public struct Client {
                     }
                     var done = response;
                     let drained = await done.finish(this);
-                    url = next;
+                    moved = Some(next);
                     redirects += 1;
                     attempts = 0;
                 }
@@ -439,10 +447,20 @@ public struct Client {
                 }
             }
         }
-        let pooled = if (predialed.length > 0) null else match (await this.pool.idleFor(url)) {
-            Ok(p) => p,
-            Err(e) => { return Err(Failure { error: e, resendable: false }); },
-        };
+        // A slot among the origin's requests, and with it a pooled connection if there is one (the predialed
+        // connection has its slot already).
+        var pooled: Box<dyn Transport + Send>? = null;
+        var kept: OwnedBuffer? = null;
+        if (predialed.length == 0) {
+            match (await this.pool.acquire(url, total)) {
+                Ok(Taken.Reused(c, buffer)) => {
+                    pooled = Some(c);
+                    kept = Some(buffer);
+                }
+                Ok(Taken.Slot) => {}
+                Err(e) => { return Err(Failure { error: e, resendable: false }); }
+            }
+        }
         let reused = match (borrow pooled) {
             Some(_) => true,
             null => false,
@@ -451,7 +469,7 @@ public struct Client {
             Some(c) => c,
             null => match (predialed.pop()) {
                 Some(c) => c,
-                null => match (await this.freshConnection(url, total)) {
+                null => match (await this.connectHolding(url, total)) {
                     Ok(c) => c,
                     Err(f) => { return Err(f); },
                 },
@@ -486,9 +504,13 @@ public struct Client {
         }
         let firstByte = Deadline.after(this.options.firstByteMs).earlier(total);
         var head = Vector<u8>.create();
-        var carry = match (OwnedBuffer.create(16384)) {
-            Ok(b) => b,
-            Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
+        // A pooled connection brings the read buffer of its last response; a new one gets its own.
+        var carry = match (kept) {
+            Some(b) => b,
+            null => match (OwnedBuffer.create(16384)) {
+                Ok(b) => b,
+                Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); },
+            },
         };
         match (await readHead(
             mut conn,
@@ -528,7 +550,7 @@ public struct Client {
             limits: this.options.limits,
             maxDrain: this.options.maxDrainBytes,
             address: finalUrl,
-            conn: one(conn)?,
+            conn: Some(conn),
             slots: held.slots.clone(),
             head: head,
             code: status,
@@ -709,7 +731,7 @@ public struct Client {
             limits: this.options.limits,
             maxDrain: this.options.maxDrainBytes,
             address: finalUrl,
-            conn: Vector<Box<dyn Transport + Send>>.create(),
+            conn: null,
             slots: slots, // unused: the connection's slot belongs to its task
             head: Vector<u8>.create(),
             code: code,
@@ -752,6 +774,24 @@ public struct Client {
             Ok(c) => { return Ok(c); }
             Err(e) => {
                 let freed = slots.trySend(0);
+                return Err(Failure { error: e, resendable: true }); // nothing was sent
+            }
+        }
+    }
+
+    /// A new connection for a request that holds a slot already; the slot is freed if none can be made.
+    async fn connectHolding(
+        borrow this,
+        url: borrow Url,
+        total: Deadline,
+    ) -> Result<Box<dyn Transport + Send>, Failure> {
+        match (await this.connect(url, total)) {
+            Ok(c) => { return Ok(c); }
+            Err(e) => {
+                match (await this.pool.slots(url)) {
+                    Ok(slots) => { let freed = slots.trySend(0); }
+                    Err(_) => {}
+                }
                 return Err(Failure { error: e, resendable: true }); // nothing was sent
             }
         }
@@ -819,6 +859,14 @@ public struct Client {
             }
         }
         var head = Vector<u8>.create();
+        var room = url.target().length + authority.length + 96;
+        for (i in 0..request.names.length) {
+            room += request.names[i].length + request.values[i].length + 4;
+        }
+        match (head.reserve(room)) {
+            Ok() => {}
+            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
+        }
         var w = RequestWriter.start(mut head, Methods.text(method).bytes(), url.target(), authority.view());
         for (i in 0..request.names.length) {
             let name = request.names[i].view();
@@ -1073,8 +1121,8 @@ public struct ClientResponse {
     private limits: Limits;
     private maxDrain: u64;
     private address: Url;
-    /// The connection while the response has it (at most one: a vector, so `finish` can move it out with `pop`).
-    private conn: Vector<Box<dyn Transport + Send>>;
+    /// The connection while the response has it; `finish` and `switched` take it out.
+    private conn: Box<dyn Transport + Send>?;
     private slots: Channel<u8>;
     private head: Vector<u8>;
     private code: u16;
@@ -1131,7 +1179,7 @@ public struct ClientResponse {
     /// The connection after a 101, out of the pool: its slot is freed, since a switched connection is no request.
     fn switched(this) -> Result<Switched, ClientError> {
         var r = this;
-        let conn = match (r.conn.pop()) {
+        let conn = match (replace(mut r.conn, null)) {
             Some(c) => c,
             null => { return Err(ClientError.Net(NetError.Closed)); },
         };
@@ -1205,6 +1253,24 @@ public struct ClientResponse {
                     return Ok(0);
                 }
                 ResponseBody.Length(_) => {
+                    // With nothing buffered, a caller's buffer that takes the rest of the body, or a good part of
+                    // it, is read into straight from the connection: the bytes are copied once, not twice.
+                    var want = buffer.length;
+                    if (want as u64 > this.left) {
+                        want = truncate<usize>(this.left);
+                    }
+                    if (this.carry.isEmpty() && this.conn.isSome() &&
+                        (want as u64 == this.left || want >= DIRECT_READ)) {
+                        let got = net(await this.readDirect(mut buffer[0..want]))?;
+                        if (got == 0) {
+                            return Err(ClientError.Net(NetError.Closed)); // shorter than its length
+                        }
+                        this.left -= got as u64;
+                        if (this.left == 0) {
+                            this.done = true;
+                        }
+                        return Ok(got);
+                    }
                     if (this.carry.isEmpty() && await this.fill()? == 0) {
                         return Err(ClientError.Net(NetError.Closed)); // shorter than its length
                     }
@@ -1236,9 +1302,9 @@ public struct ClientResponse {
                     };
                     let dest = borrow mut buffer[0..step.dataLength];
                     dest.copyFrom(input[step.dataStart..step.dataStart + step.dataLength]);
-                    for (i in 0..step.trailerLength) {
-                        pushedOk(this.trailerLines.push(input[step.trailerStart + i]))?;
-                    }
+                    pushedOk(
+                        this.trailerLines.extend(input[step.trailerStart..step.trailerStart + step.trailerLength]),
+                    )?;
                     consumed(mut this.carry, step.consumed)?;
                     if (step.finished) {
                         this.done = true;
@@ -1253,6 +1319,13 @@ public struct ClientResponse {
                     }
                 }
                 ResponseBody.UntilClose => {
+                    if (this.carry.isEmpty() && this.conn.isSome() && buffer.length >= DIRECT_READ) {
+                        let got = net(await this.readDirect(buffer))?;
+                        if (got == 0) {
+                            this.done = true;
+                        }
+                        return Ok(got);
+                    }
                     if (this.carry.isEmpty() && await this.fill()? == 0) {
                         this.done = true;
                         return Ok(0);
@@ -1270,16 +1343,60 @@ public struct ClientResponse {
 
     /// The whole body into `into`, up to `limit` bytes (`Net(LimitExceeded)` past it).
     public async fn readToEnd(borrow mut this, into: borrow mut Vector<u8>, limit: usize) -> Result<void, ClientError> {
-        var buf = [0u8; 8192];
+        // The body is read into `into`'s own room, which is made as large as the body is known to be, or grows by
+        // doubling; `filled` is how much of `into` is the body so far, and `into` is cut back to it at the end.
+        var filled = into.length;
+        let roof = limit.saturatingAdd(1); // one byte past the limit shows a body that is too long
         loop {
-            let n = await this.read(mut buf[..])?;
-            if (n == 0) {
-                return Ok();
+            if (into.length - filled < 2048 && into.length < roof) {
+                var room = if (into.length < 8192) 16384 else into.length.saturatingMul(2);
+                match (this.framing) {
+                    ResponseBody.Length(_) => {
+                        if (this.stream.length == 0) {
+                            room = filled.saturatingAdd(saturatingTruncate<usize>(this.left));
+                        }
+                    }
+                    _ => {}
+                }
+                if (room > roof) {
+                    room = roof;
+                }
+                if (room > into.length) {
+                    match (into.resize(room, 0)) {
+                        Ok() => {}
+                        Err(_) => {
+                            into.truncate(filled);
+                            return Err(ClientError.Net(NetError.OutOfMemory));
+                        }
+                    }
+                }
             }
-            if (into.length + n > limit) {
-                return Err(ClientError.Net(NetError.LimitExceeded));
+            if (filled == into.length) {
+                // No room: the body has ended exactly here, or it is longer than `limit`.
+                var probe = [0u8; 1];
+                match (await this.read(mut probe[..])) {
+                    Ok(0) => { return Ok(); }
+                    Ok(_) => { return Err(ClientError.Net(NetError.LimitExceeded)); }
+                    Err(e) => { return Err(e); }
+                }
             }
-            copyBytes(into, buf[0..n])?;
+            match (await this.read(mut into[filled..])) {
+                Ok(n) => {
+                    if (n == 0) {
+                        into.truncate(filled);
+                        return Ok();
+                    }
+                    filled += n;
+                    if (filled > limit) {
+                        into.truncate(limit);
+                        return Err(ClientError.Net(NetError.LimitExceeded));
+                    }
+                }
+                Err(e) => {
+                    into.truncate(filled);
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -1298,8 +1415,19 @@ public struct ClientResponse {
         if (!this.done || !this.keepAlive || !this.carry.isEmpty()) {
             return Ok(); // the connection closes when the response is dropped
         }
-        match (this.conn.pop()) {
-            Some(conn) => { await client.pool.give(this.address, conn); }
+        match (replace(mut this.conn, null)) {
+            Some(conn) => {
+                // The read buffer goes back with the connection (it is empty: checked above). If no empty one can be
+                // made to stand in for it here, the connection is closed instead.
+                match (OwnedBuffer.create(0)) {
+                    Ok(small) => {
+                        var carry = replace(mut this.carry, small);
+                        carry.clear();
+                        await client.pool.give(this.address, conn, carry);
+                    }
+                    Err(_) => { let freed = this.slots.trySend(0); }
+                }
+            }
             null => {}
         }
         return Ok();
@@ -1308,10 +1436,10 @@ public struct ClientResponse {
     /// Reads more of the body into `carry`; 0 at the end of the stream.
     async fn fill(borrow mut this) -> Result<usize, ClientError> {
         this.carry.compact();
-        if (this.conn.length == 0) {
-            return Ok(0);
-        }
-        let n = net(await readBoxed(mut this.conn[0], this.carry.spare(), this.readDeadline))?;
+        let n = match (borrow mut this.conn) {
+            Some(conn) => net(await readBoxed(conn, this.carry.spare(), this.readDeadline))?,
+            null => { return Ok(0); },
+        };
         if (n > 0) {
             match (this.carry.commit(n)) {
                 Ok() => {}
@@ -1321,19 +1449,18 @@ public struct ClientResponse {
         return Ok(n);
     }
 
-    drop {
-        if (this.conn.length > 0) {
-            let freed = this.slots.trySend(0); // the connection closes with the response
+    /// One read from the connection straight into `into`; 0 at the end of the stream, or without a connection.
+    async fn readDirect(borrow mut this, into: SliceMut<u8>) -> Result<usize, NetError> {
+        match (borrow mut this.conn) {
+            Some(conn) => { return await readBoxed(conn, into, this.readDeadline); }
+            null => { return Ok(0); }
         }
     }
-}
 
-/// A vector holding `conn`.
-fn one(conn: Box<dyn Transport + Send>) -> Result<Vector<Box<dyn Transport + Send>>, Failure> {
-    var v = Vector<Box<dyn Transport + Send>>.create();
-    match (v.push(conn)) {
-        Ok() => { return Ok(v); }
-        Err(_) => { return Err(Failure { error: ClientError.Net(NetError.OutOfMemory), resendable: false }); }
+    drop {
+        if (this.conn.isSome()) {
+            let freed = this.slots.trySend(0); // the connection closes with the response
+        }
     }
 }
 
@@ -1358,13 +1485,10 @@ fn net<T>(r: Result<T, NetError>) -> Result<T, ClientError> {
 }
 
 fn copyBytes(to: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, ClientError> {
-    for (b in bytes) {
-        match (to.push(b)) {
-            Ok() => {}
-            Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
-        }
+    match (to.extend(bytes)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(ClientError.Net(NetError.OutOfMemory)); }
     }
-    return Ok();
 }
 
 fn urlCopy(u: borrow Url) -> Result<Url, ClientError> {
