@@ -1,0 +1,11 @@
+[package]
+name = "bench_actix"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bench_common.workspace = true
+actix-web.workspace = true
+bytes.workspace = true
+futures-util.workspace = true

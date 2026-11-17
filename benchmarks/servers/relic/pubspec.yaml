@@ -1,0 +1,11 @@
+# The Relic comparison server (Web ADR 0015 §6): Serverpod's Relic 2.0 on Dart, pubspec.lock committed.
+name: bench_relic
+description: Relic 2.0 answering benchmarks/servers/conform.py's contract, on relic_io or relic_native.
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  relic: 2.0.0
+  relic_native: 2.0.0

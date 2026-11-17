@@ -1,6 +1,13 @@
 # Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
 
 [[package]]
+name = "json"
+source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
+commit = "ca0a13fec248bbe192f0b61b930c8b8259175eed"
+dir = "json"
+hash = "sha256:c83d0d607d2f50248e5f8b27fc0974cababf8d37c240d3d57ac2117baf7f4617"
+
+[[package]]
 name = "web_core"
 source = "path+../../packages/web_core"
 

@@ -9,3 +9,5 @@ web_transport = { path = "../../packages/web_transport" }
 web_http = { path = "../../packages/web_http" }
 web_server = { path = "../../packages/web_server" }
 web_tls = { path = "../../packages/web_tls" }
+# /json's writer: CeeSafeLibs' json, pinned as web_quic pins ngtcp2
+json = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "json" }

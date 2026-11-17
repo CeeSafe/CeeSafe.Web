@@ -1,0 +1,5 @@
+# build output of the comparison servers
+rust/target/
+kestrel/bin/
+kestrel/obj/
+relic/.dart_tool/
