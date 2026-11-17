@@ -10,6 +10,10 @@ handler, written here to a temporary directory with the configuration. /stream, 
 /stream yields its 16 KiB piece 64 times with no declared length, /json serialises its object for each request
 (mruby-json, bundled with h2o), and /echo returns the request body (`limit-request-body`, 1 MiB). The process
 replaces itself with h2o, so stopping it stops h2o.
+
+Started as root, h2o drops to `nobody` unless told otherwise. Then it cannot read its own mruby files under /root,
+nor this script's temporary directory. So as root the configuration says `user: root`, as the other servers keep
+the user that starts them.
 """
 import argparse, os, pathlib, tempfile
 
@@ -67,7 +71,8 @@ def main():
                        ("piece", alphabet(16384))):
         (work / name).write_bytes(body)
     conf = work / "h2o.conf"
-    conf.write_text(CONF.format(port=port, files=work, threads=os.cpu_count() or 1))
+    conf.write_text(("user: root\n" if os.geteuid() == 0 else "") +
+                    CONF.format(port=port, files=work, threads=os.cpu_count() or 1))
     os.execv(a.h2o, [a.h2o, "-c", str(conf)])
 
 

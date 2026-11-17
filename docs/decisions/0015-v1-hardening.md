@@ -225,6 +225,36 @@ test, which is evidence the macOS runs cannot give.
     - the comparison servers;
     - nginx, whose Ubuntu package would start a service on port 80, so it is to be built into the prefix instead.
 
+  **The owner's answer (2026-11-17): rq instead of alfaisal.** In the owner's words: "use this new box instead of
+  alfaisal. ssh root@rq.iserveus.com".
+  - **The machine.** Its hostname is bijuserver. It has a Xeon D-2123IT (4 cores, 8 threads, 2.2 to 3.0 GHz), 31 GB,
+    NVMe, Ubuntu 24.04.5 and kernel 6.8.0-149.
+  - **Not yet idle.** On the day, it ran the production containers alfaisal had: zatca, s3zatca, cosmoproxy,
+    CosmoProduction, sqlserver, zatca.seq, sqlbackup, sql-watchdog and autoheal, plus a .NET service on ports 80 and
+    443.
+  - **The order.** Asked, the owner chose to set the machine up now and to run no load until they say the services
+    are off.
+  - **Set up (2026-11-17 to 18), in `/root/cw-bench`, at nice 19:**
+    - ceesafec 0.62.2 (linux-x64), checked against the release's SHA256SUMS;
+    - OpenSSL 3.5.9 into `openssl-3.5`, checked against `603f5602…b859a`;
+    - h2load from nghttp2 1.59.0 (Ubuntu's), wrk2 built at `44a94c1`, and oha 1.16.0 (SHA-256 `620bb9e1…391716`, the
+      same as on alfaisal);
+    - nginx 1.30.6, built into the prefix against OpenSSL 3.5.9. Its tarball's SHA-256 as downloaded is
+      `3cf46f5e…b8b6c8`; nginx publishes a signature, not a checksum;
+    - clang 18 and gcc 13 from Ubuntu;
+    - the comparison servers' toolchains: Rust 1.99.1 (rustup), .NET SDK 10.0.401 (dotnet-install), and Dart 3.14.1,
+      checked against its published SHA-256;
+    - `env.sh`, which sets PATH, CPATH, LIBRARY_PATH and LD_LIBRARY_PATH as CI does. It also sets SSL_CERT_FILE,
+      because OpenSSL 3.5.9's own directory has no CA certificates.
+  - **Conformance (2026-11-18, `conform.py` against each server, no load):** 0 problems on CeeSafe.Web, Hyper, Axum,
+    Actix Web, Kestrel, h2o, and Relic on both adapters. Two servers needed fixes first:
+    - **Kestrel** would not start. `RollForward=Disable` asked for exactly .NET 10.0.0, and the pinned SDK brings
+      10.0.12. It had started on the Mac only because 10.0.0 happened to be installed there, so the Mac's runs used
+      that unpatched runtime. It now runs on the newest 10.0 patch (`LatestPatch`), and the run records which
+      (#40).
+    - **h2o** failed at its mruby handlers with "cannot load such file -- …/preloads.rb". Started as root, h2o drops
+      to `nobody`, which cannot read `/root`. `start.py` now says `user: root` when started as root.
+
 ## 7. Questions for the owner
 
 1. **The audit (§2):** a funded programme first (OSTIF or the Sovereign Tech Fund), a paid firm, or none for v1.0?
