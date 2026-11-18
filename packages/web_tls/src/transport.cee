@@ -8,6 +8,15 @@ import web_transport;
 /// The most ciphertext a handshake may consume before it is cut off (Web ADR 0002 §3.4).
 const HANDSHAKE_BYTES: u64 = 65536;
 
+/// What `incoming` and `outgoing` start with. An idle connection keeps both for its life, so they start small, and
+/// each is reserved up to its full size only when a connection's traffic needs it (Web ADR 0015 §6). The shim takes
+/// ciphertext in pieces and gives it in pieces, so a small buffer costs reads and writes, never correctness.
+const FIRST_BYTES: usize = 4096;
+/// `incoming` grown: one record's ciphertext at most (16 KiB of plaintext, 1 KiB of expansion, a 5-byte header).
+const RECORD_BYTES: usize = 17408 + 5;
+/// `outgoing` grown: one write a full record.
+const WRITE_BYTES: usize = 16384;
+
 /// A TLS connection over a plain stream. Thread-safe by this package's claim (Web ADR 0009 §1): its SSL is used by one
 /// task at a time (`borrow mut`), and only OpenSSL's read-only getters are reached through shared borrows.
 @threadSafe
@@ -102,8 +111,8 @@ public struct TlsTransport {
     /// The transport for `stream`, before its handshake. `host` is empty for a server.
     /// Safety: wt_ctx_new copies `host` and returns a fresh context or null; a null result frees nothing of ours.
     fn wrap(stream: PlainStream, config: borrow TlsConfig, host: StringView) -> Result<TlsTransport, NetError> {
-        let incoming = buffer(17408 + 5)?;
-        let outgoing = buffer(16384)?;
+        let incoming = buffer(FIRST_BYTES)?;
+        let outgoing = buffer(FIRST_BYTES)?;
         let side = if (config.isServer()) 1 else 0;
         let conn = unsafe { wt_ctx_new(config.handle(), side, host.ptr, host.length) };
         if (conn.isNull()) {
@@ -125,7 +134,7 @@ public struct TlsTransport {
     async fn handshake(borrow mut this, deadline: Deadline) -> Result<void, NetError> {
         loop {
             let r = unsafe { wt_handshake(this.conn) } as i64;
-            await this.sendOutput(deadline)?; // a flight, or the alert that ends a failed handshake
+            await this.sendOutput(deadline, false)?; // a flight, or the alert that ends a failed handshake
             if (r == Wt.done()) {
                 break;
             }
@@ -145,11 +154,20 @@ public struct TlsTransport {
         return Ok();
     }
 
-    /// Writes every byte of ciphertext the shim has for the peer.
-    /// Safety: wt_take copies at most the spare room's length into it.
-    async fn sendOutput(borrow mut this, deadline: Deadline) -> Result<void, NetError> {
+    /// Writes every byte of ciphertext the shim has for the peer. With `grow`, `outgoing` is reserved up to
+    /// WRITE_BYTES when the shim holds more than it: application data, not a handshake flight or an alert, so a
+    /// connection that only ever sends short responses keeps the small buffer.
+    /// Safety: `conn` is this transport's live context; wt_take copies at most the spare room's length into it.
+    async fn sendOutput(borrow mut this, deadline: Deadline, grow: bool) -> Result<void, NetError> {
         loop {
             this.outgoing.clear();
+            let small = this.outgoing.capacity() < WRITE_BYTES;
+            if (grow && small && unsafe { wt_pending(this.conn) } > this.outgoing.capacity() as u64) {
+                match (this.outgoing.reserve(WRITE_BYTES)) {
+                    Ok() => {}
+                    Err(_) => {} // the small buffer still sends it all, in more writes
+                }
+            }
             let spare = this.outgoing.spare();
             let n = unsafe { wt_take(this.conn, spare.ptr, spare.length) };
             if (n <= 0) {
@@ -174,7 +192,8 @@ public struct TlsTransport {
 
     /// Gives the shim more ciphertext: what was read before and not yet fed, else a new read from the stream by
     /// `deadline`. False at the end of the stream. During the handshake (`counting`), more than HANDSHAKE_BYTES is
-    /// `LimitExceeded`.
+    /// `LimitExceeded`. After the handshake, a read that fills `incoming` reserves it up to RECORD_BYTES, since more
+    /// is likely to follow.
     /// Safety: wt_feed reads at most the readable bytes' length from them and keeps no pointer.
     async fn pull(borrow mut this, deadline: Deadline, counting: bool) -> Result<bool, NetError> {
         if (this.incoming.isEmpty()) {
@@ -184,6 +203,12 @@ public struct TlsTransport {
                 return Ok(false);
             }
             this.incoming.commit(n)?;
+            if (!counting && this.incoming.spareLength() == 0 && this.incoming.capacity() < RECORD_BYTES) {
+                match (this.incoming.reserve(RECORD_BYTES)) {
+                    Ok() => {}
+                    Err(_) => {} // the small buffer still reads it all, in more reads
+                }
+            }
         }
         let ready = this.incoming.readable();
         let taken = unsafe { wt_feed(this.conn, ready.ptr, ready.length) };
@@ -252,7 +277,7 @@ impl Transport for TlsTransport {
             if (n != Wt.wantRead() && n != Wt.wantWrite()) {
                 return Err(this.failed());
             }
-            await this.sendOutput(Deadline.never())?; // a reply the protocol owes (a key update)
+            await this.sendOutput(Deadline.never(), false)?; // a reply the protocol owes (a key update)
             if (!await this.pull(Deadline.never(), false)?) {
                 return Ok(0);
             }
@@ -264,7 +289,7 @@ impl Transport for TlsTransport {
             return Err(NetError.Closed);
         }
         this.encrypt(bytes)?;
-        return await this.sendOutput(Deadline.never());
+        return await this.sendOutput(Deadline.never(), true);
     }
 
     /// Encrypts every part, then writes the records in as few writes as fit: all of `parts`, or an error.
@@ -278,7 +303,7 @@ impl Transport for TlsTransport {
             this.encrypt(p)?;
             total += p.length;
         }
-        await this.sendOutput(Deadline.never())?;
+        await this.sendOutput(Deadline.never(), true)?;
         return Ok(total);
     }
 
@@ -304,7 +329,7 @@ impl Transport for TlsTransport {
             return Err(NetError.Closed);
         }
         unsafe { wt_shutdown(this.conn); }
-        await this.sendOutput(Deadline.never())?;
+        await this.sendOutput(Deadline.never(), false)?;
         return await this.plain.shutdownWrite();
     }
 
