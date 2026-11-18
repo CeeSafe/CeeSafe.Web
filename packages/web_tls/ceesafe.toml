@@ -23,6 +23,19 @@ links = ["libssl", "libcrypto"]
 lib-dirs = ["$OPENSSL_LIB_DIR"]
 include-dirs = ["$OPENSSL_DIR/include"]
 
+[target.android]
+# A phone ships no OpenSSL an app may link: static archives built for it (tools/openssl-mobile.sh), in the directory
+# OPENSSL_ANDROID_DIR names for the ABI being built (CeeSafe ADR 0171; a packer such as claywind-pack sets it).
+links = ["ssl", "crypto"]
+lib-dirs = ["$OPENSSL_ANDROID_DIR/lib"]
+include-dirs = ["$OPENSSL_ANDROID_DIR/include"]
+
+[target.ios]
+# As Android: OPENSSL_IOS_DIR is the device's archives or the simulator's.
+links = ["ssl", "crypto"]
+lib-dirs = ["$OPENSSL_IOS_DIR/lib"]
+include-dirs = ["$OPENSSL_IOS_DIR/include"]
+
 [target.freebsd]
 # The base system's OpenSSL (3.0 on FreeBSD 14, 3.5 on 15), in /usr/lib and /usr/include (ceesafec 0.53.0, CeeSafe ADR 0149).
 links = ["ssl", "crypto"]
