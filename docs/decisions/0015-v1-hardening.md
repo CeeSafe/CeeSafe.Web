@@ -256,8 +256,30 @@ test, which is evidence the macOS runs cannot give.
         - **Tests:** every package's tests pass, and so do the allocation and cancellation sweeps of `web_core`,
           `web_http` and `web_http1`: 3,135 sweep runs and 0 failures, with ceesafec 0.62.2.
         - **Still to account for:** nginx holds 8 KB, and its TLS connections about 21 KB more than its plain ones.
-          CeeSafe.Web's `out` and `pending`, and its TLS connection's further 66 KB, are not yet measured block by
-          block.
+      - **Where a TLS connection's further bytes went** (2026-11-18, macOS 27.0.1 on the M1, ceesafec 0.62.2,
+        Homebrew's OpenSSL 3.6.4). `heap --showSizes` on `benchmarks/http`'s server, before and after 200 idle
+        HTTP/1.1 connections (one request each, then held), gave 102,659 bytes a connection over TLS and 41,215 in
+        clear. Each block's site is from `malloc_history` in a second run with `MallocStackLogging=1`, which moves
+        every block up one size class, so the sizes below are from the first run.
+
+        | held by | blocks | bytes |
+        |---|---|---:|
+        | `web_http1`'s `serve.cee`, as in clear | 16 KiB × 2 (`out`, `pending`), 4 KiB × 2 (head buffer, response head) | 40,960 |
+        | `TlsTransport.incoming` (`packages/web_tls/src/transport.cee:105`) | 17,413 bytes, which macOS's allocator rounds to 20 KiB | 20,480 |
+        | `TlsTransport.outgoing` (`transport.cee:106`) | 16 KiB | 16,384 |
+        | OpenSSL's `SSL_new` (`wt_ctx_new`) | the connection object, 6 KiB | 6,144 |
+        | OpenSSL's record layers (`tls1_change_cipher_state`), one each way | 5 KiB × 2 | 10,240 |
+        | OpenSSL and the transport's smaller blocks | 1 KiB × 4, and about 40 blocks under 1 KiB | 8,451 |
+
+        - **OpenSSL holds about 24.6 KB** a connection, near nginx's 21 KB over its plain connections. Its record
+          buffers are already released between records (`SSL_MODE_RELEASE_BUFFERS`), and the memory BIOs hold
+          nothing when idle.
+        - **The rest of the gap is the transport's own 36 KiB.** Both buffers stay allocated for the connection's
+          life, and an idle connection waits in `pull` with `incoming` lent to the read.
+          - `outgoing` holds nothing between writes: `sendOutput` takes the shim's ciphertext into it and writes it
+            before it returns.
+          - `incoming` holds bytes between reads only when a read was cancelled, or when the shim took fewer than
+            were read.
     - **TLS handshakes at 10 connections:**
 
       | server | handshakes a second | CPU per handshake | cores kept busy |
