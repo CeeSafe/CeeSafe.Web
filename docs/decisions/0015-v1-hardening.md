@@ -231,9 +231,37 @@ test, which is evidence the macOS runs cannot give.
       | nginx | 7,671 | 390 µs | 2.99 |
 
       CeeSafe.Web's handshakes are bounded by one core, while nginx spreads them over its workers.
-  - **Not yet in it**, of Web ADR 0005 §2.4: load at a constant rate (`wrk2`), and requests a second at a fixed p99.
-    wrk2's bundled LuaJIT does not build on arm64, so it waits for an x86-64 host to be tested on. Both test hosts
-    that could take it were unreachable on the day.
+  - **Added (2026-11-18), on branch `bench-slo`: requests a second at a fixed p99, under load at a constant rate.**
+    `run.py --slo-p99-ms <target>` adds a row for each h1 and tls-h1 row of `--slo-routes` (`/small` and `/json`
+    by default).
+    - **The load.** wrk2 (`$CW_WRK2`, else on PATH) runs at constant rates. A request's latency counts from when it
+      was due, so a stall cannot hide behind the requests that waited for it (coordinated omission).
+    - **The search.** Six probes of `--slo-duration` seconds (30) bisect from 0 up to h2load's rate for the same
+      row. The row's figure is the highest rate that wrk2 achieved to 97 %, with p99 within the target and no
+      errors.
+    - **What is left out.** wrk2 has no HTTP/2, and `/echo` would need a Lua script.
+    - **The report.** `report.py` gives these rows their own table, and the environment records wrk2 and the
+      target.
+  - **Tested (2026-11-18) on the FreeBSD 15.1 PC.** wrk2 was built there at `44a94c1`, which took two changes:
+    - `CC=cc`, since FreeBSD has no `gcc`;
+    - the Lua bytecode compiled from C (`luajit -b` to a `.c` file), since LLVM's linker refuses LuaJIT 2.0's
+      object file ("SHT_STRTAB string table section … is non-null terminated").
+
+    rq's wrk2, built with gcc on Linux, needed neither. At 10 connections, on CeeSafe.Web's server:
+
+    | target | mode | h2load's closed-loop rate | rate within the target | its p99 |
+    |---|---|---:|---:|---:|
+    | 5 ms | h1 | 145,705 | 143,428 | 2.33 ms |
+    | 5 ms | tls-h1 | 80,507 | 79,249 | 2.97 ms |
+    | 1 ms | h1, tls-h1, `/small` and `/json` | | 0 | over 1.17 ms |
+
+    The 1 ms result is wrk2's floor, not the server's. wrk2's p99 stayed at 1.17 ms or more even at 2,277 a
+    second, where h2load's closed-loop p99 at 145,000 a second was 70 µs. wrk2 schedules requests with
+    millisecond timers, so a target must sit well above its floor, which was about 2 ms at full rate. The report
+    lists every probe.
+  - **Fixed on the way:** the server's CPU read as 0 on FreeBSD. FreeBSD's `ps` takes everything after `pid=` in
+    `-o pid=,ppid=,…` as one column's header, so `run.py` now passes one `-o` a column. CPU read 0.89 cores there
+    afterwards, and macOS still reads it.
 - **The machine (the owner's choice):**
   - **A.** A dedicated bare-metal server, rented by the month (for example a Hetzner AX-line machine, or similar),
     used for nothing else. The load generator runs on a second machine or on pinned cores.

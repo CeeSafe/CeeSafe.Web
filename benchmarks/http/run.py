@@ -17,6 +17,9 @@ script's own, from the raw samples. Reported:
   request each, the server's RSS growth divided by their count;
 - TLS handshakes: oha (`oha` on PATH; `--no-handshakes` to skip) with keep-alive off on `/small`, a new connection and
   handshake per request, in tls-h1 at each connection count;
+- with `--slo-p99-ms`, requests a second at a fixed p99: wrk2 at constant rates (so latency counts from when each
+  request was due: no coordinated omission), bisected from h2load's rate for the same row down, for the highest
+  rate wrk2 achieves with p99 within the target and no errors; h1 and tls-h1 (wrk2 has no HTTP/2), `--slo-routes`;
 - allocations per request: two runs of the server at 10 connections, a warm-up's requests and the warm-up's plus a
   count's (`COUNTS`), each ending with the server's `CEESAFE_ALLOC_REPORT` line; the difference divided by the count.
 The server is built first (`ceesafec build`, with the ceesafec on PATH unless --ceesafec). TLS uses a self-signed
@@ -182,7 +185,9 @@ def ps_seconds(text):
 def processes():
     """{pid: (ppid, rss KiB, CPU seconds, user and system)} of every process. On Linux the CPU time is /proc's, in
     clock ticks, since Linux's `ps` gives whole seconds."""
-    r = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss=,time="], capture_output=True, text=True)
+    # One -o a column: FreeBSD's ps takes everything after `pid=` in "pid=,ppid=,…" as that column's header.
+    r = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "rss=", "-o", "time="], capture_output=True,
+                       text=True)
     table = {}
     linux = platform.system() == "Linux"
     tick = os.sysconf("SC_CLK_TCK") if linux else 1
@@ -303,6 +308,81 @@ def oha_handshakes(mode, conns, duration):
             "p50_us": us("p50"), "p99_us": us("p99"), "p999_us": us("p99.9")}
 
 
+WRK2 = os.environ.get("CW_WRK2") or "wrk2"
+# wrk2 speaks HTTP/1.1 only; GET routes only (/echo would need a Lua script).
+SLO_MODES = ("h1", "tls-h1")
+SLO_PROBES = 6
+
+
+def wrk_time_us(text):
+    """wrk2's duration (`850.00us`, `1.77ms`, `2.10s`, `1.00m`) in microseconds."""
+    m = re.fullmatch(r"([\d.]+)(us|ms|s|m)", text.strip())
+    if not m:
+        return None
+    return round(float(m.group(1)) * {"us": 1, "ms": 1e3, "s": 1e6, "m": 6e7}[m.group(2)])
+
+
+def wrk2(mode, path, conns, rate, duration):
+    """One wrk2 run at a constant `rate` a second over `conns` connections: its latency is measured from when each
+    request was due, not sent, so a stall is not hidden by requests that waited behind it (coordinated omission;
+    Web ADR 0005 §2.4)."""
+    threads = max(1, min(conns, (os.cpu_count() or 2) // 2))
+    r = subprocess.run([WRK2, f"-t{threads}", f"-c{conns}", f"-d{duration}s", f"-R{rate}", "--latency",
+                        base_url(mode) + path], capture_output=True, text=True)
+    out = {"target_rate": rate, "achieved_rate": None, "errors": 0}
+    for line in r.stdout.splitlines():
+        m = re.match(r"\s*(50|90|99|99\.900)\.?0*%\s+(\S+)", line)
+        if m and f"p{m.group(1).replace('.900', '9')}_us" not in out:
+            out[f"p{m.group(1).replace('.900', '9')}_us"] = wrk_time_us(m.group(2))
+        if line.startswith("Requests/sec:"):
+            out["achieved_rate"] = round(float(line.split()[1]))
+        if line.strip().startswith("Non-2xx or 3xx responses:"):
+            out["errors"] += int(line.split()[-1])
+        if line.strip().startswith("Socket errors:"):
+            out["errors"] += sum(int(n) for n in re.findall(r"\d+", line))
+    if out["achieved_rate"] is None:
+        out["error"] = (r.stderr or r.stdout).strip()[:200]
+    return out
+
+
+def meets(probe, slo_us):
+    """A rate is sustained within the target when wrk2 achieved it (97 % or more), its p99 is within it, and
+    nothing failed."""
+    return (probe.get("achieved_rate") is not None and probe["achieved_rate"] >= 0.97 * probe["target_rate"]
+            and probe.get("p99_us") is not None and probe["p99_us"] <= slo_us and probe["errors"] == 0)
+
+
+def slo_search(mode, route, conns, ceiling, slo_us, duration):
+    """The highest constant rate, of `SLO_PROBES` probes bisecting 0 to `ceiling` (h2load's closed-loop rate for the
+    same row, which a constant rate cannot pass), whose p99 is within `slo_us` (Web ADR 0005 §2.4: requests a second
+    at a fixed p99)."""
+    lo, hi, best, probes = 0, max(1, ceiling), None, []
+    for _ in range(SLO_PROBES):
+        rate = max(1, (lo + hi) // 2)
+        p = wrk2(mode, ROUTES[route], conns, rate, duration)
+        probes.append(p)
+        if meets(p, slo_us):
+            lo, best = rate, p
+        else:
+            hi = rate
+        if hi - lo <= max(1, ceiling // 100):
+            break
+    return {"slo_p99_us": slo_us, "rate_at_slo": best["target_rate"] if best else 0,
+            "p99_us_at_rate": best["p99_us"] if best else None, "ceiling": ceiling, "probes": probes}
+
+
+def slo_wanted(args, mode, route):
+    return args.slo_p99_ms and mode in SLO_MODES and route in args.slo_routes.split(",")
+
+
+def slo_row(args, name, mode, route, conns, ceiling, reactor=None):
+    s = slo_search(mode, route, conns, ceiling, round(args.slo_p99_ms * 1000), args.slo_duration)
+    s.update(server=name, mode=mode, route=route, conns=conns, **({"reactor": reactor} if reactor else {}))
+    print(f"| {name} | {reactor or ''} | {mode} | {route} | {conns} | {s['rate_at_slo']}/s at p99 <= "
+          f"{args.slo_p99_ms} ms (p99 {s['p99_us_at_rate']} us; of {s['ceiling']}) |", flush=True)
+    return s
+
+
 class Peak(threading.Thread):
     def __init__(self, pid):
         super().__init__(daemon=True)
@@ -411,6 +491,12 @@ def main():
                     help="idle connections to hold for bytes per idle connection (0: none; default 200, below "
                          "CeeSafe.Web's CW_WORKERS=256, which bounds the connections it holds)")
     ap.add_argument("--no-handshakes", action="store_true", help="no oha run of TLS handshakes")
+    ap.add_argument("--slo-p99-ms", type=float, default=0,
+                    help="also find the requests a second each h1 and tls-h1 row sustains with p99 within this many "
+                         "milliseconds, with wrk2 at constant rates ($CW_WRK2, else wrk2 on PATH); 0: not measured")
+    ap.add_argument("--slo-routes", default="small,json", help="the routes of the p99 search (GET routes)")
+    ap.add_argument("--slo-duration", type=int, default=30,
+                    help="seconds of each wrk2 probe (wrk2 calibrates its rate over the first seconds)")
     args = ap.parse_args()
     handshakes = not args.no_handshakes and shutil.which("oha") is not None
     if not args.no_handshakes and not handshakes and any(m.startswith("tls") for m in args.modes.split(",")):
@@ -463,6 +549,10 @@ def main():
                             r["mib_per_s"] = round(r["succeeded"] * GIBIBYTE / args.duration / 1048576)
                         results.append(r)
                         print(row(r), flush=True)
+                        if slo_wanted(args, mode, route):
+                            s = Server(tls if mode.startswith("tls") else None, scratch, route=route)
+                            results.append(slo_row(args, "ceesafe.web", mode, route, c, r["requests_per_s"], REACTOR))
+                            s.stop(base_url(mode))
                     if not args.no_alloc:
                         a = allocations(mode, route, tls if mode.startswith("tls") else None, scratch,
                                         posted)
@@ -606,6 +696,9 @@ def environment(args, name, modes, routes, conns):
                "the load generator, on the same machine, is not in it",
         "idle": (f"{args.idle} HTTP/1.1 connections after one request each, held idle for 1 s; RSS growth / count"
                  if args.idle else None),
+        "constant_rate": (f"wrk2 ({WRK2}: {first_line([WRK2, '-v'])}), constant rates bisected for "
+                          f"the most a second with p99 <= {args.slo_p99_ms} ms; {args.slo_duration} s a probe"
+                          if args.slo_p99_ms else None),
         "handshake_generator": (first_line(["oha", "--version"]) + ", keep-alive off: a handshake per request"
                                 if any(m.startswith("tls") for m in modes) and shutil.which("oha")
                                 and not args.no_handshakes else None),
@@ -706,6 +799,10 @@ def run_comparison(args, modes, routes, conns, scratch, body, results):
                     r.update(server=name, mode=mode, route=route, conns=c, peak_rss_kib=peak.peak)
                     results.append(r)
                     print(row(r), flush=True)
+                    if slo_wanted(args, mode, route):
+                        s = Comparison(name, scratch)
+                        results.append(slo_row(args, name, mode, route, c, r["requests_per_s"]))
+                        s.stop()
         if args.idle and "h1" in modes:
             s = Comparison(name, scratch)
             i = idle_connections(s.p.pid, plain, args.idle, False)
@@ -748,6 +845,8 @@ def run_nginx(args, modes, routes, conns, scratch, results, handshakes):
                         r["mib_per_s"] = round(r["succeeded"] * GIBIBYTE / args.duration / 1048576)
                     results.append(r)
                     print(row(r), flush=True)
+                    if slo_wanted(args, mode, route) and (root / route).exists():  # nginx serves files only
+                        results.append(slo_row(args, "nginx", mode, route, c, r["requests_per_s"]))
             if args.idle and mode in IDLE_MODES:
                 i = idle_connections(p.pid, PORT, args.idle, mode.startswith("tls"))
                 i.update(server="nginx", mode=mode)
