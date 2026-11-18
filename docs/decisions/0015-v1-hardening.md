@@ -193,11 +193,47 @@ test, which is evidence the macOS runs cannot give.
       alone. Against the run itself, it exited 0. With `--advisory`, it exited 0. Against the 2026-11-06 file,
       which recorded no environment, it exited 2.
     - The laptop's load average was 42 during the run, so the numbers are not results.
-  - **Not yet in it**, of Web ADR 0005 §2.4:
-    - load at a constant rate (`wrk2`), and requests a second at a fixed p99;
-    - CPU time;
-    - bytes per idle connection;
-    - TLS handshakes (`oha`).
+  - **Added (2026-11-18), on branch `bench-cpu-idle-tls`:** three more of Web ADR 0005 §2.4's measures, each in
+    `run.py`'s rows and in its own table of `report.py`.
+    - **CPU.** It is the server's process and children's user and system time over each run, from `/proc` on Linux
+      and `ps` elsewhere. nginx's workers are its master's children. It is reported as the cores kept busy over the
+      run's wall time, warm-up included, and as microseconds a request at the measured rate. The load generator's CPU
+      is not in it.
+    - **Bytes per idle connection** (`--idle`, 200 by default). The run makes HTTP/1.1 connections, in clear and
+      over TLS, and holds each idle for a second after one request. The server's RSS growth, divided by their
+      count, is the measure. The run also checks that every connection is still open at the measurement.
+      - 200 is below CeeSafe.Web's `CW_WORKERS=256`, which bounds the connections it holds (plan §11.7).
+      - h2c's idle connections are not measured yet.
+    - **TLS handshakes:** oha with keep-alive off on tls-h1, so each request is a new connection and a full
+      handshake.
+      - tls-h2 is not used for this. With `--http2`, oha 1.16 keeps its connections despite `--disable-keepalive`;
+        it measured 52,026 "handshakes" a second. A handshake costs the same whichever protocol ALPN picks.
+      - The requests still in flight at the deadline are counted apart (`cut_at_deadline`), not as errors.
+  - **Run (2026-11-18, the M1 laptop, 2 s at 10 connections, load average 2.2):** CeeSafe.Web, nginx (Homebrew's)
+    and Hyper. The numbers check the pipeline, not results, but two of them already stand out:
+    - **Idle connections.** All 200 were still open at the measurement each time.
+
+      | server | bytes per idle connection, HTTP/1.1 | over TLS |
+      |---|---:|---:|
+      | CeeSafe.Web | 70,615 | 137,544 |
+      | Hyper | 28,672 | not measured |
+      | nginx | 8,028 | 28,836 |
+
+      CeeSafe.Web's per-connection buffers come to about 48 KiB of that: the read buffer (`readBufferSize`, 16 KiB),
+      the write buffer (`writeBufferBytes`, 16 KiB) and a head of up to 16 KiB (`maxHeadBytes`). Plan §8 expects
+      bytes per idle connection to be a strong claim. Where the bytes go is to be measured before the report makes
+      that claim.
+    - **TLS handshakes at 10 connections:**
+
+      | server | handshakes a second | CPU per handshake | cores kept busy |
+      |---|---:|---:|---:|
+      | CeeSafe.Web | 3,671 | 251 µs | 0.92 |
+      | nginx | 7,671 | 390 µs | 2.99 |
+
+      CeeSafe.Web's handshakes are bounded by one core, while nginx spreads them over its workers.
+  - **Not yet in it**, of Web ADR 0005 §2.4: load at a constant rate (`wrk2`), and requests a second at a fixed p99.
+    wrk2's bundled LuaJIT does not build on arm64, so it waits for an x86-64 host to be tested on. Both test hosts
+    that could take it were unreachable on the day.
 - **The machine (the owner's choice):**
   - **A.** A dedicated bare-metal server, rented by the month (for example a Hetzner AX-line machine, or similar),
     used for nothing else. The load generator runs on a second machine or on pinned cores.

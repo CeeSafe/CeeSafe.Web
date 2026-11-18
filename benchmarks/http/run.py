@@ -11,6 +11,12 @@ favoured by multiplexing). Every request's latency comes from h2load's `--log-fi
 script's own, from the raw samples. Reported:
 - requests a second, and latency p50, p95, p99 and p99.9 in microseconds;
 - the server's peak RSS during the run (`ps`, polled every 100 ms);
+- the server's CPU: its process and children's user and system time over the run, as the cores it kept busy and as
+  microseconds a request;
+- bytes per idle connection (`--idle`, default 200): HTTP/1.1 connections, in clear and over TLS, held idle after one
+  request each, the server's RSS growth divided by their count;
+- TLS handshakes: oha (`oha` on PATH; `--no-handshakes` to skip) with keep-alive off on `/small`, a new connection and
+  handshake per request, in tls-h1 at each connection count;
 - allocations per request: two runs of the server at 10 connections, a warm-up's requests and the warm-up's plus a
   count's (`COUNTS`), each ending with the server's `CEESAFE_ALLOC_REPORT` line; the difference divided by the count.
 The server is built first (`ceesafec build`, with the ceesafec on PATH unless --ceesafec). TLS uses a self-signed
@@ -164,6 +170,139 @@ def base_url(mode):
     return f"{scheme}://127.0.0.1:{PORT}"
 
 
+def ps_seconds(text):
+    """macOS's and FreeBSD's `ps -o time`: [[hh:]mm:]ss.cc, with an optional `d-` of days."""
+    days, _, text = text.rpartition("-")
+    seconds = 0.0
+    for part in text.split(":"):
+        seconds = seconds * 60 + float(part)
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+def processes():
+    """{pid: (ppid, rss KiB, CPU seconds, user and system)} of every process. On Linux the CPU time is /proc's, in
+    clock ticks, since Linux's `ps` gives whole seconds."""
+    r = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss=,time="], capture_output=True, text=True)
+    table = {}
+    linux = platform.system() == "Linux"
+    tick = os.sysconf("SC_CLK_TCK") if linux else 1
+    for line in r.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        pid, ppid, rss = int(fields[0]), int(fields[1]), int(fields[2])
+        cpu = None
+        if linux:
+            try:
+                stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+                after = stat[stat.rindex(")") + 2:].split()  # fields from the third (state) on
+                cpu = (int(after[11]) + int(after[12])) / tick  # utime and stime, fields 14 and 15
+            except (OSError, ValueError, IndexError):
+                continue
+        else:
+            try:
+                cpu = ps_seconds(fields[3])
+            except ValueError:
+                continue
+        table[pid] = (ppid, rss, cpu)
+    return table
+
+
+def tree(root):
+    """`root` and its descendants (nginx's workers, for one): the server's rss KiB and CPU seconds."""
+    table = processes()
+    pids, grew = {root}, True
+    while grew:
+        more = {pid for pid, (ppid, _, _) in table.items() if ppid in pids and pid not in pids}
+        pids |= more
+        grew = bool(more)
+    present = [table[p] for p in pids if p in table]
+    return sum(p[1] for p in present), sum(p[2] for p in present)
+
+
+def cpu_fields(before, after, wall, rate):
+    """The server's CPU over one run: the cores it kept busy (its CPU time over the run's wall time, h2load's
+    one-second warm-up included), and from that the CPU per request at the measured rate. The load generator's CPU is
+    not in it."""
+    cores = (after - before) / wall
+    return {"cpu_cores": round(cores, 2), "cpu_us_per_request": round(cores * 1e6 / rate, 1) if rate else None}
+
+
+IDLE_REQUEST = b"GET /small HTTP/1.1\r\nhost: x\r\n\r\n"
+IDLE_MODES = ("h1", "tls-h1")
+HANDSHAKE_MODE = "tls-h1"
+
+
+def idle_connections(pid, port, count, tls):
+    """Bytes per idle connection (Web ADR 0005 §2.4): `count` connections, each after one request on HTTP/1.1 (over
+    TLS when `tls`), held open and idle for a second. The server's RSS growth over its RSS before, divided by
+    `count`. RSS moves by pages, and an allocator may keep memory it had, so this is an estimate. It is what a
+    connection costs, not a bound."""
+    rss_before, _ = tree(pid)
+    context = None
+    if tls:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.set_alpn_protocols(["http/1.1"])
+    held = []
+    try:
+        for _ in range(count):
+            s = socket.create_connection(("127.0.0.1", port), timeout=10)
+            if context:
+                s = context.wrap_socket(s)
+            s.sendall(IDLE_REQUEST)
+            data = b""
+            while not (b"\r\n\r\n" in data and data.endswith(b"hello, world\n")):
+                piece = s.recv(4096)
+                if not piece:
+                    break
+                data += piece
+            held.append(s)
+        time.sleep(1)
+        rss_after, _ = tree(pid)
+        open_now = 0
+        for s in held:  # still open: a read would wait, not see the end of the stream
+            s.setblocking(False)
+            try:
+                open_now += 1 if s.recv(1) else 0
+            except (BlockingIOError, ssl.SSLWantReadError):
+                open_now += 1
+            except OSError:
+                pass
+    finally:
+        for s in held:
+            s.close()
+    return {"idle_connections": count, "idle_open": open_now, "rss_before_kib": rss_before,
+            "rss_after_kib": rss_after,
+            "bytes_per_idle_connection": round((rss_after - rss_before) * 1024 / count) if count else None}
+
+
+def oha_handshakes(mode, conns, duration):
+    """TLS handshakes (Web ADR 0005 §2.4): oha with keep-alive off, so each request is a new connection and a new
+    handshake, on `/small`. Its rate is handshakes (and requests) a second; its latency includes the handshake.
+    HTTP/1.1 only (HANDSHAKE_MODE): with --http2, oha 1.16 keeps its connections despite --disable-keepalive, and a
+    handshake costs the same whichever protocol ALPN then picks."""
+    args = ["oha", "-z", f"{duration}s", "-c", str(conns), "--disable-keepalive", "--insecure", "--no-tui",
+            "--output-format", "json", base_url(mode) + "/small"]
+    r = subprocess.run(args, capture_output=True, text=True)
+    try:
+        out = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {"handshakes_per_s": None, "error": (r.stderr or r.stdout).strip()[:200]}
+    summary, pct = out.get("summary", {}), out.get("latencyPercentiles", {})
+    codes = out.get("statusCodeDistribution", {})
+    errors = dict(out.get("errorDistribution") or {})
+    # The requests still in flight when the duration ends (one a connection at most) are not failures.
+    cut = errors.pop("aborted due to deadline", 0)
+
+    def us(key):
+        return round(pct[key] * 1e6) if pct.get(key) is not None else None
+    return {"handshakes_per_s": round(summary.get("requestsPerSec") or 0), "ok": codes.get("200", 0),
+            "errors": sum(errors.values()), "error_kinds": errors, "cut_at_deadline": cut,
+            "p50_us": us("p50"), "p99_us": us("p99"), "p999_us": us("p99.9")}
+
+
 class Peak(threading.Thread):
     def __init__(self, pid):
         super().__init__(daemon=True)
@@ -268,7 +407,14 @@ def main():
     ap.add_argument("--nginx", action="store_true")
     ap.add_argument("--server", choices=sorted(COMPARISON))
     ap.add_argument("--no-alloc", action="store_true")
+    ap.add_argument("--idle", type=int, default=200,
+                    help="idle connections to hold for bytes per idle connection (0: none; default 200, below "
+                         "CeeSafe.Web's CW_WORKERS=256, which bounds the connections it holds)")
+    ap.add_argument("--no-handshakes", action="store_true", help="no oha run of TLS handshakes")
     args = ap.parse_args()
+    handshakes = not args.no_handshakes and shutil.which("oha") is not None
+    if not args.no_handshakes and not handshakes and any(m.startswith("tls") for m in args.modes.split(",")):
+        print("run: no oha on PATH, so no TLS handshake rows", flush=True)
     conns = [int(c) for c in args.conns.split(",")]
     modes, routes = args.modes.split(","), args.routes.split(",")
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="cw-bench-"))
@@ -290,7 +436,7 @@ def main():
     env = environment(args, name, run_modes, run_routes, conns)
     try:
         if args.nginx:
-            run_nginx(args, modes, routes, conns, scratch, results)
+            run_nginx(args, modes, routes, conns, scratch, results, handshakes)
         elif args.server:
             run_comparison(args, modes, routes, conns, scratch, body, results)
         else:
@@ -306,7 +452,9 @@ def main():
                         s = Server(tls if mode.startswith("tls") else None, scratch, route=route)
                         peak = Peak(s.p.pid)
                         peak.start()
+                        cpu = tree(s.p.pid)[1]
                         r = h2load(mode, ROUTES[route], c, args.duration, scratch, posted)
+                        r.update(cpu_fields(cpu, tree(s.p.pid)[1], args.duration + 1, r["requests_per_s"]))
                         peak.done = True
                         s.stop(base_url(mode))
                         r.update(server="ceesafe.web", mode=mode, route=route, conns=c, peak_rss_kib=peak.peak,
@@ -321,6 +469,24 @@ def main():
                         results.append({"server": "ceesafe.web", "mode": mode, "route": route,
                                         "reactor": REACTOR, "allocations_per_request": a})
                         print(f"| {mode} | {route} | allocations per request | {a} |", flush=True)
+                tls_mode = mode.startswith("tls")
+                if args.idle and mode in IDLE_MODES:
+                    s = Server(tls if tls_mode else None, scratch)
+                    i = idle_connections(s.p.pid, PORT, args.idle, tls_mode)
+                    s.stop(base_url(mode))
+                    i.update(server="ceesafe.web", mode=mode, reactor=REACTOR)
+                    results.append(i)
+                    print(idle_row(i), flush=True)
+                if mode == HANDSHAKE_MODE and handshakes:
+                    for c in conns:
+                        s = Server(tls, scratch)
+                        cpu = tree(s.p.pid)[1]
+                        h = oha_handshakes(mode, c, args.duration)
+                        h.update(cpu_fields(cpu, tree(s.p.pid)[1], args.duration, h["handshakes_per_s"]))
+                        s.stop(base_url(mode))
+                        h.update(server="ceesafe.web", mode=mode, route="small", conns=c, reactor=REACTOR)
+                        results.append(h)
+                        print(handshake_row(h), flush=True)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     if args.json:
@@ -436,6 +602,13 @@ def environment(args, name, modes, routes, conns):
         "reactor": REACTOR if name == "ceesafe.web" else None,
         "load_generator": first_line(["h2load", "--version"]),
         "method": "h2load, one request at a time on each connection (-m 1), latency from its --log-file",
+        "cpu": "the server's process and its children (user and system time) over each run, as cores kept busy; "
+               "the load generator, on the same machine, is not in it",
+        "idle": (f"{args.idle} HTTP/1.1 connections after one request each, held idle for 1 s; RSS growth / count"
+                 if args.idle else None),
+        "handshake_generator": (first_line(["oha", "--version"]) + ", keep-alive off: a handshake per request"
+                                if any(m.startswith("tls") for m in modes) and shutil.which("oha")
+                                and not args.no_handshakes else None),
         "duration_s": args.duration,
         "warm_up_s": 1,
         "conns": conns,
@@ -524,18 +697,27 @@ def run_comparison(args, modes, routes, conns, scratch, body, results):
                     PORT = s.h2c_port if mode == "h2c" else plain
                     peak = Peak(s.p.pid)
                     peak.start()
+                    cpu = tree(s.p.pid)[1]
                     r = h2load(mode, ROUTES[route], c, args.duration, scratch, posted)
+                    r.update(cpu_fields(cpu, tree(s.p.pid)[1], args.duration + 1, r["requests_per_s"]))
                     peak.done = True
                     PORT = plain
                     s.stop()
                     r.update(server=name, mode=mode, route=route, conns=c, peak_rss_kib=peak.peak)
                     results.append(r)
                     print(row(r), flush=True)
+        if args.idle and "h1" in modes:
+            s = Comparison(name, scratch)
+            i = idle_connections(s.p.pid, plain, args.idle, False)
+            s.stop()
+            i.update(server=name, mode="h1")
+            results.append(i)
+            print(idle_row(i), flush=True)
     finally:
         PORT = plain
 
 
-def run_nginx(args, modes, routes, conns, scratch, results):
+def run_nginx(args, modes, routes, conns, scratch, results, handshakes):
     global PORT
     root = scratch / "root"
     root.mkdir()
@@ -558,12 +740,27 @@ def run_nginx(args, modes, routes, conns, scratch, results):
                     continue
                 for c in conns:
                     path = "/file1g" if route == "file1g" else ROUTES[route]
+                    cpu = tree(p.pid)[1]  # the master and its workers
                     r = h2load(mode, path, c, args.duration, scratch, None)
+                    r.update(cpu_fields(cpu, tree(p.pid)[1], args.duration + 1, r["requests_per_s"]))
                     r.update(server="nginx", mode=mode, route=route, conns=c)
                     if route == "file1g":
                         r["mib_per_s"] = round(r["succeeded"] * GIBIBYTE / args.duration / 1048576)
                     results.append(r)
                     print(row(r), flush=True)
+            if args.idle and mode in IDLE_MODES:
+                i = idle_connections(p.pid, PORT, args.idle, mode.startswith("tls"))
+                i.update(server="nginx", mode=mode)
+                results.append(i)
+                print(idle_row(i), flush=True)
+            if mode == HANDSHAKE_MODE and handshakes:
+                for c in conns:
+                    cpu = tree(p.pid)[1]
+                    h = oha_handshakes(mode, c, args.duration)
+                    h.update(cpu_fields(cpu, tree(p.pid)[1], args.duration, h["handshakes_per_s"]))
+                    h.update(server="nginx", mode=mode, route="small", conns=c)
+                    results.append(h)
+                    print(handshake_row(h), flush=True)
     finally:
         PORT = plain
         p.terminate()
@@ -574,7 +771,19 @@ def row(r):
     return (f"| {r['server']} | {r.get('reactor', '')} | {r['mode']} | {r['route']} | {r['conns']} | "
             f"{r['requests_per_s']} | {r.get('mib_per_s', '')} | {r['p50_us']} | {r['p95_us']} | {r['p99_us']} | "
             f"{r['p999_us']} | "
-            f"{r.get('peak_rss_kib', '')} | {r['failed']} |")
+            f"{r.get('peak_rss_kib', '')} | {r.get('cpu_cores', '')} | {r.get('cpu_us_per_request', '')} | "
+            f"{r['failed']} |")
+
+
+def idle_row(i):
+    return (f"| {i['server']} | {i.get('reactor', '')} | {i['mode']} | idle | {i['idle_connections']} "
+            f"({i['idle_open']} open) | {i['bytes_per_idle_connection']} bytes each |")
+
+
+def handshake_row(h):
+    return (f"| {h['server']} | {h.get('reactor', '')} | {h['mode']} | handshakes | {h['conns']} | "
+            f"{h['handshakes_per_s']}/s | {h.get('p50_us')} | {h.get('p99_us')} | {h.get('cpu_cores')} | "
+            f"{h.get('errors', h.get('error'))} |")
 
 
 if __name__ == "__main__":
