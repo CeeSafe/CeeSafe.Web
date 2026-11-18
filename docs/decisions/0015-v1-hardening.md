@@ -219,10 +219,45 @@ test, which is evidence the macOS runs cannot give.
       | Hyper | 28,672 | not measured |
       | nginx | 8,028 | 28,836 |
 
-      CeeSafe.Web's per-connection buffers come to about 48 KiB of that: the read buffer (`readBufferSize`, 16 KiB),
-      the write buffer (`writeBufferBytes`, 16 KiB) and a head of up to 16 KiB (`maxHeadBytes`). Plan §8 expects
-      bytes per idle connection to be a strong claim. Where the bytes go is to be measured before the report makes
-      that claim.
+      Plan §8 expects bytes per idle connection to be a strong claim for CeeSafe.Web.
+      - **Where the bytes went** (2026-11-18). Measured with macOS's `heap` on the server, before and after 200 idle
+        connections, each connection held these blocks:
+        - four of 16 KiB: two head buffers (`maxHeadBytes`), and the write buffer `out` and the response buffer
+          `pending` (`writeBufferBytes`);
+        - one of 4 KiB, the response head;
+        - one of 256 bytes.
+
+        That is 68 KiB, from `packages/web_http1/src/serve.cee`, allocated at a connection's start and kept for its
+        life.
+        - The 256 connection workers' frames, 14 KB each, are made at startup and are not counted per connection.
+        - An earlier guess on this page named `readBufferSize`. That is not among them.
+      - **Changed** (the owner, asked how far to go: "Lazy and small buffers"). `serve.cee` now sizes the head
+        buffers:
+        - The head buffer starts at 4 KiB. It is reserved up to `maxHeadBytes` only for a longer head, and a head
+          past the limit is still 431.
+        - The second head buffer starts empty. It takes `maxHeadBytes` only when bytes follow a head, or when
+          `Exchange` reads a body or a peer's close into it (`roomInCarry`).
+        - `out` and `pending` keep 16 KiB, because `pending` is what gives a response shorter than it a
+          `Content-Length`.
+        - `OwnedBuffer.reserve`, new in `web_core`, is the explicit reallocation. Buffers still never grow by
+          themselves (Web ADR 0001 §3.1).
+
+        Measured afterwards (`heap`, then `run.py`):
+
+        | connection | bytes | before |
+        |---|---:|---:|
+        | idle GET, `heap` | 40 KiB | 68 KiB |
+        | after a request body, `heap` | 56 KiB | 68 KiB |
+        | idle HTTP/1.1, `run.py` | 41,943 | 70,615 |
+        | idle over TLS, `run.py` | 108,626 | 137,544 |
+
+        - **Allocations per request** are unchanged: main and the branch gave the same on all 12 h1 and h2c routes,
+          for example 0 on `/small` and 1 on `/echo`.
+        - **Tests:** every package's tests pass, and so do the allocation and cancellation sweeps of `web_core`,
+          `web_http` and `web_http1`: 3,135 sweep runs and 0 failures, with ceesafec 0.62.2.
+        - **Still to account for:** nginx holds 8 KB, and its TLS connections about 21 KB more than its plain ones.
+          CeeSafe.Web's `out` and `pending`, and its TLS connection's further 66 KB, are not yet measured block by
+          block.
     - **TLS handshakes at 10 connections:**
 
       | server | handshakes a second | CPU per handshake | cores kept busy |
