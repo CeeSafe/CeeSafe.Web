@@ -96,6 +96,7 @@ def environment_table(runs):
     field("CPU", lambda e: e["cpu"])
     field("idle connections", lambda e: e["idle"])
     field("TLS handshakes", lambda e: e["handshake_generator"])
+    field("constant rate", lambda e: e["constant_rate"])
     field("duration (s)", lambda e: e["duration_s"])
     field("warm-up (s)", lambda e: e["warm_up_s"])
     field("connections", lambda e: ", ".join(str(c) for c in e["conns"]))
@@ -187,6 +188,22 @@ def handshake_table(runs):
     return out
 
 
+def slo_table(runs):
+    rows = [r for run in runs for r in run.results if "rate_at_slo" in r]
+    if not rows:
+        return []
+    out = ["", "## Requests a second at a fixed p99", "",
+           "wrk2 at constant rates, so a request's latency counts from when it was due (no coordinated omission): "
+           "the highest rate, of a bisection below h2load's rate for the same row, that wrk2 achieved with p99 "
+           "within the target and no errors.", "",
+           "| server | mode | route | conns | p99 target µs | req/s within it | its p99 µs | h2load's req/s | "
+           "probes |", "|---|---|---|---:|---:|---:|---:|---:|---:|"]
+    for r in sorted(rows, key=lambda r: (r["mode"], r["route"], r["conns"], -r["rate_at_slo"])):
+        out.append(f"| {label(r)} | {r['mode']} | `/{r['route']}` | {r['conns']} | {r['slo_p99_us']} | "
+                   f"{r['rate_at_slo']} | {cell(r.get('p99_us_at_rate'))} | {r['ceiling']} | {len(r['probes'])} |")
+    return out
+
+
 def measured(runs):
     """CeeSafe.Web's rows by (reactor, mode, route, connections)."""
     rows = {}
@@ -256,7 +273,7 @@ def main():
     listed = payloads(runs)
     if listed:
         out += ["", "Payloads:", ""] + listed
-    out += (["", "## Results"] + result_tables(runs) + allocation_table(runs) + idle_table(runs) +
+    out += (["", "## Results"] + result_tables(runs) + allocation_table(runs) + slo_table(runs) + idle_table(runs) +
             handshake_table(runs))
     status = 0
     if baseline:
