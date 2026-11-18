@@ -280,6 +280,30 @@ test, which is evidence the macOS runs cannot give.
             before it returns.
           - `incoming` holds bytes between reads only when a read was cancelled, or when the shim took fewer than
             were read.
+      - **Changed** (the owner, asked how far to go: "Small, grow on need"). In `transport.cee`:
+        - Both buffers start at 4 KiB (`FIRST_BYTES`).
+        - `outgoing` is reserved up to 16 KiB when the shim holds more ciphertext than it, on a write of application
+          data.
+        - `incoming` is reserved up to a record (17,413 bytes) when a read fills it.
+        - Neither grows during the handshake or for an alert, and a failed reservation keeps the small buffer, which
+          still carries every byte in more reads and writes. A connection keeps what it reserved.
+
+        Measured afterwards (2026-11-18, the M1, ceesafec 0.70.0 for both builds):
+
+        | | main | the branch |
+        |---|---:|---:|
+        | idle TLS connection after `/small`, `heap` | 102,659 | 73,987 |
+        | allocations per request, tls-h1 (`/small`, `/4k`, `/64k`, `/echo`) | 7, 7, 23, 8 | 7, 7, 23, 8 |
+        | allocations per request, tls-h2 (the same) | 17.80, 17.84, 46.00, 20.78 | 17.76, 17.70, 46.01, 20.67 |
+
+        - **Tests:** every package's tests pass (26 runs, 2 interpreter runs skipped for C). `web_tls`'s allocation
+          sweep (3,590 runs) and cancellation sweep (969 runs) pass with 0 failures.
+        - **Not measured:** throughput. Other builds kept the laptop's load average between 26 and 120, and plain
+          HTTP/1.1, whose code did not change, fell as far as TLS. Interleaved 3 s runs of tls-h1 `/64k` and `/echo`
+          put main and the branch within each other's noise. Once a connection's buffers have grown, its path is
+          main's. It is to be measured on rq.
+        - `run.py`'s RSS-based idle figure gave 4,178 bytes for main's TLS connections in that run, which `heap`
+          contradicts; under that load it is not a measurement.
     - **TLS handshakes at 10 connections:**
 
       | server | handshakes a second | CPU per handshake | cores kept busy |
