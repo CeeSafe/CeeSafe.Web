@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CEESAFE_VERSION: v0.62.2 # main's minimum from 2026-11-17 (docs/toolchain.md)
+  CEESAFE_VERSION: v0.69.0 # main's minimum from 2026-11-18 (docs/toolchain.md)
 
 jobs:
   test:
