@@ -11,8 +11,9 @@ report has:
   flags, the reactor, the concurrency, the payloads, the TLS settings and the warm-up), and a warning when the runs
   were not on one machine with one kernel;
 - for each mode and route, every server's rows: requests a second, latency p50, p95, p99 and p99.9 in microseconds,
-  the peak RSS and the failed requests;
-- CeeSafe.Web's allocations per request.
+  the peak RSS, the CPU (cores kept busy, and microseconds a request) and the failed requests;
+- CeeSafe.Web's allocations per request;
+- bytes per idle connection, and TLS handshakes a second (oha), where the runs measured them.
 
 Files from before run.py recorded an environment (a bare list of rows) are read too; their environment is "not
 recorded", and rows without a p95 show "–".
@@ -92,6 +93,9 @@ def environment_table(runs):
     field("reactor", lambda e: e["reactor"])
     field("load generator", lambda e: e["load_generator"])
     field("method", lambda e: e["method"])
+    field("CPU", lambda e: e["cpu"])
+    field("idle connections", lambda e: e["idle"])
+    field("TLS handshakes", lambda e: e["handshake_generator"])
     field("duration (s)", lambda e: e["duration_s"])
     field("warm-up (s)", lambda e: e["warm_up_s"])
     field("connections", lambda e: ", ".join(str(c) for c in e["conns"]))
@@ -125,13 +129,14 @@ def result_tables(runs):
         throughput = any("mib_per_s" in r for r in group)
         out += ["", f"### {key[0]}, `/{key[1]}`", "",
                 "| server | conns | req/s |" + (" MiB/s |" if throughput else "") +
-                " p50 µs | p95 µs | p99 µs | p99.9 µs | peak RSS KiB | failed |",
-                "|---|---:|---:|" + ("---:|" if throughput else "") + "---:|---:|---:|---:|---:|---:|"]
+                " p50 µs | p95 µs | p99 µs | p99.9 µs | peak RSS KiB | CPU cores | CPU µs/req | failed |",
+                "|---|---:|---:|" + ("---:|" if throughput else "") + "---:|---:|---:|---:|---:|---:|---:|---:|"]
         for r in group:
             out.append(f"| {label(r)} | {r['conns']} | {r['requests_per_s']} |" +
                        (f" {cell(r.get('mib_per_s'))} |" if throughput else "") +
                        f" {cell(r.get('p50_us'))} | {cell(r.get('p95_us'))} | {cell(r.get('p99_us'))} |"
-                       f" {cell(r.get('p999_us'))} | {cell(r.get('peak_rss_kib'))} | {r['failed']} |")
+                       f" {cell(r.get('p999_us'))} | {cell(r.get('peak_rss_kib'))} | {cell(r.get('cpu_cores'))} |"
+                       f" {cell(r.get('cpu_us_per_request'))} | {r['failed']} |")
         negotiated = sorted({(label(r),) + tuple(r.get(k) or "?" for k in TLS_FIELDS)
                              for r in group if any(r.get(k) for k in TLS_FIELDS)})
         if negotiated:
@@ -147,6 +152,38 @@ def allocation_table(runs):
            "|---|---|---|---:|"]
     for r in sorted(rows, key=lambda r: (label(r),) + order((r["mode"], r["route"]))):
         out.append(f"| {label(r)} | {r['mode']} | `/{r['route']}` | {cell(r['allocations_per_request'])} |")
+    return out
+
+
+def idle_table(runs):
+    rows = [r for run in runs for r in run.results if "bytes_per_idle_connection" in r]
+    if not rows:
+        return []
+    out = ["", "## Bytes per idle connection", "",
+           "HTTP/1.1 connections held idle after one request each: the server's RSS growth over their count. RSS "
+           "moves by pages and an allocator may keep what it had, so it is an estimate.", "",
+           "| server | mode | connections | still open | RSS before KiB | RSS after KiB | bytes per connection |",
+           "|---|---|---:|---:|---:|---:|---:|"]
+    for r in sorted(rows, key=lambda r: (label(r), r["mode"])):
+        out.append(f"| {label(r)} | {r['mode']} | {r['idle_connections']} | {r['idle_open']} | "
+                   f"{r['rss_before_kib']} | {r['rss_after_kib']} | {cell(r['bytes_per_idle_connection'])} |")
+    return out
+
+
+def handshake_table(runs):
+    rows = [r for run in runs for r in run.results if "handshakes_per_s" in r]
+    if not rows:
+        return []
+    out = ["", "## TLS handshakes", "",
+           "oha with keep-alive off on `/small`: each request is a new connection and a full handshake; the latency "
+           "includes it.", "",
+           "| server | mode | conns | handshakes/s | p50 µs | p99 µs | p99.9 µs | CPU cores | CPU µs/handshake | "
+           "errors |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for r in sorted(rows, key=lambda r: (label(r), r["mode"], r["conns"])):
+        out.append(f"| {label(r)} | {r['mode']} | {r['conns']} | {cell(r['handshakes_per_s'])} | "
+                   f"{cell(r.get('p50_us'))} | {cell(r.get('p99_us'))} | {cell(r.get('p999_us'))} | "
+                   f"{cell(r.get('cpu_cores'))} | {cell(r.get('cpu_us_per_request'))} | "
+                   f"{cell(r.get('errors', r.get('error')))} |")
     return out
 
 
@@ -219,7 +256,8 @@ def main():
     listed = payloads(runs)
     if listed:
         out += ["", "Payloads:", ""] + listed
-    out += ["", "## Results"] + result_tables(runs) + allocation_table(runs)
+    out += (["", "## Results"] + result_tables(runs) + allocation_table(runs) + idle_table(runs) +
+            handshake_table(runs))
     status = 0
     if baseline:
         section, regressed, same = regression_section(runs, baseline, args.gate)
