@@ -367,6 +367,7 @@ public struct Exchange<region r> {
             BodyState.Done => {}
             _ => { return Err(HandlerError.Internal); }
         }
+        this.roomInCarry()?;
         loop {
             this.carry.compact();
             if (this.carry.spareLength() == 0) {
@@ -403,6 +404,7 @@ public struct Exchange<region r> {
 
     /// Reads more of the connection into `carry`, bounded by the minimum-rate deadline.
     async fn receive(borrow mut this) -> Result<void, HandlerError> {
+        this.roomInCarry()?;
         this.carry.compact();
         let n = match (await Transports.readWithin(this.conn, this.carry.spare(), this.rate.deadline())) {
             Ok(n) => n,
@@ -426,6 +428,18 @@ public struct Exchange<region r> {
         match (this.carry.commit(n)) {
             Ok() => { return Ok(); }
             Err(_) => { return Err(HandlerError.Internal); }
+        }
+    }
+
+    /// Gives `carry` `maxHeadBytes` before a read into it: an HTTP/1.1 connection makes its second head buffer only
+    /// when it needs one (web_http1's `serve`), and a body or a peer's close is read into it. Once per connection.
+    fn roomInCarry(borrow mut this) -> Result<void, HandlerError> {
+        if (this.carry.capacity() >= this.limits.maxHeadBytes) {
+            return Ok();
+        }
+        match (this.carry.reserve(this.limits.maxHeadBytes)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HandlerError.Io(NetError.OutOfMemory)); }
         }
     }
 

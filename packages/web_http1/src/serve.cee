@@ -1,9 +1,14 @@
 // The HTTP/1.1 connection driver (Web ADR 0004 §3.2; implementation plan §7, M2 task 4): read a head, parse it in
 // place, run the application, finish the response and the body, and go on while the connection is kept alive.
 //
-// Buffers, allocated once per connection: two head buffers that swap roles (the request's views borrow one while the
+// Buffers, kept for the connection's life: two head buffers that swap roles (the request's views borrow one while the
 // bytes after its head, a body prefix or pipelined requests, wait in the other), the write buffer `out` and the
-// response buffer `pending`.
+// response buffer `pending`. What an idle connection holds is mostly these (Web ADR 0015 §6), so the head buffers are
+// made only as large as the requests need:
+// - `a` starts at `FIRST_HEAD_BYTES`, and is reserved up to `maxHeadBytes` only for a head that does not fit;
+// - `b` starts empty. It takes `maxHeadBytes` only when bytes follow a head, or when the exchange reads a body or a
+//   peer's close into it (`Exchange`'s `carry`). The two swap only when `b` holds the next request's start.
+// A connection keeps what it reserved, so a keep-alive request still allocates nothing once its buffers exist.
 //
 // Pipelining is sequential with coalescing: a finished response stays in `out` while another complete request is
 // already buffered, so a burst of pipelined requests is answered with one write. `out` is sent when no complete
@@ -31,9 +36,11 @@ public async fn serveFrom(
     limits: borrow Limits,
     already: Slice<u8>,
 ) -> Result<void, NetError> {
-    var a = buffer(limits.maxHeadBytes)?;
+    let first = if (limits.maxHeadBytes < FIRST_HEAD_BYTES || already.length > FIRST_HEAD_BYTES) limits.maxHeadBytes
+        else FIRST_HEAD_BYTES;
+    var a = buffer(first)?;
     a.append(already)?;
-    var b = buffer(limits.maxHeadBytes)?;
+    var b = buffer(0)?;
     var out = buffer(limits.writeBufferBytes)?;
     var pending = buffer(limits.writeBufferBytes)?;
     var date = DateCache.create(limits.sendDate);
@@ -60,8 +67,15 @@ public async fn serveFrom(
             await flush(conn, mut out, limits)?;
             a.compact();
             if (a.spareLength() == 0) {
-                await reject(conn, mut out, mut response, mut date, Status.headerFieldsTooLarge(), limits);
-                return Ok();
+                if (a.capacity() >= limits.maxHeadBytes) {
+                    await reject(conn, mut out, mut response, mut date, Status.headerFieldsTooLarge(), limits);
+                    return Ok();
+                }
+                // A head longer than the first buffer: room for the longest allowed (the scanner checks the limit).
+                match (a.reserve(limits.maxHeadBytes)) {
+                    Ok() => {}
+                    Err(_) => { return Err(NetError.OutOfMemory); }
+                }
             }
             let idle = a.isEmpty();
             if (idle && connection.isDraining()) {
@@ -127,13 +141,18 @@ public async fn serveFrom(
             }
             return Ok();
         }
-        // The bytes after this head, in `b`, start the next request.
         a.clear();
-        let t = a;
-        a = b;
-        b = t;
+        if (!b.isEmpty()) {
+            // The bytes after this head, in `b`, start the next request.
+            let t = a;
+            a = b;
+            b = t;
+        }
     }
 }
+
+/// The head buffer a connection starts with: most requests' heads fit in it (a browser's are typically under 2 KiB).
+const FIRST_HEAD_BYTES: usize = 4096;
 
 /// One request: parse the head `a[start..end]`, run the application, finish. True to keep the connection.
 async fn exchangeOne(
@@ -159,6 +178,12 @@ async fn exchangeOne(
         },
     };
     b.clear();
+    if (end < input.length && b.capacity() < limits.maxHeadBytes) {
+        match (b.reserve(limits.maxHeadBytes)) {
+            Ok() => {}
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
     b.append(input[end..])?;
     var noStream = NoStream {};
     var ex = Exchange.create(

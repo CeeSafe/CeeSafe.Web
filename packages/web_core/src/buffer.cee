@@ -1,9 +1,10 @@
 // web_core buffers (Web ADR 0001 §3.1): fixed-capacity owned bytes, and a pool that recycles them by move.
 
 /// A fixed-capacity byte buffer with a readable window: bytes are written into `spare()` and made readable with
-/// `commit(n)`, then read from `readable()` and released with `consume(n)`. It never grows; a write past its capacity
-/// is `NetError.LimitExceeded`. Lending `spare()` or `readable()` to an operation borrows the buffer, so it cannot be
-/// changed, moved, recycled or dropped while the operation uses it (Web ADR 0001 §1).
+/// `commit(n)`, then read from `readable()` and released with `consume(n)`. It never grows by itself; a write past
+/// its capacity is `NetError.LimitExceeded`, and only `reserve` changes the capacity. Lending `spare()` or
+/// `readable()` to an operation borrows the buffer, so it cannot be changed, moved, recycled or dropped while the
+/// operation uses it (Web ADR 0001 §1).
 @noncopy
 public struct OwnedBuffer {
     private data: Vector<u8>;
@@ -103,6 +104,28 @@ public struct OwnedBuffer {
     public fn clear(borrow mut this) {
         this.start = 0;
         this.end = 0;
+    }
+
+    /// Gives the buffer `capacity` bytes, keeping its readable bytes at the start. This is a new allocation, made
+    /// only when asked: buffers do not grow implicitly (Web ADR 0001 §3.1). A `capacity` at or below the current one
+    /// changes nothing. It borrows the buffer mutably, so it cannot run while an operation holds `spare()` or
+    /// `readable()`. If the allocation fails, the buffer is as it was.
+    public fn reserve(borrow mut this, capacity: usize) -> Result<void, AllocError> {
+        if (capacity <= this.data.length) {
+            return Ok();
+        }
+        var data = Vector<u8>.withCapacity(capacity)?;
+        data.resize(capacity, 0)?; // within the capacity reserved above: no allocation, one fill
+        let n = this.end - this.start;
+        {
+            let all = data.viewMut();
+            let to = borrow mut all[0..n];
+            to.copyFrom(this.readable());
+        }
+        this.data = data;
+        this.start = 0;
+        this.end = n;
+        return Ok();
     }
 }
 
