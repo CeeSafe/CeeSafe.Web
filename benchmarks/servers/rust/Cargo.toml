@@ -9,12 +9,15 @@ bytes = "=1.12.1"
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 http-body-util = "=0.1.5"
 hyper = { version = "=1.12.0", features = ["server", "http1", "http2"] }
-hyper-util = { version = "=0.1.21", features = ["server-auto", "tokio"] }
+hyper-util = { version = "=0.1.21", features = ["server-auto", "service", "tokio"] }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "macros"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "http2", "tokio", "json"] }
-actix-web = { version = "=4.20.0", default-features = false, features = ["macros", "http2"] }
+actix-web = { version = "=4.20.0", default-features = false, features = ["macros", "http2", "rustls-0_23"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "=1.0.154"
+# TLS (Web ADR 0015 §6): rustls with its default crypto provider, aws-lc-rs, as Rust servers are usually deployed.
+rustls = "=0.23.46"
+tokio-rustls = { version = "=0.26.6", default-features = false }
 
 # Release builds as the plan asks: optimised, one codegen unit, LTO, no debug assertions.
 [profile.release]

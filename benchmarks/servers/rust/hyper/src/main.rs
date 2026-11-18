@@ -1,5 +1,6 @@
 //! Hyper alone (no framework): the routes of benchmarks/servers/conform.py's contract, HTTP/1.1 and h2c with prior
-//! knowledge on one port (hyper-util's auto builder), on Tokio's multi-threaded runtime (a worker per core).
+//! knowledge on one port (hyper-util's auto builder), on Tokio's multi-threaded runtime (a worker per core). With
+//! CW_CERT and CW_KEY, TLS on that port instead (rustls, tokio-rustls; ALPN h2, then http/1.1).
 
 use bench_common::{bodies, ECHO_LIMIT, MESSAGE, STREAM_PIECES};
 use bytes::Bytes;
@@ -12,7 +13,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use std::convert::Infallible;
+use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 type Body = BoxBody<Bytes, Infallible>;
 
@@ -54,12 +57,24 @@ async fn route(req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     bodies();
+    let tls = bench_common::tls(&[b"h2", b"http/1.1"]).map(|c| TlsAcceptor::from(Arc::new(c)));
     let listener = TcpListener::bind(bench_common::address()).await?;
     loop {
         let (socket, _) = listener.accept().await?;
         let _ = socket.set_nodelay(true);
+        let tls = tls.clone();
         tokio::spawn(async move {
-            let _ = Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(socket), service_fn(route)).await;
+            let http = Builder::new(TokioExecutor::new());
+            match tls {
+                Some(acceptor) => {
+                    if let Ok(stream) = acceptor.accept(socket).await {
+                        let _ = http.serve_connection(TokioIo::new(stream), service_fn(route)).await;
+                    }
+                }
+                None => {
+                    let _ = http.serve_connection(TokioIo::new(socket), service_fn(route)).await;
+                }
+            }
         });
     }
 }

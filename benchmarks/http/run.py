@@ -37,12 +37,15 @@ environment, which the server inherits. Each row records which (`reactor`).
 
 `--server` runs them against one of the comparison servers of Web ADR 0015 §6 (`benchmarks/servers/`, built first
 as its README says): Hyper, Axum, Actix Web, Kestrel, h2o, or Relic 2.0 on either adapter (`relic`, `relic-native`).
-They serve HTTP/1.1 and h2c (Relic HTTP/1.1 only), not TLS, and have no `/file`; the modes and routes they lack are
-left out. Allocations do not apply to them; the peak RSS does.
+They serve HTTP/1.1 and h2c, and over TLS (CW_CERT and CW_KEY) HTTP/1.1 and h2 by ALPN, each with its own TLS
+library (`environment.tls.server_library`); Relic serves HTTP/1.1 only. They have no `/file`; the modes and routes
+they lack are left out. Their TLS idle connections and handshakes are measured as CeeSafe.Web's are. Allocations do
+not apply to them; the peak RSS does.
 
 Before any load, `benchmarks/servers/conform.py` checks the server (CeeSafe.Web's too) on every route over HTTP/1.1
-and h2c, against bodies that script builds itself; a server that fails it is not measured (plan §8: correctness
-first). `/json` serialises `{"message":"Hello, World!"}` for each request.
+and h2c, and over TLS when a TLS mode is asked for, against bodies that script builds itself; a server that fails it
+is not measured (plan §8: correctness first). Its TLS checks need a Python whose `ssl` speaks TLS 1.3 for Relic's
+native adapter (Xcode's Python 3.9 has LibreSSL 2.8.3, which does not; Homebrew's does). `/json` serialises `{"message":"Hello, World!"}` for each request.
 
 `--json` writes `{"environment": …, "results": […]}`. The environment is what Web ADR 0005 §2.4 asks each run to
 record: the machine (CPU, threads, memory), the OS and kernel, the load average before the run, the compiler and its
@@ -78,7 +81,7 @@ H2C_OFFSET = {"kestrel": 1}
 # Relic 2.0's two adapters, one binary: relic_io (dart:io) and relic_native (its Zig server). Neither has HTTP/2.
 SERVER_ENV = {"relic": {"CW_ADAPTER": "io"}, "relic-native": {"CW_ADAPTER": "native"}}
 NO_H2C = {"relic", "relic-native"}
-COMPARISON_MODES = ("h1", "h2c")
+COMPARISON_MODES = ("h1", "h2c", "tls-h1", "tls-h2")
 COMPARISON_ROUTES = ("small", "4k", "64k", "stream", "json", "echo")
 PAYLOADS = {"small": "13 bytes", "4k": "4096 bytes", "64k": "65536 bytes",
             "stream": "16 KiB written 64 times, no length", "json": "27 bytes, serialised for each request",
@@ -114,9 +117,13 @@ def build(ceesafec):
 
 
 def certificate(scratch):
+    """A self-signed P-256 certificate and its key. Two options are for LibreSSL (macOS's `openssl`), whose output
+    rustls otherwise refuses: `ec_param_enc:named_curve`, since it writes the curve's parameters out in full, and the
+    subjectAltName, without which its certificate is X.509 v1. OpenSSL 3 writes a named curve and v3 by itself."""
     cert, key = scratch / "cert.pem", scratch / "key.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                    "-nodes", "-keyout", str(key), "-out", str(cert), "-days", "2", "-subj", "/CN=localhost"],
+                    "-pkeyopt", "ec_param_enc:named_curve", "-nodes", "-keyout", str(key), "-out", str(cert),
+                    "-days", "2", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
                    check=True, capture_output=True)
     return cert, key
 
@@ -513,7 +520,7 @@ def main():
     results = []
     name = "nginx" if args.nginx else args.server or "ceesafe.web"
     if args.server:
-        run_modes = [m for m in modes if m in COMPARISON_MODES and not (m == "h2c" and name in NO_H2C)]
+        run_modes = comparison_modes(name, modes)
         run_routes = [r for r in routes if r in COMPARISON_ROUTES]
     else:
         run_modes, run_routes = modes, [r for r in routes if not (args.nginx and r == "echo")]
@@ -524,11 +531,15 @@ def main():
         if args.nginx:
             run_nginx(args, modes, routes, conns, scratch, results, handshakes)
         elif args.server:
-            run_comparison(args, modes, routes, conns, scratch, body, results)
+            run_comparison(args, modes, routes, conns, scratch, body, results, tls, handshakes)
         else:
             s = Server(None, scratch)
             ok = conform("ceesafe.web", PORT, PORT)
             s.stop(base_url("h1"))
+            if ok and any(m.startswith("tls") for m in modes):
+                s = Server(tls, scratch)
+                ok = conform("ceesafe.web", PORT, PORT, tls=True)
+                s.stop(base_url("tls-h1"))
             if not ok:
                 sys.exit("run: ceesafe.web failed the conformance check; nothing measured")
             for mode in modes:
@@ -715,45 +726,77 @@ def environment(args, name, modes, routes, conns):
 
 
 def linked_openssl(name):
-    """The version of the libcrypto CeeSafe.Web's server links (`ldd`, or `otool -L` on macOS), asked of the
-    library itself: the `openssl` on PATH may be another (macOS's is LibreSSL). nginx's is `nginx -V`'s."""
+    """The TLS library the server uses. For CeeSafe.Web and h2o, the libcrypto the binary links (`ldd`, or `otool -L`
+    on macOS), asked of the library itself: the `openssl` on PATH may be another (macOS's is LibreSSL). nginx's is
+    `nginx -V`'s. The others name theirs: rustls's version and provider from Cargo.lock, Kestrel's SslStream with the
+    libcrypto the loader finds on Linux, and Relic's per adapter."""
     if name == "nginx":
         r = subprocess.run(["nginx", "-V"], capture_output=True, text=True)
         m = re.search(r"built with (.+)", r.stderr + r.stdout)
         return m.group(1).strip() if m else None
-    if name != "ceesafe.web":
-        return None
+    if name == "ceesafe.web":
+        return libcrypto_of(SERVER)
+    if name == "h2o":
+        return libcrypto_of(os.environ.get("CW_H2O") or SERVERS / "h2o" / "out" / "bin" / "h2o")
+    if name in ("hyper", "axum", "actix"):
+        lock = SERVERS / "rust" / "Cargo.lock"
+        return (f"rustls {lock_version(lock, 'rustls')} with aws-lc-rs {lock_version(lock, 'aws-lc-rs')} "
+                f"(aws-lc-sys {lock_version(lock, 'aws-lc-sys')})")
+    if name == "kestrel":
+        if platform.system() != "Linux":
+            return "SslStream over the platform's TLS (not OpenSSL off Linux)"
+        return "SslStream over " + (openssl_version("libcrypto.so.3") or "the system's libssl.so.3")
+    if name == "relic":
+        return "dart:io's SecurityContext (BoringSSL, built into the Dart runtime)"
+    if name == "relic-native":
+        return (f"tls.zig in relic_native {lock_version(SERVERS / 'relic' / 'pubspec.lock', 'relic_native')}, "
+                "TLS 1.3 only")
+    return None
+
+
+def openssl_version(library):
+    """OpenSSL_version(OPENSSL_VERSION) of `library` (a path, or a name the loader resolves, honouring
+    LD_LIBRARY_PATH as a server's own dlopen would), or None."""
     import ctypes
+    try:
+        version = ctypes.CDLL(str(library)).OpenSSL_version
+    except (OSError, AttributeError):
+        return None
+    version.restype = ctypes.c_char_p
+    return version(0).decode() + f" ({library})"
+
+
+def libcrypto_of(binary):
+    """The version of the libcrypto `binary` links, or its path, or None."""
     darwin = platform.system() == "Darwin"
-    r = subprocess.run(["otool", "-L", str(SERVER)] if darwin else ["ldd", str(SERVER)], capture_output=True,
+    r = subprocess.run(["otool", "-L", str(binary)] if darwin else ["ldd", str(binary)], capture_output=True,
                        text=True)
     for line in r.stdout.splitlines():
         if "libcrypto" in line:
             path = line.split()[0] if darwin else line.split("=>")[-1].split("(")[0].strip()
-            try:
-                version = ctypes.CDLL(path).OpenSSL_version
-                version.restype = ctypes.c_char_p
-                return version(0).decode() + f" ({path})"
-            except (OSError, AttributeError):
-                return path
+            return openssl_version(path) or path
     return None
 
 
-def conform(name, port, h2c_port):
-    """benchmarks/servers/conform.py against the running server: True if every check passes."""
+def conform(name, port, h2c_port, tls=False):
+    """benchmarks/servers/conform.py against the running server, over TLS with `tls`: True if every check passes."""
     h2c = ["--no-h2c"] if name in NO_H2C else ["--h2c-port", str(h2c_port)]
-    r = subprocess.run([sys.executable, str(CONFORM), "--port", str(port), *h2c, "--name", name],
+    r = subprocess.run([sys.executable, str(CONFORM), "--port", str(port), *h2c, *(["--tls"] if tls else []),
+                        "--name", name],
                        capture_output=True, text=True)
     print(r.stdout.strip(), flush=True)
     return r.returncode == 0
 
 
 class Comparison:
-    """One comparison server, started with CW_PORT=PORT; stopped with SIGTERM."""
+    """One comparison server, started with CW_PORT=PORT; stopped with SIGTERM. With `tls` (a certificate and key),
+    CW_CERT and CW_KEY name them, and the server speaks TLS on PORT alone (benchmarks/servers/README.md)."""
 
-    def __init__(self, name, scratch):
-        self.h2c_port = PORT + H2C_OFFSET.get(name, 0)
+    def __init__(self, name, scratch, tls=None):
+        self.h2c_port = PORT if tls else PORT + H2C_OFFSET.get(name, 0)
         env = dict(os.environ, CW_PORT=str(PORT), CW_H2C_PORT=str(self.h2c_port), **SERVER_ENV.get(name, {}))
+        if tls:
+            env["CW_CERT"], env["CW_KEY"] = (str(p) for p in tls)
         self.log = open(scratch / f"{name}.log", "ab")
         self.p = subprocess.Popen(COMPARISON[name], env=env, stdout=self.log, stderr=subprocess.STDOUT)
         wait_port(PORT)
@@ -770,23 +813,35 @@ class Comparison:
         self.log.close()
 
 
-def run_comparison(args, modes, routes, conns, scratch, body, results):
+def comparison_modes(name, modes):
+    """The modes of `modes` that `name` serves: Relic has no HTTP/2, in clear or over TLS."""
+    return [m for m in modes if m in COMPARISON_MODES and not (name in NO_H2C and m in ("h2c", "tls-h2"))]
+
+
+def run_comparison(args, modes, routes, conns, scratch, body, results, tls, handshakes):
     global PORT
     name = args.server
     if not os.path.exists(COMPARISON[name][-1]):
         sys.exit(f"run: {COMPARISON[name][-1]} is not built (benchmarks/servers/README.md)")
-    s = Comparison(name, scratch)
-    ok = conform(name, PORT, s.h2c_port)
-    s.stop()
-    if not ok:
-        sys.exit(f"run: {name} failed the conformance check; nothing measured")
+    run_modes = comparison_modes(name, modes)
+    # The contract in clear, and over TLS before any TLS row: nothing is measured from a server that fails either.
+    for over in [None] + ([tls] if any(m.startswith("tls") for m in run_modes) else []):
+        s = Comparison(name, scratch, over)
+        ok = conform(name, PORT, s.h2c_port, tls=over is not None)
+        s.stop()
+        if not ok:
+            sys.exit(f"run: {name} failed the conformance check{' over TLS' if over else ''}; nothing measured")
     plain = PORT
+
+    def start(mode):
+        return Comparison(name, scratch, tls if mode.startswith("tls") else None)
+
     try:
-        for mode in [m for m in modes if m in COMPARISON_MODES and not (m == "h2c" and name in NO_H2C)]:
+        for mode in run_modes:
             for route in [r for r in routes if r in COMPARISON_ROUTES]:
                 posted = body if route == "echo" else None
                 for c in conns:
-                    s = Comparison(name, scratch)
+                    s = start(mode)
                     PORT = s.h2c_port if mode == "h2c" else plain
                     peak = Peak(s.p.pid)
                     peak.start()
@@ -800,16 +855,26 @@ def run_comparison(args, modes, routes, conns, scratch, body, results):
                     results.append(r)
                     print(row(r), flush=True)
                     if slo_wanted(args, mode, route):
-                        s = Comparison(name, scratch)
+                        s = start(mode)
                         results.append(slo_row(args, name, mode, route, c, r["requests_per_s"]))
                         s.stop()
-        if args.idle and "h1" in modes:
-            s = Comparison(name, scratch)
-            i = idle_connections(s.p.pid, plain, args.idle, False)
-            s.stop()
-            i.update(server=name, mode="h1")
-            results.append(i)
-            print(idle_row(i), flush=True)
+            if args.idle and mode in IDLE_MODES:
+                s = start(mode)
+                i = idle_connections(s.p.pid, plain, args.idle, mode.startswith("tls"))
+                s.stop()
+                i.update(server=name, mode=mode)
+                results.append(i)
+                print(idle_row(i), flush=True)
+            if mode == HANDSHAKE_MODE and handshakes:
+                for c in conns:
+                    s = start(mode)
+                    cpu = tree(s.p.pid)[1]
+                    h = oha_handshakes(mode, c, args.duration)
+                    h.update(cpu_fields(cpu, tree(s.p.pid)[1], args.duration, h["handshakes_per_s"]))
+                    s.stop()
+                    h.update(server=name, mode=mode, route="small", conns=c)
+                    results.append(h)
+                    print(handshake_row(h), flush=True)
     finally:
         PORT = plain
 

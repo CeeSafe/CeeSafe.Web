@@ -146,8 +146,8 @@ test, which is evidence the macOS runs cannot give.
       `relic_native` (2.0's server in Zig). Both speak HTTP/1.1 only.
     - **`benchmarks/http/run.py --server <name>`** measures any of them. It runs `conform.py` first, CeeSafe.Web's
       server included, and measures nothing from a server that fails it (plan §8).
-    - **Not yet in it:** TLS, and Kestrel's h2c on the HTTP/1.1 port. Kestrel cannot serve h2c on a cleartext
-      endpoint that also speaks HTTP/1.1, so its h2c has a port of its own.
+    - **Not yet in it:** Kestrel's h2c on the HTTP/1.1 port. Kestrel cannot serve h2c on a cleartext endpoint that
+      also speaks HTTP/1.1, so its h2c has a port of its own. TLS was added on 2026-11-19 (below).
   - **Run (2026-11-17, macOS 27.0.1 on an Apple M1, Rust 1.99.1, .NET SDK 10.0.401, h2load from nghttp2):**
     - `conform.py` passes on all six servers: 12 HTTP/1.1 requests on one kept-alive connection and 6 h2c requests
       each, 0 problems. It passes on both Relic adapters over HTTP/1.1 (`--no-h2c`), with Dart 3.14.1 (the SDK
@@ -157,6 +157,39 @@ test, which is evidence the macOS runs cannot give.
     - `run.py` ran each server, 2 s at 10 connections on four routes over h1 and h2c (Relic h1 only), with 0
       failed requests. That
       checks the pipeline only; the numbers are not results (a laptop, the load generator beside the server).
+  - **TLS added (2026-11-19), on branch `bench-servers-tls`** (`benchmarks/servers/README.md`, "TLS"). With `CW_CERT`
+    and `CW_KEY`, every server speaks TLS on `CW_PORT`, choosing HTTP/1.1 or h2 by ALPN (Relic HTTP/1.1 only).
+    - **The libraries.** Each server uses the one it is usually deployed with, so a TLS row compares whole stacks:
+      - h2o: the OpenSSL it is built against;
+      - Hyper, Axum and Actix Web: rustls 0.23.46 with aws-lc-rs 1.19.0. Asked between rustls, OpenSSL 3.5.9 and
+        both, the owner chose rustls;
+      - Kestrel: `SslStream`, which is OpenSSL on Linux and Apple's TLS on macOS;
+      - Relic: dart:io's BoringSSL, or `relic_native`'s tls.zig (TLS 1.3 only).
+
+      The run's environment names each server's library, and each row what was negotiated.
+    - **`conform.py --tls`** checks the routes over TLS: HTTP/1.1 with ALPN `http/1.1`, and h2 with ALPN `h2`.
+      `run.py` runs it before any TLS row, CeeSafe.Web's server included.
+    - **`run.py --server`** takes tls-h1 and tls-h2, and measures the comparison servers' TLS idle connections and
+      handshakes as CeeSafe.Web's.
+    - **Two servers needed more than a certificate:**
+      - Axum's `axum::serve` has no TLS. With a certificate, the router is served over tokio-rustls with
+        hyper-util's auto builder, the one `axum::serve` uses.
+      - Relic's `relic_io` cannot take a `SecurityContext` with more than one isolate: `serve` sends it to each
+        isolate, and Dart cannot send one ("object is unsendable"). The program spawns the isolates itself, each with
+        its own context, binding the port shared as `serve` does.
+    - **The certificate.** `run.py`'s self-signed certificate now names the curve (`ec_param_enc:named_curve`) and has
+      a subjectAltName. Under LibreSSL, macOS's `openssl`, it was X.509 v1 with the curve's parameters written out,
+      which rustls refuses. OpenSSL 3 already wrote both forms.
+    - **Run (2026-11-19, the M1 laptop, 2 s at 10 connections, `/small` and `/64k`, 50 idle connections):**
+      - every server passed `conform.py` in clear and over TLS, with 0 problems: CeeSafe.Web, Hyper, Axum, Actix
+        Web, Kestrel, h2o, and Relic on both adapters;
+      - `run.py` gave tls-h1 and tls-h2 rows (Relic tls-h1) with 0 failed requests, and TLS idle rows for each;
+      - the negotiated settings differ:
+        - every server agreed on TLS 1.3, except Kestrel on macOS (TLS 1.2, `ECDHE-ECDSA-AES256-GCM-SHA384`);
+        - CeeSafe.Web agreed on `TLS_AES_256_GCM_SHA384`, OpenSSL's first by default. rustls, h2o and Relic agreed on
+          `TLS_AES_128_GCM_SHA256`.
+      - oha was not installed, so no handshake rows were made.
+      - The numbers check the pipeline, not results.
 - The report is `docs/benchmarks/v1.0.md`. It is made by a script from the recorded JSON, with every field Web ADR
   0005 §2.4 lists (hardware, kernel, compilers and flags, reactor, concurrency, payload, TLS settings, warm-up) and
   the raw results beside it.
