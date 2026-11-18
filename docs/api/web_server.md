@@ -75,7 +75,12 @@ could not grow.
 
 ```ceesafe
 public interface Handler<S> {
-    async fn handle(borrow this, ctx: borrow mut RequestContext<S>, request: borrow Request, exchange: borrow mut Exchange,) -> Result<void, HandlerError>;
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError>;
 }
 ```
 
@@ -97,7 +102,12 @@ Whether a middleware's `before` let the request through.
 
 ```ceesafe
 public interface Middleware<S> {
-    async fn before(borrow this, ctx: borrow mut RequestContext<S>, request: borrow Request, exchange: borrow mut Exchange,) -> Result<Flow, HandlerError>;
+    async fn before(
+        borrow this,
+        ctx: borrow mut RequestContext<S>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<Flow, HandlerError>;
     async fn after(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
 }
 ```

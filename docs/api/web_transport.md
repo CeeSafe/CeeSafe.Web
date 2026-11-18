@@ -258,7 +258,12 @@ TlsAcceptor). The server takes one, so packages below web_tls never link OpenSSL
 
 ```ceesafe
 public interface Connector {
-    async fn connect(borrow this, stream: PlainStream, host: StringView, deadline: Deadline,) -> Result<Box<dyn Transport + Send>, NetError>;
+    async fn connect(
+        borrow this,
+        stream: PlainStream,
+        host: StringView,
+        deadline: Deadline,
+    ) -> Result<Box<dyn Transport + Send>, NetError>;
 }
 ```
 
@@ -445,7 +450,11 @@ Where connections come from: a TCP listener, or a queue of mocks in tests. Share
 
 ```ceesafe
 public interface ConnectionHandler {
-    async fn serve(borrow this, conn: borrow mut dyn Transport, ctx: borrow ConnectionContext) -> Result<void, NetError>;
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError>;
 }
 ```
 
