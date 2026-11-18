@@ -25,7 +25,11 @@ public interface ConnectionHandler {
     /// Serves `conn` until done. Between requests, a handler races its idle wait against the drain
     /// (`drainStarted(ctx.drain())`) and returns `Ok` when the drain wins. `Ok` lets the server close gracefully; an
     /// error drops the connection.
-    async fn serve(borrow this, conn: borrow mut dyn Transport, ctx: borrow ConnectionContext) -> Result<void, NetError>;
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError>;
 }
 
 /// A queue of scripted connections for tests: push mocks, then close it to end the server's source.

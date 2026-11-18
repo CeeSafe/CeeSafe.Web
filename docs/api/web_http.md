@@ -387,8 +387,17 @@ How a handler failed (Web ADR 0007 §3.1).
 
 ```ceesafe
 public interface Application {
-    async fn handle(borrow this, request: borrow Request, exchange: borrow mut Exchange, connection: borrow ConnectionContext,) -> Result<void, HandlerError>;
-    async fn beforeHead(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError>;
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError>;
 }
 ```
 

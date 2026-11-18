@@ -604,10 +604,172 @@ int32_t wt_cfg_key_log(SSL_CTX *ctx, const uint8_t *path, size_t len) {
     return 1;
 }
 
-/* Trusts the system's default CA locations: OpenSSL's defaults (a bundle or directory on Unix), and on Windows the
+#if defined(__ANDROID__)
+#include <dirent.h>
+
+/* Android's roots: a directory of PEM files, one a root, named by OpenSSL 0.9's subject hash, which OpenSSL 3 does
+   not look files up by: each is loaded. The first directory is the updatable one (Android 14 and later), the second
+   the system image's. Roots a user added are not an app's to read. The number loaded. */
+static int android_roots(SSL_CTX *ctx) {
+    static const char *const places[] = {"/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"};
+    int loaded = 0;
+    for (size_t k = 0; k < sizeof places / sizeof places[0] && loaded == 0; k++) {
+        DIR *dir = opendir(places[k]);
+        if (dir == NULL) {
+            continue;
+        }
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            char path[512];
+            if (entry->d_name[0] == '.' ||
+                snprintf(path, sizeof path, "%s/%s", places[k], entry->d_name) >= (int)sizeof path) {
+                continue;
+            }
+            if (SSL_CTX_load_verify_file(ctx, path) == 1) {
+                loaded++;
+            } else {
+                ERR_clear_error(); /* one file that is no certificate does not lose the rest */
+            }
+        }
+        closedir(dir);
+    }
+    return loaded;
+}
+#endif
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include <dlfcn.h>
+
+/* iOS keeps its roots where an app cannot read them: the server's chain is given to the system to judge (Security's
+   SecTrust), for the name the connection asked for. The two frameworks are loaded by name, as CeeSafe's runtime loads
+   UIKit: a manifest names libraries, not frameworks. */
+typedef const void *wt_cf;
+static struct {
+    int ready;
+    wt_cf (*data)(wt_cf allocator, const uint8_t *bytes, long length);
+    wt_cf (*array)(wt_cf allocator, long capacity, const void *callbacks);
+    void (*append)(wt_cf array, wt_cf value);
+    wt_cf (*string)(wt_cf allocator, const char *text, uint32_t encoding);
+    void (*release)(wt_cf object);
+    const void *array_callbacks;
+    wt_cf (*certificate)(wt_cf allocator, wt_cf der);
+    wt_cf (*ssl_policy)(unsigned char server, wt_cf host);
+    int32_t (*trust)(wt_cf certificates, wt_cf policy, wt_cf *out);
+    unsigned char (*evaluate)(wt_cf trust, wt_cf *error);
+} apple;
+
+static int apple_load(void) {
+    if (apple.ready != 0) {
+        return apple.ready > 0;
+    }
+    void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+    void *security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW);
+    apple.ready = -1;
+    if (cf == NULL || security == NULL) {
+        return 0;
+    }
+    apple.data = (wt_cf (*)(wt_cf, const uint8_t *, long))dlsym(cf, "CFDataCreate");
+    apple.array = (wt_cf (*)(wt_cf, long, const void *))dlsym(cf, "CFArrayCreateMutable");
+    apple.append = (void (*)(wt_cf, wt_cf))dlsym(cf, "CFArrayAppendValue");
+    apple.string = (wt_cf (*)(wt_cf, const char *, uint32_t))dlsym(cf, "CFStringCreateWithCString");
+    apple.release = (void (*)(wt_cf))dlsym(cf, "CFRelease");
+    apple.array_callbacks = dlsym(cf, "kCFTypeArrayCallBacks");
+    apple.certificate = (wt_cf (*)(wt_cf, wt_cf))dlsym(security, "SecCertificateCreateWithData");
+    apple.ssl_policy = (wt_cf (*)(unsigned char, wt_cf))dlsym(security, "SecPolicyCreateSSL");
+    apple.trust = (int32_t (*)(wt_cf, wt_cf, wt_cf *))dlsym(security, "SecTrustCreateWithCertificates");
+    apple.evaluate = (unsigned char (*)(wt_cf, wt_cf *))dlsym(security, "SecTrustEvaluateWithError");
+    if (apple.data == NULL || apple.array == NULL || apple.append == NULL || apple.string == NULL ||
+        apple.release == NULL || apple.array_callbacks == NULL || apple.certificate == NULL ||
+        apple.ssl_policy == NULL || apple.trust == NULL || apple.evaluate == NULL) {
+        return 0;
+    }
+    apple.ready = 1;
+    return 1;
+}
+
+/* Appends `x` to `list` as the system's certificate; 0 when it cannot be made. */
+static int apple_add(wt_cf list, X509 *x) {
+    unsigned char *der = NULL;
+    int n = i2d_X509(x, &der);
+    if (n <= 0) {
+        return 0;
+    }
+    wt_cf data = apple.data(NULL, der, n);
+    OPENSSL_free(der);
+    if (data == NULL) {
+        return 0;
+    }
+    wt_cf certificate = apple.certificate(NULL, data);
+    apple.release(data);
+    if (certificate == NULL) {
+        return 0;
+    }
+    apple.append(list, certificate);
+    apple.release(certificate);
+    return 1;
+}
+
+/* OpenSSL's certificate verification, done by the system: 1 when it trusts the server's chain for the name asked
+   for (the connection's SNI), 0 with the error set otherwise. */
+static int apple_verify(X509_STORE_CTX *store, void *unused) {
+    (void)unused;
+    X509 *leaf = X509_STORE_CTX_get0_cert(store);
+    STACK_OF(X509) *rest = X509_STORE_CTX_get0_untrusted(store);
+    SSL *ssl = X509_STORE_CTX_get_ex_data(store, SSL_get_ex_data_X509_STORE_CTX_idx());
+    const char *host = ssl == NULL ? NULL : SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    int ok = 0;
+    if (leaf != NULL && host != NULL && apple_load()) {
+        wt_cf list = apple.array(NULL, 0, apple.array_callbacks);
+        wt_cf name = apple.string(NULL, host, 0x08000100 /* kCFStringEncodingUTF8 */);
+        if (list != NULL && name != NULL && apple_add(list, leaf)) {
+            int all = 1;
+            for (int k = 0; rest != NULL && k < sk_X509_num(rest); k++) {
+                X509 *x = sk_X509_value(rest, k);
+                if (x != leaf && !apple_add(list, x)) {
+                    all = 0;
+                }
+            }
+            wt_cf policy = all ? apple.ssl_policy(1, name) : NULL;
+            wt_cf trust = NULL;
+            if (policy != NULL && apple.trust(list, policy, &trust) == 0 && trust != NULL) {
+                ok = apple.evaluate(trust, NULL) ? 1 : 0;
+            }
+            if (trust != NULL) {
+                apple.release(trust);
+            }
+            if (policy != NULL) {
+                apple.release(policy);
+            }
+        }
+        if (name != NULL) {
+            apple.release(name);
+        }
+        if (list != NULL) {
+            apple.release(list);
+        }
+    }
+    X509_STORE_CTX_set_error(store, ok ? X509_V_OK : X509_V_ERR_CERT_UNTRUSTED);
+    return ok;
+}
+#endif
+
+/* Trusts the system's roots. On a Unix, OpenSSL's default locations (a bundle or a directory). On Windows the
  * system's certificate store too, which OpenSSL's defaults do not reach (its winstore loader, OpenSSL 3.2 and later;
- * Web ADR 0002 amendment 4). 1 on success. */
+ * Web ADR 0002 amendment 4). On Android, the system's directory of roots, which OpenSSL's defaults do not name. On
+ * iOS, where there is nothing to load, the system judges each server's chain itself. 1 on success. */
 int32_t wt_cfg_trust_default(SSL_CTX *ctx) {
+#if defined(__ANDROID__)
+    return android_roots(ctx) > 0 ? 1 : 0;
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    if (!apple_load()) {
+        return 0;
+    }
+    SSL_CTX_set_cert_verify_callback(ctx, apple_verify, NULL);
+    return 1;
+#endif
     if (!SSL_CTX_set_default_verify_paths(ctx)) {
         return 0;
     }

@@ -23,11 +23,20 @@ public enum HandlerError {
 /// needs no type parameter.
 public interface Application {
     /// Handles one request: read its body and write its response through `exchange`.
-    async fn handle(borrow this, request: borrow Request, exchange: borrow mut Exchange, connection: borrow ConnectionContext,) -> Result<void, HandlerError>;
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError>;
 
     /// Runs just before a response head is sent, when the handler writes past the buffer or returns: middleware's
     /// `after` hooks add their fields here (Web ADR 0007 §3.2, amendment 1).
-    async fn beforeHead(borrow this, request: borrow Request, head: borrow mut ResponseHead) -> Result<void, HandlerError>;
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError>;
 }
 
 /// The state of the request body.
