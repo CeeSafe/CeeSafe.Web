@@ -119,3 +119,27 @@ fn owned_buffer_truncate() -> Result<void, TestFailure> {
     Check.isTrue(b.isEmpty(), "truncate 0 empties it")?;
     return Ok();
 }
+
+@test
+fn owned_buffer_reserve_keeps_the_readable_bytes() -> Result<void, TestFailure> {
+    var b = alloc(OwnedBuffer.create(4))?;
+    Check.isTrue(bufferOk(b.append("abcd".bytes())) && bufferOk(b.consume(1)), "abcd, less a")?;
+    alloc(b.reserve(8))?;
+    // The readable bytes move to the start of the new storage, and the rest is spare.
+    Check.equalU64(8, b.capacity() as u64)?;
+    Check.equalBytes("bcd".bytes(), b.readable())?;
+    Check.equalU64(5, b.spareLength() as u64)?;
+    Check.isTrue(bufferOk(b.append("efghi".bytes())), "append to the new capacity")?;
+    Check.equalBytes("bcdefghi".bytes(), b.readable())?;
+    // A smaller or equal capacity changes nothing; the buffer still does not grow by itself.
+    alloc(b.reserve(2))?;
+    alloc(b.reserve(8))?;
+    Check.equalU64(8, b.capacity() as u64)?;
+    Check.isTrue(bufferLimit(b.append("j".bytes())), "full")?;
+    // A zero-capacity buffer is given its first storage.
+    var z = alloc(OwnedBuffer.create(0))?;
+    alloc(z.reserve(3))?;
+    Check.isTrue(bufferOk(z.append("xyz".bytes())), "zero, then 3")?;
+    Check.equalBytes("xyz".bytes(), z.readable())?;
+    return Ok();
+}

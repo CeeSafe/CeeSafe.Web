@@ -24,9 +24,10 @@ public struct OwnedBuffer
 ```
 
 A fixed-capacity byte buffer with a readable window: bytes are written into `spare()` and made readable with
-`commit(n)`, then read from `readable()` and released with `consume(n)`. It never grows; a write past its capacity
-is `NetError.LimitExceeded`. Lending `spare()` or `readable()` to an operation borrows the buffer, so it cannot be
-changed, moved, recycled or dropped while the operation uses it (Web ADR 0001 §1).
+`commit(n)`, then read from `readable()` and released with `consume(n)`. It never grows by itself; a write past
+its capacity is `NetError.LimitExceeded`, and only `reserve` changes the capacity. Lending `spare()` or
+`readable()` to an operation borrows the buffer, so it cannot be changed, moved, recycled or dropped while the
+operation uses it (Web ADR 0001 §1).
 
 ### OwnedBuffer.create
 
@@ -132,6 +133,17 @@ public fn clear(borrow mut this)
 ```
 
 Forgets every readable byte.
+
+### OwnedBuffer.reserve
+
+```ceesafe
+public fn reserve(borrow mut this, capacity: usize) -> Result<void, AllocError>
+```
+
+Gives the buffer `capacity` bytes, keeping its readable bytes at the start. This is a new allocation, made
+only when asked: buffers do not grow implicitly (Web ADR 0001 §3.1). A `capacity` at or below the current one
+changes nothing. It borrows the buffer mutably, so it cannot run while an operation holds `spare()` or
+`readable()`. If the allocation fails, the buffer is as it was.
 
 ## struct BufferPool
 

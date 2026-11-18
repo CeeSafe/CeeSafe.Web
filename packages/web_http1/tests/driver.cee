@@ -352,3 +352,62 @@ fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
     }
     return true;
 }
+
+/// A GET of /a whose head carries `X-Long:` with `n` bytes of `a`: about `n + 40` bytes of head.
+fn longHead(n: usize, out: borrow mut Vector<u8>) -> Result<void, TestFailure> {
+    var ok = pushText(out, "GET /a HTTP/1.1\r\nHost: x\r\nX-Long: ");
+    for (i in 0..n) {
+        ok = ok && pushText(out, "a");
+    }
+    ok = ok && pushText(out, "\r\n\r\n");
+    return if (ok) Ok() else Err(TestFailure.create("input"));
+}
+
+/// `got` starts with `prefix`.
+fn startsWith(got: borrow Vector<u8>, prefix: StringView) -> bool {
+    let p = prefix.bytes();
+    let g = got.view();
+    return g.length >= p.length && sameBytes(g[0..p.length], p);
+}
+
+// The driver starts a connection with a 4 KiB head buffer and makes room for `maxHeadBytes` only for a longer head
+// (serve.cee, Web ADR 0015 §6). A head between the two is served; one past `maxHeadBytes` is 431 (RFC 6585 §5), as
+// before.
+@test
+async fn a_head_longer_than_the_first_buffer_is_served() -> Result<void, TestFailure> {
+    var input = Vector<u8>.create();
+    longHead(6000, mut input)?;
+    let text = match (StringView.fromUtf8(input.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let whole = await run(text, 65536, quiet())?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\n\r\n/a:", whole.output)?;
+    let trickle = await run(text, 1, quiet())?; // the buffer is made larger while the head is still arriving
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\n\r\n/a:", trickle.output)?;
+    return Ok();
+}
+
+@test
+async fn a_head_past_the_limit_is_431() -> Result<void, TestFailure> {
+    var input = Vector<u8>.create();
+    longHead(17000, mut input)?; // past Limits.defaults()'s 16 KiB
+    let text = match (StringView.fromUtf8(input.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let s = await run(text, 65536, quiet())?;
+    Check.isTrue(startsWith(s.output, "HTTP/1.1 431 Request Header Fields Too Large\r\n"), "431")?;
+    // A limit below the first buffer's 4 KiB is the buffer's size: 100 bytes of head against 64 are refused.
+    var small = quiet();
+    small.maxHeadBytes = 64;
+    var shortInput = Vector<u8>.create();
+    longHead(60, mut shortInput)?;
+    let shortText = match (StringView.fromUtf8(shortInput.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let t = await run(shortText, 65536, small)?;
+    Check.isTrue(startsWith(t.output, "HTTP/1.1 431 Request Header Fields Too Large\r\n"), "431 under 64")?;
+    return Ok();
+}
