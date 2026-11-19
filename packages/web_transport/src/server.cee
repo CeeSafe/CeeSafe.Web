@@ -301,9 +301,12 @@ public struct ConnectionServer {
             Err(_) => { return Err(NetError.OutOfMemory); },
         };
         let workers = if (limits.workers == 0) 1u32 else limits.workers;
-        // The set's crashes, and the connections that finished: each holds as many as can run at once.
-        let crashes = channel<TaskCrash>(workers as usize)?;
-        let finished = channel<u64>(workers as usize)?;
+        // The set's crashes, and the connections that finished. Each is sent with `trySend`, so neither may fill:
+        // while the accepting task waits in `spawnIsolated` every running connection may end, and the one it then
+        // starts may end before `spawnIsolated` returns, so `workers + 1` can arrive before it reads them. A lost
+        // finish would keep its entry in `kept`, and the drain would wait out the grace for it.
+        let crashes = channel<TaskCrash>(2 * workers as usize)?;
+        let finished = channel<u64>(2 * workers as usize)?;
         let r: Result<Raced<bool>, NetError> = await Async.race(
             async () => {
                 let served = await Async.tasks(workers, NetError.Reset, async (set) =>

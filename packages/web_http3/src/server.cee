@@ -162,7 +162,8 @@ impl QuicApplication for Http3Application {
         // they are: the QUIC server then sends nothing more (an `Ok` would make it close with code 0).
         // Each request's task is isolated: its crash comes through `crashes`, which a task of the set passes on as a
         // message, and the connection resets the stream (Web ADR 0016 §2.3).
-        let crashes = channel<TaskCrash>(this.requests as usize)?;
+        // Twice the set's limit: a crash is sent with `trySend`, and one that does not fit is never reset.
+        let crashes = channel<TaskCrash>(2 * this.requests as usize)?;
         let r = await Async.tasks(this.requests, QuicError.NoMemory, async (set) => {
             if (!Isolation.watch(set, crashes)) {
                 return Err(QuicError.NoMemory);

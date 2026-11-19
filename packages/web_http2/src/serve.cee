@@ -144,7 +144,9 @@ public async fn serveH2(
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
     // Each stream's task is isolated: its crash comes here, and the connection resets that stream (Web ADR 0016 §2.3).
-    let crashes = match (Channel<TaskCrash>.create(256)) {
+    // Twice the set's limit: a crash is sent with `trySend`, and one that does not fit is never reset (its client
+    // waits for its idle timeout).
+    let crashes = match (Channel<TaskCrash>.create(512)) {
         Ok(c) => c,
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
