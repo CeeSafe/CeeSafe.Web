@@ -37,6 +37,8 @@ enum Outgoing {
     Reset(i64, u64),
     /// The request's task is done.
     Done(i64),
+    /// A request's task trapped and ended alone (Web ADR 0016 §2.3): its number, from the set's watcher.
+    Crashed(u64),
 }
 
 /// Request body for a request's task.
@@ -48,6 +50,9 @@ enum BodyPart {
 
 /// The connection's side of one request.
 struct Link {
+    /// The request's isolated task (`trySpawnIsolated`, Web ADR 0016 §2.3), whose crash resets the stream; 0 if there
+    /// was no memory to isolate it.
+    task: u64;
     body: Channel<BodyPart>;
     acks: Channel<u8>;
     reset: Channel<u8>;
@@ -155,8 +160,19 @@ impl QuicApplication for Http3Application {
         };
         // `run` ends only with an error, so the set cancels the requests left. `Draining` and `IdleTimeout` go back as
         // they are: the QUIC server then sends nothing more (an `Ok` would make it close with code 0).
-        return await Async.tasks(this.requests, QuicError.NoMemory, async (set) =>
-            await run(set, link, mut h3, this, context, outgoing, mut links));
+        // Each request's task is isolated: its crash comes through `crashes`, which a task of the set passes on as a
+        // message, and the connection resets the stream (Web ADR 0016 §2.3).
+        let crashes = channel<TaskCrash>(this.requests as usize)?;
+        let r = await Async.tasks(this.requests, QuicError.NoMemory, async (set) => {
+            if (!Isolation.watch(set, crashes)) {
+                return Err(QuicError.NoMemory);
+            }
+            let watched = crashes.clone();
+            let told = outgoing.clone();
+            await set.spawn(async move () => await passCrashes(watched, told))?;
+            return await run(set, link, mut h3, this, context, outgoing, mut links);
+        });
+        return r;
     }
 }
 
@@ -406,6 +422,22 @@ async fn run(
     }
 }
 
+/// Passes each crash of the set's request tasks on to the connection's task as a message, which wakes it where it
+/// waits. It ends when either channel closes, or with the set.
+async fn passCrashes(crashes: Channel<TaskCrash>, outgoing: Channel<Outgoing>) -> Result<void, QuicError> {
+    loop {
+        let crash = match (await crashes.recvAsync()) {
+            Ok(Some(c)) => c,
+            Ok(null) => { return Ok(); },
+            Err(_) => { return Ok(); }, // cancelled with the set
+        };
+        match (await outgoing.sendAsync(Outgoing.Crashed(crash.task))) {
+            Ok() => {}
+            Err(_) => { return Ok(); }
+        }
+    }
+}
+
 /// A connection error from HTTP/3: close with its code (RFC 9114 §8), and end the connection's task.
 async fn fail(link: borrow mut QuicLink, e: H3Error) -> Result<void, QuicError> =>
     await failWith(link, H3Errors.closeCode(e));
@@ -445,14 +477,17 @@ fn startRequest(
     let k = acks.clone();
     let rs = reset.clone();
     let limits = server.limits;
-    let started = set.trySpawn(async move () =>
+    // Isolated (Web ADR 0016 §2.3): a trap in the application's handler ends this task alone, and the connection
+    // resets the stream (`Outgoing.Crashed`).
+    let started = set.trySpawnIsolated(QuicError.Draining, async move () =>
         await requestTask(a, owned, stream, head, hasBody, sentEarly, b, o, k, rs, limits));
-    if (!started) {
+    let task = started ?? {
         let _ = link.resetStream(stream, h3RequestRejected()); // RFC 9114 §4.1.1: not processed, may be retried
         h3.shutdownWrite(stream);
         return Ok();
-    }
+    };
     let l = Link {
+        task: task,
         body: body,
         acks: acks,
         reset: reset,
@@ -531,6 +566,24 @@ fn handle(
             let _ = link.resetStream(stream, code);
             h3.shutdownWrite(stream);
             endLink(links, stream);
+        }
+        Outgoing.Crashed(task) => {
+            var found: i64? = null;
+            for (i in 0..links.length()) {
+                let stream: u64 = links.keyAt(i);
+                match (links.get(stream)) {
+                    Some(l) => {
+                        if (task != 0 && l.task == task) {
+                            found = Some(truncate<i64>(stream));
+                        }
+                    }
+                    null => {}
+                }
+            }
+            match (found) {
+                Some(stream) => { refuse(h3, link, links, stream); } // H3_INTERNAL_ERROR (RFC 9114 §8.1)
+                null => {}                                           // already ended
+            }
         }
         Outgoing.Done(stream) => {
             match (links.get(truncate<u64>(stream))) {

@@ -112,7 +112,7 @@ impl Transport for Client {
 /// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css";
 /// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends;
 /// `/trailers`: reads the body, then answers each trailer as `name=value;`; `/rtrailers`: "abc" and the trailer
-/// `x-sum: 3`.
+/// `x-sum: 3`; `/trap`: traps (an index out of bounds) after 20 ms.
 /// `r` in decimal, or "-" for null, then ";".
 fn remainingOf(r: u64?, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     match (r) {
@@ -212,6 +212,15 @@ impl Application for Site {
                 Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
             }
             return await exchange.send(Status.ok(), "slow".bytes());
+        }
+        if (Ascii.equals(path.bytes(), "/trap")) {
+            match (await Timer.sleep(20)) { // the other streams start meanwhile
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+            let small = [0u8; 2];
+            let at = path.bytes().length; // 5: out of bounds, a trap that ends this stream's task alone
+            return await exchange.send(Status.ok(), small[at..at + 1]);
         }
         if (Ascii.equals(path.bytes(), "/stall")) {
             match (await Timer.sleep(10000)) {
@@ -435,6 +444,26 @@ async fn a_body_echoed_and_two_streams_interleaved() -> Result<void, TestFailure
     Check.isTrue(contains(log.view(), "headers 3 f4 200; "), "stream 3's head")?;
     Check.isTrue(contains(log.view(), "data 3 f1 hello; "), "stream 3's body")?;
     return Check.isTrue(contains(log.view(), "data 1 f1 abcdef; "), "stream 1's body echoed");
+}
+
+/// A stream whose handler traps is reset with INTERNAL_ERROR (Web ADR 0016 §2.3), and the connection serves the
+/// other streams, before and after it.
+@test
+async fn a_stream_that_traps_is_reset_alone() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let trap = getBlock("/trap")?;
+    let get = getBlock("/hello")?;
+    let slow = getBlock("/slow")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, trap.view())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 3, get.view())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 5, slow.view())?;
+    let out = await served(bytes, 600)?;
+    let log = frames(out)?;
+    Check.isTrue(contains(log.view(), "rst 1 code 2; "), "the trapped stream is reset with INTERNAL_ERROR")?;
+    Check.isFalse(contains(log.view(), "headers 1 "), "it sent no head")?;
+    Check.isTrue(contains(log.view(), "data 3 f1 hello; "), "a stream beside it is answered")?;
+    return Check.isTrue(contains(log.view(), "data 5 f1 slow; "), "a stream that ends after the trap is answered");
 }
 
 /// A read that completed as the wait's other arm won (a stream's message; io_uring, CeeSafe ADR 0035 §3.4) keeps its

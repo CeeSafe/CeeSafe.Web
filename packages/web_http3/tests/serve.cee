@@ -9,6 +9,7 @@
 //   GET /wide      200 "wide", after 300 ms, with four 600-byte fields (lossy.cee)
 //   GET /early     200 "early" if the request came in 0-RTT (`request.earlyData()`), else "late"
 //   GET /fail      the handler fails: 500
+//   GET /trap      the handler traps (an index out of bounds) after 20 ms: its stream is reset, alone (Web ADR 0016)
 //   anything else  404
 import web_core;
 import web_http;
@@ -24,6 +25,15 @@ impl Application for TestApp {
         connection: borrow ConnectionContext,
     ) -> Result<void, HandlerError> {
         let path = request.path().bytes();
+        if (same(path, "/trap")) {
+            match (await Timer.sleep(20)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+            let small = [0u8; 2];
+            let at = path.length; // 5: out of bounds
+            return await exchange.send(Status.ok(), small[at..at + 1]);
+        }
         if (same(path, "/hello")) {
             return await exchange.send(Status.ok(), "hello, h3".bytes());
         }
@@ -252,6 +262,56 @@ async fn six_requests_over_udp() -> Result<void, TestFailure> {
         },
         async () => {
             match (await sixRequests(s.clientTls, local)) {
+                Ok() => { return Ok(Ended.Client); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    return outcome(raced);
+}
+
+/// A request whose handler traps: its stream is reset (H3_INTERNAL_ERROR), the others on the connection are answered,
+/// one of them after the trap.
+async fn oneTraps(tls: borrow QuicTls, server: SocketAddress) -> Result<void, TestFailure> {
+    var c = await TestClient.connect(tls, server)?;
+    let none = "".bytes();
+    let _ = c.request("GET", "/trap", none)?;
+    let _ = c.request("GET", "/hello", none)?;
+    let _ = c.request("GET", "/slow", none)?;
+    let deadline = Clock.monotonicNanos() + 10000000000;
+    while (!c.allDone()) {
+        if (Clock.monotonicNanos() > deadline || c.closed) {
+            return Err(TestFailure.create("the answers did not all end in 10 s"));
+        }
+        await c.turn(10)?;
+    }
+    let all = c.answers.view();
+    Check.isTrue(all[0].reset, "/trap: its stream is reset")?;
+    Check.isTrue(startsWith(all[1].fields.view(), ":status: 200\n") && all[1].ended && !all[1].reset, "/hello: 200")?;
+    Check.isTrue(startsWith(all[2].fields.view(), ":status: 200\n") && all[2].ended && !all[2].reset, "/slow: 200")?;
+    Check.equalBytes("slow".bytes(), all[2].data.view())?;
+    Check.isFalse(c.closed, "the connection stays open")?;
+    return Ok();
+}
+
+@test
+async fn a_request_that_traps_is_reset_alone() -> Result<void, TestFailure> {
+    let s = setup()?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let socket = s.socket;
+    let local = s.local;
+    let tls = s.tls;
+    let app = s.app;
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await Http3Server.serve(socket, local, tls, app, Limits.defaults(), drain, Http3Options.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await oneTraps(s.clientTls, local)) {
                 Ok() => { return Ok(Ended.Client); }
                 Err(e) => { return Ok(Ended.ClientFailed(e)); }
             }
