@@ -1246,6 +1246,19 @@ job runs `web_ws` in the interpreter again.
 - **CI** (pull request #32's `freebsd` job, 0.57.1): `web_ws` in the interpreter, 26 passed; the whole job passed with
   #34's fix.
 
+## U25 — A non-waiting isolated spawn   *(found 2026-11-19, Web ADR 0016 §5, ceesafec 0.75.0; proposed with that ADR)*
+
+**Gap:** CeeSafe ADR 0175 (0.75.0) gives a task set `spawnIsolated(crashed, child)`, which waits for room, and no
+`trySpawnIsolated`. HTTP/2 and HTTP/3 start a stream's task with `set.trySpawn` from the connection's frame loop
+(`packages/web_http2/src/serve.cee:371`, `packages/web_http3/src/server.cee:448`) and refuse the stream when the set
+is full. That loop cannot wait for room: the streams that would free it wait for the loop to send their data.
+
+**Wanted:** `set.trySpawnIsolated(crashed, async move () => …)`: `u64?`, the child's number, or null when the set is
+full, with `spawnIsolated`'s rules for the child (N0334, N0349) and its crash.
+
+**Effect on CeeSafe.Web until then:** streams are not isolated; Web ADR 0016's connections are (they need 0.75.0
+only).
+
 ## Tooling (small, any time before M1's exit)
 
 - **T1 Sweeps on any package.** CeeSafe.Web's M1 gate reuses `tools/cancel_sweep.py` and `tools/fault_sweep.py`. Check that both accept a package directory, not only corpus files. If they don't, add a `--package <dir>` mode.
