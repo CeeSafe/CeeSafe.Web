@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Runs h2o as the comparison server: the routes of benchmarks/servers/conform.py's contract on 127.0.0.1:CW_PORT
-(8090 by default), HTTP/1.1 and h2c with prior knowledge on one port, a thread per core (h2o's default).
+(8090 by default), HTTP/1.1 and h2c with prior knowledge on one port, a thread per core (h2o's default). With
+CW_CERT and CW_KEY (PEM), that port speaks TLS instead (the OpenSSL h2o was built with), HTTP/1.1 and HTTP/2 chosen
+by ALPN, as h2o offers both.
 
 usage: CW_PORT=18190 python3 benchmarks/servers/h2o/start.py [--h2o PATH]
        (default: $CW_H2O, else ./out/bin/h2o, which build.sh makes)
@@ -31,7 +33,7 @@ http2-idle-timeout: 60
 listen:
   host: 127.0.0.1
   port: {port}
-hosts:
+{ssl}hosts:
   default:
     paths:
       /small:
@@ -70,9 +72,11 @@ def main():
     for name, body in (("small", b"hello, world\n"), ("4k", alphabet(4096)), ("64k", alphabet(65536)),
                        ("piece", alphabet(16384))):
         (work / name).write_bytes(body)
+    cert, key = os.environ.get("CW_CERT"), os.environ.get("CW_KEY")
+    ssl = f"  ssl:\n    certificate-file: {cert}\n    key-file: {key}\n" if cert and key else ""
     conf = work / "h2o.conf"
     conf.write_text(("user: root\n" if os.geteuid() == 0 else "") +
-                    CONF.format(port=port, files=work, threads=os.cpu_count() or 1))
+                    CONF.format(port=port, files=work, threads=os.cpu_count() or 1, ssl=ssl))
     os.execv(a.h2o, [a.h2o, "-c", str(conf)])
 
 

@@ -24,7 +24,33 @@ with a worker per core, and keeps connections alive. Two exceptions:
 - **Relic** has no HTTP/2 on either adapter, so it is checked and measured over HTTP/1.1 only (`conform.py
   --no-h2c`).
 
-TLS is not part of the comparison yet.
+### TLS
+
+With `CW_CERT` and `CW_KEY` (a PEM certificate chain and key), every server speaks TLS on `CW_PORT` instead, and
+chooses HTTP/1.1 or HTTP/2 by ALPN (Relic: HTTP/1.1 only). Kestrel then needs no h2c port. `conform.py --tls` checks
+the same routes over TLS, and `run.py` runs it before any TLS row. Each server uses the TLS library it is usually
+deployed with, so a TLS row compares whole stacks:
+
+| Server | TLS library |
+|---|---|
+| CeeSafe.Web, h2o | OpenSSL: the libcrypto each links (on the benchmark machine, 3.5.9; h2o through `OPENSSL_ROOT_DIR`) |
+| Hyper, Axum, Actix Web | rustls 0.23.46 with its default provider, aws-lc-rs 1.19.0 (the owner's choice, 2026-11-19); tokio-rustls 0.26.6 for Hyper and Axum, Actix's `rustls-0_23` feature |
+| Kestrel | `SslStream`: OpenSSL on Linux (`libssl.so.3` as the loader finds it, so `env.sh`'s `LD_LIBRARY_PATH` decides), Apple's TLS on macOS, which agrees on TLS 1.2 |
+| Relic (`relic_io`) | dart:io's `SecurityContext`: BoringSSL, built into the Dart runtime |
+| Relic (`relic_native`) | tls.zig, inside `relic_native`: TLS 1.3 only |
+
+Each TLS row records what h2load negotiated (protocol, cipher, key exchange, ALPN), and the run's environment names
+the server's library (`tls.server_library`).
+
+- **Axum:** `axum::serve` has no TLS, so with a certificate the router is served as Axum's own low-level TLS example
+  does: hyper-util's auto builder (the one `axum::serve` uses) over tokio-rustls.
+- **Relic's `relic_io`:** `serve(noOfIsolates: n, securityContext: c)` fails, since it sends `c` to each isolate it
+  spawns and Dart cannot send a `SecurityContext` between isolates. So the program spawns the isolates itself, each
+  with its own context, binding the port shared as `serve` does.
+- **The certificate** is `run.py`'s self-signed P-256 one. Under LibreSSL (macOS's `openssl`) it needs
+  `ec_param_enc:named_curve` and a subjectAltName, or rustls refuses it.
+- **Relic's native adapter** speaks TLS 1.3 only, so `conform.py` and `run.py`'s idle connections need a Python whose
+  `ssl` has it: not Xcode's Python 3.9 (LibreSSL 2.8.3).
 
 ## The servers
 
@@ -56,7 +82,8 @@ TLS is not part of the comparison yet.
 
 ```sh
 python3 benchmarks/servers/conform.py --port 8090 [--h2c-port 8091] --name axum   # a server already running
-python3 benchmarks/http/run.py --server axum --modes h1,h2c --routes small,4k,64k,stream,json,echo --json axum.json
+python3 benchmarks/servers/conform.py --port 8090 --tls --name axum                 # started with CW_CERT, CW_KEY
+python3 benchmarks/http/run.py --server axum --modes h1,h2c,tls-h1,tls-h2 --routes small,4k,64k,stream,json,echo --json axum.json
 python3 benchmarks/report.py ceesafe-web.json axum.json hyper.json -o docs/benchmarks/v1.0.md   # the report
 python3 benchmarks/report.py ceesafe-web.json --baseline previous-release.json      # the 5 % regression gate
 ```

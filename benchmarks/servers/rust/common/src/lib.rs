@@ -48,3 +48,23 @@ pub struct Message {
 }
 
 pub const MESSAGE: Message = Message { message: "Hello, World!" };
+
+/// rustls's server configuration when CW_CERT and CW_KEY name a PEM certificate chain and key, so the server speaks
+/// TLS on CW_PORT; None without them (cleartext). `alpn` is the protocols offered, the most preferred first (Actix
+/// sets its own, so it passes none). rustls's default provider is aws-lc-rs.
+pub fn tls(alpn: &[&[u8]]) -> Option<rustls::ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let cert = std::env::var("CW_CERT").ok().filter(|s| !s.is_empty())?;
+    let key = std::env::var("CW_KEY").ok().filter(|s| !s.is_empty())?;
+    let chain = CertificateDer::pem_file_iter(&cert)
+        .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_else(|e| panic!("CW_CERT {cert}: {e}"));
+    let key = PrivateKeyDer::from_pem_file(&key).unwrap_or_else(|e| panic!("CW_KEY {key}: {e}"));
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap_or_else(|e| panic!("the certificate and key: {e}"));
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Some(config)
+}
