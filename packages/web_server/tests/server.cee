@@ -124,6 +124,40 @@ async fn through_the_connection_server() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// The same six connections through `Server.runIsolated` (Web ADR 0016): each in an isolated task, every request
+/// served, none crashed.
+@test
+async fn through_the_isolated_connection_server() -> Result<void, TestFailure> {
+    let s = marked()?;
+    let incoming = net(MockIncoming.create(8))?;
+    let text = "GET /users HTTP/1.1\r\nhost: a\r\n\r\nPOST /users HTTP/1.1\r\nhost: a\r\ncontent-length: 0\r\n\r\n";
+    for (k in 0..6u64) {
+        let m = match (MockTransport.create(text.bytes())) {
+            Ok(m) => m,
+            Err(_) => { return Err(TestFailure.create("a mock")); },
+        };
+        netDone(incoming.push(m.withSeededSplits(k + 1, 7)))?;
+    }
+    incoming.close();
+    var limits = ConnectionLimits.defaults();
+    limits.workers = 3;
+    let drain = net(Drain.create())?;
+    let hits = s.state().hits.clone();
+    let acceptor: Box<dyn Acceptor + Send + Share> = match (Box.create(PlainAcceptor {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("no memory")); },
+    };
+    let report = net(await s.runIsolated(incoming, acceptor, limits, drain))?;
+    Check.equalU64(6, report.accepted)?;
+    Check.equalU64(6, report.served)?;
+    Check.equalU64(0, report.failed)?;
+    Check.equalU64(0, report.crashed)?;
+    Check.isTrue(!report.forced, "not forced")?;
+    Check.isTrue(report.workersUsed >= 1 && report.workersUsed <= 3, "at most 3 at once")?;
+    Check.equalU64(12, hits.get().load())?;
+    return Ok();
+}
+
 /// `r`, a network error as the test's failure.
 fn net<T>(r: Result<T, NetError>) -> Result<T, TestFailure> {
     match (r) {

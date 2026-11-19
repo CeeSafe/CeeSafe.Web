@@ -1259,6 +1259,46 @@ full, with `spawnIsolated`'s rules for the child (N0334, N0349) and its crash.
 **Effect on CeeSafe.Web until then:** streams are not isolated; Web ADR 0016's connections are (they need 0.75.0
 only).
 
+## B21 — Bug: on macOS, a closer cannot end a connection whose peer has half-closed   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0, macOS)*
+
+**Seen:** `StreamCloser.shutdown()` is `shutdown(fd, SHUT_RDWR)` (`runtime/hosted/ceesafe_rt_io.c`,
+`ceesafe_host_handover_shutdown`). On macOS, once the peer's FIN has arrived, that call fails with `ENOTCONN` and
+sends nothing, so the peer of a crashed connection waits for its own timeout. `shutdown(fd, SHUT_WR)` on the same
+socket succeeds and the peer reads the end. Checked with Python's sockets on macOS arm64 (2026-11-19): `SHUT_RDWR`
+gives `[Errno 57] Socket is not connected` and the client times out; `SHUT_WR` gives `b''` at once. Through
+`runIsolated`, a client that sends its request, half-closes and then reads waits 10 s where one that does not
+half-close reads the end at once. On Linux (Ubuntu 24.04) both calls succeed and the peer reads the end.
+
+**Wanted:** `shutdown()` ends the connection for the peer in that state too, for example `SHUT_WR`, then
+`SHUT_RD` with `ENOTCONN` taken as done.
+
+**Effect on CeeSafe.Web until then:** `tools/isolated_check.py`'s trapping clients do not half-close. An HTTP/1.1
+client rarely half-closes before reading its response.
+
+## B22 — Bug: `ceesafec test` reports a test whose isolated task trapped as panicked   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0)*
+
+**Seen:** `src/host/test_runner.cee:399` classifies a test as panicked when its standard error contains
+`ceesafe panic`, and an isolated task that ends alone writes that line too (`… (isolated task 3: ended alone)`, CeeSafe
+ADR 0175 §2.5). A test that checks that a trap costs one connection cannot pass. What a crashed task leaked would
+also be counted as live allocations at the end ("leaked").
+
+**Wanted:** a panic line that says the task ended alone is not the test's panic, and what the units leaked
+(`Isolation.report()`) is not the test's leak.
+
+**Effect on CeeSafe.Web until then:** `web_transport`'s tests of `runIsolated` set no trap; the traps are checked by
+`tools/isolated_check.py` against `examples/http1`.
+
+## B23 — Bug: the interpreter leaks a watched channel made inside its task set's body   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0, interpreter only)*
+
+**Seen:** `Isolation.watch(set, crashes)` where `crashes` is made inside `Async.tasks`' body leaves one allocation
+live at the end under `ceesafec test --interp`; natively nothing is left. The same with the channel made before
+`Async.tasks` leaves nothing in either. Reduced to a test that makes the channel, watches, and returns.
+
+**Wanted:** the set gives its handle of the channel back at its end in the interpreter as it does natively.
+
+**Effect on CeeSafe.Web until then:** none: `runIsolated` makes its channels before the set, beside the other values
+the set's tasks share.
+
 ## Tooling (small, any time before M1's exit)
 
 - **T1 Sweeps on any package.** CeeSafe.Web's M1 gate reuses `tools/cancel_sweep.py` and `tools/fault_sweep.py`. Check that both accept a package directory, not only corpus files. If they don't, add a `--package <dir>` mode.

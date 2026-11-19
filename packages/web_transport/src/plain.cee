@@ -19,6 +19,12 @@ public struct PlainStream {
     /// A scripted transport, for tests.
     public fn mock(m: MockTransport) -> PlainStream => PlainStream { plain: Plain.Mock(m) };
 
+    /// `TcpTransport.closer()` for TCP; null for a mock.
+    public fn closer(borrow this) -> StreamCloser? => match (borrow this.plain) {
+        Plain.Tcp(t) => t.closer(),
+        Plain.Mock(_) => null,
+    };
+
     /// Whether it is a mock.
     public fn isMock(borrow this) -> bool => match (borrow this.plain) {
         Plain.Mock(_) => true,

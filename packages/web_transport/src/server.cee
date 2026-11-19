@@ -81,8 +81,12 @@ public struct ServerReport {
     public failed: u64;
     /// Failed accepts (the worker paused and tried again).
     public acceptErrors: u64;
-    /// Workers that took at least one connection: the ones whose frames became resident (`Turns`).
+    /// `run`: workers that took at least one connection, the ones whose frames became resident (`Turns`).
+    /// `runIsolated`: the most connections served at once.
     public workersUsed: u64;
+    /// `runIsolated`: connections whose task trapped and ended alone (CeeSafe ADR 0175). Their memory and descriptor
+    /// are leaked, and `Isolation.report()` counts the memory. Always 0 under `run`, where a trap ends the process.
+    public crashed: u64;
     /// Whether the grace period ran out and connections in flight were cancelled.
     public forced: bool;
 }
@@ -95,6 +99,9 @@ struct Counters {
     failed: AtomicU64;
     acceptErrors: AtomicU64;
     workersUsed: AtomicU64;
+    crashed: AtomicU64;
+    /// `runIsolated`: connections being served now.
+    live: AtomicU64;
 
     fn create() -> Counters => Counters {
         accepted: AtomicU64.create(0),
@@ -103,6 +110,8 @@ struct Counters {
         failed: AtomicU64.create(0),
         acceptErrors: AtomicU64.create(0),
         workersUsed: AtomicU64.create(0),
+        crashed: AtomicU64.create(0),
+        live: AtomicU64.create(0),
     };
 
     fn report(borrow this, forced: bool) -> ServerReport => ServerReport {
@@ -112,6 +121,7 @@ struct Counters {
         failed: this.failed.load(),
         acceptErrors: this.acceptErrors.load(),
         workersUsed: this.workersUsed.load(),
+        crashed: this.crashed.load(),
         forced: forced,
     };
 }
@@ -265,6 +275,60 @@ public struct ConnectionServer {
             Err(e) => { return Err(e); }
         }
     }
+
+    /// Serves connections from `incoming` as `run` does, each in a task of its own that is isolated (Web ADR 0016,
+    /// CeeSafe ADR 0175): a trap in a connection's acceptor step or handler ends that connection, whose socket is shut,
+    /// and the server goes on. At most `limits.workers` are served at once. A crash is counted in the report's
+    /// `crashed`; what the connection held is leaked, and `Isolation.report()` counts its memory. A trap under C (a
+    /// TLS callback) or in a `Critical` still ends the process.
+    public async fn runIsolated(
+        incoming: borrow dyn Incoming,
+        acceptor: Arc<Box<dyn Acceptor + Send + Share>>,
+        handler: Arc<Box<dyn ConnectionHandler + Send + Share>>,
+        limits: borrow ConnectionLimits,
+        drain: borrow Drain,
+    ) -> Result<ServerReport, NetError> {
+        let counters = match (Arc<Counters>.create(Counters.create())) {
+            Ok(c) => c,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let copied = match (limits.copy()) {
+            Ok(l) => l,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let shared = match (Arc<ConnectionLimits>.create(copied)) {
+            Ok(l) => l,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let workers = if (limits.workers == 0) 1u32 else limits.workers;
+        // The set's crashes, and the connections that finished: each holds as many as can run at once.
+        let crashes = channel<TaskCrash>(workers as usize)?;
+        let finished = channel<u64>(workers as usize)?;
+        let r: Result<Raced<bool>, NetError> = await Async.race(
+            async () => {
+                let served = await Async.tasks(workers, NetError.Reset, async (set) =>
+                    await acceptIsolated(set, incoming, acceptor, handler, shared, drain, counters, crashes, finished));
+                // A crashed task is the set's `Reset`, which no connection's own result is: `serveConnection` fails
+                // only when cancelled.
+                match (served) {
+                    Ok() => { return Ok(false); }
+                    Err(NetError.Reset) => { return Ok(false); }
+                    Err(e) => { return Err(e); }
+                }
+            },
+            async () => {
+                await drain.wait()?;
+                match (await Timer.sleep(limits.graceMs)) {
+                    Ok() => { return Ok(true); }
+                    Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                }
+            },
+        );
+        match (r) {
+            Ok(raced) => { return Ok(counters.get().report(raced.value)); }
+            Err(e) => { return Err(e); }
+        }
+    }
 }
 
 /// One worker: accept, hand shake, serve, close; again until the drain starts or the source ends. Only cancellation
@@ -334,66 +398,316 @@ async fn worker(
             used = true;
             let first = counters.workersUsed.fetchAdd(1);
         }
-        let handshake = Deadline.after(limits.handshakeMs);
-        // Behind a balancer that speaks the PROXY protocol (Web ADR 0012 §3.6, amendment 2): from a source it lists,
-        // the header first, read exactly, within the handshake's time; any other source is closed unread.
-        var said = ProxyHeader.Local;
-        if (!limits.proxyProtocolFrom.isEmpty()) {
-            var s = stream;
-            let from = match (s.peerAddress()) {
-                Some(a) => limits.proxyProtocolFrom.trusts(a),
-                null => false,
-            };
-            if (!from) {
-                let failed = counters.handshakesFailed.fetchAdd(1);
-                continue;
-            }
-            match (await readProxyHeader(mut s, handshake)) {
-                Ok(h) => { said = h; }
-                Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
-                Err(_) => {
-                    let failed = counters.handshakesFailed.fetchAdd(1);
-                    continue;
-                }
-            }
-            stream = s;
-        }
-        var conn = match (await acceptor.accept(stream, handshake)) {
-            Ok(c) => c,
-            Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
-            Err(_) => {
-                let failed = counters.handshakesFailed.fetchAdd(1);
-                continue;
-            }
+        await serveConnection(stream, acceptor, handler, limits, drain, counters, id, mut scratch[..])?;
+    }
+}
+
+/// One connection, from the accepted stream to its close: the PROXY header where the limits ask for one, the
+/// acceptor's step, the handler, the graceful close. A failure is counted and ends this connection only; only
+/// cancellation is an error.
+async fn serveConnection(
+    given: PlainStream,
+    acceptor: borrow dyn Acceptor,
+    handler: borrow dyn ConnectionHandler,
+    limits: borrow ConnectionLimits,
+    drain: borrow Drain,
+    counters: borrow Counters,
+    id: u64,
+    scratch: SliceMut<u8>,
+) -> Result<void, NetError> {
+    var stream = given;
+    let handshake = Deadline.after(limits.handshakeMs);
+    // Behind a balancer that speaks the PROXY protocol (Web ADR 0012 §3.6, amendment 2): from a source it lists,
+    // the header first, read exactly, within the handshake's time; any other source is closed unread.
+    var said = ProxyHeader.Local;
+    if (!limits.proxyProtocolFrom.isEmpty()) {
+        var s = stream;
+        let from = match (s.peerAddress()) {
+            Some(a) => limits.proxyProtocolFrom.trusts(a),
+            null => false,
         };
-        var identity = PeerIdentity.empty();
-        let verified = conn.peerIdentity(mut identity); // a TLS client certificate, copied before `conn` is lent out
-        var peer = conn.peerAddress();
-        var local = conn.localAddress();
-        match (said) {
-            ProxyHeader.Proxied(from, to) => {
-                peer = Some(from);
-                local = Some(to);
-            }
-            ProxyHeader.Local => {}
+        if (!from) {
+            let failed = counters.handshakesFailed.fetchAdd(1);
+            return Ok();
         }
-        let ctx = ConnectionContext.acceptedNow(id, drain).withAddresses(peer, local).withPeerIdentity(identity);
-        match (await handler.serve(mut conn, ctx)) {
-            Ok() => {
-                let done = counters.served.fetchAdd(1);
-                match (await Transports.closeGracefully(
-                    mut conn,
-                    mut scratch[..],
-                    Deadline.after(limits.closeLingerMs),
-                )) {
-                    Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
-                    _ => {} // the peer lingered or failed: the drop closes the socket anyway
-                }
-            }
+        match (await readProxyHeader(mut s, handshake)) {
+            Ok(h) => { said = h; }
             Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
             Err(_) => {
-                let failed = counters.failed.fetchAdd(1);
+                let failed = counters.handshakesFailed.fetchAdd(1);
+                return Ok();
             }
         }
+        stream = s;
+    }
+    var conn = match (await acceptor.accept(stream, handshake)) {
+        Ok(c) => c,
+        Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+        Err(_) => {
+            let failed = counters.handshakesFailed.fetchAdd(1);
+            return Ok();
+        }
+    };
+    var identity = PeerIdentity.empty();
+    let verified = conn.peerIdentity(mut identity); // a TLS client certificate, copied before `conn` is lent out
+    var peer = conn.peerAddress();
+    var local = conn.localAddress();
+    match (said) {
+        ProxyHeader.Proxied(from, to) => {
+            peer = Some(from);
+            local = Some(to);
+        }
+        ProxyHeader.Local => {}
+    }
+    let ctx = ConnectionContext.acceptedNow(id, drain).withAddresses(peer, local).withPeerIdentity(identity);
+    match (await handler.serve(mut conn, ctx)) {
+        Ok() => {
+            let done = counters.served.fetchAdd(1);
+            match (await Transports.closeGracefully(mut conn, scratch, Deadline.after(limits.closeLingerMs))) {
+                Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+                _ => {} // the peer lingered or failed: the drop closes the socket anyway
+            }
+        }
+        Err(NetError.Cancelled) => { return Err(NetError.Cancelled); }
+        Err(_) => {
+            let failed = counters.failed.fetchAdd(1);
+        }
+    }
+    return Ok();
+}
+
+/// A connection in an isolated task, as the accepting task keeps it (Web ADR 0016 §2.2): its number, the task's
+/// number, and the closer that ends it for the peer if the task traps.
+struct Isolated {
+    connection: u64;
+    task: u64;
+    closer: StreamCloser?;
+}
+
+/// What the accepting task of `runIsolated` waits for.
+enum Arrival {
+    Stream(PlainStream),
+    /// A crash, a finished connection, or both: a race that both sides won gives both.
+    Events(TaskCrash?, u64?),
+    /// The source ended (`Closed`), or the drain started: no more connections are taken.
+    NoMore,
+    /// An accept failed (out of descriptors, say): paused, then tried again.
+    AcceptFailed,
+}
+
+/// The next stream, or why there is none.
+async fn nextStream(incoming: borrow dyn Incoming, drain: borrow Drain) -> Result<Arrival, NetError> {
+    let next: Result<Raced<PlainStream>, NetError> = await Async.race(
+        async () => await incoming.next(),
+        async () => await drainStarted<PlainStream>(drain),
+    );
+    return match (next) {
+        Ok(raced) => Ok(Arrival.Stream(raced.value)),
+        Err(NetError.Closed) => Ok(Arrival.NoMore),
+        Err(NetError.Cancelled) => if (drain.isDraining()) Ok(Arrival.NoMore) else Err(NetError.Cancelled),
+        Err(NetError.OutOfMemory) => Err(NetError.OutOfMemory),
+        Err(_) => Ok(Arrival.AcceptFailed),
+    };
+}
+
+/// The next crash or finished connection, or both.
+async fn nextEvent(crashes: borrow Channel<TaskCrash>, finished: borrow Channel<u64>) -> Result<Arrival, NetError> {
+    let r: Result<Raced<Arrival>, NetError> = await Async.race(
+        async () => match (await crashes.recvAsync()) {
+            Ok(Some(c)) => Ok(Arrival.Events(Some(c), null)),
+            Ok(null) => Err(NetError.Closed),
+            Err(e) => Err(NetErrors.fromAsync(e)),
+        },
+        async () => match (await finished.recvAsync()) {
+            Ok(Some(n)) => Ok(Arrival.Events(null, Some(n))),
+            Ok(null) => Err(NetError.Closed),
+            Err(e) => Err(NetErrors.fromAsync(e)),
+        },
+    );
+    let raced = r?;
+    var crash: TaskCrash? = null;
+    var done: u64? = null;
+    match (raced.value) {
+        Arrival.Events(c, n) => {
+            crash = c;
+            done = n;
+        }
+        _ => {}
+    }
+    match (raced.other) {
+        Some(Arrival.Events(c, n)) => {
+            if (c.isSome()) {
+                crash = c;
+            }
+            if (n.isSome()) {
+                done = n;
+            }
+        }
+        _ => {}
+    }
+    return Ok(Arrival.Events(crash, done));
+}
+
+/// What happened to the connections the accepting task keeps: a finished one's closer is dropped, a crashed one's is
+/// shut first, so the peer sees the end.
+fn settle(kept: borrow mut Vector<Isolated>, crash: TaskCrash?, done: u64?, counters: borrow Counters) {
+    match (done) {
+        Some(n) => {
+            for (i in 0..kept.length) {
+                if (kept[i].connection == n) {
+                    let gone = kept.swapRemove(i);
+                    break;
+                }
+            }
+        }
+        null => {}
+    }
+    match (crash) {
+        Some(c) => {
+            let crashed = counters.crashed.fetchAdd(1);
+            let left = counters.live.fetchSub(1); // the task never took itself off
+            for (i in 0..kept.length) {
+                if (kept[i].task == c.task && c.task != 0) {
+                    match (borrow kept[i].closer) {
+                        Some(closer) => {
+                            let _ = closer.shutdown();
+                        }
+                        null => {}
+                    }
+                    let gone = kept.swapRemove(i);
+                    break;
+                }
+            }
+        }
+        null => {}
+    }
+}
+
+/// The accepting task of `runIsolated`: takes connections and starts an isolated task for each, until the source
+/// ends or the drain starts, and then, until every task has ended, settles what they leave.
+async fn acceptIsolated(
+    set: borrow TaskSet<NetError>,
+    incoming: borrow dyn Incoming,
+    acceptor: borrow Arc<Box<dyn Acceptor + Send + Share>>,
+    handler: borrow Arc<Box<dyn ConnectionHandler + Send + Share>>,
+    limits: borrow Arc<ConnectionLimits>,
+    drain: borrow Drain,
+    counters: borrow Arc<Counters>,
+    crashes: borrow Channel<TaskCrash>,
+    finished: borrow Channel<u64>,
+) -> Result<void, NetError> {
+    let room = limits.get().workers as usize;
+    if (!Isolation.watch(set, crashes)) {
+        return Err(NetError.OutOfMemory);
+    }
+    var kept = Vector<Isolated>.create();
+    if (kept.reserve(room).isErr()) {
+        return Err(NetError.OutOfMemory);
+    }
+    var taking = true;
+    loop {
+        // What arrived while this task was not waiting for it, first: the channels hold `room` each.
+        loop {
+            match (crashes.tryRecv()) {
+                Some(c) => { settle(mut kept, Some(c), null, counters.get()); }
+                null => { break; }
+            }
+        }
+        loop {
+            match (finished.tryRecv()) {
+                Some(n) => { settle(mut kept, null, Some(n), counters.get()); }
+                null => { break; }
+            }
+        }
+        if (taking && drain.isDraining()) {
+            taking = false;
+        }
+        if (!taking && kept.length == 0) {
+            return Ok();
+        }
+        // Up to two arrivals: a race whose both sides returned gives both, and neither may be lost.
+        var arrivals = Vector<Arrival>.create();
+        if (arrivals.reserve(2).isErr()) {
+            return Err(NetError.OutOfMemory);
+        }
+        if (taking) {
+            let r: Result<Raced<Arrival>, NetError> = await Async.race(
+                async () => await nextStream(incoming, drain),
+                async () => await nextEvent(crashes, finished),
+            );
+            let raced = r?;
+            match (raced.other) {
+                Some(o) => {
+                    let _ = arrivals.push(o);
+                }
+                null => {}
+            }
+            let _ = arrivals.push(raced.value);
+        } else {
+            let _ = arrivals.push(await nextEvent(crashes, finished)?);
+        }
+        loop {
+            let arrival = arrivals.pop() ?? { break; };
+            match (arrival) {
+                Arrival.Stream(stream) => {
+                    let number = counters.get().accepted.fetchAdd(1);
+                    let closer = stream.closer();
+                    let a = acceptor.clone();
+                    let h = handler.clone();
+                    let l = limits.clone();
+                    let c = counters.clone();
+                    let d = drain.share();
+                    let f = finished.clone();
+                    // Kept before the task starts, which may end before `spawnIsolated` returns; its task's number is
+                    // filled in after.
+                    match (kept.push(Isolated { connection: number, task: 0, closer: closer })) {
+                        Ok() => {}
+                        Err(_) => { return Err(NetError.OutOfMemory); }
+                    }
+                    // Waits while `workers` connections are served: the admission limit, as the workers are for `run`.
+                    let task = await set.spawnIsolated(NetError.Reset, async move () => {
+                        var scratch = [0u8; 64];
+                        let now = c.get().live.fetchAdd(1) + 1;
+                        if (now > c.get().workersUsed.load()) {
+                            c.get().workersUsed.store(now); // the tasks of one set run on one thread
+                        }
+                        let ended = await serveConnection(
+                            stream,
+                            a.get(),
+                            h.get(),
+                            l.get(),
+                            d,
+                            c.get(),
+                            number,
+                            mut scratch[..],
+                        );
+                        let left = c.get().live.fetchSub(1);
+                        let _ = f.trySend(number);
+                        return ended;
+                    })?;
+                    for (i in 0..kept.length) {
+                        if (kept[i].connection == number) {
+                            kept[i].task = task;
+                        }
+                    }
+                }
+                Arrival.NoMore => { taking = false; }
+                Arrival.AcceptFailed => {
+                    let failed = counters.get().acceptErrors.fetchAdd(1);
+                    match (await Timer.sleep(limits.get().acceptBackoffMs)) {
+                        Ok() => {}
+                        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+                    }
+                }
+                Arrival.Events(crash, done) => { settle(mut kept, crash, done, counters.get()); }
+            }
+        }
+    }
+}
+
+fn channel<T: Send>(n: usize) -> Result<Channel<T>, NetError> {
+    match (Channel<T>.create(if (n == 0) 1usize else n)) {
+        Ok(c) => { return Ok(c); }
+        Err(_) => { return Err(NetError.OutOfMemory); }
     }
 }

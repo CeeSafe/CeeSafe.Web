@@ -1,8 +1,9 @@
 # Web ADR 0016 — Isolated connections and streams: a trap ends one connection or one stream, not the process
 
-**Status:** proposed 2026-11-19, for the owner's answers to §7. Written at the owner's request ("Move httpserver onto
-spawnIsolated and Process.spawnWith", then "Web ADR first"), from CeeSafe ADR 0175 §5 and §9 step 4, which leave
-this change to CeeSafe.Web.
+**Status:** accepted 2026-11-19. The owner: "I accept ADR 0016's five questions as written" (§7, every recommendation).
+Written at the owner's request ("Move httpserver onto spawnIsolated and Process.spawnWith", then "Web ADR first"),
+from CeeSafe ADR 0175 §5 and §9 step 4, which leave this change to CeeSafe.Web. The connections' part is implemented
+with 0.75.0 (§9); the streams' part waits for U25.
 **Scope:** `web_transport` (`ConnectionServer`, `PlainStream`, `TcpTransport`), `web_http2` and `web_http3` (a
 stream's task), `web_server` (`Server.runIsolated`), the toolchain minimum (0.75.0), one upstream item (U25). No
 change to the engines, which stay sans-I/O (Web ADR 0004), and none to `ConnectionServer.run`, which stays as it is.
@@ -174,15 +175,15 @@ CeeSafe.Web's rule (no workarounds for CeeSafe gaps) leaves the streams' part wa
 
 ## 7. Questions for the owner
 
-1. **A second entry point, `ConnectionServer.runIsolated`, with `run` unchanged** (§2.1, §3)? *Recommended: yes.*
+1. **A second entry point, `ConnectionServer.runIsolated`, with `run` unchanged** (§2.1, §3)? *Recommended: yes.* **Accepted 2026-11-19.**
 2. **A crash costs the connection, whose socket the server shuts through the kept closer, and its memory and
-   descriptor are leaked** (§2.2)? *Recommended: yes*: CeeSafe ADR 0175 §2.4 leaves no sound alternative.
+   descriptor are leaked** (§2.2)? *Recommended: yes*: CeeSafe ADR 0175 §2.4 leaves no sound alternative. **Accepted 2026-11-19.**
 3. **No new `NetError` variant**: a crash is `ServerReport.crashed`, and the set's error for it is never seen
-   (§2.1)? *Recommended: yes.*
+   (§2.1)? *Recommended: yes.* **Accepted 2026-11-19.**
 4. **Streams isolated with U25's `trySpawnIsolated`**, asked of CeeSafe now, with the streams' part waiting for it
-   (§2.3, §5)? *Recommended: yes.* The alternative is that the frame loop awaits room, which can stall a connection.
+   (§2.3, §5)? *Recommended: yes.* The alternative is that the frame loop awaits room, which can stall a connection. **Accepted 2026-11-19.**
 5. **The minimum rises to the release with U25** for every package (§2.5)? *Recommended: yes*, in one step with
-   the streams' part. If U25 is late, the connections' part lands alone with 0.75.0.
+   the streams' part. If U25 is late, the connections' part lands alone with 0.75.0. **Accepted 2026-11-19.**
 
 ## 8. Tests
 
@@ -213,3 +214,51 @@ implemented.
   three runs each, on the benchmark machine. The difference is recorded here.
 - httpserver: `tools/supervisor_check.py` with a route that traps on an isolated application. One request is lost
   per trap, no worker ends, and the worker drains and is replaced past the threshold.
+
+## 9. Implementation notes (2026-11-19)
+
+The connections' part (§2.1, §2.2, §2.4) is implemented with ceesafec 0.75.0; the streams' part (§2.3) waits for U25.
+It differs from §2 in these places.
+
+- **A new connection is put in the table before its task starts** (`Isolated`, `packages/web_transport/src/
+  server.cee`), and the task's number is filled in after: a connection can finish before `spawnIsolated` returns.
+- **A race that both sides win gives both values** (`Raced.other`). The accepting task keeps a stream or a finished
+  connection that arrived in the losing child. The first version dropped them and hung after its last connection.
+- **`workersUsed` counts the tasks serving at once**: each task counts itself in and out, and a crash takes its
+  task off. Counting the table instead counted finished connections not yet settled.
+- **The channels are made in `runIsolated`**, before the set, with the other values its tasks share. Made inside the
+  set's body, the watched one is left live in the interpreter (B23).
+- **`ConnectionLimits.copy()` and `TrustedProxies.copy()`** are new: the tasks share one copy of the limits in an
+  `Arc`, since `ConnectionLimits` holds a `Vector` and is not Copy.
+- **The steps of one connection** (PROXY header, acceptor, handler, graceful close) are now one function,
+  `serveConnection`, which `run`'s workers and `runIsolated`'s tasks both call. `run` behaves as before.
+- **`examples/http1` takes `CW_ISOLATED=1`** rather than a `--isolated` switch, like its other settings, and has
+  `GET /trap`.
+- **The traps are checked by `tools/isolated_check.py`, not `ceesafec test`**: the test runner reports a test whose
+  isolated task trapped as panicked (B22). The `web_transport` tests of `runIsolated` (`tests/isolated.cee`) cover
+  admission and the drain. CI runs the check on Linux and macOS.
+- **A client that half-closes before reading** is not told its connection ended on macOS (B21). The check's clients
+  do not half-close.
+
+**Run (2026-11-19, macOS arm64, the 0.75.0 release):**
+- `web_transport`'s tests: 44 passed natively and in the interpreter. The four of `runIsolated` pass the
+  allocation-failure sweep (179 runs) and the cancellation sweep (245 runs). `web_server`'s: 27 passed in both.
+- `tools/isolated_check.py`, against `examples/http1` with `CW_ISOLATED=1`, passed every step:
+  - a trap on a keep-alive connection ends that connection (`RemoteDisconnected`), and another keep-alive
+    connection open across it is still answered;
+  - 200 more traps each end their connection, in 0.1 s for all 200;
+  - a new connection and the old keep-alive one are answered after them;
+  - the descriptors grew by 202 for 200 traps;
+  - `/stop` drains the server, and it exits with 0;
+  - there is one `ended alone` line for each of the 201 traps;
+  - without `CW_ISOLATED`, a trap ends the process (status -6), as before.
+- `check`, `fmt --check` in the 14 packages and 12 examples, `check_layers.py`, `api_check.py` (new:
+  `ConnectionServer.runIsolated`, `Server.runIsolated`, `TcpTransport.closer`, `PlainStream.closer`,
+  `ConnectionLimits.copy`, `TrustedProxies.copy`; the field `ServerReport.crashed`).
+
+**Run on Linux** (Ubuntu 24.04, x86-64, the release's linux-x64 binary): `tools/isolated_check.py` passed every
+step (200 traps in under 0.1 s, descriptors +202), and `web_transport`'s four tests of `runIsolated` passed. gcc 13.3
+warns `-Wclobbered` about two variables of the runtime's jump point (`t`, `outer`, `ceesafe_rt_async.c:3105`,
+`:3126`), which the build does not treat as errors.
+
+**Not done yet:** the streams (§2.3, U25); the check over TLS; the benchmark of §8; Windows and FreeBSD, left to CI.

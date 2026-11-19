@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CEESAFE_VERSION: v0.69.0 # main's minimum from 2026-11-18 (docs/toolchain.md)
+  CEESAFE_VERSION: v0.75.0 # main's minimum from 2026-11-19 (docs/toolchain.md)
 
 jobs:
   test:
@@ -162,6 +162,15 @@ jobs:
       - name: Example builds
         shell: bash
         run: (cd examples/echo && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec build -o out/echo)
+
+      # Web ADR 0016: a request that traps costs its connection only (examples/http1 with CW_ISOLATED=1). It counts the
+      # process's descriptors with /proc or lsof, so not on Windows.
+      - name: Isolated connections
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          (cd examples/http1 && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec build)
+          python3 tools/isolated_check.py
 
   freebsd:
     # FreeBSD (Web ADR 0015 §5, option A, accepted): GitHub has no FreeBSD runner, so FreeBSD 15.1 (amd64) runs in a VM

@@ -231,6 +231,7 @@ fn emptyReport() -> ServerReport => ServerReport {
     failed: 0,
     acceptErrors: 0,
     workersUsed: 0,
+    crashed: 0,
     forced: false,
 };
 

@@ -54,6 +54,14 @@ public fn defaults() -> ConnectionLimits
 The defaults: 256 workers, 10 s handshake and head, 60 s idle, 30 s write, 240 B/s after 5 s, 16 KiB buffer,
 1 s linger, 30 s grace, 50 ms accept backoff, no PROXY protocol.
 
+### ConnectionLimits.copy
+
+```ceesafe
+public fn copy(borrow this) -> Result<ConnectionLimits, AllocError>
+```
+
+The same limits, with a list of trusted balancers of its own.
+
 ## struct MockTransport
 
 ```ceesafe
@@ -233,6 +241,14 @@ public fn mock(m: MockTransport) -> PlainStream
 
 A scripted transport, for tests.
 
+### PlainStream.closer
+
+```ceesafe
+public fn closer(borrow this) -> StreamCloser?
+```
+
+`TcpTransport.closer()` for TCP; null for a mock.
+
 ### PlainStream.isMock
 
 ```ceesafe
@@ -337,6 +353,14 @@ public fn add(borrow mut this, text: StringView) -> Result<bool, AllocError>
 ```
 
 Trusts the block `text` (`Cidr.parse`); false if it is not one.
+
+### TrustedProxies.copy
+
+```ceesafe
+public fn copy(borrow this) -> Result<TrustedProxies, AllocError>
+```
+
+The same blocks, in a list of its own.
 
 ### TrustedProxies.isEmpty
 
@@ -505,6 +529,7 @@ public struct ServerReport {
     public failed: u64;
     public acceptErrors: u64;
     public workersUsed: u64;
+    public crashed: u64;
     public forced: bool;
 }
 ```
@@ -536,6 +561,24 @@ ends and every connection is done. Once `drain` starts, idle workers stop at onc
 have `limits.graceMs` to finish; then they are cancelled (`forced` in the report). A connection's failure ends
 that connection only.
 
+### ConnectionServer.runIsolated
+
+```ceesafe
+public async fn runIsolated(
+    incoming: borrow dyn Incoming,
+    acceptor: Arc<Box<dyn Acceptor + Send + Share>>,
+    handler: Arc<Box<dyn ConnectionHandler + Send + Share>>,
+    limits: borrow ConnectionLimits,
+    drain: borrow Drain,
+) -> Result<ServerReport, NetError>
+```
+
+Serves connections from `incoming` as `run` does, each in a task of its own that is isolated (Web ADR 0016,
+CeeSafe ADR 0175): a trap in a connection's acceptor step or handler ends that connection, whose socket is shut,
+and the server goes on. At most `limits.workers` are served at once. A crash is counted in the report's
+`crashed`; what the connection held is leaked, and `Isolation.report()` counts its memory. A trap under C (a
+TLS callback) or in a `Critical` still ends the process.
+
 ## struct TcpTransport
 
 ```ceesafe
@@ -552,6 +595,16 @@ public fn fromStream(stream: AsyncTcpStream) -> TcpTransport
 
 The transport over an accepted or connected stream. Its addresses are read now, once: null if the kernel no
 longer knows them (the peer already reset).
+
+### TcpTransport.closer
+
+```ceesafe
+public fn closer(borrow this) -> StreamCloser?
+```
+
+A second hold on the socket, whose `shutdown()` ends the connection for the peer whoever holds this transport
+(CeeSafe ADR 0175 §2.7): what a server keeps of a connection it hands to an isolated task. Null if the system
+gives none.
 
 ### TcpTransport.connect
 
