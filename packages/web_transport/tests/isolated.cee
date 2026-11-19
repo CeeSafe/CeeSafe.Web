@@ -1,0 +1,214 @@
+// ConnectionServer.runIsolated (Web ADR 0016): every connection served as `run` serves it, admission by `workers`,
+// and the drain: connections in flight finish, idle ones close, and those that ignore it are cancelled after the
+// grace. A trap in a connection is checked by tools/isolated_check.py against examples/http1, not here: ceesafec
+// 0.75.0's test runner reports a test whose isolated task trapped as panicked, though the task ended alone
+// (docs/ceesafe-upstream-work.md, B22).
+import web_core;
+
+/// Echoes each connection whole, and counts the most served at once; the connections numbered in `traps` (by
+/// arrival, from 1) trap instead (an index out of bounds), after reading. Kept for when B22 is fixed: no test here
+/// sets a trap yet.
+struct TrapHandler {
+    arrived: AtomicU64;
+    /// A bit per connection number that traps.
+    traps: u64;
+    echoed: AtomicU64;
+    active: AtomicU64;
+    peak: AtomicU64;
+}
+
+impl ConnectionHandler for TrapHandler {
+    async fn serve(
+        borrow this,
+        conn: borrow mut dyn Transport,
+        ctx: borrow ConnectionContext,
+    ) -> Result<void, NetError> {
+        let n = this.arrived.fetchAdd(1) + 1;
+        let now = this.active.fetchAdd(1) + 1;
+        if (now > this.peak.load()) {
+            this.peak.store(now);
+        }
+        var buf = [0u8; 64];
+        var got: usize = 0;
+        loop {
+            let r = await Transports.readWithin(conn, mut buf[got..], Deadline.after(2000));
+            let k = match (r) {
+                Ok(k) => k,
+                Err(e) => {
+                    let left = this.active.fetchSub(1);
+                    return Err(e);
+                },
+            };
+            if (k == 0) {
+                break;
+            }
+            got += k;
+            if (got == 26) {
+                break;
+            }
+        }
+        if (n < 64 && ((this.traps >> n) & 1) == 1) {
+            let small = [0u8; 2];
+            let at = got + n as usize;
+            buf[0] = small[at]; // the trap: the task's unit ends here, and `active` keeps its count
+        }
+        await nap(5)?; // so that connections overlap
+        let left = this.active.fetchSub(1);
+        await conn.write(buf[0..got])?;
+        let done = this.echoed.fetchAdd(1);
+        return Ok();
+    }
+}
+
+fn trapHandler(traps: u64) -> Result<Arc<Box<dyn ConnectionHandler + Send + Share>>, TestFailure> {
+    let h = TrapHandler {
+        arrived: AtomicU64.create(0),
+        traps: traps,
+        echoed: AtomicU64.create(0),
+        active: AtomicU64.create(0),
+        peak: AtomicU64.create(0),
+    };
+    let boxed: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(h)) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("no memory")); },
+    };
+    match (Arc.create(boxed)) {
+        Ok(a) => { return Ok(a); }
+        Err(_) => { return Err(TestFailure.create("no memory")); }
+    }
+}
+
+fn plainAcceptor() -> Result<Arc<Box<dyn Acceptor + Send + Share>>, TestFailure> {
+    let boxed: Box<dyn Acceptor + Send + Share> = match (Box.create(PlainAcceptor {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("no memory")); },
+    };
+    match (Arc.create(boxed)) {
+        Ok(a) => { return Ok(a); }
+        Err(_) => { return Err(TestFailure.create("no memory")); }
+    }
+}
+
+/// `runIsolated` until `incoming` ends.
+async fn serveIsolated(
+    incoming: borrow MockIncoming,
+    handler: borrow Arc<Box<dyn ConnectionHandler + Send + Share>>,
+    l: borrow ConnectionLimits,
+) -> Result<ServerReport, TestFailure> {
+    let acceptor = plainAcceptor()?;
+    let drain = net(Drain.create())?;
+    return net(await ConnectionServer.runIsolated(incoming, acceptor, handler.clone(), l, drain));
+}
+
+fn limitsOf(workers: u32) -> ConnectionLimits {
+    var l = ConnectionLimits.defaults();
+    l.workers = workers;
+    l.graceMs = 1000;
+    l.closeLingerMs = 100;
+    l.handshakeMs = 20;
+    return l;
+}
+
+@test
+async fn isolated_serves_every_connection() -> Result<void, TestFailure> {
+    let incoming = net(MockIncoming.create(16))?;
+    let m = alphabet();
+    for (k in 0..12u64) {
+        netDone(incoming.push(net(mockOf(m[..]))?.withSeededSplits(k + 1, 5)))?;
+    }
+    incoming.close();
+    let h = trapHandler(0)?;
+    let l = limitsOf(4);
+    let r = await serveIsolated(incoming, h, l)?;
+    Check.isTrue(r.accepted == 12 && r.served == 12 && r.failed == 0, "12 connections accepted and served")?;
+    Check.isTrue(r.crashed == 0 && !r.forced, "none crashed, none forced")?;
+    Check.isTrue(r.workersUsed >= 2 && r.workersUsed <= 4, "admission: never more than 4 at once")?;
+    return Ok();
+}
+
+
+/// `handler` as `runIsolated` takes it.
+fn arcOf<H: ConnectionHandler + Send + Share>(handler: H) -> Result<Arc<Box<dyn ConnectionHandler + Send + Share>>, TestFailure> {
+    let boxed: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(handler)) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("no memory")); },
+    };
+    match (Arc.create(boxed)) {
+        Ok(a) => { return Ok(a); }
+        Err(_) => { return Err(TestFailure.create("no memory")); }
+    }
+}
+
+/// `runIsolated` with a drain started after `drainAfterMs`.
+async fn drainIsolated(
+    incoming: borrow MockIncoming,
+    handler: Arc<Box<dyn ConnectionHandler + Send + Share>>,
+    l: borrow ConnectionLimits,
+    drainAfterMs: u64,
+    report: borrow mut ServerReport,
+) -> Result<void, NetError> {
+    let drain = Drain.create()?;
+    let acceptor = match (plainAcceptor()) {
+        Ok(a) => a,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            report = await ConnectionServer.runIsolated(incoming, acceptor.clone(), handler.clone(), l, drain)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            await nap(drainAfterMs)?;
+            drain.start();
+            return Ok();
+        });
+    })?;
+    return Ok();
+}
+
+@test
+async fn isolated_drain_lets_in_flight_finish() -> Result<void, TestFailure> {
+    let m = alphabet();
+    let incoming = net(MockIncoming.create(4))?;
+    netDone(incoming.push(net(mockOf(m[..]))?))?;
+    netDone(incoming.push(net(mockOf(m[..]))?))?;
+    let l = serverLimits(4, 5000);
+    var r = emptyReport();
+    let started = Timer.now();
+    netDone(await drainIsolated(incoming, arcOf(SlowHandler { ms: 60 })?, l, 10, mut r))?;
+    let took = Timer.now() - started;
+    Check.isTrue(r.served == 2 && !r.forced && r.crashed == 0, "requests in flight finish during the drain")?;
+    Check.isTrue(took >= 60 && took < 2000, "the drain ends when they do")?;
+    return Ok();
+}
+
+@test
+async fn isolated_drain_closes_idle_connections() -> Result<void, TestFailure> {
+    let m = alphabet();
+    let incoming = net(MockIncoming.create(4))?;
+    netDone(incoming.push(net(mockOf(m[0..0]))?.withHang()))?;
+    netDone(incoming.push(net(mockOf(m[0..0]))?.withHang()))?;
+    let l = serverLimits(4, 5000);
+    var r = emptyReport();
+    let started = Timer.now();
+    netDone(await drainIsolated(incoming, arcOf(IdleHandler {})?, l, 10, mut r))?;
+    let took = Timer.now() - started;
+    Check.isTrue(r.served == 2 && !r.forced && took < 2000, "idle keep-alive connections close on drain")?;
+    return Ok();
+}
+
+@test
+async fn isolated_grace_runs_out() -> Result<void, TestFailure> {
+    let m = alphabet();
+    let incoming = net(MockIncoming.create(4))?;
+    netDone(incoming.push(net(mockOf(m[0..0]))?.withHang()))?;
+    netDone(incoming.push(net(mockOf(m[0..0]))?.withHang()))?;
+    let l = serverLimits(4, 50);
+    var r = emptyReport();
+    let started = Timer.now();
+    netDone(await drainIsolated(incoming, arcOf(StubbornHandler {})?, l, 10, mut r))?;
+    let took = Timer.now() - started;
+    Check.isTrue(r.forced && r.served == 0, "connections ignoring the drain are cancelled after the grace")?;
+    Check.isTrue(took >= 60 && took < 1000, "shutdown within drain + grace + epsilon")?;
+    return Ok();
+}

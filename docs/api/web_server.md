@@ -381,6 +381,22 @@ connection server, until `drain` finishes or `incoming` ends (`ConnectionServer.
 when TLS negotiated `h2`, or when it starts with HTTP/2's preface (prior knowledge, RFC 9113 §3.3); HTTP/1.1
 otherwise. The server moves into an `Arc` shared by every connection and HTTP/2 stream.
 
+### Server.runIsolated
+
+```ceesafe
+public async fn runIsolated(
+    this,
+    incoming: borrow dyn Incoming,
+    acceptor: Box<dyn Acceptor + Send + Share>,
+    limits: borrow ConnectionLimits,
+    drain: borrow Drain,
+) -> Result<ServerReport, NetError>
+```
+
+`run` over `ConnectionServer.runIsolated` (Web ADR 0016): each connection in an isolated task, so a trap in a
+handler ends its connection, whose socket is shut, and the server goes on. The report counts the crashes; what a
+crashed connection held is leaked, and `Isolation.report()` counts its memory.
+
 Implements `ConnectionHandler`.
 
 Implements `Application`.

@@ -47,4 +47,20 @@ public struct ConnectionLimits {
         acceptBackoffMs: 50,
         proxyProtocolFrom: TrustedProxies.none(),
     };
+
+    /// The same limits, with a list of trusted balancers of its own.
+    public fn copy(borrow this) -> Result<ConnectionLimits, AllocError> => Ok(ConnectionLimits {
+        workers: this.workers,
+        handshakeMs: this.handshakeMs,
+        headerReadMs: this.headerReadMs,
+        idleMs: this.idleMs,
+        writeMs: this.writeMs,
+        minBodyRate: this.minBodyRate,
+        minRateGraceMs: this.minRateGraceMs,
+        readBufferSize: this.readBufferSize,
+        closeLingerMs: this.closeLingerMs,
+        graceMs: this.graceMs,
+        acceptBackoffMs: this.acceptBackoffMs,
+        proxyProtocolFrom: this.proxyProtocolFrom.copy()?,
+    });
 }

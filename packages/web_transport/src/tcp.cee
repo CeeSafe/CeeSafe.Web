@@ -24,6 +24,14 @@ public struct TcpTransport {
         return TcpTransport { stream: stream, poisoned: false, shut: false, peer: peer, local: local };
     }
 
+    /// A second hold on the socket, whose `shutdown()` ends the connection for the peer whoever holds this transport
+    /// (CeeSafe ADR 0175 §2.7): what a server keeps of a connection it hands to an isolated task. Null if the system
+    /// gives none.
+    public fn closer(borrow this) -> StreamCloser? => match (this.stream.closer()) {
+        Ok(c) => Some(c),
+        Err(_) => null,
+    };
+
     /// Connects to `address` (IPv4 or IPv6 text) and `port`.
     public async fn connect(address: StringView, port: u16) -> Result<TcpTransport, NetError> {
         match (await AsyncTcpStream.connect(address, port)) {

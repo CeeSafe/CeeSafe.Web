@@ -69,6 +69,31 @@ public struct Server<S: Send + Share> {
         let service = serviceOf(this)?;
         return await ConnectionServer.run(incoming, acceptor, service, limits, drain);
     }
+
+    /// `run` over `ConnectionServer.runIsolated` (Web ADR 0016): each connection in an isolated task, so a trap in a
+    /// handler ends its connection, whose socket is shut, and the server goes on. The report counts the crashes; what a
+    /// crashed connection held is leaked, and `Isolation.report()` counts its memory.
+    public async fn runIsolated(
+        this,
+        incoming: borrow dyn Incoming,
+        acceptor: Box<dyn Acceptor + Send + Share>,
+        limits: borrow ConnectionLimits,
+        drain: borrow Drain,
+    ) -> Result<ServerReport, NetError> {
+        let service: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(serviceOf(this)?)) {
+            Ok(b) => b,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let handler = match (Arc<Box<dyn ConnectionHandler + Send + Share>>.create(service)) {
+            Ok(h) => h,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let accepting = match (Arc<Box<dyn Acceptor + Send + Share>>.create(acceptor)) {
+            Ok(a) => a,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        return await ConnectionServer.runIsolated(incoming, accepting, handler, limits, drain);
+    }
 }
 
 /// An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection (Web ADR 0011 §3.2).

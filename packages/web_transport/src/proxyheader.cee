@@ -127,6 +127,16 @@ public struct TrustedProxies {
         return Ok(true);
     }
 
+    /// The same blocks, in a list of its own.
+    public fn copy(borrow this) -> Result<TrustedProxies, AllocError> {
+        var blocks = Vector<Cidr>.create();
+        blocks.reserve(this.blocks.length)?;
+        for (i in 0..this.blocks.length) {
+            blocks.push(this.blocks[i])?;
+        }
+        return Ok(TrustedProxies { blocks: blocks });
+    }
+
     /// Whether there are no blocks.
     public fn isEmpty(borrow this) -> bool => this.blocks.length == 0;
 

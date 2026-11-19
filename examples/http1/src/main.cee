@@ -5,6 +5,8 @@
 //   GET  /, /hello   "hello, world"
 //   POST /echo       the request body back
 //   GET  /stream     three chunks, flushed one by one
+//   GET  /trap       traps (an index out of bounds): with CW_ISOLATED=1 (`ConnectionServer.runIsolated`, Web ADR
+//                    0016) that connection ends and the server goes on; otherwise the process ends
 //   any other        404
 //   request "/stop"  starts the drain (for scripts)
 import web_core;
@@ -40,6 +42,11 @@ impl Application for App {
                 await exchange.flush()?;
             }
             return Ok();
+        }
+        if (Ascii.equals(p, "/trap")) {
+            let small = [0u8; 2];
+            let at = p.length; // 5: out of bounds
+            return await exchange.send(Status.ok(), small[at..at + 1]);
         }
         if (Ascii.equals(p, "/stop")) {
             connection.drain().start();
@@ -98,6 +105,26 @@ async fn run() -> Result<void, NetError> {
     match (await AsyncConsole.writeLine("http1: listening")) {
         Ok() => {}
         Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+    if (setting("CW_ISOLATED", 0) == 1) {
+        let handler: Box<dyn ConnectionHandler + Send + Share> = match (Box.create(http)) {
+            Ok(b) => b,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let accepting: Box<dyn Acceptor + Send + Share> = match (Box.create(acceptor)) {
+            Ok(b) => b,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let h = match (Arc.create(handler)) {
+            Ok(a) => a,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let a = match (Arc.create(accepting)) {
+            Ok(x) => x,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        let report = await ConnectionServer.runIsolated(listener, a, h, limits, drain)?;
+        return Ok();
     }
     let report = await ConnectionServer.run(listener, acceptor, http, limits, drain)?;
     return Ok();
