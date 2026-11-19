@@ -1310,6 +1310,19 @@ counts the live blocks the crashed units' tasks reach (conservatively natively, 
 channel handles are now tagged so that the walk follows them). Both tests pass, natively and (HTTP/2) in the
 interpreter.
 
+## B25 — Bug: LeakSanitizer reports what a crashed isolated task left, and the program exits 1   *(found 2026-11-19, Web ADR 0016 §2.3, ceesafec 0.77.1; fixed in 0.77.2, CeeSafe ADR 0175 amendment 3)*
+
+**Seen:** CI's sanitizer step (`run_tests.py --sanitize`, ASan and UBSan) on ubuntu-24.04 and ubuntu-26.04: the
+five tests whose handler traps (`web_http2`'s `a_stream_that_traps_is_reset_alone`, `web_http3`'s
+`a_request_that_traps_is_reset_alone`, `web_transport`'s three `isolated_trap…`) ended "exited", status 1, natively and in the allocation and cancellation sweeps; every other test passed. A
+crashed unit leaves what it held (CeeSafe ADR 0175 §2.4), and nothing live points to its task blocks once its set
+has counted it, so LeakSanitizer reported them ("Indirect leak … in cee_spawn") at exit. Reduced to a 30-line
+program whose isolated child traps holding a captured `Vector`.
+
+**Fixed in 0.77.2:** built with AddressSanitizer, the runtime marks a crashed unit's root and its trapping task with
+`__lsan_ignore_object`, so what they reach is not reported, and every other leak still is. The five tests pass with
+the sanitizers and in both sweeps (Linux). macOS's AddressSanitizer has no LeakSanitizer, so its job never failed.
+
 ## Tooling (small, any time before M1's exit)
 
 - **T1 Sweeps on any package.** CeeSafe.Web's M1 gate reuses `tools/cancel_sweep.py` and `tools/fault_sweep.py`. Check that both accept a package directory, not only corpus files. If they don't, add a `--package <dir>` mode.

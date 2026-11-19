@@ -1,7 +1,7 @@
 // ConnectionServer.runIsolated (Web ADR 0016): every connection served as `run` serves it, admission by `workers`,
 // the drain (connections in flight finish, idle ones close, those that ignore it are cancelled after the grace), and
 // a trap in a connection's handler, which ends that connection only; over real TCP, its peer sees the end. A test
-// whose isolated task traps passes under `ceesafec test` from 0.77.1 (B22, B24).
+// whose isolated task traps passes under `ceesafec test` from 0.77.1 (B22, B24), and with the sanitizers from 0.77.2 (B25).
 import web_core;
 
 /// Echoes each connection whole, and counts the most served at once; the connections numbered in `traps` (by

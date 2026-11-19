@@ -3,7 +3,7 @@
 **Status:** accepted 2026-11-19. The owner: "I accept ADR 0016's five questions as written" (§7, every recommendation).
 Written at the owner's request ("Move httpserver onto spawnIsolated and Process.spawnWith", then "Web ADR first"),
 from CeeSafe ADR 0175 §5 and §9 step 4, which leave this change to CeeSafe.Web. The connections' part is implemented
-with 0.75.0 (§9); the streams' part with 0.77.1, which has U25 and the fix of B24 (§10).
+with 0.75.0 (§9); the streams' part with 0.77.2, which has U25 and the fixes of B24 and B25 (§10).
 **Scope:** `web_transport` (`ConnectionServer`, `PlainStream`, `TcpTransport`), `web_http2` and `web_http3` (a
 stream's task), `web_server` (`Server.runIsolated`), the toolchain minimum (0.75.0), one upstream item (U25). No
 change to the engines, which stay sans-I/O (Web ADR 0004), and none to `ConnectionServer.run`, which stays as it is.
@@ -288,4 +288,9 @@ crashed task captured (B24); CeeSafe ADR 0175 amendment 2, which the owner accep
 tests passed, each with a stream whose handler traps (reset; the stream beside it, and one that ends after the trap,
 answered; the connection stays up); `web_transport`'s seven `runIsolated` tests, natively and in the interpreter;
 `isolated_check.py`. Linux (Ubuntu 24.04): `web_http2` 53 passed.
+
+**CI's sanitizer job (2026-11-19):** with 0.77.1 the five trap tests exited with status 1 under ASan and UBSan, as
+LeakSanitizer reported what each crash left (B25). CeeSafe ADR 0175 amendment 3, which the owner accepted ("Accept
+as written"), has the runtime tell LeakSanitizer so; released in 0.77.2, which CI now uses. With it the five tests
+pass with the sanitizers and in both sweeps on Linux.
 
