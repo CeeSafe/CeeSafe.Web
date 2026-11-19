@@ -44,7 +44,11 @@ struct DynamicTable {
     }
 
     /// The `i`th entry, 1 for the newest.
-    fn at(borrow this, i: usize) -> usize => (this.oldest + this.count - i) % this.slots.length;
+    fn at(borrow this, i: usize) -> usize => this.wrap(this.oldest + this.count - i);
+
+    /// A position in the ring from one below twice its length (`oldest < length` and `count <= length`), without the
+    /// division `%` costs: the encoder looks an entry up this way for every field it sends.
+    fn wrap(borrow this, j: usize) -> usize => if (j >= this.slots.length) j - this.slots.length else j;
 
     fn evictTo(borrow mut this, room: u32) {
         while (this.count > 0 && this.size > room) {
@@ -52,7 +56,7 @@ struct DynamicTable {
             this.size -= entrySize(this.slots[s].name.length, this.slots[s].value.length);
             this.slots[s].name.clear();
             this.slots[s].value.clear();
-            this.oldest = (this.oldest + 1) % this.slots.length;
+            this.oldest = this.wrap(this.oldest + 1);
             this.count -= 1;
         }
     }
@@ -71,7 +75,7 @@ struct DynamicTable {
             return Ok();
         }
         this.evictTo(this.maxSize - cost);
-        let s = (this.oldest + this.count) % this.slots.length;
+        let s = this.wrap(this.oldest + this.count);
         this.slots[s].name.clear();
         this.slots[s].value.clear();
         appendAll(mut this.slots[s].name, name)?;
