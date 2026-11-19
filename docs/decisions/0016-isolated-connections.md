@@ -3,7 +3,7 @@
 **Status:** accepted 2026-11-19. The owner: "I accept ADR 0016's five questions as written" (§7, every recommendation).
 Written at the owner's request ("Move httpserver onto spawnIsolated and Process.spawnWith", then "Web ADR first"),
 from CeeSafe ADR 0175 §5 and §9 step 4, which leave this change to CeeSafe.Web. The connections' part is implemented
-with 0.75.0 (§9); the streams' part waits for U25.
+with 0.75.0 (§9); the streams' part with 0.77.1, which has U25 and the fix of B24 (§10).
 **Scope:** `web_transport` (`ConnectionServer`, `PlainStream`, `TcpTransport`), `web_http2` and `web_http3` (a
 stream's task), `web_server` (`Server.runIsolated`), the toolchain minimum (0.75.0), one upstream item (U25). No
 change to the engines, which stay sans-I/O (Web ADR 0004), and none to `ConnectionServer.run`, which stays as it is.
@@ -262,3 +262,30 @@ warns `-Wclobbered` about two variables of the runtime's jump point (`t`, `outer
 `:3126`), which the build does not treat as errors.
 
 **Not done yet:** the streams (§2.3, U25); the check over TLS; the benchmark of §8; Windows and FreeBSD, left to CI.
+
+## 10. Implementation notes: the streams (2026-11-19)
+
+The owner, of the streams' part after 0.77.0 was released: "Yes, go ahead". CeeSafe 0.77.0 has U25
+(`trySpawnIsolated`, CeeSafe ADR 0175 amendment 1) and fixes B21, B22 and B23. Its leak count still missed what a
+crashed task captured (B24); CeeSafe ADR 0175 amendment 2, which the owner accepted, fixed it in 0.77.1.
+
+- **HTTP/2** (`packages/web_http2/src/serve.cee`): a stream's task is started with
+  `set.trySpawnIsolated(NetError.Reset, …)`, and its `Link` keeps the task's number. The set's crashes come on a
+  channel the connection's wait races (`quietWake`, `crashOrTimer`). A crashed stream is reset with
+  `INTERNAL_ERROR` and its link dropped (`crashed`). A wait now returns every arrival, not one: a crash taken by a
+  race's losing side is kept, as a read is. The set's `Err(Reset)` for a crash is the connection's normal end.
+- **HTTP/3** (`packages/web_http3/src/server.cee`): `trySpawnIsolated(QuicError.Draining, …)`. The connection waits
+  in `web_quic`'s `waitWith(outgoing, …)`, so a task of the set (`passCrashes`) passes each crash on as
+  `Outgoing.Crashed(task)`. The stream is then refused as one the driver can no longer answer: `H3_INTERNAL_ERROR`.
+  `Draining` is the crash's value because a set reports its first error, and the QUIC server treats `Draining` and
+  `IdleTimeout`, what the loop ends with, alike.
+- **The connections' trap tests** are back in `web_transport` (`tests/isolated.cee`): they set aside under 0.75.0
+  for B22. Over TCP, a peer that half-closed first is told too (B21). In the interpreter, which has no closers, the
+  TCP test checks the server's side only.
+- `tools/isolated_check.py` adds a client that half-closes before it reads.
+
+**Run (2026-11-19, ceesafec 0.77.1 built from its tagged commit):** macOS arm64: `web_http2` 53 and `web_http3` 14
+tests passed, each with a stream whose handler traps (reset; the stream beside it, and one that ends after the trap,
+answered; the connection stays up); `web_transport`'s seven `runIsolated` tests, natively and in the interpreter;
+`isolated_check.py`. Linux (Ubuntu 24.04): `web_http2` 53 passed.
+

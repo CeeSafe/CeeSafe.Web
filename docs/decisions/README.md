@@ -21,7 +21,7 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0013](0013-low-level-io.md) | Low-level I/O: profiling, buffers, vectored writes, sending files, static files | Accepted 2026-11-06 | M9 |
 | [0014](0014-quic-and-http3.md) | HTTP/3 and QUIC: ngtcp2 and nghttp3 behind a sans-I/O shim | Accepted 2026-11-09 | M10 |
 | [0015](0015-v1-hardening.md) | v1.0 hardening: the audit, the fuzz farm, the API freeze, portability, the benchmark report | Accepted 2026-11-11 | v1.0 |
-| [0016](0016-isolated-connections.md) | Isolated connections and streams: a trap ends one connection or one stream, not the process | Accepted 2026-11-19 (connections implemented; streams wait for U25) | after v0.5 |
+| [0016](0016-isolated-connections.md) | Isolated connections and streams: a trap ends one connection or one stream, not the process | Accepted 2026-11-19 (connections and streams implemented) | after v0.5 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 
