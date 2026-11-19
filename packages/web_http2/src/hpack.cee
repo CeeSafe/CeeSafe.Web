@@ -416,7 +416,9 @@ public struct HpackEncoder {
         let valueLen = STATIC_VALUE_LEN;
         var nameIndex: u64 = 0;
         for (i in 1..62usize) {
-            if (!same(t[nameAt[i] as usize..nameAt[i] as usize + nameLen[i] as usize], name)) {
+            // The length first: most entries differ in it, and it costs no slice of the text.
+            if (nameLen[i] as usize != name.length ||
+                !same(t[nameAt[i] as usize..nameAt[i] as usize + nameLen[i] as usize], name)) {
                 continue;
             }
             if (nameIndex == 0) {
@@ -471,7 +473,9 @@ public struct HpackEncoder {
         let valueLen = STATIC_VALUE_LEN;
         var nameIndex: u64 = 0;
         for (i in 1..62usize) {
-            if (!same(t[nameAt[i] as usize..nameAt[i] as usize + nameLen[i] as usize], name)) {
+            // The length first: most entries differ in it, and it costs no slice of the text.
+            if (nameLen[i] as usize != name.length ||
+                !same(t[nameAt[i] as usize..nameAt[i] as usize + nameLen[i] as usize], name)) {
                 continue;
             }
             if (nameIndex == 0) {
