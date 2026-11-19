@@ -46,10 +46,33 @@ async fn nap(ms: u64) -> Result<void, NetError> {
     }
 }
 
-/// The process's open descriptors (`/dev/fd`), or null where it cannot be listed (Windows).
+/// The process's open descriptors (`/dev/fd`), or null where they cannot be counted: where `/dev/fd` cannot be
+/// listed (Windows) or does not follow the descriptors (FreeBSD without fdescfs lists only 0, 1 and 2), which shows
+/// as a listing that does not grow while one more socket is open.
 fn openDescriptors() -> usize? {
+    let n = listedDescriptors()?;
+    let withProbe = listedWithProbe()?;
+    if (withProbe != n + 1) {
+        return null;
+    }
+    return Some(n);
+}
+
+/// The names `/dev/fd` lists, or null where it cannot be listed.
+fn listedDescriptors() -> usize? {
     match (Directory.list("/dev/fd")) {
         Ok(names) => { return Some(names.length); }
+        Err(_) => { return null; }
+    }
+}
+
+/// The names `/dev/fd` lists while a probe listener is open; dropping it on return closes it.
+fn listedWithProbe() -> usize? {
+    match (Listener.bind("127.0.0.1", 0)) {
+        Ok(probe) => {
+            let n = listedDescriptors();
+            return n;
+        }
         Err(_) => { return null; }
     }
 }

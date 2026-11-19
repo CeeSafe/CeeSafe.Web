@@ -10,10 +10,10 @@ other request is answered, that each trap's peer saw its connection end, that th
 line a trap, and that its descriptors grew by about one a trap (the crashed connections' sockets are leaked, CeeSafe
 ADR 0175 §2.4). Then `/stop` drains it. Last, without CW_ISOLATED, a trap ends the process, as before.
 
-The trapping clients do not half-close their side first: with ceesafec 0.75.0 on macOS, a closer cannot end a
-connection whose peer has already sent its FIN (docs/ceesafe-upstream-work.md, B21).
+One trapping client half-closes its side before it reads: a closer ends that connection too (ceesafec 0.77.0, which
+fixed B21 of docs/ceesafe-upstream-work.md on macOS).
 """
-import argparse, http.client, os, pathlib, subprocess, sys, time
+import argparse, http.client, os, pathlib, socket, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 BINARY = HERE / "examples" / "http1" / "out" / "http1"
@@ -78,6 +78,19 @@ try:
     expect(f"the request that traps gets no answer, and its connection ends ({got})", not isinstance(got, tuple))
     expect("the other keep-alive connection is still answered", ask(kept, "/hello") == (200, b"hello, world"))
 
+    # A client that sends its request and ends its side, then reads: the end comes at once, not at its timeout.
+    raw = socket.create_connection(("127.0.0.1", a.port), timeout=5)
+    raw.sendall(b"GET /trap HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+    raw.shutdown(socket.SHUT_WR)
+    t0 = time.time()
+    try:
+        got = raw.recv(64)
+    except OSError as e:
+        got = type(e).__name__
+    raw.close()
+    expect(f"a trap whose client half-closed first ends its connection at once ({got!r}, {time.time() - t0:.2f} s)",
+           got in (b"", "ConnectionResetError") and time.time() - t0 < 2)
+
     before = descriptors(p.pid)
     ended = 0
     t0 = time.time()
@@ -112,7 +125,7 @@ finally:
         p.kill()
 err = p.stderr.read()
 alone = err.count("ended alone)")
-expect(f"one 'ended alone' line a trap ({alone} for {a.traps + 1})", alone == a.traps + 1)
+expect(f"one 'ended alone' line a trap ({alone} for {a.traps + 2})", alone == a.traps + 2)
 
 p = start(False)
 try:

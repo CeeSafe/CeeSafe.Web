@@ -1246,7 +1246,7 @@ job runs `web_ws` in the interpreter again.
 - **CI** (pull request #32's `freebsd` job, 0.57.1): `web_ws` in the interpreter, 26 passed; the whole job passed with
   #34's fix.
 
-## U25 — A non-waiting isolated spawn   *(found 2026-11-19, Web ADR 0016 §5, ceesafec 0.75.0; proposed with that ADR)*
+## U25 — A non-waiting isolated spawn   *(found 2026-11-19, Web ADR 0016 §5, ceesafec 0.75.0; released in 0.77.0, CeeSafe ADR 0175 amendment 1)*
 
 **Gap:** CeeSafe ADR 0175 (0.75.0) gives a task set `spawnIsolated(crashed, child)`, which waits for room, and no
 `trySpawnIsolated`. HTTP/2 and HTTP/3 start a stream's task with `set.trySpawn` from the connection's frame loop
@@ -1259,7 +1259,7 @@ full, with `spawnIsolated`'s rules for the child (N0334, N0349) and its crash.
 **Effect on CeeSafe.Web until then:** streams are not isolated; Web ADR 0016's connections are (they need 0.75.0
 only).
 
-## B21 — Bug: on macOS, a closer cannot end a connection whose peer has half-closed   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0, macOS)*
+## B21 — Bug: on macOS, a closer cannot end a connection whose peer has half-closed   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0, macOS; fixed in 0.77.0)*
 
 **Seen:** `StreamCloser.shutdown()` is `shutdown(fd, SHUT_RDWR)` (`runtime/hosted/ceesafe_rt_io.c`,
 `ceesafe_host_handover_shutdown`). On macOS, once the peer's FIN has arrived, that call fails with `ENOTCONN` and
@@ -1275,7 +1275,7 @@ half-close reads the end at once. On Linux (Ubuntu 24.04) both calls succeed and
 **Effect on CeeSafe.Web until then:** `tools/isolated_check.py`'s trapping clients do not half-close. An HTTP/1.1
 client rarely half-closes before reading its response.
 
-## B22 — Bug: `ceesafec test` reports a test whose isolated task trapped as panicked   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0)*
+## B22 — Bug: `ceesafec test` reports a test whose isolated task trapped as panicked   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0; fixed in 0.77.0, and for what the task captured in 0.77.1, B24)*
 
 **Seen:** `src/host/test_runner.cee:399` classifies a test as panicked when its standard error contains
 `ceesafe panic`, and an isolated task that ends alone writes that line too (`… (isolated task 3: ended alone)`, CeeSafe
@@ -1288,7 +1288,7 @@ also be counted as live allocations at the end ("leaked").
 **Effect on CeeSafe.Web until then:** `web_transport`'s tests of `runIsolated` set no trap; the traps are checked by
 `tools/isolated_check.py` against `examples/http1`.
 
-## B23 — Bug: the interpreter leaks a watched channel made inside its task set's body   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0, interpreter only)*
+## B23 — Bug: the interpreter leaks a watched channel made inside its task set's body   *(found 2026-11-19, Web ADR 0016, ceesafec 0.75.0, interpreter only; fixed in 0.77.0)*
 
 **Seen:** `Isolation.watch(set, crashes)` where `crashes` is made inside `Async.tasks`' body leaves one allocation
 live at the end under `ceesafec test --interp`; natively nothing is left. The same with the channel made before
@@ -1298,6 +1298,30 @@ live at the end under `ceesafec test --interp`; natively nothing is left. The sa
 
 **Effect on CeeSafe.Web until then:** none: `runIsolated` makes its channels before the set, beside the other values
 the set's tasks share.
+
+## B24 — Bug: `ceesafec test` reports what a crashed isolated task captured as the test's leak   *(found 2026-11-19, Web ADR 0016 §2.3, ceesafec 0.77.0; fixed in 0.77.1, CeeSafe ADR 0175 amendment 2)*
+
+**Seen:** 0.77.0 took off `live` the blocks allocated under a crashed unit's budget, and its root's frame. A child's
+captures are allocated by its parent before the unit exists, so they were missed: `web_http2`'s test of a stream
+whose handler traps ended with `live=17` and `isolated leaked=3`, and was reported leaked; `web_http3`'s, 10 and 0.
+
+**Fixed in 0.77.1:** in a run that counts allocations, the runtime keeps a table of live blocks and, at the end,
+counts the live blocks the crashed units' tasks reach (conservatively natively, exactly in the interpreter, whose
+channel handles are now tagged so that the walk follows them). Both tests pass, natively and (HTTP/2) in the
+interpreter.
+
+## B25 — Bug: LeakSanitizer reports what a crashed isolated task left, and the program exits 1   *(found 2026-11-19, Web ADR 0016 §2.3, ceesafec 0.77.1; fixed in 0.77.2, CeeSafe ADR 0175 amendment 3)*
+
+**Seen:** CI's sanitizer step (`run_tests.py --sanitize`, ASan and UBSan) on ubuntu-24.04 and ubuntu-26.04: the
+five tests whose handler traps (`web_http2`'s `a_stream_that_traps_is_reset_alone`, `web_http3`'s
+`a_request_that_traps_is_reset_alone`, `web_transport`'s three `isolated_trap…`) ended "exited", status 1, natively and in the allocation and cancellation sweeps; every other test passed. A
+crashed unit leaves what it held (CeeSafe ADR 0175 §2.4), and nothing live points to its task blocks once its set
+has counted it, so LeakSanitizer reported them ("Indirect leak … in cee_spawn") at exit. Reduced to a 30-line
+program whose isolated child traps holding a captured `Vector`.
+
+**Fixed in 0.77.2:** built with AddressSanitizer, the runtime marks a crashed unit's root and its trapping task with
+`__lsan_ignore_object`, so what they reach is not reported, and every other leak still is. The five tests pass with
+the sanitizers and in both sweeps (Linux). macOS's AddressSanitizer has no LeakSanitizer, so its job never failed.
 
 ## Tooling (small, any time before M1's exit)
 

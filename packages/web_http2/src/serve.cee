@@ -79,6 +79,9 @@ enum BodyPart {
 
 /// The connection's side of one stream.
 struct Link {
+    /// The stream's isolated task (`trySpawnIsolated`, Web ADR 0016 §2.3), whose crash resets the stream; 0 if there
+    /// was no memory to isolate it.
+    task: u64;
     body: Channel<BodyPart>;
     credit: Channel<u32>;
     reset: Channel<u8>;
@@ -108,6 +111,8 @@ struct StreamContext {
 enum Wake {
     Read(usize),
     Message(Outgoing),
+    /// A stream's task trapped and ended alone (CeeSafe ADR 0175).
+    Crash(TaskCrash),
     Timer,
 }
 
@@ -138,12 +143,22 @@ public async fn serveH2(
         Ok(c) => c,
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
+    // Each stream's task is isolated: its crash comes here, and the connection resets that stream (Web ADR 0016 §2.3).
+    let crashes = match (Channel<TaskCrash>.create(256)) {
+        Ok(c) => c,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
     var links = HashMap<u32, Link>.create();
-    let r = await Async.tasks(256, NetError.OutOfMemory, async (set) =>
-        await run(set, conn, connection, app, limits, mut engine, mut input, outgoing, mut links));
+    let r = await Async.tasks(256, NetError.OutOfMemory, async (set) => {
+        if (!Isolation.watch(set, crashes)) {
+            return Err(NetError.OutOfMemory);
+        }
+        return await run(set, conn, connection, app, limits, mut engine, mut input, outgoing, crashes, mut links);
+    });
     match (r) {
         Ok() => { return Ok(); }
         Err(NetError.Closed) => { return Ok(); } // the connection's normal end, which cancelled the streams
+        Err(NetError.Reset) => { return Ok(); }  // a stream that crashed, which the connection reset; it went on
         Err(e) => { return Err(e); }
     }
 }
@@ -158,6 +173,7 @@ async fn run(
     engine: borrow mut H2Connection,
     input: borrow mut OwnedBuffer,
     outgoing: borrow Channel<Outgoing>,
+    crashes: borrow Channel<TaskCrash>,
     links: borrow mut HashMap<u32, Link>,
 ) -> Result<void, NetError> {
     var head = HeaderBlock.create();
@@ -241,6 +257,13 @@ async fn run(
                 H2Event.GoAway(_, _) => { leaving = true; }
             }
         }
+        // The streams whose tasks trapped since the last turn.
+        loop {
+            match (crashes.tryRecv()) {
+                Some(c) => { crashed(engine, links, c, mut total)?; }
+                null => { break; }
+            }
+        }
         // What the streams queued, as long as there is any.
         loop {
             match (outgoing.tryRecv()) {
@@ -284,18 +307,18 @@ async fn run(
         // While DATA is awaited, only the streams are waited on (a read would be cancelled by their message), and for
         // at most 10 ms, should a granted stream not send.
         let cap: u64 = if (awaited) 10 else 1000;
-        let woke = await wake(conn, input, outgoing, if (waitMs > cap) cap else waitMs, !peerDone && !awaited)?;
-        // Both of a race's children may have finished: a read the kernel completed as it was cancelled (io_uring,
-        // CeeSafe ADR 0035 §3.4) comes back as `other`, and its bytes are already in `input`.
-        var current: Wake? = Some(woke.value);
-        var later: Wake? = woke.other;
-        loop {
-            let w = match (current) {
-                Some(x) => x,
-                null => { break; },
-            };
-            current = later;
-            later = null;
+        // Everything that arrived: a race's children may each have finished, and none of what they took may be lost (a
+        // read the kernel completed as it was cancelled, io_uring, CeeSafe ADR 0035 §3.4: its bytes are in `input`).
+        var woke = await wake(
+            conn,
+            input,
+            outgoing,
+            crashes,
+            if (waitMs > cap) cap else waitMs,
+            !peerDone && !awaited,
+        )?;
+        while (woke.length > 0) {
+            let w = VectorEditing.remove(mut woke, 0);
             match (w) {
                 Wake.Read(0) => {
                     peerDone = true;
@@ -308,6 +331,7 @@ async fn run(
                 Wake.Message(m) => {
                     await handle(set, connection, app, limits, engine, links, outgoing, mut kits, m, mut total)?;
                 }
+                Wake.Crash(c) => { crashed(engine, links, c, mut total)?; }
                 Wake.Timer => {
                     if (peerDone && links.length() > 0) {
                         engineOk(engine.ping([0u8; 8]))?;
@@ -368,13 +392,16 @@ fn startStream(
     let c = credit.clone();
     let rs = reset.clone();
     let rp = replies.clone();
-    let started = set.trySpawn(async move () =>
+    // Isolated (Web ADR 0016 §2.3): a trap in the application's handler ends this task alone, and the connection
+    // resets the stream (`crashed`). A full set refuses the stream, as RFC 9113 §8.7 allows.
+    let started = set.trySpawnIsolated(NetError.Reset, async move () =>
         await streamTask(a, context, id, head, hasBody, b, o, c, rp, rs, limits, kit));
-    if (!started) {
+    let task = started ?? {
         engineOk(engine.resetStream(id, ErrorCodes.refusedStream()))?;
         return Ok();
-    }
+    };
     let link = Link {
+        task: task,
         body: body,
         credit: credit,
         reset: reset,
@@ -613,35 +640,115 @@ async fn writeOutput(
     return Ok();
 }
 
-/// One wait: bytes from the client (when `reading`), a stream's message, or `waitMs` passing. Both of the race's
-/// children may have finished, so both values come back (`value`, then `other`).
+/// A stream's task trapped: the stream is reset with INTERNAL_ERROR (RFC 9113 §7) and its link dropped, as for a
+/// stream the client reset. Its task held its kit, which is not returned to the pool.
+fn crashed(
+    engine: borrow mut H2Connection,
+    links: borrow mut HashMap<u32, Link>,
+    crash: TaskCrash,
+    total: borrow mut i64,
+) -> Result<void, NetError> {
+    if (crash.task == 0) {
+        return Ok();
+    }
+    var found: u32? = null;
+    for (i in 0..links.length()) {
+        let id: u32 = links.keyAt(i);
+        match (links.get(id)) {
+            Some(link) => {
+                if (link.task == crash.task) {
+                    found = Some(id);
+                }
+            }
+            null => {}
+        }
+    }
+    let id = found ?? { return Ok(); }; // already ended
+    engineOk(engine.resetStream(id, ErrorCodes.internalError()))?;
+    endLink(links, id, mut total);
+    return Ok();
+}
+
+/// One wait: bytes from the client (when `reading`), a stream's message, a stream's crash, or `waitMs` passing.
+/// Everything that arrived, in order: a race's children may both have finished.
 async fn wake(
     conn: borrow mut dyn Transport,
     input: borrow mut OwnedBuffer,
     outgoing: borrow Channel<Outgoing>,
+    crashes: borrow Channel<TaskCrash>,
     waitMs: u64,
     reading: bool,
-) -> Result<Raced<Wake>, NetError> {
+) -> Result<Vector<Wake>, NetError> {
     if (!reading) {
-        let w = await quietWake(outgoing, waitMs)?;
-        return Ok(Raced<Wake> { winner: 1, value: w, other: null });
+        return await quietWake(outgoing, crashes, waitMs);
     }
-    return await Async.race(
+    let r: Result<Raced<Vector<Wake>>, NetError> = await Async.race(
         async () => {
             let n = await conn.read(input.spare())?;
-            return Ok(Wake.Read(n));
+            var read = Vector<Wake>.create();
+            alloc(read.push(Wake.Read(n)))?;
+            return Ok(read);
         },
-        async () => await quietWake(outgoing, waitMs),
+        async () => await quietWake(outgoing, crashes, waitMs),
     );
+    let raced = r?;
+    var all = raced.value;
+    match (raced.other) {
+        Some(more) => {
+            var rest = more;
+            while (rest.length > 0) {
+                alloc(all.push(VectorEditing.remove(mut rest, 0)))?;
+            }
+        }
+        null => {}
+    }
+    return Ok(all);
 }
 
-/// One wait without reading: a stream's message, or `waitMs` passing. A message taken as the timer won is kept: the
-/// timer's wake is the one dropped.
-async fn quietWake(outgoing: borrow Channel<Outgoing>, waitMs: u64) -> Result<Wake, NetError> {
+/// One wait without reading: a stream's message, a stream's crash, or `waitMs` passing. Whatever was taken is kept;
+/// a timer's wake beside something else is dropped.
+async fn quietWake(
+    outgoing: borrow Channel<Outgoing>,
+    crashes: borrow Channel<TaskCrash>,
+    waitMs: u64,
+) -> Result<Vector<Wake>, NetError> {
     let raced: Result<Raced<Wake>, NetError> = await Async.race(
         async () => {
             match (await outgoing.recvAsync()) {
                 Ok(Some(m)) => { return Ok(Wake.Message(m)); }
+                Ok(null) => { return Err(NetError.Closed); }
+                Err(e) => { return Err(NetErrors.fromAsync(e)); }
+            }
+        },
+        async () => await crashOrTimer(crashes, waitMs),
+    );
+    let won = raced?;
+    var all = Vector<Wake>.create();
+    keep(mut all, won.value)?;
+    match (won.other) {
+        Some(w) => { keep(mut all, w)?; }
+        null => {}
+    }
+    if (all.length == 0) {
+        alloc(all.push(Wake.Timer))?;
+    }
+    return Ok(all);
+}
+
+/// `all` with `w`, unless `w` is the timer's, which only says that nothing came.
+fn keep(all: borrow mut Vector<Wake>, w: Wake) -> Result<void, NetError> {
+    match (w) {
+        Wake.Timer => { return Ok(); }
+        other => { return alloc(all.push(other)); }
+    }
+}
+
+/// A stream's crash, or `waitMs` passing; a crash taken as the timer won is kept.
+async fn crashOrTimer(crashes: borrow Channel<TaskCrash>, waitMs: u64) -> Result<Wake, NetError> {
+    let raced: Result<Raced<Wake>, NetError> = await Async.race(
+        async () => {
+            match (await crashes.recvAsync()) {
+                Ok(Some(c)) => { return Ok(Wake.Crash(c)); }
                 Ok(null) => { return Err(NetError.Closed); }
                 Err(e) => { return Err(NetErrors.fromAsync(e)); }
             }
@@ -655,10 +762,10 @@ async fn quietWake(outgoing: borrow Channel<Outgoing>, waitMs: u64) -> Result<Wa
     );
     let won = raced?;
     if (won.winner == 0) {
-        return Ok(won.value); // the data won: `other`, if any, is the timer's
+        return Ok(won.value);
     }
     return match (won.other) {
-        Some(m) => Ok(m),
+        Some(c) => Ok(c),
         null => Ok(won.value),
     };
 }

@@ -1,13 +1,11 @@
 // ConnectionServer.runIsolated (Web ADR 0016): every connection served as `run` serves it, admission by `workers`,
-// and the drain: connections in flight finish, idle ones close, and those that ignore it are cancelled after the
-// grace. A trap in a connection is checked by tools/isolated_check.py against examples/http1, not here: ceesafec
-// 0.75.0's test runner reports a test whose isolated task trapped as panicked, though the task ended alone
-// (docs/ceesafe-upstream-work.md, B22).
+// the drain (connections in flight finish, idle ones close, those that ignore it are cancelled after the grace), and
+// a trap in a connection's handler, which ends that connection only; over real TCP, its peer sees the end. A test
+// whose isolated task traps passes under `ceesafec test` from 0.77.1 (B22, B24), and with the sanitizers from 0.77.2 (B25).
 import web_core;
 
 /// Echoes each connection whole, and counts the most served at once; the connections numbered in `traps` (by
-/// arrival, from 1) trap instead (an index out of bounds), after reading. Kept for when B22 is fixed: no test here
-/// sets a trap yet.
+/// arrival, from 1) trap instead (an index out of bounds), after reading.
 struct TrapHandler {
     arrived: AtomicU64;
     /// A bit per connection number that traps.
@@ -210,5 +208,146 @@ async fn isolated_grace_runs_out() -> Result<void, TestFailure> {
     let took = Timer.now() - started;
     Check.isTrue(r.forced && r.served == 0, "connections ignoring the drain are cancelled after the grace")?;
     Check.isTrue(took >= 60 && took < 1000, "shutdown within drain + grace + epsilon")?;
+    return Ok();
+}
+
+@test
+async fn isolated_trap_ends_its_connection_only() -> Result<void, TestFailure> {
+    let incoming = net(MockIncoming.create(16))?;
+    let m = alphabet();
+    for (k in 0..5u64) {
+        netDone(incoming.push(net(mockOf(m[..]))?))?;
+    }
+    incoming.close();
+    let h = trapHandler(1 << 3)?; // the third connection traps
+    let l = limitsOf(2);
+    let r = await serveIsolated(incoming, h, l)?;
+    Check.isTrue(r.accepted == 5, "5 accepted")?;
+    Check.isTrue(r.crashed == 1, "one crashed")?;
+    Check.isTrue(r.served == 4 && r.failed == 0, "the other 4 served, none counted as failed")?;
+    Check.isTrue(Isolation.report().crashes >= 1, "the process counts the crash")?;
+    return Ok();
+}
+
+@test
+async fn isolated_traps_do_not_stop_the_server() -> Result<void, TestFailure> {
+    let incoming = net(MockIncoming.create(32))?;
+    let m = alphabet();
+    for (k in 0..20u64) {
+        netDone(incoming.push(net(mockOf(m[..]))?.withSeededSplits(k + 1, 3)))?;
+    }
+    incoming.close();
+    // every other connection traps
+    var traps: u64 = 0;
+    for (n in 1..21u64) {
+        if (n % 2 == 0) {
+            traps = traps | (1u64 << n);
+        }
+    }
+    let h = trapHandler(traps)?;
+    let l = limitsOf(3);
+    let r = await serveIsolated(incoming, h, l)?;
+    Check.isTrue(r.accepted == 20 && r.crashed == 10 && r.served == 10, "10 crashed, 10 served")?;
+    Check.isFalse(r.forced, "the server ended when the source did, not by the grace")?;
+    return Ok();
+}
+
+/// A TCP client that sends the alphabet without ending its side first, then reads to the end: true if it got the
+/// alphabet back, false if the connection ended with nothing (as a trapped one does), or was reset.
+async fn plainClient(port: u16, halfClose: bool) -> Result<bool, NetError> {
+    var c = await TcpTransport.connect("127.0.0.1", port)?;
+    let m = alphabet();
+    await c.write(m[..])?;
+    if (halfClose) {
+        await c.shutdownWrite()?;
+    }
+    var buf = [0u8; 32];
+    var got: usize = 0;
+    loop {
+        let n = match (await Transports.readWithin(mut c, mut buf[got..], Deadline.after(3000))) {
+            Ok(n) => n,
+            Err(NetError.TimedOut) => { return Err(NetError.TimedOut); }, // the server never ended it
+            Err(_) => { return Ok(false); },
+        };
+        if (n == 0) {
+            break;
+        }
+        got += n;
+    }
+    return Ok(got == m.length);
+}
+
+/// Whether this system gives a stream a closer: not under `ceesafec run --interp` (CeeSafe ADR 0175 §10), where a
+/// trapped connection's socket cannot be shut for its peer. Asked of a connection of its own.
+async fn closersWork() -> Result<bool, TestFailure> {
+    let probe = net(Listener.bind("127.0.0.1", 0))?;
+    let port = net(probe.port())?;
+    let c = net(await TcpTransport.connect("127.0.0.1", port))?;
+    return Ok(c.closer().isSome());
+}
+
+/// Over TCP: the peers of connections whose handler traps read the end, one of them having half-closed first (on
+/// macOS that needed ceesafec 0.77.0, B21), and a client after them is echoed. Where there are no closers, the peers
+/// are not told, and only the server's side is checked.
+async fn trapOverTcpChecks() -> Result<void, TestFailure> {
+    let told = await closersWork()?;
+    let listener = net(Listener.bind("127.0.0.1", 0))?;
+    let port = net(listener.port())?;
+    let drain = net(Drain.create())?;
+    let h = trapHandler((1 << 1) | (1 << 2))?; // the first two connections trap
+    let a = plainAcceptor()?;
+    let l = limitsOf(4);
+    var r = emptyReport();
+    var first: bool? = null;
+    var second: bool? = null;
+    var third: bool? = null;
+    netDone(await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => {
+            r = await ConnectionServer.runIsolated(listener, a.clone(), h.clone(), l, drain)?;
+            return Ok();
+        });
+        s.spawn(async () => {
+            first = match (await plainClient(port, false)) {
+                Ok(echoed) => Some(echoed),
+                Err(NetError.TimedOut) => null, // nobody shut it: no closers here
+                Err(e) => { return Err(e); },
+            };
+            second = match (await plainClient(port, true)) {
+                Ok(echoed) => Some(echoed),
+                Err(NetError.TimedOut) => null,
+                Err(e) => { return Err(e); },
+            };
+            third = Some(await plainClient(port, true)?);
+            drain.start();
+            return Ok();
+        });
+    }))?;
+    if (told) {
+        Check.isTrue(first == Some(false), "a trapped connection ended, and its client was not left waiting")?;
+        Check.isTrue(second == Some(false), "so did one whose client had half-closed")?;
+    }
+    Check.isTrue(third == Some(true), "the next connection is echoed")?;
+    Check.isTrue(r.accepted == 3 && r.crashed == 2 && r.served == 1, "TCP report: 2 crashed, 1 served")?;
+    return Ok();
+}
+
+// Sync, as the other TCP tests, to count descriptors: each crashed connection's socket is leaked (CeeSafe ADR 0175
+// §2.4), so the process holds exactly two more afterwards (the probe's are closed).
+@test
+fn isolated_trap_over_tcp() -> Result<void, TestFailure> {
+    let before = openDescriptors();
+    match (Async.run(trapOverTcpChecks())) {
+        Ok() => {}
+        Err(failure) => { return Err(failure); }
+    }
+    match (before) {
+        Some(b) => {
+            match (openDescriptors()) {
+                Some(after) => { Check.isTrue(after == b + 2, "two descriptors leaked: the crashed connections' sockets")?; }
+                null => {}
+            }
+        }
+        null => {}
+    }
     return Ok();
 }
