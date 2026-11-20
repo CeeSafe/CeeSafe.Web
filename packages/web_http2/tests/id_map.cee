@@ -1,0 +1,107 @@
+// IdMap against lib/std's HashMap, its model: the same operations on both give the same values, the same length and
+// the same entries in the same order (insertion order, a removal moving the last entry into the gap).
+
+fn mapFailure(what: StringView) -> TestFailure => TestFailure.create(what);
+
+/// Both maps agree on every id in 0..range, and entry by entry.
+fn agree(ids: borrow IdMap<u64>, model: borrow HashMap<u32, u64>, range: u32) -> Result<void, TestFailure> {
+    if (ids.length() != model.length()) {
+        return Err(mapFailure("lengths differ"));
+    }
+    for (i in 0..ids.length()) {
+        if (ids.keyAt(i) != *model.keyAt(i)) {
+            return Err(mapFailure("entry order differs"));
+        }
+        if (*ids.valueAt(i) != *model.valueAt(i)) {
+            return Err(mapFailure("entry values differ"));
+        }
+    }
+    for (id in 0u32..range) {
+        let a = match (ids.get(id)) {
+            Some(v) => *v,
+            null => 0xFFFFFFFFFFFFFFFF,
+        };
+        let b = match (model.get(id)) {
+            Some(v) => *v,
+            null => 0xFFFFFFFFFFFFFFFF,
+        };
+        if (a != b || ids.contains(id) != model.contains(id)) {
+            return Err(mapFailure("a lookup differs"));
+        }
+    }
+    return Ok();
+}
+
+/// Puts, removes and changes, chosen by a fixed sequence, on both.
+fn exercise(key: u64, range: u32, steps: u32) -> Result<void, TestFailure> {
+    var ids = IdMap<u64>.withKey(key);
+    var model = HashMap<u32, u64>.withSeed(1, 2);
+    var state: u64 = 0x243F6A8885A308D3;
+    for (step in 0u32..steps) {
+        state = state.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407);
+        let id = truncate<u32>(state >> 33) % range;
+        let op = truncate<u32>(state >> 20) % 4;
+        if (op == 3) {
+            let a = ids.remove(id);
+            let b = model.remove(id);
+            if (a != b) {
+                return Err(mapFailure("remove differs"));
+            }
+        } else if (op == 2) {
+            match (ids.getMut(id)) {
+                Some(v) => { *v = *v + 1; }
+                null => {}
+            }
+            match (model.getMut(id)) {
+                Some(v) => { *v = *v + 1; }
+                null => {}
+            }
+        } else {
+            let a = match (ids.put(id, step as u64)) {
+                Ok(v) => v,
+                Err(_) => { return Err(mapFailure("out of memory")); },
+            };
+            let b = match (model.put(id, step as u64)) {
+                Ok(v) => v,
+                Err(_) => { return Err(mapFailure("out of memory")); },
+            };
+            if (a != b) {
+                return Err(mapFailure("put differs"));
+            }
+        }
+        if (step % 97 == 0) {
+            agree(ids, model, range)?;
+        }
+    }
+    return agree(ids, model, range);
+}
+
+@test
+fn id_map_matches_hash_map() -> Result<void, TestFailure> {
+    exercise(0, 64, 4000)?;             // a few dozen live ids, growing and shrinking
+    exercise(0x5DEECE66D, 1024, 6000)?; // more ids than the table starts with: it grows
+    return exercise(7, 3, 500);         // three ids: every probe collides with another's run
+}
+
+@test
+fn id_map_takes_odd_stream_ids() -> Result<void, TestFailure> {
+    // A client's ids, as RFC 9113 §5.1.1 has them: odd and rising; the map holds a window of them.
+    var ids = IdMap<u64>.create();
+    for (k in 0u32..2000) {
+        let id = 2 * k + 1;
+        match (ids.put(id, id as u64)) {
+            Ok(null) => {}
+            _ => { return Err(mapFailure("put")); }
+        }
+        if (k >= 100) {
+            let old = 2 * (k - 100) + 1;
+            if (ids.remove(old) != Some(old as u64)) {
+                return Err(mapFailure("remove"));
+            }
+        }
+    }
+    if (ids.length() != 100 || ids.get(3999).isNull() || ids.contains(3799)) {
+        return Err(mapFailure("window"));
+    }
+    return Ok();
+}

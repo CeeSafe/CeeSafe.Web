@@ -109,7 +109,7 @@ public struct H2Connection {
     private guards: H2Guards;
     private decoder: HpackDecoder;
     private encoder: HpackEncoder;
-    private streams: HashMap<u32, Stream>;
+    private streams: IdMap<Stream>;
     private out: Vector<u8>;
     private scratch: Vector<u8>;
     private prefaceRead: bool;
@@ -162,7 +162,7 @@ public struct H2Connection {
             guards: guards,
             decoder: decoder,
             encoder: encoder,
-            streams: HashMap<u32, Stream>.create(),
+            streams: IdMap<Stream>.create(),
             out: Vector<u8>.create(),
             scratch: Vector<u8>.create(),
             prefaceRead: isClient, // a client reads no preface but the server's SETTINGS (§3.4)

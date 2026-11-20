@@ -1,0 +1,199 @@
+// A map from a stream id to a value, for a connection's streams (the engine's) and its links (serve.cee): lib/std's
+// HashMap, with the same entries in insertion order (a removal moves the last entry into the gap), the same
+// open-addressing table of entry numbers and the same backward-shift deletion, but the id hashed by a keyed 64-bit
+// mixer (murmur3's finalizer) instead of SipHash. Each frame looks up its stream in both maps, and SipHash's rounds
+// were 1.7 % of an HTTP/2 proxy's time (cee-proxy's PORTING_PLAN.md, P8). The ids are the peer's, so the key is
+// random per map; a peer can only have as many entries as SETTINGS_MAX_CONCURRENT_STREAMS lets it.
+
+public struct IdMap<V> {
+    keys: Vector<u32>;
+    values: Vector<V>;
+    // 0: empty; else the hash's low 32 bits (its home slot and a fingerprint) above the entry's index plus one, as
+    // HashMap's. The length is 0 or a power of two.
+    slots: Vector<u64>;
+    key: u64;
+
+    /// An empty map with a random key (a fixed one if the system gives no random bytes).
+    public fn create() -> IdMap<V> {
+        var bytes = [0u8; 8];
+        var key: u64 = 0x9E3779B97F4A7C15;
+        match (Random.fill(mut bytes[..])) {
+            Ok() => {
+                key = 0;
+                for (k in 0..8usize) {
+                    key = key | ((bytes[k] as u64) << (8 * k as u64));
+                }
+            }
+            Err(_) => {}
+        }
+        return IdMap<V>.withKey(key);
+    }
+
+    /// An empty map keyed by `key`: for tests.
+    public fn withKey(key: u64) -> IdMap<V> => IdMap {
+        keys: Vector<u32>.create(),
+        values: Vector<V>.create(),
+        slots: Vector<u64>.create(),
+        key: key,
+    };
+
+    /// How many entries.
+    public fn length(borrow this) -> usize => this.keys.length;
+
+    fn hashOf(borrow this, id: u32) -> u64 {
+        var h = (id as u64) ^ this.key;
+        h = (h ^ (h >> 33)).wrappingMul(0xFF51AFD7ED558CCD);
+        h = (h ^ (h >> 33)).wrappingMul(0xC4CEB9FE1A85EC53);
+        return h ^ (h >> 33);
+    }
+
+    /// The slot holding `id`'s entry, or none; `empty` is where the probe stopped when it is not there.
+    fn probe(borrow this, id: u32, hash: u64, empty: borrow mut usize) -> usize? {
+        if (this.slots.length == 0) {
+            return null;
+        }
+        let mask = this.slots.length - 1;
+        let tag = (hash & 0xFFFFFFFF) << 32;
+        var i = truncate<usize>(hash & 0xFFFFFFFF) & mask;
+        loop {
+            let slot = this.slots[i];
+            if (slot == 0) {
+                empty = i;
+                return null;
+            }
+            if ((slot & 0xFFFFFFFF00000000) == tag && this.keys[truncate<usize>((slot & 0xFFFFFFFF) - 1)] == id) {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn entryAt(borrow this, slot: usize) -> usize => truncate<usize>((this.slots[slot] & 0xFFFFFFFF) - 1);
+
+    /// The value of `id`, if it is there.
+    public fn get(borrow this, id: u32) -> borrow(this) V? {
+        var empty: usize = 0;
+        let slot = this.probe(id, this.hashOf(id), mut empty)?;
+        return borrow this.values[this.entryAt(slot)];
+    }
+
+    /// The same, to change it.
+    public fn getMut(borrow mut this, id: u32) -> borrow mut(this) V? {
+        let hash = this.hashOf(id);
+        var empty: usize = 0;
+        let slot = this.probe(id, hash, mut empty)?;
+        let entry = this.entryAt(slot);
+        return borrow mut this.values[entry];
+    }
+
+    /// Whether `id` is there.
+    public fn contains(borrow this, id: u32) -> bool {
+        var empty: usize = 0;
+        return this.probe(id, this.hashOf(id), mut empty) != null;
+    }
+
+    /// The id of entry `i` (0 ≤ i < length).
+    public fn keyAt(borrow this, i: usize) -> u32 => this.keys[i];
+
+    /// The value of entry `i` (0 ≤ i < length).
+    public fn valueAt(borrow this, i: usize) -> borrow(this) V => borrow this.values[i];
+
+    fn place(slots: borrow mut Vector<u64>, word: u64) {
+        let mask = slots.length - 1;
+        var i = truncate<usize>(word >> 32) & mask;
+        while (slots[i] != 0) {
+            i = (i + 1) & mask;
+        }
+        slots[i] = word;
+    }
+
+    /// A table twice as large (at least 8), built before it replaces the old one, so a failure changes nothing.
+    fn grow(borrow mut this) -> Result<void, AllocError> {
+        let size = if (this.slots.length == 0) 8 else this.slots.length * 2;
+        var slots = Vector<u64>.withCapacity(size)?;
+        for (k in 0..size) {
+            slots.push(0)?;
+        }
+        for (k in 0..this.slots.length) {
+            let word = this.slots[k];
+            if (word != 0) {
+                IdMap<V>.place(mut slots, word);
+            }
+        }
+        this.slots = slots;
+        return Ok();
+    }
+
+    /// Puts `value` at `id`: the old value if the id was there, else null. A failure leaves the map as it was.
+    public fn put(borrow mut this, id: u32, value: V) -> Result<V?, AllocError> {
+        let hash = this.hashOf(id);
+        var empty: usize = 0;
+        match (this.probe(id, hash, mut empty)) {
+            Some(slot) => {
+                let entry = this.entryAt(slot);
+                this.values.push(value)?;
+                let last = this.values.length - 1;
+                this.values.swap(entry, last);
+                return Ok(this.values.pop());
+            }
+            null => {}
+        }
+        if (this.keys.length >= 0xFFFFFFFF) {
+            return Err(AllocError.OutOfMemory);
+        }
+        let grows = (this.keys.length + 1) * 4 > this.slots.length * 3;
+        if (grows) {
+            this.grow()?;
+        }
+        this.keys.push(id)?;
+        match (this.values.push(value)) {
+            Ok() => {}
+            Err(e) => {
+                let dropped = this.keys.pop();
+                return Err(e);
+            }
+        }
+        let word = ((hash & 0xFFFFFFFF) << 32) | this.keys.length as u64;
+        if (grows) {
+            IdMap<V>.place(mut this.slots, word);
+        } else {
+            this.slots[empty] = word;
+        }
+        return Ok(null);
+    }
+
+    /// Takes `id` out: its value, or null. The last entry moves into its place.
+    public fn remove(borrow mut this, id: u32) -> V? {
+        let hash = this.hashOf(id);
+        var empty: usize = 0;
+        let found = this.probe(id, hash, mut empty)?;
+        let entry = this.entryAt(found);
+        let mask = this.slots.length - 1;
+        var hole = found;
+        this.slots[hole] = 0;
+        var i = (hole + 1) & mask;
+        while (this.slots[i] != 0) {
+            let home = truncate<usize>(this.slots[i] >> 32) & mask;
+            let within = if (hole <= i) home > hole && home <= i else home > hole || home <= i;
+            if (!within) {
+                this.slots[hole] = this.slots[i];
+                this.slots[i] = 0;
+                hole = i;
+            }
+            i = (i + 1) & mask;
+        }
+        let last = this.keys.length - 1;
+        if (entry != last) {
+            let lastHash = this.hashOf(this.keys[last]);
+            var j = truncate<usize>(lastHash & 0xFFFFFFFF) & mask;
+            while ((this.slots[j] & 0xFFFFFFFF) != last as u64 + 1) {
+                j = (j + 1) & mask;
+            }
+            this.slots[j] = (this.slots[j] & 0xFFFFFFFF00000000) | (entry as u64 + 1);
+        }
+        this.keys.swap(entry, last);
+        let removedKey = this.keys.pop();
+        this.values.swap(entry, last);
+        return this.values.pop();
+    }
+}

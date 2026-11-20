@@ -150,7 +150,7 @@ public async fn serveH2(
         Ok(c) => c,
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
-    var links = HashMap<u32, Link>.create();
+    var links = IdMap<Link>.create();
     let r = await Async.tasks(256, NetError.OutOfMemory, async (set) => {
         if (!Isolation.watch(set, crashes)) {
             return Err(NetError.OutOfMemory);
@@ -176,7 +176,7 @@ async fn run(
     input: borrow mut OwnedBuffer,
     outgoing: borrow Channel<Outgoing>,
     crashes: borrow Channel<TaskCrash>,
-    links: borrow mut HashMap<u32, Link>,
+    links: borrow mut IdMap<Link>,
 ) -> Result<void, NetError> {
     var head = HeaderBlock.create();
     var data = Vector<u8>.create();
@@ -351,7 +351,7 @@ fn startStream(
     app: borrow Arc<Box<dyn Application + Send + Share>>,
     limits: Limits,
     engine: borrow mut H2Connection,
-    links: borrow mut HashMap<u32, Link>,
+    links: borrow mut IdMap<Link>,
     outgoing: borrow Channel<Outgoing>,
     kits: borrow mut Vector<StreamKit>,
     id: u32,
@@ -437,7 +437,7 @@ async fn handle(
     app: borrow Arc<Box<dyn Application + Send + Share>>,
     limits: Limits,
     engine: borrow mut H2Connection,
-    links: borrow mut HashMap<u32, Link>,
+    links: borrow mut IdMap<Link>,
     outgoing: borrow Channel<Outgoing>,
     kits: borrow mut Vector<StreamKit>,
     m: Outgoing,
@@ -534,7 +534,7 @@ async fn handle(
 }
 
 /// Credit for `id` (every waiting stream when 0), as far as the windows allow.
-fn grantAll(engine: borrow H2Connection, links: borrow mut HashMap<u32, Link>, id: u32, total: borrow mut i64) {
+fn grantAll(engine: borrow H2Connection, links: borrow mut IdMap<Link>, id: u32, total: borrow mut i64) {
     if (id != 0) {
         grant(engine, links, id, total);
         return;
@@ -547,7 +547,7 @@ fn grantAll(engine: borrow H2Connection, links: borrow mut HashMap<u32, Link>, i
 
 /// Grants stream `id` what it asked for, up to its window and the connection's (less what is granted and not yet
 /// sent) and one frame.
-fn grant(engine: borrow H2Connection, links: borrow mut HashMap<u32, Link>, id: u32, total: borrow mut i64) {
+fn grant(engine: borrow H2Connection, links: borrow mut IdMap<Link>, id: u32, total: borrow mut i64) {
     match (links.getMut(id)) {
         Some(link) => {
             if (link.want == 0) {
@@ -612,7 +612,7 @@ fn deliver(link: borrow mut Link) -> Result<void, NetError> {
 }
 
 /// A stream is over: its task is told (if still running) and its link dropped, with its unused credit.
-fn endLink(links: borrow mut HashMap<u32, Link>, id: u32, total: borrow mut i64) {
+fn endLink(links: borrow mut IdMap<Link>, id: u32, total: borrow mut i64) {
     match (links.remove(id)) {
         Some(link) => {
             total -= link.outstanding;
@@ -646,7 +646,7 @@ async fn writeOutput(
 /// stream the client reset. Its task held its kit, which is not returned to the pool.
 fn crashed(
     engine: borrow mut H2Connection,
-    links: borrow mut HashMap<u32, Link>,
+    links: borrow mut IdMap<Link>,
     crash: TaskCrash,
     total: borrow mut i64,
 ) -> Result<void, NetError> {
