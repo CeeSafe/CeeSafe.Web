@@ -135,11 +135,21 @@ async fn nextHead(
             }
         }
         let idle = a.isEmpty();
-        if (idle && connection.isDraining()) {
-            return Ok(null);
-        }
         var n: usize = 0;
-        if (idle) {
+        if (idle && connection.isDraining()) {
+            // The server drains (Web ADR 0019): the next request, if it comes within the linger, is served, and its
+            // response says `connection: close` (`keep` is false while draining); else the connection closes. A
+            // client that had just sent on it is answered rather than left to send it again on a new connection.
+            if (limits.drainLingerMs == 0) {
+                return Ok(null);
+            }
+            let linger = if (limits.drainLingerMs < limits.idleTimeoutMs) limits.drainLingerMs else limits.idleTimeoutMs;
+            match (await Transports.readWithin(conn, a.spare(), Deadline.after(linger))) {
+                Ok(v) => { n = v; }
+                Err(NetError.TimedOut) => { return Ok(null); }
+                Err(e) => { return Err(e); }
+            }
+        } else if (idle) {
             let d = Deadline.after(limits.idleTimeoutMs);
             let r: Result<Raced<usize>, NetError> = await Async.race(
                 async () => await Transports.readWithin(conn, a.spare(), d),
@@ -150,7 +160,7 @@ async fn nextHead(
                 Err(NetError.TimedOut) => { return Ok(null); } // idle too long
                 Err(NetError.Cancelled) => {
                     if (connection.isDraining()) {
-                        return Ok(null);
+                        continue; // the drain began while it waited: wait on within the linger, above
                     }
                     return Err(NetError.Cancelled);
                 }

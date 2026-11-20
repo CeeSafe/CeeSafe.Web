@@ -1050,6 +1050,7 @@ public struct Limits {
     public drainBytes: u64;
     public headerTimeoutMs: u64;
     public idleTimeoutMs: u64;
+    public drainLingerMs: u64;
     public writeTimeoutMs: u64;
     public minBodyRate: u64;
     public minBodyRateGraceMs: u64;
@@ -1068,7 +1069,7 @@ public fn defaults() -> Limits
 ```
 
 8 KiB request line, 16 KiB head, 64 fields, 8 MiB body, 256-byte chunk extensions, 4 KiB trailers, 64 KiB
-drain; 10 s for a head, 60 s idle, 30 s per write; 240 B/s after 5 s (Kestrel's minimum rate); 16 KiB of
+drain; 10 s for a head, 60 s idle, 1 s of an idle connection's linger in a drain, 30 s per write; 240 B/s after 5 s (Kestrel's minimum rate); 16 KiB of
 output per flush; `Date` sent; requests not isolated.
 
 ## enum Method

@@ -256,6 +256,23 @@ async fn run(text: StringView, step: usize, limits: borrow Limits) -> Result<Scr
     return Ok(s);
 }
 
+/// `run` on a connection whose server already drains (Web ADR 0019).
+async fn runDraining(text: StringView, step: usize, limits: borrow Limits) -> Result<Script, TestFailure> {
+    var s = script(text, step)?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    drain.start();
+    let ctx = ConnectionContext.acceptedNow(1, drain);
+    let app = App { handled: AtomicU64.create(0), trapped: counter()? };
+    match (await serve(mut s, ctx, app, limits)) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    return Ok(s);
+}
+
 /// What `runIsolated` gives back: the script, how many requests trapped (`Application.crashed`), and how many crashes
 /// the connection's context counted (`ConnectionContext.countCrash`).
 struct IsolatedRun {

@@ -42,6 +42,20 @@ async fn one_get() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// Web ADR 0019: a connection idle when the server drains lets its next request in, answered with `connection: close`
+/// and nothing after it; with `drainLingerMs` 0 it closes without reading.
+@test
+async fn a_drain_lets_the_next_request_in_and_closes() -> Result<void, TestFailure> {
+    let text = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    let lingered = await runDraining(text, 4096, quiet())?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 3\r\nconnection: close\r\n\r\n/a:", lingered.output)?;
+    var none = quiet();
+    none.drainLingerMs = 0;
+    let closed = await runDraining(text, 4096, none)?;
+    Check.equalU64(0, closed.output.length as u64)?;
+    return Ok();
+}
+
 @test
 async fn pipelined_requests_coalesce_and_keep_their_own_heads() -> Result<void, TestFailure> {
     let text = "GET /a HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n\r\nPOST /b HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nxyzGET /c HTTP/1.1\r\nHost: x\r\n\r\n";
