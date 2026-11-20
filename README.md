@@ -44,3 +44,5 @@ See [`AGENTS.md`](AGENTS.md) for the project's rules.
 
 CeeSafe.Web is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)), as CeeSafe is,
 with an exception that permits linking it with OpenSSL ([COPYING.OPENSSL](COPYING.OPENSSL)), which `web_tls` does.
+`web_tls`'s Android builds carry Mozilla's root certificate list (`packages/web_tls/c/roots_mozilla.pem`, curl's
+extract of it), which is under the Mozilla Public License 2.0 ([COPYING.MPL](COPYING.MPL)); Web ADR 0018.
