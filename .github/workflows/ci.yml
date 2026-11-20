@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CEESAFE_VERSION: v0.77.2 # main's minimum from 2026-11-19 (docs/toolchain.md)
+  CEESAFE_VERSION: v0.80.0 # main's minimum from 2026-11-21 (docs/toolchain.md)
 
 jobs:
   test:
@@ -166,6 +166,12 @@ jobs:
       - name: Example builds
         shell: bash
         run: (cd examples/echo && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec build -o out/echo)
+
+      # Web ADR 0017 §2.2: a request past the program's bound (CeeSafe ADR 0186) is answered 500 like a trap. The bound
+      # needs polls; without them the test has nothing to check and passes.
+      - name: The bound under isolated requests
+        shell: bash
+        run: (cd packages/web_http1 && ceesafec test --cflag -DCEE_POLLS=1 --filter bound)
 
       # Web ADR 0016: a request that traps costs its connection only (examples/http1 with CW_ISOLATED=1). It counts the
       # process's descriptors with /proc or lsof, so not on Windows.

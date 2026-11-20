@@ -98,6 +98,7 @@ impl Transport for Script {
 ///   `/trap-late`: writes "part1", flushes, then traps;
 /// - `/upgrade`: switches to the protocol `test` and writes "hi" on the raw connection;
 /// - `/wait-close`: waits for the client to close (`peerClosed`), then answers "closed";
+/// - `/spin`: computes without end, for a bound (CeeSafe ADR 0186) to end;
 /// - anything else: reads the body and answers `<path>:<body>`.
 /// Its hook adds `x-hook: 1` to every response; `crashed` counts the requests that trapped (Web ADR 0017).
 struct App {
@@ -171,6 +172,13 @@ impl Application for App {
         if (Ascii.equals(p, "/wait-close")) {
             await exchange.peerClosed()?;
             return await exchange.send(Status.ok(), "closed".bytes());
+        }
+        if (Ascii.equals(p, "/spin")) {
+            var x: u64 = p.length as u64;
+            while (x != 0) {
+                x = x.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407) | 1;
+            }
+            return await exchange.send(Status.ok(), "never".bytes());
         }
         if (Ascii.equals(p, "/fail")) {
             return Err(HandlerError.Status(Status.notFound()));

@@ -140,6 +140,25 @@ async fn a_trap_is_answered_500_and_the_connection_goes_on() -> Result<void, Tes
     return Check.equalU64(5, r5.trapped);
 }
 
+/// A request that computes past the program's bound (CeeSafe ADR 0186) is ended with `Overran`, a crash like a trap:
+/// answered 500, and the connection goes on (Web ADR 0017 §2.2). Only in a build with polls (`--cflag -DCEE_POLLS=1`,
+/// CI's `bound` step); without them `Async.runBound` is false and no bound can end it, so there is nothing to check.
+@test
+async fn a_request_past_its_bound_is_answered_500() -> Result<void, TestFailure> {
+    if (!Async.runBound(100, RunBound.Count)) {
+        return Ok();
+    }
+    let text = "GET /spin HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    var expected = Vector<u8>.create();
+    Check.isTrue(pushText(mut expected, ANSWERED_500), "e")?;
+    echoed("/b", "", mut expected)?;
+    let r = await runIsolated(text, 4096, quiet())?;
+    Check.equalBytes(expected.view(), r.script.output.view())?;
+    Check.equalU64(1, r.trapped)?;
+    Check.isTrue(Async.overruns() >= 1, "an overrun counted")?;
+    return Ok();
+}
+
 /// A trap with part of the body unread: what is left is drained within `drainBytes` and the connection kept; past it,
 /// the 500 says `connection: close` and nothing more is read (ADR §2.2). The connection reads the body for its request
 /// in chunks of at most 16 KiB, so a short body is off the wire whole before the trap: only what was never read counts.
