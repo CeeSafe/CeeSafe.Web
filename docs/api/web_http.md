@@ -398,6 +398,7 @@ public interface Application {
         request: borrow Request,
         head: borrow mut ResponseHead,
     ) -> Result<void, HandlerError>;
+    async fn crashed(borrow this, request: borrow Request, crash: borrow TaskCrash) {}
 }
 ```
 
@@ -458,6 +459,29 @@ An exchange for a request that came on a multiplexed stream (Web ADR 0011 §3.2)
 response written through `stream`. `conn` is a `NoTransport`, and `carry` and `out` are unused; `pending`
 collects the body before the head is sent, as over HTTP/1.1. `hasBody` is false when the request ended with
 its head (END_STREAM).
+
+### Exchange.forRelay
+
+```ceesafe
+public fn forRelay(
+    stream: borrow mut(r) dyn StreamSink,
+    conn: borrow mut(r) dyn Transport,
+    carry: borrow mut(r) OwnedBuffer,
+    out: borrow mut(r) OwnedBuffer,
+    pending: borrow mut(r) OwnedBuffer,
+    response: borrow mut(r) ResponseHead,
+    app: borrow(r) dyn Application,
+    request: borrow(r) Request<r>,
+    limits: borrow(r) Limits,
+    date: borrow mut(r) DateCache,
+    hasBody: bool,
+) -> Exchange<r>
+```
+
+An exchange for an HTTP/1.1 request served in its own isolated task (Web ADR 0017): `forStream`'s, its body and
+response going through `stream` to the connection's task, which frames them as HTTP/1.1. Its head carries
+`connection: close` when the handler asked for it (`closeConnection`, or a 500 that closes), and `date` only when
+the handler set one: the connection adds its own.
 
 ### Exchange.read
 
@@ -1031,6 +1055,7 @@ public struct Limits {
     public minBodyRateGraceMs: u64;
     public writeBufferBytes: usize;
     public sendDate: bool;
+    public isolateRequests: bool;
 }
 ```
 
@@ -1044,7 +1069,7 @@ public fn defaults() -> Limits
 
 8 KiB request line, 16 KiB head, 64 fields, 8 MiB body, 256-byte chunk extensions, 4 KiB trailers, 64 KiB
 drain; 10 s for a head, 60 s idle, 30 s per write; 240 B/s after 5 s (Kestrel's minimum rate); 16 KiB of
-output per flush; `Date` sent.
+output per flush; `Date` sent; requests not isolated.
 
 ## enum Method
 
@@ -1606,6 +1631,14 @@ public interface StreamSink {
     async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError>;
     @effects(alloc)
     fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError>;
+    async fn peerClosed(borrow mut this) -> Result<void, HandlerError> {
+        loop {
+            match (await Timer.sleep(3600000)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+        }
+    }
 }
 ```
 

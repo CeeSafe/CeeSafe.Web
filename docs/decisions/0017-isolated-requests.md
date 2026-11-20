@@ -1,6 +1,7 @@
 # Web ADR 0017 — Isolated requests: a handler that traps is answered 500, and its connection goes on
 
 **Status:** accepted 2026-11-20. The owner: "I accept all the above ADRs as written" (§7, every recommendation).
+Implemented 2026-11-20 (§9), but for question 6 and the default of question 1, which wait for their follow-ups.
 Proposed 2026-11-20, written at the owner's request to close the gaps between httpserver and Elixir's web
 servers ("We need to tackle where Elixir is ahead", then "Draft ADRs for all gaps"). It is the gap of a request
 that traps: Cowboy answers it 500 from the connection's process and keeps the connection; CeeSafe.Web, under Web ADR
@@ -256,3 +257,107 @@ the machine's load; the order held in every round.
 - The benchmark (Web ADR 0005 §4.2): `benchmarks/http` with and without `isolateRequests`, `h2load --h1 -c 64 -t 4`,
   three runs each, on the benchmark machine; the difference is recorded here and decides question 1's default.
 - httpserver: `supervisor_check.py --isolated` with its expectations changed as §4 says.
+
+## 9. Implementation notes (2026-11-20)
+
+Implemented on branch `adr-0017-isolated-requests` from `main` at `4d71b12`, after the owner's "I accept all the above
+ADRs as written". Checked with ceesafec 0.80.0 and with 0.77.2, main's minimum, which CI pins: `check` and `fmt
+--check` clean in every package changed, `check_layers.py` and `api_check.py` (the public API record rewritten for
+`web_core`, `web_http`, `web_http1` and `web_server`).
+
+**What landed.**
+- `web_http`: `Limits.isolateRequests` (false by default); `Application.crashed(request, crash)`, a default method that
+  does nothing (§2.5); `Exchange.forRelay`, `forStream`'s exchange for an isolated HTTP/1.1 request, whose head carries
+  `connection: close` when the handler closes (`closeConnection`, a `ResponseHead` that closes, or a 500 that closes)
+  and no `date` but the handler's; and `StreamSink.peerClosed`, a default method (below).
+- `web_http1`: `serveIsolated` (`src/isolated.cee`). The head-reading loop of `serveFrom` is now `nextHead`, which
+  both drivers use; `serveFrom` is otherwise unchanged.
+- `web_http2`: a stream's `Link` has `headSent`; a crash before it is answered HEADERS `:status 500`,
+  `content-length: 0`, ending the stream, then RST_STREAM NO_ERROR if the client is still sending; after it, the reset
+  as before. The messages a stream posted before it trapped are handled before its crash, in a turn and in a wake.
+- `web_http3`: the same, with STOP_SENDING H3_NO_ERROR for a request still being sent. Its crash already comes after
+  the request's messages, through the same channel.
+- `web_server`: `HttpService` serves HTTP/1.1 with `serveIsolated` when `isolateRequests`. `Server<S>` served as a
+  `ConnectionHandler` itself (no `Arc`) cannot isolate, and its doc says so; `run` and `runIsolated` go through
+  `serviceOf`, which can.
+- `web_core` and `web_transport`: `ConnectionContext.withCrashCounter`, `countCrash` and `crashCounter`, and
+  `ServerReport.crashed` counting a connection's request and stream crashes beside `runIsolated`'s connection crashes,
+  under `run` as well (§2.2's last item, which needs a way from a connection to its server's report).
+- `examples/http1` takes `CW_ISOLATE_REQUESTS=1`; `tools/isolated_check.py` checks it.
+
+**How it differs from §2.1, and why.**
+- **The connection frames through an `Exchange` of its own.** §2.1 has the connection's task read the body with the
+  framing it parsed and write the response "from the head message". It does, through an ordinary HTTP/1.1 `Exchange`
+  (`Exchange.create`, as `exchangeOne` makes it) whose application is a stub (`Relayed`: no `beforeHead` hooks, which
+  the request's task already ran on the head it relays). So `100 Continue`, the response's framing, chunks and trailers,
+  HEAD and HTTP/1.0, coalescing, the drain of an unread body and the keep-alive verdict are `serveFrom`'s code, not a
+  second copy of it. The request's messages become calls on it: the head's fields `setStatus`, `setContentLength`,
+  `closeConnection` and `header`; body bytes `write`, then `flush` unless they end the response (the request sends them
+  only when its buffer fills, its handler flushes, or before trailers: they were on the wire at that point under
+  `serveFrom` too); a second head its trailers, through `trailer`.
+- **The body is pulled.** The request's task asks for body bytes (`WantBody`) and the connection reads one chunk of up
+  to 16 KiB with its exchange's `read` and sends it. The channel holds at most one chunk, so the flow control is the
+  request's own reading, and the first ask is what sends `100 Continue`, as `read` does over the connection.
+- **A request whose body is read whole before its trap is kept**, whatever `drainBytes` says: the connection had read
+  the bytes off the wire, and the next request starts after them. `drainBytes` bites only on what was never read, as
+  over the connection.
+- **`peerClosed` reaches an isolated request.** A handler that waits for the client to go (`web_sse`) would otherwise
+  wait to be cancelled. `StreamSink.peerClosed` is a new default method that waits to be cancelled (what a stream's
+  exchange did); `Exchange.peerClosed` calls it for a multiplexed exchange; the isolated request's sink asks its
+  connection (`WatchPeer`), which then races its own exchange's `peerClosed` against the request's messages and passes
+  the close on. As over the connection, the body must have been read first (`Internal` otherwise).
+- **A crash is a message.** As `web_http3` does, a task of the connection's set passes the set's crashes into the
+  request's channel (`passCrashes`), so the connection waits on one channel, and a crash comes after what the request
+  posted before it. The first version raced the two channels for every wait: a race, two child tasks, a request.
+- **The set has room for three**: the crash forwarder, a request, and the request before it while it returns after its
+  `Done`. `spawnIsolated` waits for room, so no request is refused for that; if it fails (no memory), the request is
+  answered 503 and the connection closes.
+- **A request that switches protocols or opens a tunnel** is recognised by its `Upgrade` field or `CONNECT` and served
+  by `exchangeOne` in place (§2.4).
+- **HTTP/3's crashes are not counted** in a report: `Http3Server` keeps none.
+- **`Overran`** is a trap like any other in this code (only `TaskCrash.kind` differs). A test with `/spin` under
+  `Async.runBound(100, RunBound.Count)` passed with 0.80.0 natively with `--cflag -DCEE_POLLS=1` (500, the connection
+  kept, `Async.overruns() >= 1`) and in the interpreter; it is not committed, since `Async.runBound` is 0.80.0's and
+  main's minimum is 0.77.2 (implementation plan §11, item 22). It lands with the minimum that has it.
+- **TLS end to end** is not in `isolated_check.py`: `examples/http1` is plaintext. The driver sees a `dyn Transport`
+  either way, and the TLS state stays in the connection's task by construction.
+
+**Tests.** `web_http1/tests/isolated.cee`: every response shape of `driver.cee` served by `serve` and `serveIsolated`
+gives the same bytes (pipelining and coalescing, bodies by length and chunked at read sizes 1 to 11, trailers both
+ways, `100 Continue` read and unread, drained and undrained bodies, HEAD, HTTP/1.0, a handler's status, large declared
+responses, rejected heads); a hundred pipelined requests in one write, as `serve`'s; a large undeclared response in
+16 KiB chunks (`serve` sends a large write directly, so its chunks differ; decoded, the bytes are the same); a trap
+answered `500` with no content between two answered requests, at read sizes 4096 and 1, and five in a row; a trap
+after reading 4 of 10 body bytes (kept), after 16 KiB of 40 000 (drained and kept with 64 KiB, closed with 4), and in a
+chunked body; a trap with `100 Continue` pending (closed); a trap after a flushed head (the chunked body cut short, the
+next request unanswered); an `Upgrade` served in place, as `serve` serves it; `peerClosed` in an isolated request.
+`Application.crashed` and `countCrash` are counted in each. `web_http2` and `web_http3`: a stream that traps before
+its head is answered 500 (the HTTP/2 test was `a_stream_that_traps_is_reset_alone`); one that traps after its head
+(new, HTTP/2) is reset with INTERNAL_ERROR. `web_server`: an isolated request that traps behind the middleware is
+answered 500 without their fields, and the next request with them; `Server.run`'s report counts the crash.
+`tools/isolated_check.py`: on one keep-alive connection, a trap answered 500 and 200 more (one in ten with a 1000-byte
+body), each answered 500, the connection answering between them, no descriptor leaked (0 for 200), one "ended alone"
+line a trap, `/stop` draining it; the checks of Web ADR 0016 before it pass as they did.
+
+**Cost (§4's question).** `examples/http1`, `/hello` (12 bytes), `h2load --h1 -c 64 -t 2 -D 4`, on the development
+machine (macOS arm64, 8 cores), not the benchmark machine, under other work's load. Interleaved, isolated requests off
+and on, requests a second:
+- with the race of the first version, load about 53: off 24 664 to 26 136, on 15 547 to 18 518 (28 to 38% fewer);
+- with `passCrashes`, load 20 to 29, six pairs: off 31 953 to 59 221, on 26 893 to 51 507; the pairs' ratios 0.53 to
+  1.07, median 0.84 (16% fewer).
+
+The spread is the load's. The benchmark machine decides question 1's default (Web ADR 0005 §4.2), as §8 says.
+
+**The isolated spawn (§4, §5).** A throwaway program, 2 000 000 children that allocate, wait once and return, in sets
+of 64, timed by CPU time (`/usr/bin/time`, load about 17): an ordinary child 155 to 170 ns, an isolated one 700 to 735
+ns. §8's probe's 2 to 3 µs was the load of the time. CeeSafe ADR 0175 §10 measured 255 to 273 ns for an isolated
+child; this one is about 2.7 times that, with 0.80.0. It is noted here and not sent upstream yet: the difference is
+measured once, on a loaded machine.
+
+**Left.**
+- `sendfile` for an isolated request (question 6): its file is read and sent through the channel until then.
+- The benchmark-machine run that decides the default (question 1).
+- httpserver: its `Service.serve` (`src/app.cee:446`) chooses the entry as `HttpService` does (`serveIsolated` with its
+  `Arc` when `limits.isolateRequests`), its `App` gives `Application.crashed` to its access log (§2.5), and
+  `tools/supervisor_check.py --isolated` changes its expectations as §4 says.
+- The `Overran` test, with the minimum that has `Async.runBound`.

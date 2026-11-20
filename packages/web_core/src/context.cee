@@ -9,6 +9,9 @@ public struct ConnectionContext<region r> {
     private peer: SocketAddress?;
     private local: SocketAddress?;
     private identity: PeerIdentity;
+    /// The server's count of crashes (its `ServerReport.crashed`), when it keeps one: a request or a stream of this
+    /// connection that trapped and ended alone is counted there (Web ADR 0017 §2.2).
+    private crashes: Arc<AtomicU64>?;
 
     /// The context of connection `id`, accepted at `acceptedAt` on `Timer.now()`'s clock, served under `drain`.
     public fn create(id: u64, acceptedAt: u64, drain: borrow(r) Drain) -> ConnectionContext<r> =>
@@ -19,6 +22,7 @@ public struct ConnectionContext<region r> {
             peer: null,
             local: null,
             identity: PeerIdentity.empty(),
+            crashes: null,
         };
 
     /// The context of connection `id`, accepted now.
@@ -34,6 +38,7 @@ public struct ConnectionContext<region r> {
             peer: peer,
             local: local,
             identity: this.identity,
+            crashes: this.crashes,
         };
 
     /// The same context with the peer's verified identity (`Transport.peerIdentity`).
@@ -45,7 +50,35 @@ public struct ConnectionContext<region r> {
             peer: this.peer,
             local: this.local,
             identity: identity,
+            crashes: this.crashes,
         };
+
+    /// The same context, its requests' and streams' crashes counted in `counter` (Web ADR 0017 §2.2).
+    public fn withCrashCounter(this, counter: Arc<AtomicU64>?) -> ConnectionContext<r> =>
+        ConnectionContext {
+            number: this.number,
+            acceptedAt: this.acceptedAt,
+            drainSignal: this.drainSignal,
+            peer: this.peer,
+            local: this.local,
+            identity: this.identity,
+            crashes: counter,
+        };
+
+    /// Counts a crash of one of this connection's requests or streams, which ended alone (Web ADR 0017 §2.2), in the
+    /// server's report; nothing if the server keeps no count.
+    public fn countCrash(borrow this) {
+        match (borrow this.crashes) {
+            Some(c) => { let before = c.get().fetchAdd(1); }
+            null => {}
+        }
+    }
+
+    /// The server's crash counter, shared, for the context of a request's or a stream's own task; null if none.
+    public fn crashCounter(borrow this) -> Arc<AtomicU64>? => match (borrow this.crashes) {
+        Some(c) => Some(c.clone()),
+        null => null,
+    };
 
     /// The peer's verified identity: a TLS client certificate under client authentication; empty otherwise.
     public fn peerIdentity(borrow this) -> borrow PeerIdentity => borrow this.identity;

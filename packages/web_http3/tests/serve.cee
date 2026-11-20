@@ -9,7 +9,8 @@
 //   GET /wide      200 "wide", after 300 ms, with four 600-byte fields (lossy.cee)
 //   GET /early     200 "early" if the request came in 0-RTT (`request.earlyData()`), else "late"
 //   GET /fail      the handler fails: 500
-//   GET /trap      the handler traps (an index out of bounds) after 20 ms: its stream is reset, alone (Web ADR 0016)
+//   GET /trap      the handler traps (an index out of bounds) after 20 ms: its stream is answered 500, alone (Web ADR
+//                  0016, Web ADR 0017 §2.6)
 //   anything else  404
 import web_core;
 import web_http;
@@ -270,8 +271,8 @@ async fn six_requests_over_udp() -> Result<void, TestFailure> {
     return outcome(raced);
 }
 
-/// A request whose handler traps: its stream is reset (H3_INTERNAL_ERROR), the others on the connection are answered,
-/// one of them after the trap.
+/// A request whose handler traps before its head: its stream is answered 500 with no content (Web ADR 0017 §2.6; it
+/// was reset before), the others on the connection are answered, one of them after the trap.
 async fn oneTraps(tls: borrow QuicTls, server: SocketAddress) -> Result<void, TestFailure> {
     var c = await TestClient.connect(tls, server)?;
     let none = "".bytes();
@@ -286,7 +287,8 @@ async fn oneTraps(tls: borrow QuicTls, server: SocketAddress) -> Result<void, Te
         await c.turn(10)?;
     }
     let all = c.answers.view();
-    Check.isTrue(all[0].reset, "/trap: its stream is reset")?;
+    Check.isTrue(startsWith(all[0].fields.view(), ":status: 500\n") && all[0].ended && !all[0].reset, "/trap: 500")?;
+    Check.equalU64(0, all[0].data.length as u64)?;
     Check.isTrue(startsWith(all[1].fields.view(), ":status: 200\n") && all[1].ended && !all[1].reset, "/hello: 200")?;
     Check.isTrue(startsWith(all[2].fields.view(), ":status: 200\n") && all[2].ended && !all[2].reset, "/slow: 200")?;
     Check.equalBytes("slow".bytes(), all[2].data.view())?;
@@ -295,7 +297,7 @@ async fn oneTraps(tls: borrow QuicTls, server: SocketAddress) -> Result<void, Te
 }
 
 @test
-async fn a_request_that_traps_is_reset_alone() -> Result<void, TestFailure> {
+async fn a_request_that_traps_is_answered_500_alone() -> Result<void, TestFailure> {
     let s = setup()?;
     let drain = match (Drain.create()) {
         Ok(d) => d,

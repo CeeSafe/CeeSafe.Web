@@ -84,8 +84,9 @@ public struct ServerReport {
     /// `run`: workers that took at least one connection, the ones whose frames became resident (`Turns`).
     /// `runIsolated`: the most connections served at once.
     public workersUsed: u64;
-    /// `runIsolated`: connections whose task trapped and ended alone (CeeSafe ADR 0175). Their memory and descriptor
-    /// are leaked, and `Isolation.report()` counts the memory. Always 0 under `run`, where a trap ends the process.
+    /// Tasks that trapped and ended alone (CeeSafe ADR 0175): under `runIsolated` connections, whose memory and
+    /// descriptor are leaked; under either, a connection's isolated requests and streams (Web ADR 0016 §2.3, Web ADR
+    /// 0017 §2.2), each answered 500 or reset. `Isolation.report()` counts the memory they left.
     public crashed: u64;
     /// Whether the grace period ran out and connections in flight were cancelled.
     public forced: bool;
@@ -100,19 +101,28 @@ struct Counters {
     acceptErrors: AtomicU64;
     workersUsed: AtomicU64;
     crashed: AtomicU64;
+    /// The crashes of connections' requests and streams, which their contexts count (`ConnectionContext.countCrash`).
+    requests: Arc<AtomicU64>;
     /// `runIsolated`: connections being served now.
     live: AtomicU64;
 
-    fn create() -> Counters => Counters {
-        accepted: AtomicU64.create(0),
-        handshakesFailed: AtomicU64.create(0),
-        served: AtomicU64.create(0),
-        failed: AtomicU64.create(0),
-        acceptErrors: AtomicU64.create(0),
-        workersUsed: AtomicU64.create(0),
-        crashed: AtomicU64.create(0),
-        live: AtomicU64.create(0),
-    };
+    fn create() -> Result<Counters, NetError> {
+        let requests = match (Arc<AtomicU64>.create(AtomicU64.create(0))) {
+            Ok(r) => r,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        };
+        return Ok(Counters {
+            accepted: AtomicU64.create(0),
+            handshakesFailed: AtomicU64.create(0),
+            served: AtomicU64.create(0),
+            failed: AtomicU64.create(0),
+            acceptErrors: AtomicU64.create(0),
+            workersUsed: AtomicU64.create(0),
+            crashed: AtomicU64.create(0),
+            requests: requests,
+            live: AtomicU64.create(0),
+        });
+    }
 
     fn report(borrow this, forced: bool) -> ServerReport => ServerReport {
         accepted: this.accepted.load(),
@@ -121,7 +131,7 @@ struct Counters {
         failed: this.failed.load(),
         acceptErrors: this.acceptErrors.load(),
         workersUsed: this.workersUsed.load(),
-        crashed: this.crashed.load(),
+        crashed: this.crashed.load() + this.requests.get().load(),
         forced: forced,
     };
 }
@@ -249,7 +259,7 @@ public struct ConnectionServer {
         limits: borrow ConnectionLimits,
         drain: borrow Drain,
     ) -> Result<ServerReport, NetError> {
-        let counters = Counters.create();
+        let counters = Counters.create()?;
         let turns = Turns.create(limits.workers)?;
         let r: Result<Raced<bool>, NetError> = await Async.race(
             async () => {
@@ -288,7 +298,7 @@ public struct ConnectionServer {
         limits: borrow ConnectionLimits,
         drain: borrow Drain,
     ) -> Result<ServerReport, NetError> {
-        let counters = match (Arc<Counters>.create(Counters.create())) {
+        let counters = match (Arc<Counters>.create(Counters.create()?)) {
             Ok(c) => c,
             Err(_) => { return Err(NetError.OutOfMemory); },
         };
@@ -462,7 +472,10 @@ async fn serveConnection(
         }
         ProxyHeader.Local => {}
     }
-    let ctx = ConnectionContext.acceptedNow(id, drain).withAddresses(peer, local).withPeerIdentity(identity);
+    let ctx = ConnectionContext.acceptedNow(id, drain)
+        .withAddresses(peer, local)
+        .withPeerIdentity(identity)
+        .withCrashCounter(Some(counters.requests.clone()));
     match (await handler.serve(mut conn, ctx)) {
         Ok() => {
             let done = counters.served.fetchAdd(1);

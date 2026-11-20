@@ -112,7 +112,7 @@ impl Transport for Client {
 /// `/hello`: "hello"; `/echo`: the body back; `/push`: pushes `/style.css`, then "pushed"; `/style.css`: "css";
 /// `/slow`: "slow" after 300 ms; `/stall`: "stall" after 10 s; `/big`: 100 000 bytes of `x`, in ten sends;
 /// `/trailers`: reads the body, then answers each trailer as `name=value;`; `/rtrailers`: "abc" and the trailer
-/// `x-sum: 3`; `/trap`: traps (an index out of bounds) after 20 ms.
+/// `x-sum: 3`; `/trap`: traps (an index out of bounds) after 20 ms; `/trap-late`: sends its head and "part", then traps.
 /// `r` in decimal, or "-" for null, then ";".
 fn remainingOf(r: u64?, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     match (r) {
@@ -220,6 +220,13 @@ impl Application for Site {
             }
             let small = [0u8; 2];
             let at = path.bytes().length; // 5: out of bounds, a trap that ends this stream's task alone
+            return await exchange.send(Status.ok(), small[at..at + 1]);
+        }
+        if (Ascii.equals(path.bytes(), "/trap-late")) {
+            await exchange.write("part".bytes())?;
+            await exchange.flush()?;
+            let small = [0u8; 2];
+            let at = path.bytes().length; // 10: out of bounds
             return await exchange.send(Status.ok(), small[at..at + 1]);
         }
         if (Ascii.equals(path.bytes(), "/stall")) {
@@ -446,10 +453,10 @@ async fn a_body_echoed_and_two_streams_interleaved() -> Result<void, TestFailure
     return Check.isTrue(contains(log.view(), "data 1 f1 abcdef; "), "stream 1's body echoed");
 }
 
-/// A stream whose handler traps is reset with INTERNAL_ERROR (Web ADR 0016 §2.3), and the connection serves the
-/// other streams, before and after it.
+/// A stream whose handler traps before its head is answered 500 with no content (Web ADR 0017 §2.6; it was reset
+/// before), and the connection serves the other streams, before and after it.
 @test
-async fn a_stream_that_traps_is_reset_alone() -> Result<void, TestFailure> {
+async fn a_stream_that_traps_is_answered_500_alone() -> Result<void, TestFailure> {
     var bytes = Vector<u8>.create();
     preface(mut bytes)?;
     let trap = getBlock("/trap")?;
@@ -460,10 +467,27 @@ async fn a_stream_that_traps_is_reset_alone() -> Result<void, TestFailure> {
     frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 5, slow.view())?;
     let out = await served(bytes, 600)?;
     let log = frames(out)?;
-    Check.isTrue(contains(log.view(), "rst 1 code 2; "), "the trapped stream is reset with INTERNAL_ERROR")?;
-    Check.isFalse(contains(log.view(), "headers 1 "), "it sent no head")?;
+    Check.isTrue(contains(log.view(), "headers 1 f5 500; "), "the trapped stream is answered 500, ending it")?;
+    Check.isFalse(contains(log.view(), "rst 1 "), "and not reset: its request had ended")?;
     Check.isTrue(contains(log.view(), "data 3 f1 hello; "), "a stream beside it is answered")?;
     return Check.isTrue(contains(log.view(), "data 5 f1 slow; "), "a stream that ends after the trap is answered");
+}
+
+/// A stream whose handler traps after its head went out is reset with INTERNAL_ERROR, as before Web ADR 0017: a
+/// status already sent cannot be taken back.
+@test
+async fn a_stream_that_traps_after_its_head_is_reset() -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    preface(mut bytes)?;
+    let late = getBlock("/trap-late")?;
+    let get = getBlock("/hello")?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 1, late.view())?;
+    frame(mut bytes, FrameTypes.headers(), FrameFlags.endHeaders() | FrameFlags.endStream(), 3, get.view())?;
+    let out = await served(bytes, 300)?;
+    let log = frames(out)?;
+    Check.isTrue(contains(log.view(), "headers 1 f4 200; "), "its head went out")?;
+    Check.isTrue(contains(log.view(), "rst 1 code 2; "), "then it is reset with INTERNAL_ERROR")?;
+    return Check.isTrue(contains(log.view(), "data 3 f1 hello; "), "a stream beside it is answered");
 }
 
 /// A read that completed as the wait's other arm won (a stream's message; io_uring, CeeSafe ADR 0035 §3.4) keeps its

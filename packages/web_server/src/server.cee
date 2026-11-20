@@ -96,7 +96,9 @@ public struct Server<S: Send + Share> {
     }
 }
 
-/// An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection (Web ADR 0011 §3.2).
+/// An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection (Web ADR 0011 §3.2). With
+/// `Limits.isolateRequests`, each HTTP/1.1 request runs in its own isolated task (`web_http1.serveIsolated`, Web ADR
+/// 0017); HTTP/2 streams always do (Web ADR 0016 §2.3).
 public struct HttpService {
     private app: Arc<Box<dyn Application + Send + Share>>;
     private httpLimits: Limits;
@@ -136,6 +138,10 @@ impl ConnectionHandler for HttpService {
         let app: borrow dyn Application = this.app.get();
         if (n == first.length && prefixOf(first[..], preface)) {
             return await serveH2(conn, ctx, this.app, this.httpLimits, first[..]);
+        }
+        if (this.httpLimits.isolateRequests) {
+            // Each request in its own isolated task: a trap is answered 500 and the connection goes on (Web ADR 0017).
+            return await web_http1.serveIsolated(conn, ctx, this.app, this.httpLimits, first[0..n]);
         }
         return await web_http1.serveFrom(conn, ctx, app, this.httpLimits, first[0..n]);
     }
@@ -184,6 +190,8 @@ fn prefixOf(bytes: Slice<u8>, whole: Slice<u8>) -> bool {
     return true;
 }
 
+/// A server served as it is, with no `Arc` to share: HTTP/1.1 only, every request in the connection's own task
+/// (`Limits.isolateRequests` needs the shared application of `serviceOf`, which `run` and `runIsolated` use).
 impl<S: Send + Share> ConnectionHandler for Server<S> {
     async fn serve(
         borrow this,

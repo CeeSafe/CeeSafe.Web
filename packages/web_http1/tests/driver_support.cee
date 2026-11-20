@@ -94,10 +94,22 @@ impl Transport for Script {
 /// - `/big`: 20000 bytes of `x`, length not declared; `/bigknown`: the same, declared;
 /// - `/huge`: writes "ab", then 40000 bytes of `x` in one write, length not declared; `/hugeknown`: the same, declared;
 /// - `/trailers`: reads the body, then answers `/trailers:` and each trailer as `name=value;`;
+/// - `/trap`: traps (an index out of bounds) before writing; `/trap-half`: reads 4 bytes of the body, then traps;
+///   `/trap-late`: writes "part1", flushes, then traps;
+/// - `/upgrade`: switches to the protocol `test` and writes "hi" on the raw connection;
+/// - `/wait-close`: waits for the client to close (`peerClosed`), then answers "closed";
 /// - anything else: reads the body and answers `<path>:<body>`.
-/// Its hook adds `x-hook: 1` to every response.
+/// Its hook adds `x-hook: 1` to every response; `crashed` counts the requests that trapped (Web ADR 0017).
 struct App {
     handled: AtomicU64;
+    trapped: Arc<AtomicU64>;
+}
+
+/// Traps: `small[at..at + 1]` with `at` past its end (every caller's path is longer than 2).
+fn trap(at: usize) -> u8 {
+    let small = [0u8; 2];
+    let piece = small[at..at + 1];
+    return piece[0];
 }
 
 impl Application for App {
@@ -128,6 +140,37 @@ impl Application for App {
         }
         if (Ascii.equals(p, "/ignore")) {
             return await exchange.send(Status.ok(), "ok".bytes());
+        }
+        if (Ascii.equals(p, "/trap")) {
+            let b = trap(p.length);
+            return await exchange.send(Status.ok(), "never".bytes());
+        }
+        if (Ascii.equals(p, "/trap-half")) {
+            var four = [0u8; 4];
+            var got: usize = 0;
+            while (got < 4) {
+                let k = await exchange.read(mut four[got..])?;
+                if (k == 0) {
+                    break;
+                }
+                got += k;
+            }
+            let b = trap(p.length);
+            return await exchange.send(Status.ok(), "never".bytes());
+        }
+        if (Ascii.equals(p, "/trap-late")) {
+            await exchange.write("part1".bytes())?;
+            await exchange.flush()?;
+            let b = trap(p.length);
+            return Ok();
+        }
+        if (Ascii.equals(p, "/upgrade")) {
+            await exchange.switchProtocols("test")?;
+            return await exchange.writeRaw("hi".bytes());
+        }
+        if (Ascii.equals(p, "/wait-close")) {
+            await exchange.peerClosed()?;
+            return await exchange.send(Status.ok(), "closed".bytes());
         }
         if (Ascii.equals(p, "/fail")) {
             return Err(HandlerError.Status(Status.notFound()));
@@ -184,6 +227,17 @@ impl Application for App {
             Err(_) => { return Err(HandlerError.Internal); }
         }
     }
+
+    async fn crashed(borrow this, request: borrow Request, crash: borrow TaskCrash) {
+        let before = this.trapped.get().fetchAdd(1);
+    }
+}
+
+fn counter() -> Result<Arc<AtomicU64>, TestFailure> {
+    match (Arc<AtomicU64>.create(AtomicU64.create(0))) {
+        Ok(c) => { return Ok(c); }
+        Err(_) => { return Err(TestFailure.create("a counter")); }
+    }
 }
 
 /// Serves `text`, delivered `step` bytes per read, and returns the script with what was written.
@@ -194,12 +248,48 @@ async fn run(text: StringView, step: usize, limits: borrow Limits) -> Result<Scr
         Err(_) => { return Err(TestFailure.create("a drain")); },
     };
     let ctx = ConnectionContext.acceptedNow(1, drain);
-    let app = App { handled: AtomicU64.create(0) };
+    let app = App { handled: AtomicU64.create(0), trapped: counter()? };
     match (await serve(mut s, ctx, app, limits)) {
         Ok() => {}
         Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
     }
     return Ok(s);
+}
+
+/// What `runIsolated` gives back: the script, how many requests trapped (`Application.crashed`), and how many crashes
+/// the connection's context counted (`ConnectionContext.countCrash`).
+struct IsolatedRun {
+    script: Script;
+    trapped: u64;
+    counted: u64;
+}
+
+/// `run`, through `serveIsolated` (Web ADR 0017): each request in an isolated task.
+async fn runIsolated(text: StringView, step: usize, limits: borrow Limits) -> Result<IsolatedRun, TestFailure> {
+    var s = script(text, step)?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let trapped = counter()?;
+    let counted = counter()?;
+    let ctx = ConnectionContext.acceptedNow(1, drain).withCrashCounter(Some(counted.clone()));
+    let boxed: Box<dyn Application + Send + Share> = match (Box.create(App {
+        handled: AtomicU64.create(0),
+        trapped: trapped.clone(),
+    })) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("a box")); },
+    };
+    let app = match (Arc<Box<dyn Application + Send + Share>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("an arc")); },
+    };
+    match (await serveIsolated(mut s, ctx, app, limits, "".bytes())) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    return Ok(IsolatedRun { script: s, trapped: trapped.get().load(), counted: counted.get().load() });
 }
 
 fn same(expected: StringView, got: borrow Vector<u8>) -> Result<void, TestFailure> => Check.equalBytes(expected.bytes(), got.view());

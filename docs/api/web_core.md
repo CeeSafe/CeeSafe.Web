@@ -236,6 +236,31 @@ public fn withPeerIdentity(this, identity: PeerIdentity) -> ConnectionContext<r>
 
 The same context with the peer's verified identity (`Transport.peerIdentity`).
 
+### ConnectionContext.withCrashCounter
+
+```ceesafe
+public fn withCrashCounter(this, counter: Arc<AtomicU64>?) -> ConnectionContext<r>
+```
+
+The same context, its requests' and streams' crashes counted in `counter` (Web ADR 0017 §2.2).
+
+### ConnectionContext.countCrash
+
+```ceesafe
+public fn countCrash(borrow this)
+```
+
+Counts a crash of one of this connection's requests or streams, which ended alone (Web ADR 0017 §2.2), in the
+server's report; nothing if the server keeps no count.
+
+### ConnectionContext.crashCounter
+
+```ceesafe
+public fn crashCounter(borrow this) -> Arc<AtomicU64>?
+```
+
+The server's crash counter, shared, for the context of a request's or a stream's own task; null if none.
+
 ### ConnectionContext.peerIdentity
 
 ```ceesafe

@@ -49,85 +49,23 @@ public async fn serveFrom(
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
     loop {
-        // A complete head in `a`.
-        var scanner = HeadScanner.create();
-        // A head already begun (bytes read to choose the protocol, or a pipelined request's start) is held to the
-        // header timeout from now; one not begun, from its first byte (below).
-        var headDeadline = if (a.isEmpty()) Deadline.never() else Deadline.after(limits.headerTimeoutMs);
-        loop {
-            match (scanner.scan(a.readable(), limits)) {
-                Ok(true) => { break; }
-                Ok(false) => {}
-                Err(e) => {
-                    await reject(conn, mut out, mut response, mut date, ProtocolErrors.status(e), limits);
-                    return Ok();
-                }
-            }
-            // Nothing complete is buffered: send what is waiting before waiting for more.
-            await flush(conn, mut out, limits)?;
-            a.compact();
-            if (a.spareLength() == 0) {
-                if (a.capacity() >= limits.maxHeadBytes) {
-                    await reject(conn, mut out, mut response, mut date, Status.headerFieldsTooLarge(), limits);
-                    return Ok();
-                }
-                // A head longer than the first buffer: room for the longest allowed (the scanner checks the limit).
-                match (a.reserve(limits.maxHeadBytes)) {
-                    Ok() => {}
-                    Err(_) => { return Err(NetError.OutOfMemory); }
-                }
-            }
-            let idle = a.isEmpty();
-            if (idle && connection.isDraining()) {
-                return Ok();
-            }
-            var n: usize = 0;
-            if (idle) {
-                let d = Deadline.after(limits.idleTimeoutMs);
-                let r: Result<Raced<usize>, NetError> = await Async.race(
-                    async () => await Transports.readWithin(conn, a.spare(), d),
-                    async () => await drainStarted<usize>(connection.drain()),
-                );
-                match (r) {
-                    Ok(raced) => { n = raced.value; }
-                    Err(NetError.TimedOut) => { return Ok(); } // idle too long
-                    Err(NetError.Cancelled) => {
-                        if (connection.isDraining()) {
-                            return Ok();
-                        }
-                        return Err(NetError.Cancelled);
-                    }
-                    Err(e) => { return Err(e); }
-                }
-            } else {
-                match (await Transports.readWithin(conn, a.spare(), headDeadline)) {
-                    Ok(v) => { n = v; }
-                    Err(NetError.TimedOut) => {
-                        await reject(conn, mut out, mut response, mut date, Status.requestTimeout(), limits);
-                        return Ok();
-                    }
-                    Err(e) => { return Err(e); }
-                }
-            }
-            if (n == 0) {
-                return Ok(); // the client closed, between requests or within a head
-            }
-            if (idle) {
-                headDeadline = Deadline.after(limits.headerTimeoutMs);
-            }
-            match (a.commit(n)) {
-                Ok() => {}
-                Err(e) => { return Err(e); }
-            }
-        }
+        let span = await nextHead(
+            conn,
+            connection,
+            limits,
+            mut a,
+            mut out,
+            mut response,
+            mut date,
+        )? ?? { return Ok(); };
         let keep = await exchangeOne(
             conn,
             connection,
             app,
             limits,
             a,
-            scanner.start(),
-            scanner.end(),
+            span.start,
+            span.end,
             mut b,
             mut out,
             mut pending,
@@ -149,6 +87,97 @@ public async fn serveFrom(
             b = t;
         }
     }
+}
+
+/// Where a complete head lies in `a`.
+struct HeadSpan {
+    start: usize;
+    end: usize;
+}
+
+/// Reads until `a` holds a complete head, and returns where it lies; null when the connection ends instead (the client
+/// closed or idled out, the drain, or a head that cannot be read, which is answered here). A peer's reset or a failed
+/// write is `Err`.
+async fn nextHead(
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    limits: borrow Limits,
+    a: borrow mut OwnedBuffer,
+    out: borrow mut OwnedBuffer,
+    response: borrow mut ResponseHead,
+    date: borrow mut DateCache,
+) -> Result<HeadSpan?, NetError> {
+    var scanner = HeadScanner.create();
+    // A head already begun (bytes read to choose the protocol, or a pipelined request's start) is held to the header
+    // timeout from now; one not begun, from its first byte (below).
+    var headDeadline = if (a.isEmpty()) Deadline.never() else Deadline.after(limits.headerTimeoutMs);
+    loop {
+        match (scanner.scan(a.readable(), limits)) {
+            Ok(true) => { break; }
+            Ok(false) => {}
+            Err(e) => {
+                await reject(conn, out, response, date, ProtocolErrors.status(e), limits);
+                return Ok(null);
+            }
+        }
+        // Nothing complete is buffered: send what is waiting before waiting for more.
+        await flush(conn, out, limits)?;
+        a.compact();
+        if (a.spareLength() == 0) {
+            if (a.capacity() >= limits.maxHeadBytes) {
+                await reject(conn, out, response, date, Status.headerFieldsTooLarge(), limits);
+                return Ok(null);
+            }
+            // A head longer than the first buffer: room for the longest allowed (the scanner checks the limit).
+            match (a.reserve(limits.maxHeadBytes)) {
+                Ok() => {}
+                Err(_) => { return Err(NetError.OutOfMemory); }
+            }
+        }
+        let idle = a.isEmpty();
+        if (idle && connection.isDraining()) {
+            return Ok(null);
+        }
+        var n: usize = 0;
+        if (idle) {
+            let d = Deadline.after(limits.idleTimeoutMs);
+            let r: Result<Raced<usize>, NetError> = await Async.race(
+                async () => await Transports.readWithin(conn, a.spare(), d),
+                async () => await drainStarted<usize>(connection.drain()),
+            );
+            match (r) {
+                Ok(raced) => { n = raced.value; }
+                Err(NetError.TimedOut) => { return Ok(null); } // idle too long
+                Err(NetError.Cancelled) => {
+                    if (connection.isDraining()) {
+                        return Ok(null);
+                    }
+                    return Err(NetError.Cancelled);
+                }
+                Err(e) => { return Err(e); }
+            }
+        } else {
+            match (await Transports.readWithin(conn, a.spare(), headDeadline)) {
+                Ok(v) => { n = v; }
+                Err(NetError.TimedOut) => {
+                    await reject(conn, out, response, date, Status.requestTimeout(), limits);
+                    return Ok(null);
+                }
+                Err(e) => { return Err(e); }
+            }
+        }
+        if (n == 0) {
+            return Ok(null); // the client closed, between requests or within a head
+        }
+        if (idle) {
+            headDeadline = Deadline.after(limits.headerTimeoutMs);
+        }
+        match (a.commit(n)) {
+            Ok() => {}
+            Err(e) => { return Err(e); }
+        }
+    }
+    return Ok(Some(HeadSpan { start: scanner.start(), end: scanner.end() }));
 }
 
 /// The head buffer a connection starts with: most requests' heads fit in it (a browser's are typically under 2 KiB).

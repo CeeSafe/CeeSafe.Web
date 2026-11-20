@@ -5,8 +5,10 @@
 //   GET  /, /hello   "hello, world"
 //   POST /echo       the request body back
 //   GET  /stream     three chunks, flushed one by one
-//   GET  /trap       traps (an index out of bounds): with CW_ISOLATED=1 (`ConnectionServer.runIsolated`, Web ADR
-//                    0016) that connection ends and the server goes on; otherwise the process ends
+//   GET  /trap       traps (an index out of bounds): with CW_ISOLATE_REQUESTS=1 (`web_http1.serveIsolated`, Web ADR
+//                    0017) it is answered 500 and its connection goes on; with CW_ISOLATED=1 (`ConnectionServer.
+//                    runIsolated`, Web ADR 0016) that connection ends and the server goes on; otherwise the process
+//                    ends
 //   any other        404
 //   request "/stop"  starts the drain (for scripts)
 import web_core;
@@ -63,9 +65,9 @@ impl Application for App {
         Ok();
 }
 
-/// Runs the HTTP/1.1 driver on each connection.
+/// Runs the HTTP/1.1 driver on each connection: with `Limits.isolateRequests`, each request in its own isolated task.
 struct Http {
-    app: App;
+    app: Arc<Box<dyn Application + Send + Share>>;
     limits: Limits;
 }
 
@@ -74,8 +76,13 @@ impl ConnectionHandler for Http {
         borrow this,
         conn: borrow mut dyn Transport,
         ctx: borrow ConnectionContext,
-    ) -> Result<void, NetError> =>
-        await web_http1.serve(conn, ctx, this.app, this.limits);
+    ) -> Result<void, NetError> {
+        if (this.limits.isolateRequests) {
+            return await web_http1.serveIsolated(conn, ctx, this.app, this.limits, "".bytes());
+        }
+        let app: borrow dyn Application = this.app.get();
+        return await web_http1.serve(conn, ctx, app, this.limits);
+    }
 }
 
 fn setting(name: StringView, otherwise: u64) -> u64 {
@@ -99,7 +106,17 @@ async fn run() -> Result<void, NetError> {
     let listener = Listener.bindWith(SocketAddresses.v4Loopback(port), options)?;
     var limits = ConnectionLimits.defaults();
     limits.workers = truncate<u32>(setting("CW_WORKERS", 64));
-    let http = Http { app: App {}, limits: Limits.defaults() };
+    var http1 = Limits.defaults();
+    http1.isolateRequests = setting("CW_ISOLATE_REQUESTS", 0) == 1;
+    let boxed: Box<dyn Application + Send + Share> = match (Box.create(App {})) {
+        Ok(b) => b,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    let app = match (Arc.create(boxed)) {
+        Ok(x) => x,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    let http = Http { app: app, limits: http1 };
     let drain = Drain.create()?;
     let acceptor = PlainAcceptor {};
     match (await AsyncConsole.writeLine("http1: listening")) {

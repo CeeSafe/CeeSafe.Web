@@ -37,6 +37,10 @@ public interface Application {
         request: borrow Request,
         head: borrow mut ResponseHead,
     ) -> Result<void, HandlerError>;
+
+    /// A request's handler trapped and ended alone (Web ADR 0017 §2.5): called by the connection's task after it
+    /// answered, with the request as its head was read. The default does nothing; an access log overrides it.
+    async fn crashed(borrow this, request: borrow Request, crash: borrow TaskCrash) {}
 }
 
 /// The state of the request body.
@@ -55,6 +59,10 @@ public struct Exchange<region r> {
     /// through `conn`, with a `NoStream` here.
     private stream: borrow mut(r) dyn StreamSink;
     private multiplexed: bool;
+    /// An isolated HTTP/1.1 request's (Web ADR 0017, `forRelay`): written through `stream` as a multiplexed one, its
+    /// connection framing it again as HTTP/1.1. Its head carries `connection: close` when the connection must close,
+    /// and no `date` but the handler's own.
+    private relayed: bool;
     private carry: borrow mut(r) OwnedBuffer;
     private out: borrow mut(r) OwnedBuffer;
     private pending: borrow mut(r) OwnedBuffer;
@@ -128,6 +136,7 @@ public struct Exchange<region r> {
             conn: conn,
             stream: stream,
             multiplexed: false,
+            relayed: false,
             carry: carry,
             out: out,
             pending: pending,
@@ -185,6 +194,7 @@ public struct Exchange<region r> {
             conn: conn,
             stream: stream,
             multiplexed: true,
+            relayed: false,
             carry: carry,
             out: out,
             pending: pending,
@@ -211,6 +221,29 @@ public struct Exchange<region r> {
             trailerFields: HeaderBlock.create(),
             responseTrailers: HeaderBlock.create(),
         };
+    }
+
+    /// An exchange for an HTTP/1.1 request served in its own isolated task (Web ADR 0017): `forStream`'s, its body and
+    /// response going through `stream` to the connection's task, which frames them as HTTP/1.1. Its head carries
+    /// `connection: close` when the handler asked for it (`closeConnection`, or a 500 that closes), and `date` only when
+    /// the handler set one: the connection adds its own.
+    public fn forRelay(
+        stream: borrow mut(r) dyn StreamSink,
+        conn: borrow mut(r) dyn Transport,
+        carry: borrow mut(r) OwnedBuffer,
+        out: borrow mut(r) OwnedBuffer,
+        pending: borrow mut(r) OwnedBuffer,
+        response: borrow mut(r) ResponseHead,
+        app: borrow(r) dyn Application,
+        request: borrow(r) Request<r>,
+        limits: borrow(r) Limits,
+        date: borrow mut(r) DateCache,
+        hasBody: bool,
+    ) -> Exchange<r> {
+        var ex = Exchange.forStream(stream, conn, carry, out, pending, response, app, request, limits, date, hasBody);
+        ex.relayed = true;
+        ex.keep = true;
+        return ex;
     }
 
     // ---- The request body ----
@@ -364,13 +397,11 @@ public struct Exchange<region r> {
     /// failed write finds the close instead. Cancelling it loses nothing.
     public async fn peerClosed(borrow mut this) -> Result<void, HandlerError> {
         if (this.multiplexed) {
-            // A stream's reset cancels its whole task (Web ADR 0011 §3.2), so this only waits to be cancelled.
-            loop {
-                match (await Timer.sleep(3600000)) {
-                    Ok() => {}
-                    Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
-                }
-            }
+            // A stream's reset cancels its whole task (Web ADR 0011 §3.2): its sink waits to be cancelled. An isolated
+            // HTTP/1.1 request's sink returns when its connection reads the client's close (Web ADR 0017).
+            await this.stream.peerClosed()?;
+            this.keep = false;
+            return Ok();
         }
         match (this.body) {
             BodyState.Done => {}
@@ -867,6 +898,18 @@ public struct Exchange<region r> {
             }
             null => {}
         }
+        if (this.relayed) {
+            // The connection frames this head as HTTP/1.1 (Web ADR 0017): it adds its own `date` after the status line
+            // unless the handler's is among the fields, and closes after a head that says so.
+            if (this.response.closes()) {
+                this.keep = false;
+            }
+            if (!this.keep) {
+                grown(fields.push("connection".bytes(), "close".bytes(), false))?;
+            }
+            this.sent = true;
+            return await this.stream.sendHead(fields, end);
+        }
         // One `Date` (RFC 9110 §6.6.1): the handler's when it set one (a proxy relays its origin's), else ours.
         if (!this.response.has("date")) {
             this.date.refresh();
@@ -1148,6 +1191,9 @@ public struct Exchange<region r> {
         if (this.multiplexed) {
             if (this.sent) {
                 return false; // the driver resets the stream instead
+            }
+            if (close) {
+                this.keep = false; // a relayed head says so (Web ADR 0017); a stream's never closes its connection
             }
             this.response.reset();
             this.response.setStatus(status);
