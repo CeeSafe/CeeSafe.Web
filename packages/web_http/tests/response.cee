@@ -40,6 +40,7 @@ fn response_head_fields() -> Result<void, TestFailure> {
     Check.isTrue(h.has("content-type"), "has content-type, any case")?;
     Check.isFalse(h.has("type"), "not a suffix of a name")?;
     Check.isFalse(h.has("text/plain"), "not a value")?;
+    Check.isFalse(h.has("content"), "not a prefix of a name")?;
     Check.isTrue(match (h.add("X-Evil", "a\r\nSet-Cookie: x".bytes())) {
         Err(FieldError.BadValue) => true,
         _ => false,
@@ -183,5 +184,21 @@ fn http_date_refusals() -> Result<void, TestFailure> {
     dateRefused("Someday, 06-Nov-94 08:49:37 GMT")?;
     dateRefused("Sun Nov 6 08:49:37 1994")?; // asctime pads the day to two places
     dateRefused("Sun, 06 Nov 1994 08:49:37 GMT ")?;
+    return Ok();
+}
+
+@test
+fn response_head_has_on_any_line() -> Result<void, TestFailure> {
+    var h = match (ResponseHead.create(256)) {
+        Ok(v) => v,
+        Err(_) => { return Err(TestFailure.create("a head")); },
+    };
+    Check.isFalse(h.has("date"), "an empty head has nothing")?;
+    let added = h.add("Cache-Control", "no-store".bytes()).isOk() && h.add("X-A", "1".bytes()).isOk()
+        && h.add("Date", "Fri, 20 Nov 2026 12:00:00 GMT".bytes()).isOk();
+    Check.isTrue(added, "three fields are added")?;
+    Check.isTrue(h.has("cache-control") && h.has("x-a") && h.has("date"), "each line's name")?;
+    Check.isFalse(h.has("x") || h.has("x-ab") || h.has("cache"), "not a prefix, nor longer")?;
+    Check.isFalse(h.has("12") || h.has("00 gmt") || h.has("no-store"), "not a value, nor after its colons")?;
     return Ok();
 }
