@@ -1,6 +1,7 @@
 # Web ADR 0017 — Isolated requests: a handler that traps is answered 500, and its connection goes on
 
-**Status:** proposed 2026-11-20. Written at the owner's request to close the gaps between httpserver and Elixir's web
+**Status:** accepted 2026-11-20. The owner: "I accept all the above ADRs as written" (§7, every recommendation).
+Proposed 2026-11-20, written at the owner's request to close the gaps between httpserver and Elixir's web
 servers ("We need to tackle where Elixir is ahead", then "Draft ADRs for all gaps"). It is the gap of a request
 that traps: Cowboy answers it 500 from the connection's process and keeps the connection; CeeSafe.Web, under Web ADR
 0016, ends the connection with no answer.
