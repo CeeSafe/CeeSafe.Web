@@ -21,6 +21,18 @@ public interface StreamSink {
     /// Appends the request's trailer fields to `into`, once `readBody` has returned 0 (none if the request had none).
     @effects(alloc)
     fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError>;
+
+    /// Returns when the client has gone, for `Exchange.peerClosed`. The default waits to be cancelled: a multiplexed
+    /// stream's reset cancels its whole task (Web ADR 0011 §3.2). An isolated HTTP/1.1 request's sink returns when its
+    /// connection reads the end of the stream (Web ADR 0017).
+    async fn peerClosed(borrow mut this) -> Result<void, HandlerError> {
+        loop {
+            match (await Timer.sleep(3600000)) {
+                Ok() => {}
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+        }
+    }
 }
 
 /// The sink of an HTTP/1.1 exchange, which has no stream: every call is `Internal`, and nothing is pushed.

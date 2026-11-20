@@ -1,0 +1,917 @@
+// Isolated requests (Web ADR 0017): each request's handler runs in its own isolated task (CeeSafe ADR 0175), so a
+// trap in it is answered 500 and the connection goes on.
+//
+// The connection's task keeps the socket, the TLS state and the head buffers, reads and parses each head as `serveFrom`
+// does, and frames the response as HTTP/1.1 through an ordinary `Exchange` of its own. The request's task gets a copy
+// of the head, parses it again, and serves it through `Exchange.forRelay`, whose body and response go through channels
+// as an HTTP/2 stream's do (`RequestPort`). So the connection's exchange still sends `100 Continue`, chooses the
+// framing, drains an unread body and decides whether the connection is kept, with the same code as `serveFrom`'s.
+//
+// Messages, request to connection (`ToConnection`): the response's head (then its trailers, as a second head), its
+// body, a request for body bytes, a request to watch for the client's close, and the end with the kit back. Connection
+// to request (`ToRequest`): body bytes, the body's end with its trailers, a failed read, and the client's close.
+//
+// A trap is learned from the set's watch (`Isolation.watch`), which a task of the connection's passes on into the same
+// channel as a message, so the connection waits on one channel, and the messages the request posted before it are
+// handled first; then, if no byte of the response has left, the body is drained as after any response and 500 is written,
+// with `connection: close` when the connection cannot be kept; otherwise the connection ends at once (ADR §2.2).
+import web_core;
+import web_http;
+
+/// What a request's task sends its connection.
+enum ToConnection {
+    /// The response's head (`:status` first), or after it its trailers; with `true`, nothing follows.
+    Head(HeaderBlock, bool),
+    /// Body bytes; with `true`, the response is complete.
+    Data(Vector<u8>, bool),
+    /// The handler wants body bytes.
+    WantBody,
+    /// The handler waits for the client to go (`Exchange.peerClosed`).
+    WatchPeer,
+    /// The request is done: its kit back, whether the connection may carry another request, and whether the response
+    /// could not be completed (the connection must close at once).
+    Done(RequestKit, bool, bool),
+    /// The request's task trapped and ended alone: from the set's watch, through `passCrashes`, after every message the
+    /// task posted before it.
+    Crashed(TaskCrash),
+}
+
+/// What a connection sends its request's task.
+enum ToRequest {
+    Data(Vector<u8>),
+    /// The body's end, with the request's trailer fields (empty if none).
+    End(HeaderBlock),
+    /// The body could not be read: the handler's read fails with this.
+    Failed(HandlerError),
+    /// The client closed the connection.
+    PeerClosed,
+}
+
+/// A request task's buffers: the head it parses, and its exchange's. Lent to each request and given back with `Done`;
+/// a request that traps keeps it, and the connection makes another.
+struct RequestKit {
+    head: Vector<u8>;
+    carry: OwnedBuffer;
+    out: OwnedBuffer;
+    pending: OwnedBuffer;
+    response: ResponseHead;
+}
+
+fn makeKit(limits: borrow Limits) -> Result<RequestKit, NetError> {
+    let carry = buffer(16)?;
+    let out = buffer(16)?;
+    let pending = buffer(limits.writeBufferBytes)?;
+    let response = match (ResponseHead.create(4096)) {
+        Ok(h) => h,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    return Ok(RequestKit { head: Vector<u8>.create(), carry: carry, out: out, pending: pending, response: response });
+}
+
+/// What a request's task needs of its connection's context, owned (an isolated task holds no loan).
+struct RequestContext {
+    id: u64;
+    acceptedAt: u64;
+    drain: Drain;
+    peer: SocketAddress?;
+    local: SocketAddress?;
+    identity: PeerIdentity;
+    crashes: Arc<AtomicU64>?;
+}
+
+/// The most body bytes a connection reads for one `WantBody`.
+const BODY_CHUNK: usize = 16384;
+
+/// `serveFrom`, with each request's handler in its own isolated task (Web ADR 0017): a trap in it is answered `500`
+/// when no byte of its response has left, and the connection goes on as after any response; a trap after that ends the
+/// connection. `app.crashed` is told, and the connection's context counts it (`ConnectionContext.countCrash`). A request
+/// that may switch protocols (`Upgrade`) or open a tunnel (`CONNECT`) is served in place, in the connection's own task,
+/// as `serveFrom` serves it.
+public async fn serveIsolated(
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
+    limits: borrow Limits,
+    already: Slice<u8>,
+) -> Result<void, NetError> {
+    let crashes = channel<TaskCrash>(4)?;
+    // Room for a small response's head, body and end, so a request that never waits finishes without waiting for its
+    // connection.
+    let toConnection = channel<ToConnection>(8)?;
+    let toRequest = channel<ToRequest>(2)?;
+    var failure: NetError? = null;
+    // Room for the crash forwarder, a request, and the one before it while it returns after its `Done`.
+    let r = await Async.tasks(3, NetError.Reset, async (set) => {
+        if (!Isolation.watch(set, crashes)) {
+            return Err(NetError.OutOfMemory);
+        }
+        let watched = crashes.clone();
+        let told = toConnection.clone();
+        await set.spawn(async move () => await passCrashes(watched, told))?;
+        match (await serveRequests(set, conn, connection, app, limits, already, toConnection, toRequest)) {
+            Ok() => {}
+            Err(e) => { failure = Some(e); }
+        }
+        // Ends the set, cancelling a request still running: one the connection gave up on (a failed write).
+        return Err(NetError.Closed);
+    });
+    match (r) {
+        Ok() => {}
+        Err(_) => {} // the set's own end, or a request's crash, which the connection answered
+    }
+    return match (failure) {
+        Some(e) => Err(e),
+        null => Ok(),
+    };
+}
+
+/// The connection task's loop: `serveFrom`'s, each request through `exchangeIsolated`.
+async fn serveRequests(
+    set: borrow TaskSet<NetError>,
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
+    limits: borrow Limits,
+    already: Slice<u8>,
+    toConnection: borrow Channel<ToConnection>,
+    toRequest: borrow Channel<ToRequest>,
+) -> Result<void, NetError> {
+    let first = if (limits.maxHeadBytes < FIRST_HEAD_BYTES || already.length > FIRST_HEAD_BYTES) limits.maxHeadBytes
+        else FIRST_HEAD_BYTES;
+    var a = buffer(first)?;
+    a.append(already)?;
+    var b = buffer(0)?;
+    var out = buffer(limits.writeBufferBytes)?;
+    var pending = buffer(limits.writeBufferBytes)?;
+    var date = DateCache.create(limits.sendDate);
+    var response = match (ResponseHead.create(4096)) {
+        Ok(h) => h,
+        Err(_) => { return Err(NetError.OutOfMemory); },
+    };
+    var kits = Vector<RequestKit>.create();
+    var scratch = Vector<u8>.create();
+    loop {
+        let span = await nextHead(
+            conn,
+            connection,
+            limits,
+            mut a,
+            mut out,
+            mut response,
+            mut date,
+        )? ?? { return Ok(); };
+        let keep = await exchangeIsolated(
+            set,
+            conn,
+            connection,
+            app,
+            limits,
+            a,
+            span.start,
+            span.end,
+            mut b,
+            mut out,
+            mut pending,
+            mut response,
+            mut date,
+            mut kits,
+            mut scratch,
+            toConnection,
+            toRequest,
+        )?;
+        if (!keep) {
+            match (await flush(conn, mut out, limits)) {
+                Ok() => {}
+                Err(_) => {} // closing anyway
+            }
+            return Ok();
+        }
+        a.clear();
+        if (!b.isEmpty()) {
+            // The bytes after this head, in `b`, start the next request.
+            let t = a;
+            a = b;
+            b = t;
+        }
+    }
+}
+
+/// The application the connection's own exchange reports to: the request's task already ran the application's
+/// `beforeHead` hooks on the head it relays, and a 500 after a trap runs none (ADR §2.2).
+struct Relayed {}
+
+impl Application for Relayed {
+    async fn handle(
+        borrow this,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+        connection: borrow ConnectionContext,
+    ) -> Result<void, HandlerError> => Err(HandlerError.Internal);
+
+    async fn beforeHead(
+        borrow this,
+        request: borrow Request,
+        head: borrow mut ResponseHead,
+    ) -> Result<void, HandlerError> =>
+        Ok();
+}
+
+/// What woke the connection while its request runs: a message, the request's crash, the client's close (when
+/// watched); any of them may have come together.
+struct Woken {
+    message: ToConnection?;
+    crash: TaskCrash?;
+    peerClosed: bool;
+}
+
+/// How a request ended for its connection.
+enum Ending {
+    /// The connection ends (after what is in `out`).
+    Close,
+    /// The connection may carry another request; true if the response was streamed (flushed by its handler).
+    Keep(bool),
+}
+
+/// One request: parse the head `a[start..end]`, run it in an isolated task, frame its response. True to keep the
+/// connection.
+async fn exchangeIsolated(
+    set: borrow TaskSet<NetError>,
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
+    limits: borrow Limits,
+    a: borrow OwnedBuffer,
+    start: usize,
+    end: usize,
+    b: borrow mut OwnedBuffer,
+    out: borrow mut OwnedBuffer,
+    pending: borrow mut OwnedBuffer,
+    response: borrow mut ResponseHead,
+    date: borrow mut DateCache,
+    kits: borrow mut Vector<RequestKit>,
+    scratch: borrow mut Vector<u8>,
+    toConnection: borrow Channel<ToConnection>,
+    toRequest: borrow Channel<ToRequest>,
+) -> Result<bool, NetError> {
+    let input = a.readable();
+    let head = match (parseHead(input, start, end, limits)) {
+        Ok(h) => h,
+        Err(e) => {
+            await reject(conn, out, response, date, ProtocolErrors.status(e), limits);
+            return Ok(false);
+        },
+    };
+    // A request that can take the connection over is served in place (ADR §2.4).
+    if (Methods.same(
+        head.request.method(),
+        Method.Connect,
+    ) || head.request.headers().get(HeaderName.Upgrade).isSome()) {
+        let application: borrow dyn Application = app.get();
+        return await exchangeOne(conn, connection, application, limits, a, start, end, b, out, pending, response, date);
+    }
+    b.clear();
+    if (end < input.length && b.capacity() < limits.maxHeadBytes) {
+        match (b.reserve(limits.maxHeadBytes)) {
+            Ok() => {}
+            Err(_) => { return Err(NetError.OutOfMemory); }
+        }
+    }
+    b.append(input[end..])?;
+    var kit = match (kits.pop()) {
+        Some(k) => k,
+        null => makeKit(limits)?,
+    };
+    kit.head.clear();
+    match (kit.head.extend(input[start..end])) {
+        Ok() => {}
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+    let hasBody = match (head.framing) {
+        BodyFraming.None => false,
+        _ => true,
+    };
+    let context = RequestContext {
+        id: connection.id(),
+        acceptedAt: connection.acceptedAtMs(),
+        drain: connection.drain().share(),
+        peer: connection.peerAddress(),
+        local: connection.localAddress(),
+        identity: match (connection.peerIdentity().copy()) {
+            Ok(i) => i,
+            Err(_) => { return Err(NetError.OutOfMemory); },
+        },
+        crashes: connection.crashCounter(),
+    };
+    let ending = await relayRequest(
+        set,
+        conn,
+        connection,
+        app,
+        limits,
+        head,
+        hasBody,
+        b,
+        out,
+        pending,
+        response,
+        date,
+        kits,
+        kit,
+        context,
+        scratch,
+        toConnection,
+        toRequest,
+    )?;
+    // Coalescing, as `exchangeOne`: keep `out` while a complete request waits in `b`; send it otherwise.
+    match (ending) {
+        Ending.Close => { return Ok(false); }
+        Ending.Keep(streamed) => {
+            var nextReady = false;
+            if (!streamed) {
+                var s = HeadScanner.create();
+                nextReady = match (s.scan(b.readable(), limits)) {
+                    Ok(true) => true,
+                    _ => false,
+                };
+            }
+            if (!nextReady) {
+                await flush(conn, out, limits)?;
+            }
+            return Ok(true);
+        }
+    }
+}
+
+/// The request in its isolated task, its response framed by the connection's own exchange: how it ended.
+async fn relayRequest(
+    set: borrow TaskSet<NetError>,
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
+    limits: borrow Limits,
+    head: borrow Head,
+    hasBody: bool,
+    b: borrow mut OwnedBuffer,
+    out: borrow mut OwnedBuffer,
+    pending: borrow mut OwnedBuffer,
+    response: borrow mut ResponseHead,
+    date: borrow mut DateCache,
+    kits: borrow mut Vector<RequestKit>,
+    kit: RequestKit,
+    context: RequestContext,
+    scratch: borrow mut Vector<u8>,
+    toConnection: borrow Channel<ToConnection>,
+    toRequest: borrow Channel<ToRequest>,
+) -> Result<Ending, NetError> {
+    var noStream = NoStream {};
+    var relayed = Relayed {};
+    var ex = Exchange.create(
+        conn,
+        mut noStream,
+        b,
+        out,
+        pending,
+        response,
+        relayed,
+        head.request,
+        limits,
+        date,
+        head.framing,
+        head.expectContinue,
+        head.keepAlive && !connection.isDraining(),
+    );
+    let shared = app.clone();
+    let tc = toConnection.clone();
+    let tr = toRequest.clone();
+    let copied: Limits = limits;
+    let task = match (await set.spawnIsolated(NetError.Reset, async move () =>
+        await requestTask(shared, context, hasBody, tr, tc, copied, kit))) {
+        Ok(t) => t,
+        Err(_) => {
+            // No room to isolate it: refused, as a server that cannot take a request now (RFC 9110 §15.6.4).
+            if (await ex.respondError(Status.serviceUnavailable(), true)) {
+                await ex.finishBody();
+            }
+            return Ok(Ending.Close);
+        },
+    };
+    var headSeen = false;
+    var bodyEnded = !hasBody;
+    var watching = false;
+    loop {
+        // What the request posted, as long as there is any; then a wait for more, its crash, or the client's close.
+        let woke = match (toConnection.tryRecv()) {
+            Some(m) => woken(m),
+            null => await wake(toConnection, mut ex, watching)?,
+        };
+        match (woke.message) {
+            Some(ToConnection.Done(back, keep, broken)) => {
+                let kept = kits.push(back); // out of memory: the kit goes, as a crashed request's does
+                if (broken) {
+                    return Ok(Ending.Close);
+                }
+                if (!keep) {
+                    ex.closeConnection();
+                }
+                return Ok(await finishRelayed(mut ex));
+            }
+            Some(m) => {
+                if (!(await relay(mut ex, m, mut headSeen, mut bodyEnded, mut watching, scratch, toRequest))) {
+                    return Ok(Ending.Close); // the connection failed: the set's end cancels the request
+                }
+            }
+            null => {}
+        }
+        if (woke.peerClosed) {
+            watching = false;
+            let told = toRequest.trySend(ToRequest.PeerClosed);
+        }
+        let crash = woke.crash ?? { continue; };
+        if (crash.task != task) {
+            continue; // not this request's (none other runs)
+        }
+        // What the request posted before it trapped comes first: its head may be among it.
+        loop {
+            match (toConnection.tryRecv()) {
+                Some(ToConnection.Done(back, keep, broken)) => {} // cannot follow a trap
+                Some(ToConnection.Crashed(_)) => {}               // nor can another's: one request runs at a time
+                Some(m) => {
+                    if (!(await relay(mut ex, m, mut headSeen, mut bodyEnded, mut watching, scratch, toRequest))) {
+                        return Ok(Ending.Close);
+                    }
+                }
+                null => { break; }
+            }
+        }
+        // What it never took is dropped, so the next request does not read it.
+        loop {
+            match (toRequest.tryRecv()) {
+                Some(_) => {}
+                null => { break; }
+            }
+        }
+        connection.countCrash();
+        let application: borrow dyn Application = app.get();
+        if (ex.headSent()) {
+            // Part of the response left: it cannot be taken back, and the client must see it end short.
+            await application.crashed(head.request, crash);
+            return Ok(Ending.Close);
+        }
+        // As after any response: what is left of the body is drained, or the connection closes; then 500, which says
+        // `connection: close` when it does.
+        await ex.finishBody();
+        let answered = await ex.respondError(Status.internalServerError(), false);
+        await application.crashed(head.request, crash);
+        if (!answered || !ex.keepAlive()) {
+            return Ok(Ending.Close);
+        }
+        return Ok(Ending.Keep(false));
+    }
+}
+
+/// One wait while the request runs: a message from it (its crash among them), or (when `watching`) the client's close.
+async fn wake(
+    toConnection: borrow Channel<ToConnection>,
+    ex: borrow mut Exchange,
+    watching: bool,
+) -> Result<Woken, NetError> {
+    if (!watching) {
+        return await nextMessage(toConnection);
+    }
+    let r: Result<Raced<Woken>, NetError> = await Async.race(
+        async () => await nextMessage(toConnection),
+        async () => {
+            match (await ex.peerClosed()) {
+                Ok() => {}
+                Err(HandlerError.Io(NetError.Cancelled)) => { return Err(NetError.Cancelled); }
+                Err(_) => {} // a reset is a close
+            }
+            return Ok(Woken { message: null, crash: null, peerClosed: true });
+        },
+    );
+    let raced = r?;
+    let w = raced.value;
+    let o = raced.other ?? { return Ok(w); };
+    // Both came: a message and the close, kept together.
+    return Ok(Woken {
+        message: if (w.message.isSome()) w.message else o.message,
+        crash: if (w.crash.isSome()) w.crash else o.crash,
+        peerClosed: w.peerClosed || o.peerClosed,
+    });
+}
+
+/// The request's next message; its crash is one.
+async fn nextMessage(toConnection: borrow Channel<ToConnection>) -> Result<Woken, NetError> {
+    match (await toConnection.recvAsync()) {
+        Ok(Some(m)) => { return Ok(woken(m)); }
+        Ok(null) => { return Err(NetError.Closed); }
+        Err(e) => { return Err(NetErrors.fromAsync(e)); }
+    }
+}
+
+/// A message as what woke the connection.
+fn woken(m: ToConnection) -> Woken => match (m) {
+    ToConnection.Crashed(c) => Woken { message: null, crash: Some(c), peerClosed: false },
+    other => Woken { message: Some(other), crash: null, peerClosed: false },
+};
+
+/// Passes each crash of the set's requests on to the connection's task as a message, after what the request posted
+/// before it: the connection then waits on one channel, with no race a request (as web_http3's connection does).
+async fn passCrashes(crashes: Channel<TaskCrash>, toConnection: Channel<ToConnection>) -> Result<void, NetError> {
+    loop {
+        let crash = match (await crashes.recvAsync()) {
+            Ok(Some(c)) => c,
+            Ok(null) => { return Ok(); },
+            Err(e) => { return Err(NetErrors.fromAsync(e)); },
+        };
+        match (await toConnection.sendAsync(ToConnection.Crashed(crash))) {
+            Ok() => {}
+            Err(_) => { return Ok(); } // the connection has gone
+        }
+    }
+}
+
+/// One message of the request's: its head, body, or a request for the body or the client's close. False if the
+/// connection failed.
+async fn relay(
+    ex: borrow mut Exchange,
+    m: ToConnection,
+    headSeen: borrow mut bool,
+    bodyEnded: borrow mut bool,
+    watching: borrow mut bool,
+    scratch: borrow mut Vector<u8>,
+    toRequest: borrow Channel<ToRequest>,
+) -> bool {
+    match (m) {
+        ToConnection.Head(fields, end) => {
+            if (headSeen) {
+                // Its trailers (RFC 9110 §6.5): the last chunk carries them.
+                for (i in 0..fields.count()) {
+                    let name = StringView.fromUtf8(fields.name(i)) ?? { return false; };
+                    match (ex.trailer(name, fields.value(i))) {
+                        Ok() => {}
+                        Err(_) => { return false; }
+                    }
+                }
+                return true;
+            }
+            headSeen = true;
+            return applyHead(ex, fields);
+        }
+        ToConnection.Data(bytes, end) => {
+            match (await ex.write(bytes.view())) {
+                Ok() => {}
+                Err(_) => { return false; }
+            }
+            if (!end) {
+                // Sent by the request when its buffer filled or its handler flushed: on the wire now, as then.
+                match (await ex.flush()) {
+                    Ok() => {}
+                    Err(_) => { return false; }
+                }
+            }
+            return true;
+        }
+        ToConnection.WantBody => {
+            if (scratch.length < BODY_CHUNK) {
+                while (scratch.length < BODY_CHUNK) {
+                    match (scratch.push(0)) {
+                        Ok() => {}
+                        Err(_) => {
+                            let told = toRequest.trySend(ToRequest.Failed(HandlerError.Internal));
+                            return true;
+                        }
+                    }
+                }
+            }
+            let message = match (await ex.read(scratch.viewMut())) {
+                Ok(0) => {
+                    bodyEnded = true;
+                    var trailers = HeaderBlock.create();
+                    match (trailers.pushAll(ex.trailers())) {
+                        Ok() => ToRequest.End(trailers),
+                        Err(_) => ToRequest.Failed(HandlerError.Internal),
+                    }
+                },
+                Ok(n) => {
+                    var chunk = Vector<u8>.create();
+                    let view = scratch.view();
+                    match (chunk.extend(view[0..n])) {
+                        Ok() => ToRequest.Data(chunk),
+                        Err(_) => ToRequest.Failed(HandlerError.Internal),
+                    }
+                },
+                Err(e) => {
+                    bodyEnded = true;
+                    ToRequest.Failed(e)
+                },
+            };
+            let told = toRequest.trySend(message); // the request waits for it, and nothing else is in the channel
+            return true;
+        }
+        ToConnection.WatchPeer => {
+            if (bodyEnded && ex.remaining() == Some(0u64)) {
+                watching = true;
+            } else {
+                // As over the connection: the body must be read first.
+                let told = toRequest.trySend(ToRequest.Failed(HandlerError.Internal));
+            }
+            return true;
+        }
+        ToConnection.Done(back, keep, broken) => { return true; } // handled by the caller
+        ToConnection.Crashed(_) => { return true; }               // handled by the caller
+    }
+}
+
+/// The request's head, as the connection's exchange will send it: its status, its length, `connection: close`, and the
+/// other fields as they are.
+fn applyHead(ex: borrow mut Exchange, fields: borrow HeaderBlock) -> bool {
+    for (i in 0..fields.count()) {
+        let name = fields.name(i);
+        let value = fields.value(i);
+        if (sameText(name, ":status")) {
+            let code = Ascii.parseDecimal(value) ?? { return false; };
+            let small = checkedTruncate<u16>(code) ?? { return false; };
+            let status = StatusCode.of(small) ?? { return false; };
+            ex.setStatus(status);
+        } else if (sameText(name, "content-length")) {
+            let n = Ascii.parseDecimal(value) ?? { return false; };
+            ex.setContentLength(n);
+        } else if (sameText(name, "connection")) {
+            ex.closeConnection(); // a relayed head names `connection` only to close
+        } else {
+            let text = StringView.fromUtf8(name) ?? { return false; };
+            match (ex.header(text, value)) {
+                Ok() => {}
+                Err(_) => { return false; }
+            }
+        }
+    }
+    return true;
+}
+
+/// The request returned: its response finished as `exchangeOne` finishes one, its body drained.
+async fn finishRelayed(ex: borrow mut Exchange) -> Ending {
+    var failed: HandlerError? = null;
+    match (await ex.finish()) {
+        Ok() => {}
+        Err(e) => { failed = Some(e); }
+    }
+    match (failed) {
+        Some(HandlerError.Status(s)) => {
+            if (!(await ex.respondError(s, false))) {
+                return Ending.Close;
+            }
+        }
+        Some(HandlerError.Internal) => {
+            if (!(await ex.respondError(Status.internalServerError(), true))) {
+                return Ending.Close;
+            }
+        }
+        Some(HandlerError.Io(_)) => { return Ending.Close; }
+        null => {}
+    }
+    await ex.finishBody();
+    if (!ex.keepAlive()) {
+        return Ending.Close;
+    }
+    return Ending.Keep(ex.streamed());
+}
+
+// ---- The request's task ----
+
+/// A request task's end of its channels, as the `StreamSink` its exchange uses.
+struct RequestPort {
+    toConnection: Channel<ToConnection>;
+    toRequest: Channel<ToRequest>;
+    current: Vector<u8>;
+    at: usize;
+    ended: bool;
+    failed: HandlerError?;
+    peerGone: bool;
+    trailers: HeaderBlock;
+}
+
+impl StreamSink for RequestPort {
+    async fn readBody(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError> {
+        loop {
+            if (this.at < this.current.length) {
+                let ready = this.current.view();
+                let n = if (into.length < ready.length - this.at) into.length else ready.length - this.at;
+                let to = borrow mut into[0..n];
+                to.copyFrom(ready[this.at..this.at + n]);
+                this.at += n;
+                return Ok(n);
+            }
+            match (this.failed) {
+                Some(e) => { return Err(e); }
+                null => {}
+            }
+            if (this.ended) {
+                return Ok(0);
+            }
+            await post(this.toConnection, ToConnection.WantBody)?;
+            loop {
+                match (await this.toRequest.recvAsync()) {
+                    Ok(Some(ToRequest.Data(bytes))) => {
+                        this.current = bytes;
+                        this.at = 0;
+                        break;
+                    }
+                    Ok(Some(ToRequest.End(trailers))) => {
+                        this.ended = true;
+                        this.trailers = trailers;
+                        break;
+                    }
+                    Ok(Some(ToRequest.Failed(e))) => {
+                        this.failed = Some(e);
+                        break;
+                    }
+                    Ok(Some(ToRequest.PeerClosed)) => { this.peerGone = true; }
+                    Ok(null) => { return Err(HandlerError.Io(NetError.Closed)); }
+                    Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+                }
+            }
+        }
+    }
+
+    async fn sendHead(borrow mut this, fields: HeaderBlock, endStream: bool) -> Result<void, HandlerError> =>
+        await post(this.toConnection, ToConnection.Head(fields, endStream));
+
+    async fn sendData(borrow mut this, bytes: Slice<u8>, endStream: bool) -> Result<void, HandlerError> {
+        var chunk = Vector<u8>.create();
+        if (failed(chunk.extend(bytes))) {
+            return Err(HandlerError.Internal);
+        }
+        return await post(this.toConnection, ToConnection.Data(chunk, endStream));
+    }
+
+    async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError> => Ok(false);
+
+    @effects(alloc)
+    fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError> =>
+        into.pushAll(this.trailers);
+
+    async fn peerClosed(borrow mut this) -> Result<void, HandlerError> {
+        if (this.peerGone) {
+            return Ok();
+        }
+        await post(this.toConnection, ToConnection.WatchPeer)?;
+        loop {
+            match (await this.toRequest.recvAsync()) {
+                Ok(Some(ToRequest.PeerClosed)) => {
+                    this.peerGone = true;
+                    return Ok();
+                }
+                Ok(Some(ToRequest.Failed(e))) => { return Err(e); }
+                Ok(Some(_)) => {} // body bytes cannot come: the body was read
+                Ok(null) => { return Ok(); }
+                Err(_) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+            }
+        }
+    }
+}
+
+async fn post(toConnection: borrow Channel<ToConnection>, m: ToConnection) -> Result<void, HandlerError> {
+    match (await toConnection.sendAsync(m)) {
+        Ok() => { return Ok(); }
+        Err(SendError.Closed(_)) => { return Err(HandlerError.Io(NetError.Closed)); }
+        Err(SendError.Cancelled(_)) => { return Err(HandlerError.Io(NetError.Cancelled)); }
+    }
+}
+
+/// A request's task: the application's handler for its request, then the kit back to the connection.
+async fn requestTask(
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
+    context: borrow RequestContext,
+    hasBody: bool,
+    toRequest: borrow Channel<ToRequest>,
+    toConnection: borrow Channel<ToConnection>,
+    limits: Limits,
+    given: RequestKit,
+) -> Result<void, NetError> {
+    var kit = given;
+    var keep = true;
+    var broken = false;
+    await serveRequest(app, context, hasBody, toRequest, toConnection, limits, mut kit, mut keep, mut broken);
+    kit.carry.clear();
+    kit.out.clear();
+    kit.pending.clear();
+    kit.response.reset();
+    match (await toConnection.sendAsync(ToConnection.Done(kit, keep, broken))) {
+        Ok() => {}
+        Err(_) => {} // the connection has gone
+    }
+    return Ok(); // a request's failure is its own: the connection answers for it
+}
+
+/// The request parsed from the kit's head, run through the application, its response finished.
+async fn serveRequest(
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
+    context: borrow RequestContext,
+    hasBody: bool,
+    toRequest: borrow Channel<ToRequest>,
+    toConnection: borrow Channel<ToConnection>,
+    limits: Limits,
+    kit: borrow mut RequestKit,
+    keep: borrow mut bool,
+    broken: borrow mut bool,
+) {
+    let input = kit.head.view();
+    let head = match (parseHead(input, 0, input.length, limits)) {
+        Ok(h) => h,
+        Err(_) => {
+            broken = true; // the connection parsed it: cannot happen
+            return;
+        },
+    };
+    let ctx = ConnectionContext.create(context.id, context.acceptedAt, context.drain)
+        .withAddresses(context.peer, context.local)
+        .withPeerIdentity(match (context.identity.copy()) {
+            Ok(i) => i,
+            Err(_) => {
+                broken = true;
+                return;
+            },
+        })
+        .withCrashCounter(match (borrow context.crashes) {
+            Some(c) => Some(c.clone()),
+            null => null,
+        });
+    var port = RequestPort {
+        toConnection: toConnection.clone(),
+        toRequest: toRequest.clone(),
+        current: Vector<u8>.create(),
+        at: 0,
+        ended: !hasBody,
+        failed: null,
+        peerGone: false,
+        trailers: HeaderBlock.create(),
+    };
+    var none = NoTransport {};
+    var date = DateCache.create(limits.sendDate);
+    let application: borrow dyn Application = app.get();
+    var ex = Exchange.forRelay(
+        mut port,
+        mut none,
+        mut kit.carry,
+        mut kit.out,
+        mut kit.pending,
+        mut kit.response,
+        application,
+        head.request,
+        limits,
+        mut date,
+        hasBody,
+    );
+    var failure: HandlerError? = null;
+    match (await application.handle(head.request, mut ex, ctx)) {
+        Ok() => {
+            match (await ex.finish()) {
+                Ok() => {}
+                Err(e) => { failure = Some(e); }
+            }
+        }
+        Err(e) => { failure = Some(e); }
+    }
+    match (failure) {
+        Some(HandlerError.Status(s)) => {
+            if (!(await ex.respondError(s, false))) {
+                broken = true;
+            }
+        }
+        Some(HandlerError.Internal) => {
+            if (!(await ex.respondError(Status.internalServerError(), true))) {
+                broken = true;
+            }
+        }
+        Some(HandlerError.Io(_)) => { broken = true; }
+        null => {}
+    }
+    keep = ex.keepAlive();
+}
+
+fn sameText(a: Slice<u8>, text: StringView) -> bool {
+    let b = text.bytes();
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn channel<T: Send>(n: usize) -> Result<Channel<T>, NetError> {
+    match (Channel<T>.create(n)) {
+        Ok(c) => { return Ok(c); }
+        Err(_) => { return Err(NetError.OutOfMemory); }
+    }
+}
+
+fn failed(r: Result<void, AllocError>) -> bool => match (r) {
+    Ok() => false,
+    Err(_) => true,
+};

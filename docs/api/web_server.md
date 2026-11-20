@@ -407,7 +407,9 @@ Implements `Application`.
 public struct HttpService
 ```
 
-An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection (Web ADR 0011 §3.2).
+An application served over HTTP/1.1 and HTTP/2: the protocol is chosen per connection (Web ADR 0011 §3.2). With
+`Limits.isolateRequests`, each HTTP/1.1 request runs in its own isolated task (`web_http1.serveIsolated`, Web ADR
+0017); HTTP/2 streams always do (Web ADR 0016 §2.3).
 
 Implements `ConnectionHandler`.
 

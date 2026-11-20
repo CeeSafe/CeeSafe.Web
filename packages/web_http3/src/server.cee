@@ -50,8 +50,8 @@ enum BodyPart {
 
 /// The connection's side of one request.
 struct Link {
-    /// The request's isolated task (`trySpawnIsolated`, Web ADR 0016 §2.3), whose crash resets the stream; 0 if there
-    /// was no memory to isolate it.
+    /// The request's isolated task (`trySpawnIsolated`, Web ADR 0016 §2.3), whose crash is answered 500 or resets the
+    /// stream (Web ADR 0017 §2.6); 0 if there was no memory to isolate it.
     task: u64;
     body: Channel<BodyPart>;
     acks: Channel<u8>;
@@ -582,8 +582,8 @@ fn handle(
                 }
             }
             match (found) {
-                Some(stream) => { refuse(h3, link, links, stream); } // H3_INTERNAL_ERROR (RFC 9114 §8.1)
-                null => {}                                           // already ended
+                Some(stream) => { crashed(h3, link, links, stream)?; }
+                null => {} // already ended
             }
         }
         Outgoing.Done(stream) => {
@@ -634,6 +634,42 @@ fn pushBody(h3: borrow mut H3Connection, links: borrow mut HashMap<u64, Link>, s
 }
 
 /// A stream the driver can no longer answer on: reset it, and end its task.
+/// A request's task trapped (Web ADR 0017 §2.6): with no head sent, the stream is answered `500` with no content, and
+/// if the client is still sending its request it is asked to stop with H3_NO_ERROR (RFC 9114 §4.1.1); after its head,
+/// the stream is reset with H3_INTERNAL_ERROR (RFC 9114 §8.1), as before.
+fn crashed(
+    h3: borrow mut H3Connection,
+    link: borrow mut QuicLink,
+    links: borrow mut HashMap<u64, Link>,
+    stream: i64,
+) -> Result<void, QuicError> {
+    var headSent = true;
+    var ended = true;
+    match (links.get(truncate<u64>(stream))) {
+        Some(l) => {
+            headSent = l.headSent;
+            ended = l.ended;
+        }
+        null => {}
+    }
+    if (headSent) {
+        refuse(h3, link, links, stream);
+        return Ok();
+    }
+    var f = H3Fields.create();
+    addField(mut f, ":status".bytes(), "500".bytes())?;
+    addField(mut f, "content-length".bytes(), "0".bytes())?;
+    if (!h3.respond(stream, f, false).isOk()) {
+        refuse(h3, link, links, stream);
+        return Ok();
+    }
+    if (!ended) {
+        let _ = link.stopReading(stream, h3NoErrorCode());
+    }
+    endLink(links, stream);
+    return Ok();
+}
+
 fn refuse(h3: borrow mut H3Connection, link: borrow mut QuicLink, links: borrow mut HashMap<u64, Link>, stream: i64) {
     let _ = link.resetStream(stream, h3InternalError());
     h3.shutdownWrite(stream);

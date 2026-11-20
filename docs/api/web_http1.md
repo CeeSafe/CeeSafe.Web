@@ -7,6 +7,7 @@
 - [struct HeadScanner](#struct-headscanner)
 - [struct Head](#struct-head)
 - [fn parseHead](#fn-parsehead)
+- [fn serveIsolated](#fn-serveisolated)
 - [fn serve](#fn-serve)
 - [fn serveFrom](#fn-servefrom)
 
@@ -167,6 +168,24 @@ public fn parseHead<region r>(
 
 Parses the complete head `input[start..end]` (from a `HeadScanner`: it ends with CRLF CRLF). The request's views
 borrow `input`. Any other range is an error, never a panic.
+
+## fn serveIsolated
+
+```ceesafe
+public async fn serveIsolated(
+    conn: borrow mut dyn Transport,
+    connection: borrow ConnectionContext,
+    app: borrow Arc<Box<dyn Application + Send + Share>>,
+    limits: borrow Limits,
+    already: Slice<u8>,
+) -> Result<void, NetError>
+```
+
+`serveFrom`, with each request's handler in its own isolated task (Web ADR 0017): a trap in it is answered `500`
+when no byte of its response has left, and the connection goes on as after any response; a trap after that ends the
+connection. `app.crashed` is told, and the connection's context counts it (`ConnectionContext.countCrash`). A request
+that may switch protocols (`Upgrade`) or open a tunnel (`CONNECT`) is served in place, in the connection's own task,
+as `serveFrom` serves it.
 
 ## fn serve
 

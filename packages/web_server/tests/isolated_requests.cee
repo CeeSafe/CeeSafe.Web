@@ -1,0 +1,82 @@
+// `Limits.isolateRequests` (Web ADR 0017) through the server: `HttpService` serves HTTP/1.1 with each request in its
+// own isolated task, so a route that traps is answered 500 and the next request on the connection is served; the
+// server's report counts the crash. The expected bytes are written out by hand from §2.2: the 500 carries none of the
+// middleware's fields (its `after` hooks are the application's code, which just trapped).
+import web_core;
+import web_transport;
+import web_http;
+
+/// Traps: an index out of bounds.
+struct Trapping {}
+
+impl Handler<St> for Trapping {
+    async fn handle(
+        borrow this,
+        ctx: borrow mut RequestContext<St>,
+        request: borrow Request,
+        exchange: borrow mut Exchange,
+    ) -> Result<void, HandlerError> {
+        let small = [0u8; 2];
+        let at = request.path().bytes().length; // "/trap": 5
+        return await exchange.send(Status.ok(), small[at..at + 1]);
+    }
+}
+
+/// `marked()`'s routes and middleware with `GET /trap` added, its requests isolated.
+fn isolatedServer() -> Result<Server<St>, TestFailure> {
+    var limits = quiet();
+    limits.isolateRequests = true;
+    var s = routed(Server<St>.create(state()?, limits))?;
+    added(s.use(mark(1)?))?;
+    added(s.use(mark(2)?))?;
+    added(s.router().get("/users", named(2)?))?;
+    let trapping: Box<dyn Handler<St> + Send + Share> = alloc(Box.create(Trapping {}))?;
+    added(s.router().get("/trap", trapping))?;
+    return Ok(s);
+}
+
+@test
+async fn an_isolated_request_that_traps_is_answered_500() -> Result<void, TestFailure> {
+    let service = match (serviceOf(isolatedServer()?)) {
+        Ok(v) => v,
+        Err(_) => { return Err(TestFailure.create("a service")); },
+    };
+    let text = "GET /users HTTP/1.1\r\nhost: a\r\n\r\nGET /trap HTTP/1.1\r\nhost: a\r\n\r\nGET /users HTTP/1.1\r\nhost: a\r\n\r\n";
+    var conn = alloc(MockTransport.create(text.bytes()))?;
+    let drain = match (Drain.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("a drain")); },
+    };
+    let counted = alloc(Arc<AtomicU64>.create(AtomicU64.create(0)))?;
+    let ctx = ConnectionContext.acceptedNow(1, drain).withCrashCounter(Some(counted.clone()));
+    match (await service.serve(mut conn, ctx)) {
+        Ok() => {}
+        Err(e) => { return Err(TestFailure.create(NetErrors.describe(e))); }
+    }
+    let ok = "HTTP/1.1 200 OK\r\nx-m2: 1\r\nx-m1: 1\r\ncontent-length: 2\r\n\r\nh2";
+    var expected = Vector<u8>.create();
+    alloc(expected.extend(ok.bytes()))?;
+    alloc(expected.extend("HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n".bytes()))?;
+    alloc(expected.extend(ok.bytes()))?;
+    Check.equalBytes(expected.view(), conn.written())?;
+    return Check.equalU64(1, counted.get().load());
+}
+
+/// Through `Server.run`: the connection with the trap is served (its handler returned `Ok`), and the report counts one
+/// crash, which under `run` without isolated requests would have ended the process.
+@test
+async fn the_report_counts_an_isolated_request_crash() -> Result<void, TestFailure> {
+    let s = isolatedServer()?;
+    let incoming = net(MockIncoming.create(4))?;
+    let text = "GET /trap HTTP/1.1\r\nhost: a\r\n\r\nGET /users HTTP/1.1\r\nhost: a\r\n\r\n";
+    let m = alloc(MockTransport.create(text.bytes()))?;
+    netDone(incoming.push(m))?;
+    incoming.close();
+    let drain = net(Drain.create())?;
+    let hits = s.state().hits.clone();
+    let report = net(await s.run(incoming, PlainAcceptor {}, ConnectionLimits.defaults(), drain))?;
+    Check.equalU64(1, report.accepted)?;
+    Check.equalU64(1, report.served)?;
+    Check.equalU64(1, report.crashed)?;
+    return Check.equalU64(1, hits.get().load()); // the request after the trap reached its handler
+}

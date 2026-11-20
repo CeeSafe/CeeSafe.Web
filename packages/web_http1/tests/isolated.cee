@@ -1,0 +1,224 @@
+// Isolated requests (Web ADR 0017): `serveIsolated` over the scripted transport. A request that does not trap is
+// answered with the bytes `serve` writes for it, so most checks compare the two; the expected bytes of a trap are
+// written out by hand from the ADR's §2.2 and RFC 9112.
+import web_core;
+import web_http;
+
+/// `text` served by `serve` and by `serveIsolated`, `step` bytes per read: the same bytes, and no trap.
+async fn sameBoth(text: StringView, step: usize, limits: borrow Limits) -> Result<void, TestFailure> {
+    let direct = await run(text, step, limits)?;
+    let isolated = await runIsolated(text, step, limits)?;
+    Check.equalBytes(direct.output.view(), isolated.script.output.view())?;
+    Check.equalU64(0, isolated.trapped)?;
+    return Check.equalU64(0, isolated.counted);
+}
+
+/// Every response shape of the driver's tests (driver.cee), at the read sizes they use: pipelining and coalescing,
+/// bodies by length and chunked, trailers both ways, `100 Continue`, drained and undrained bodies, HEAD, HTTP/1.0, a
+/// handler's error status, large responses with a declared length, rejected heads, long heads.
+@test
+async fn isolated_requests_are_answered_as_serve_answers_them() -> Result<void, TestFailure> {
+    await sameBoth("GET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    let pipelined = "GET /a HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n\r\nPOST /b HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nxyzGET /c HTTP/1.1\r\nHost: x\r\n\r\n";
+    await sameBoth(pipelined, 4096, quiet())?;
+    await sameBoth(pipelined, 1, quiet())?;
+    let bodies = "POST /l HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloPOST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;e=1\r\nde\r\n0\r\nT: 1\r\n\r\n";
+    for (step in 1..12usize) {
+        await sameBoth(bodies, step, quiet())?;
+    }
+    let trailers = "POST /trailers HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nT: 1\r\nx-b:  two \r\n\r\n";
+    for (step in 1..12usize) {
+        await sameBoth(trailers, step, quiet())?;
+    }
+    await sameBoth("GET /stream-trailers HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("GET /stream HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("GET /whole-trailers HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("HEAD /whole-trailers HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("POST /e HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", 4096, quiet())?;
+    await sameBoth(
+        "POST /ignore HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhiGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
+        4096,
+        quiet(),
+    )?;
+    let unread = "POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    await sameBoth(unread, 4096, quiet())?;
+    var small = quiet();
+    small.drainBytes = 4;
+    await sameBoth(unread, 4096, small)?;
+    await sameBoth("HEAD /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("GET /a HTTP/1.0\r\n\r\nGET /b HTTP/1.0\r\n\r\n", 4096, quiet())?;
+    await sameBoth("GET /fail HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("GET /big HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("GET /bigknown HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("GET /hugeknown HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("HEAD /hugeknown HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    await sameBoth("POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 4096, quiet())?;
+    return Ok();
+}
+
+/// A hundred pipelined requests, each in its own task, answered in order and coalesced as `serve` coalesces them.
+@test
+async fn a_hundred_isolated_requests_in_order() -> Result<void, TestFailure> {
+    var input = Vector<u8>.create();
+    for (i in 0..100) {
+        var name = [47u8, 48, 48];
+        name[1] = truncate<u8>(48 + i / 10);
+        name[2] = truncate<u8>(48 + i % 10);
+        let path = match (StringView.fromUtf8(name[..])) {
+            Some(p) => p,
+            null => { return Err(TestFailure.create("path")); },
+        };
+        Check.isTrue(pushText(mut input, "GET ") && pushText(mut input, path) &&
+            pushText(mut input, " HTTP/1.1\r\nHost: x\r\n\r\n"), "input")?;
+    }
+    let text = match (StringView.fromUtf8(input.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let direct = await run(text, 65536, quiet())?;
+    let isolated = await runIsolated(text, 65536, quiet())?;
+    Check.equalBytes(direct.output.view(), isolated.script.output.view())?;
+    return Check.equalU64(1, isolated.script.writes.length as u64); // 100 responses, one write, as `serve`'s
+}
+
+/// A large response whose length is not declared goes out chunked as it fills the request's buffer: the bytes are
+/// `serve`'s once the chunks are decoded (`serve` sends a large write directly, in larger chunks).
+@test
+async fn a_large_undeclared_response_is_chunked() -> Result<void, TestFailure> {
+    let r = await runIsolated("GET /huge HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    var expected = Vector<u8>.create();
+    Check.isTrue(pushText(mut expected, "HTTP/1.1 200 OK\r\nx-hook: 1\r\ntransfer-encoding: chunked\r\n\r\n4000\r\nab"), "e")?;
+    for (i in 0..16382) {
+        Check.isTrue(pushText(mut expected, "x"), "e")?;
+    }
+    Check.isTrue(pushText(mut expected, "\r\n4000\r\n"), "e")?;
+    for (i in 0..16384) {
+        Check.isTrue(pushText(mut expected, "x"), "e")?;
+    }
+    Check.isTrue(pushText(mut expected, "\r\n1c42\r\n"), "e")?; // 40002 - 32768 = 7234
+    for (i in 0..7234) {
+        Check.isTrue(pushText(mut expected, "x"), "e")?;
+    }
+    Check.isTrue(pushText(mut expected, "\r\n0\r\n\r\n"), "e")?;
+    return Check.equalBytes(expected.view(), r.script.output.view());
+}
+
+const ANSWERED_500: StringView = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n";
+const CLOSED_500: StringView = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+/// A request that traps before writing is answered 500 with no content, and the requests pipelined before and after
+/// it on the same connection are answered (ADR §2.2). The application is told once; the context counts it once.
+@test
+async fn a_trap_is_answered_500_and_the_connection_goes_on() -> Result<void, TestFailure> {
+    let text = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /trap HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    var expected = Vector<u8>.create();
+    echoed("/a", "", mut expected)?;
+    Check.isTrue(pushText(mut expected, ANSWERED_500), "e")?;
+    echoed("/b", "", mut expected)?;
+    for (step in [4096usize, 1]) {
+        let r = await runIsolated(text, step, quiet())?;
+        Check.equalBytes(expected.view(), r.script.output.view())?;
+        Check.equalU64(1, r.trapped)?;
+        Check.equalU64(1, r.counted)?;
+    }
+    // Five in a row, each answered, the connection kept.
+    var five = Vector<u8>.create();
+    var answers = Vector<u8>.create();
+    for (i in 0..5) {
+        Check.isTrue(pushText(mut five, "GET /trap HTTP/1.1\r\nHost: x\r\n\r\n"), "input")?;
+        Check.isTrue(pushText(mut answers, ANSWERED_500), "e")?;
+    }
+    Check.isTrue(pushText(mut five, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), "input")?;
+    echoed("/a", "", mut answers)?;
+    let fiveText = match (StringView.fromUtf8(five.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let r5 = await runIsolated(fiveText, 4096, quiet())?;
+    Check.equalBytes(answers.view(), r5.script.output.view())?;
+    return Check.equalU64(5, r5.trapped);
+}
+
+/// A trap with part of the body unread: what is left is drained within `drainBytes` and the connection kept; past it,
+/// the 500 says `connection: close` and nothing more is read (ADR §2.2). The connection reads the body for its request
+/// in chunks of at most 16 KiB, so a short body is off the wire whole before the trap: only what was never read counts.
+@test
+async fn a_trap_drains_the_body_or_closes() -> Result<void, TestFailure> {
+    // A body read whole before the trap: the connection is kept.
+    let short = "POST /trap-half HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    var kept = Vector<u8>.create();
+    Check.isTrue(pushText(mut kept, ANSWERED_500), "e")?;
+    echoed("/a", "", mut kept)?;
+    for (step in 1..12usize) {
+        let r = await runIsolated(short, step, quiet())?;
+        Check.equalBytes(kept.view(), r.script.output.view())?;
+    }
+    var small = quiet();
+    small.drainBytes = 4;
+    let shortSmall = await runIsolated(short, 4096, small)?;
+    Check.equalBytes(kept.view(), shortSmall.script.output.view())?;
+    // 40 000 bytes, one 16 KiB chunk read: the rest drained (64 KiB allowed), or past 4 bytes the connection closed.
+    var input = Vector<u8>.create();
+    Check.isTrue(pushText(mut input, "POST /trap-half HTTP/1.1\r\nHost: x\r\nContent-Length: 40000\r\n\r\n"), "input")?;
+    for (i in 0..40000) {
+        Check.isTrue(pushText(mut input, "b"), "input")?;
+    }
+    Check.isTrue(pushText(mut input, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), "input")?;
+    let long = match (StringView.fromUtf8(input.view())) {
+        Some(t) => t,
+        null => { return Err(TestFailure.create("text")); },
+    };
+    let drained = await runIsolated(long, 65536, quiet())?;
+    Check.equalBytes(kept.view(), drained.script.output.view())?;
+    let closed = await runIsolated(long, 65536, small)?;
+    same(CLOSED_500, closed.script.output)?;
+    // A chunked body, read whole: kept.
+    let chunked = "POST /trap-half HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabcdef\r\n0\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n";
+    let c = await runIsolated(chunked, 3, quiet())?;
+    return Check.equalBytes(kept.view(), c.script.output.view());
+}
+
+/// A trap before the body of an `Expect: 100-continue` request was asked for: the client may send it or not, so the 500
+/// closes the connection (ADR §2.2; RFC 9110 §10.1.1).
+@test
+async fn a_trap_with_a_continue_pending_closes() -> Result<void, TestFailure> {
+    let r = await runIsolated(
+        "POST /trap HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhiGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
+        4096,
+        quiet(),
+    )?;
+    return same(CLOSED_500, r.script.output);
+}
+
+/// A trap after part of the response left: the connection ends there, the chunked body without its last chunk, so the
+/// client sees it cut short (RFC 9112 §7.1); the request behind it is not answered.
+@test
+async fn a_trap_after_the_head_ends_the_connection() -> Result<void, TestFailure> {
+    let r = await runIsolated(
+        "GET /trap-late HTTP/1.1\r\nHost: x\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n",
+        4096,
+        quiet(),
+    )?;
+    same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ntransfer-encoding: chunked\r\n\r\n5\r\npart1\r\n", r.script.output)?;
+    Check.equalU64(1, r.trapped)?;
+    return Check.equalU64(1, r.counted);
+}
+
+/// A request that may switch protocols is served in place (ADR §2.4): the same bytes as `serve`'s.
+@test
+async fn an_upgrade_is_served_in_place() -> Result<void, TestFailure> {
+    let text = "GET /upgrade HTTP/1.1\r\nHost: x\r\nUpgrade: test\r\nConnection: upgrade\r\n\r\n";
+    let direct = await run(text, 4096, quiet())?;
+    let isolated = await runIsolated(text, 4096, quiet())?;
+    same("HTTP/1.1 101 Switching Protocols\r\nupgrade: test\r\nconnection: upgrade\r\nx-hook: 1\r\n\r\nhi", direct.output)?;
+    return Check.equalBytes(direct.output.view(), isolated.script.output.view());
+}
+
+/// `peerClosed` in an isolated request returns when the connection reads the client's close, as over the connection.
+@test
+async fn peer_closed_reaches_an_isolated_request() -> Result<void, TestFailure> {
+    await sameBoth("GET /wait-close HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    let r = await runIsolated("GET /wait-close HTTP/1.1\r\nHost: x\r\n\r\n", 4096, quiet())?;
+    return same("HTTP/1.1 200 OK\r\nx-hook: 1\r\ncontent-length: 6\r\nconnection: close\r\n\r\nclosed", r.script.output);
+}

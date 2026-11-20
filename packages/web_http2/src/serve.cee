@@ -79,9 +79,11 @@ enum BodyPart {
 
 /// The connection's side of one stream.
 struct Link {
-    /// The stream's isolated task (`trySpawnIsolated`, Web ADR 0016 §2.3), whose crash resets the stream; 0 if there
-    /// was no memory to isolate it.
+    /// The stream's isolated task (`trySpawnIsolated`, Web ADR 0016 §2.3), whose crash is answered 500 or resets the
+    /// stream (Web ADR 0017 §2.6); 0 if there was no memory to isolate it.
     task: u64;
+    /// Whether the stream's response head went to the engine: after it, a crash can only reset the stream.
+    headSent: bool;
     body: Channel<BodyPart>;
     credit: Channel<u32>;
     reset: Channel<u8>;
@@ -259,19 +261,19 @@ async fn run(
                 H2Event.GoAway(_, _) => { leaving = true; }
             }
         }
-        // The streams whose tasks trapped since the last turn.
-        loop {
-            match (crashes.tryRecv()) {
-                Some(c) => { crashed(engine, links, c, mut total)?; }
-                null => { break; }
-            }
-        }
-        // What the streams queued, as long as there is any.
+        // What the streams queued, as long as there is any; then the streams whose tasks trapped since the last turn,
+        // after what they posted before (Web ADR 0017 §2.6: a head among it means the crash can only reset).
         loop {
             match (outgoing.tryRecv()) {
                 Some(m) => {
                     await handle(set, connection, app, limits, engine, links, outgoing, mut kits, m, mut total)?;
                 }
+                null => { break; }
+            }
+        }
+        loop {
+            match (crashes.tryRecv()) {
+                Some(c) => { crashed(connection, engine, links, c, mut total)?; }
                 null => { break; }
             }
         }
@@ -319,6 +321,7 @@ async fn run(
             if (waitMs > cap) cap else waitMs,
             !peerDone && !awaited,
         )?;
+        var trapped = Vector<TaskCrash>.create();
         while (woke.length > 0) {
             let w = VectorEditing.remove(mut woke, 0);
             match (w) {
@@ -333,12 +336,26 @@ async fn run(
                 Wake.Message(m) => {
                     await handle(set, connection, app, limits, engine, links, outgoing, mut kits, m, mut total)?;
                 }
-                Wake.Crash(c) => { crashed(engine, links, c, mut total)?; }
+                Wake.Crash(c) => { alloc(trapped.push(c))?; } // after every message, below
                 Wake.Timer => {
                     if (peerDone && links.length() > 0) {
                         engineOk(engine.ping([0u8; 8]))?;
                     }
                 }
+            }
+        }
+        if (trapped.length > 0) {
+            // What the trapped streams posted before they trapped comes first.
+            loop {
+                match (outgoing.tryRecv()) {
+                    Some(m) => {
+                        await handle(set, connection, app, limits, engine, links, outgoing, mut kits, m, mut total)?;
+                    }
+                    null => { break; }
+                }
+            }
+            for (c in trapped.view()) {
+                crashed(connection, engine, links, c, mut total)?;
             }
         }
     }
@@ -404,6 +421,7 @@ fn startStream(
     };
     let link = Link {
         task: task,
+        headSent: false,
         body: body,
         credit: credit,
         reset: reset,
@@ -444,7 +462,13 @@ async fn handle(
     total: borrow mut i64,
 ) -> Result<void, NetError> {
     match (m) {
-        Outgoing.Head(id, fields, end) => { engineOk(engine.sendHeaders(id, fields, end))?; }
+        Outgoing.Head(id, fields, end) => {
+            match (links.getMut(id)) {
+                Some(link) => { link.headSent = true; }
+                null => {}
+            }
+            engineOk(engine.sendHeaders(id, fields, end))?;
+        }
         Outgoing.Data(id, bytes, end) => {
             let n = truncate<i64>(bytes.length);
             engineOk(engine.sendData(id, bytes.view(), end))?;
@@ -642,9 +666,12 @@ async fn writeOutput(
     return Ok();
 }
 
-/// A stream's task trapped: the stream is reset with INTERNAL_ERROR (RFC 9113 §7) and its link dropped, as for a
-/// stream the client reset. Its task held its kit, which is not returned to the pool.
+/// A stream's task trapped (Web ADR 0017 §2.6): with no head sent, it is answered `500` with no content, and reset
+/// with NO_ERROR if the client is still sending its request (RFC 9113 §8.1); after its head, it is reset with
+/// INTERNAL_ERROR (RFC 9113 §7). Its link is dropped, as for a stream the client reset, and the crash counted. Its task
+/// held its kit, which is not returned to the pool.
 fn crashed(
+    connection: borrow ConnectionContext,
     engine: borrow mut H2Connection,
     links: borrow mut HashMap<u32, Link>,
     crash: TaskCrash,
@@ -666,7 +693,22 @@ fn crashed(
         }
     }
     let id = found ?? { return Ok(); }; // already ended
-    engineOk(engine.resetStream(id, ErrorCodes.internalError()))?;
+    connection.countCrash();
+    let headSent = match (links.get(id)) {
+        Some(link) => link.headSent,
+        null => true,
+    };
+    if (headSent) {
+        engineOk(engine.resetStream(id, ErrorCodes.internalError()))?;
+    } else {
+        var fields = HeaderBlock.create();
+        alloc(fields.push(":status".bytes(), "500".bytes(), false))?;
+        alloc(fields.push("content-length".bytes(), "0".bytes(), false))?;
+        engineOk(engine.sendHeaders(id, fields, true))?;
+        if (engine.remoteOpen(id)) {
+            engineOk(engine.resetStream(id, ErrorCodes.noError()))?;
+        }
+    }
     endLink(links, id, mut total);
     return Ok();
 }
