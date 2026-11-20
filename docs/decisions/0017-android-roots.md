@@ -93,5 +93,8 @@ list and the tool that refreshes it, a licence notice. No API change; no change 
   host through the API (it has no verify call without a handshake, and no server with Let's Encrypt's key). Run
   2026-11-20 on macOS: `ceesafec test` in `packages/web_tls`, 20 passed, 0 failed. By hand: `openssl verify` of
   `api.rawabialqimma.com`'s chain fails with the Sunmi V2's 156 roots and passes with the list. The Android branch
-  is checked on the device (§5's last item).
+  is checked on the device (§5's last item): 2026-11-20, IPos built for armeabi-v7a with `web_tls` at this branch, on
+  the Sunmi V2 (Android 7.1.1), signing in to `https://api.rawabialqimma.com` with a user name that does not exist:
+  the server's answer, "Invalid User name or password", where the same build on the old `web_tls` said "TLS
+  certificate rejected".
 - Web ADR 0005 gains the release step as an amendment.
