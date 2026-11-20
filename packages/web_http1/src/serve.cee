@@ -143,7 +143,8 @@ async fn nextHead(
             if (limits.drainLingerMs == 0) {
                 return Ok(null);
             }
-            let linger = if (limits.drainLingerMs < limits.idleTimeoutMs) limits.drainLingerMs else limits.idleTimeoutMs;
+            let linger =
+                if (limits.drainLingerMs < limits.idleTimeoutMs) limits.drainLingerMs else limits.idleTimeoutMs;
             match (await Transports.readWithin(conn, a.spare(), Deadline.after(linger))) {
                 Ok(v) => { n = v; }
                 Err(NetError.TimedOut) => { return Ok(null); }
