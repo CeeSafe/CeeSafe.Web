@@ -99,11 +99,29 @@ impl Transport for Script {
 /// - `/upgrade`: switches to the protocol `test` and writes "hi" on the raw connection;
 /// - `/wait-close`: waits for the client to close (`peerClosed`), then answers "closed";
 /// - `/spin`: computes without end, for a bound (CeeSafe ADR 0186) to end;
+/// - `/file`: bytes 2 to 11 of `FILE_PATH`, given with `sendFileOwned` (Web ADR 0020);
 /// - anything else: reads the body and answers `<path>:<body>`.
 /// Its hook adds `x-hook: 1` to every response; `crashed` counts the requests that trapped (Web ADR 0017).
 struct App {
     handled: AtomicU64;
     trapped: Arc<AtomicU64>;
+}
+
+/// The file `/file` sends, which `writeTestFile` writes: "0123456789abcdef", in the package's directory.
+const FILE_PATH: StringView = "web_http1_test_file.txt";
+
+/// Writes `FILE_PATH`, on a worker thread: a test is async and must not block its thread.
+async fn writeTestFile() -> Result<void, TestFailure> {
+    let r: Result<void, IoError> = await Async.blocking(() => {
+        var f = File.create(FILE_PATH)?;
+        return f.write("0123456789abcdef".bytes());
+    });
+    return if (r.isOk()) Ok() else Err(TestFailure.create("the test file"));
+}
+
+/// Removes `FILE_PATH`.
+async fn removeTestFile() {
+    let r: Result<void, IoError> = await Async.blocking(() => File.remove(FILE_PATH));
 }
 
 /// Traps: `small[at..at + 1]` with `at` past its end (every caller's path is longer than 2).
@@ -172,6 +190,16 @@ impl Application for App {
         if (Ascii.equals(p, "/wait-close")) {
             await exchange.peerClosed()?;
             return await exchange.send(Status.ok(), "closed".bytes());
+        }
+        if (Ascii.equals(p, "/file")) {
+            let opened: Result<File, IoError> = await Async.blocking(() => File.open(FILE_PATH));
+            let f = match (opened) {
+                Ok(f) => f,
+                Err(_) => { return Err(HandlerError.Internal); },
+            };
+            exchange.setStatus(Status.ok());
+            exchange.setContentLength(10);
+            return await exchange.sendFileOwned(f, 2, 10);
         }
         if (Ascii.equals(p, "/spin")) {
             var x: u64 = p.length as u64;

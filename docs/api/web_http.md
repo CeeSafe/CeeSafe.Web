@@ -622,6 +622,20 @@ chunked response sends each slice as a chunk. A file that ends before `length` f
 and the response is never completed: the HTTP/1.1 connection closes without the last chunk, and an HTTP/2
 stream is reset, so a client sees a transfer cut short, never a short success.
 
+### Exchange.sendFileOwned
+
+```ceesafe
+public async fn sendFileOwned(borrow mut this, file: File, offset: u64, length: u64) -> Result<void, HandlerError>
+```
+
+`sendFile` with the file given, not lent (Web ADR 0020): over an HTTP/1.1 connection the same; over a stream
+the stream's sink sends it (`StreamSink.sendFile`), so an isolated HTTP/1.1 request (Web ADR 0017) hands it to
+its connection's task, which sends it with `sendfile` as an exchange of its own would, where `sendFile` reads it
+and copies it through the request's channel. A static-file handler that opens the file for the response has it
+to give. Over HTTP/2 and HTTP/3 it goes as DATA, as `sendFile`'s does. An error the connection's task meets
+sending it (the file shorter than `length`, the client gone) closes the connection, as `sendFile`'s does, but is
+not returned here: the file has left.
+
 ### Exchange.flush
 
 ```ceesafe
@@ -1629,6 +1643,29 @@ public interface StreamSink {
     async fn readBody(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError>;
     async fn sendHead(borrow mut this, fields: HeaderBlock, endStream: bool) -> Result<void, HandlerError>;
     async fn sendData(borrow mut this, bytes: Slice<u8>, endStream: bool) -> Result<void, HandlerError>;
+    async fn sendFile(borrow mut this, file: File, offset: u64, length: u64) -> Result<void, HandlerError> {
+        var f = file;
+        var piece = match (Transports.fileBuffer(length)) {
+            Ok(b) => b,
+            Err(e) => { return Err(HandlerError.Io(e)); },
+        };
+        let size = piece.length;
+        var sent: u64 = 0;
+        while (sent < length) {
+            let left = length - sent;
+            let want: usize = if (left < size as u64) truncate<usize>(left) else size;
+            let n = match (await AsyncFiles.readAt(mut f, mut piece[0..want], offset + sent)) {
+                Ok(n) => n,
+                Err(e) => { return Err(HandlerError.Io(NetErrors.fromAsync(e))); },
+            };
+            if (n == 0) {
+                return Err(HandlerError.Io(NetError.Io(IoError.InvalidInput))); // the file ended before `length`
+            }
+            await this.sendData(piece[0..n], false)?;
+            sent += n as u64;
+        }
+        return Ok();
+    }
     async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError>;
     @effects(alloc)
     fn copyTrailers(borrow this, into: borrow mut HeaderBlock) -> Result<void, AllocError>;

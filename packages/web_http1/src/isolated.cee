@@ -24,6 +24,8 @@ enum ToConnection {
     Head(HeaderBlock, bool),
     /// Body bytes; with `true`, the response is complete.
     Data(Vector<u8>, bool),
+    /// A file's bytes as body: the file, the offset, the length (Web ADR 0020), sent by the connection's exchange.
+    File(File, u64, u64),
     /// The handler wants body bytes.
     WantBody,
     /// The handler waits for the client to go (`Exchange.peerClosed`).
@@ -572,6 +574,14 @@ async fn relay(
             }
             return true;
         }
+        ToConnection.File(file, offset, length) => {
+            // As `sendFile` on the connection's own exchange: `sendfile` over a plain stream (Web ADR 0020).
+            var f = file;
+            match (await ex.sendFile(mut f, offset, length)) {
+                Ok() => { return true; }
+                Err(_) => { return false; }
+            }
+        }
         ToConnection.WantBody => {
             if (scratch.length < BODY_CHUNK) {
                 while (scratch.length < BODY_CHUNK) {
@@ -745,6 +755,9 @@ impl StreamSink for RequestPort {
         }
         return await post(this.toConnection, ToConnection.Data(chunk, endStream));
     }
+
+    async fn sendFile(borrow mut this, file: File, offset: u64, length: u64) -> Result<void, HandlerError> =>
+        await post(this.toConnection, ToConnection.File(file, offset, length));
 
     async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError> => Ok(false);
 
