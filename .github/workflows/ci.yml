@@ -250,7 +250,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - env:
-          CEESAFE_VERSION: v0.3.2 # the stage 0 CeeSafe's bootstrap chain is recorded for (its bootstrap/reference.md)
+          CEESAFE_VERSION: v0.78.1 # CeeSafe's release stage 0 since 2026-11-20 (its tools/bootstrap_release.sh): main's sources need 0.78.1's language
         run: |
           sudo apt-get install -y libssl-dev
           curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
