@@ -5,7 +5,7 @@
 // were 1.7 % of an HTTP/2 proxy's time (cee-proxy's PORTING_PLAN.md, P8). The ids are the peer's, so the key is
 // random per map; a peer can only have as many entries as SETTINGS_MAX_CONCURRENT_STREAMS lets it.
 
-public struct IdMap<V> {
+struct IdMap<V> {
     keys: Vector<u32>;
     values: Vector<V>;
     // 0: empty; else the hash's low 32 bits (its home slot and a fingerprint) above the entry's index plus one, as
@@ -14,7 +14,7 @@ public struct IdMap<V> {
     key: u64;
 
     /// An empty map with a random key (a fixed one if the system gives no random bytes).
-    public fn create() -> IdMap<V> {
+    fn create() -> IdMap<V> {
         var bytes = [0u8; 8];
         var key: u64 = 0x9E3779B97F4A7C15;
         match (Random.fill(mut bytes[..])) {
@@ -30,7 +30,7 @@ public struct IdMap<V> {
     }
 
     /// An empty map keyed by `key`: for tests.
-    public fn withKey(key: u64) -> IdMap<V> => IdMap {
+    fn withKey(key: u64) -> IdMap<V> => IdMap {
         keys: Vector<u32>.create(),
         values: Vector<V>.create(),
         slots: Vector<u64>.create(),
@@ -38,7 +38,7 @@ public struct IdMap<V> {
     };
 
     /// How many entries.
-    public fn length(borrow this) -> usize => this.keys.length;
+    fn length(borrow this) -> usize => this.keys.length;
 
     fn hashOf(borrow this, id: u32) -> u64 {
         var h = (id as u64) ^ this.key;
@@ -71,14 +71,14 @@ public struct IdMap<V> {
     fn entryAt(borrow this, slot: usize) -> usize => truncate<usize>((this.slots[slot] & 0xFFFFFFFF) - 1);
 
     /// The value of `id`, if it is there.
-    public fn get(borrow this, id: u32) -> borrow(this) V? {
+    fn get(borrow this, id: u32) -> borrow(this) V? {
         var empty: usize = 0;
         let slot = this.probe(id, this.hashOf(id), mut empty)?;
         return borrow this.values[this.entryAt(slot)];
     }
 
     /// The same, to change it.
-    public fn getMut(borrow mut this, id: u32) -> borrow mut(this) V? {
+    fn getMut(borrow mut this, id: u32) -> borrow mut(this) V? {
         let hash = this.hashOf(id);
         var empty: usize = 0;
         let slot = this.probe(id, hash, mut empty)?;
@@ -87,16 +87,16 @@ public struct IdMap<V> {
     }
 
     /// Whether `id` is there.
-    public fn contains(borrow this, id: u32) -> bool {
+    fn contains(borrow this, id: u32) -> bool {
         var empty: usize = 0;
         return this.probe(id, this.hashOf(id), mut empty) != null;
     }
 
     /// The id of entry `i` (0 ≤ i < length).
-    public fn keyAt(borrow this, i: usize) -> u32 => this.keys[i];
+    fn keyAt(borrow this, i: usize) -> u32 => this.keys[i];
 
     /// The value of entry `i` (0 ≤ i < length).
-    public fn valueAt(borrow this, i: usize) -> borrow(this) V => borrow this.values[i];
+    fn valueAt(borrow this, i: usize) -> borrow(this) V => borrow this.values[i];
 
     fn place(slots: borrow mut Vector<u64>, word: u64) {
         let mask = slots.length - 1;
@@ -125,7 +125,7 @@ public struct IdMap<V> {
     }
 
     /// Puts `value` at `id`: the old value if the id was there, else null. A failure leaves the map as it was.
-    public fn put(borrow mut this, id: u32, value: V) -> Result<V?, AllocError> {
+    fn put(borrow mut this, id: u32, value: V) -> Result<V?, AllocError> {
         let hash = this.hashOf(id);
         var empty: usize = 0;
         match (this.probe(id, hash, mut empty)) {
@@ -163,7 +163,7 @@ public struct IdMap<V> {
     }
 
     /// Takes `id` out: its value, or null. The last entry moves into its place.
-    public fn remove(borrow mut this, id: u32) -> V? {
+    fn remove(borrow mut this, id: u32) -> V? {
         let hash = this.hashOf(id);
         var empty: usize = 0;
         let found = this.probe(id, hash, mut empty)?;
