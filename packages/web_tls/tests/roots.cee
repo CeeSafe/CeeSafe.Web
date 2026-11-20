@@ -1,0 +1,77 @@
+// Mozilla's root list, which web_tls adds to Android's frozen system roots (Web ADR 0017). The list is
+// c/roots_mozilla.pem, curl's extract, from which c/roots_mozilla.h is made (tools/update_roots.py --check). The oracle
+// for ISRG Root X2 is Let's Encrypt's own copy (https://letsencrypt.org/certs/isrg-root-x2.pem), not the list.
+
+static MOZILLA_ROOTS: Slice<u8> = embed("../c/roots_mozilla.pem");
+static ISRG_ROOT_X2: Slice<u8> = embed("certs/isrg-root-x2.pem");
+
+/// The base64 of every certificate in `pem`, run together: its BEGIN and END lines, curl's comments and the line
+/// breaks left out, so that two files wrapped differently compare.
+fn base64Of(pem: Slice<u8>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    var start: usize = 0;
+    while (start < pem.length) {
+        var end = start;
+        while (end < pem.length && pem[end] != '\n') {
+            end += 1;
+        }
+        let skip = end == start || pem[start] == '-' || pem[start] == '#' || pem[start] == '=';
+        if (!skip) {
+            for (k in start..end) {
+                if (pem[k] != '\r' && pem[k] != ' ') {
+                    let _ = out.push(pem[k]);
+                }
+            }
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+fn holds(haystack: Slice<u8>, needle: Slice<u8>) -> bool {
+    if (needle.length == 0 || needle.length > haystack.length) {
+        return false;
+    }
+    for (at in 0..haystack.length - needle.length + 1) {
+        var same = true;
+        for (k in 0..needle.length) {
+            if (haystack[at + k] != needle[k]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn certificateCount(pem: Slice<u8>) -> usize {
+    let mark = "-----BEGIN CERTIFICATE-----".bytes();
+    var count: usize = 0;
+    for (at in 0..pem.length - mark.length + 1) {
+        if (pem[at] == '-' && holds(pem[at..at + mark.length], mark)) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+@test
+fn mozilla_roots_load_as_trust() -> Result<void, TestFailure> {
+    // A root store: well over a hundred roots, every one of which OpenSSL reads as a root to trust.
+    Check.isTrue(certificateCount(MOZILLA_ROOTS) >= 100, "a root store's worth of certificates")?;
+    var c = setupOk(TlsConfig.client())?;
+    setupDone(c.trustPem(MOZILLA_ROOTS))?;
+    return Ok();
+}
+
+@test
+fn mozilla_roots_hold_isrg_root_x2() -> Result<void, TestFailure> {
+    // The root Android 7's store lacks, which Let's Encrypt's ECDSA chains (YE2, Root YE) end at.
+    let x2 = base64Of(ISRG_ROOT_X2);
+    Check.isTrue(x2.length > 500, "Let's Encrypt's copy of ISRG Root X2 reads")?;
+    Check.isTrue(holds(base64Of(MOZILLA_ROOTS).view(), x2.view()), "the list holds ISRG Root X2")?;
+    return Ok();
+}

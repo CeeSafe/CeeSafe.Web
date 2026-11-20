@@ -606,14 +606,19 @@ int32_t wt_cfg_key_log(SSL_CTX *ctx, const uint8_t *path, size_t len) {
 
 #if defined(__ANDROID__)
 #include <dirent.h>
+#include "roots_mozilla.h"
 
 /* Android's roots: a directory of PEM files, one a root, named by OpenSSL 0.9's subject hash, which OpenSSL 3 does
    not look files up by: each is loaded. The first directory is the updatable one (Android 14 and later), the second
-   the system image's. Roots a user added are not an app's to read. The number loaded. */
+   the system image's. Roots a user added are not an app's to read. The system image's roots are those of the day
+   its release was built and never change, so with them Mozilla's list (roots_mozilla.h) is trusted too: a root
+   either has is trusted (Web ADR 0017). The number loaded. */
 static int android_roots(SSL_CTX *ctx) {
     static const char *const places[] = {"/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"};
     int loaded = 0;
+    size_t from = 0;
     for (size_t k = 0; k < sizeof places / sizeof places[0] && loaded == 0; k++) {
+        from = k;
         DIR *dir = opendir(places[k]);
         if (dir == NULL) {
             continue;
@@ -632,6 +637,9 @@ static int android_roots(SSL_CTX *ctx) {
             }
         }
         closedir(dir);
+    }
+    if (loaded == 0 || from > 0) {
+        loaded += wt_cfg_trust_pem(ctx, (const uint8_t *)wt_mozilla_roots, sizeof wt_mozilla_roots - 1);
     }
     return loaded;
 }

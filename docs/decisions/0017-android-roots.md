@@ -1,6 +1,7 @@
 # Web ADR 0017 — Android's frozen roots: Mozilla's root list with the system's, below Android 14
 
-**Status:** proposed 2026-11-20. Asked for by the owner: IPos on a Sunmi V2 (Android 7.1.1) cannot sign in to its
+**Status:** accepted 2026-11-20. The owner: "Yes, I accept both 1 and 2" (§6, both as recommended). Implemented (§8).
+Asked for by the owner: IPos on a Sunmi V2 (Android 7.1.1) cannot sign in to its
 production server, and of the fixes offered (an RSA certificate on the server, a root in IPos, a root list in
 `web_tls`) the owner chose "Root bundle in web_tls".
 **Scope:** `web_tls` on Android only: `trustSystem` (`wt_cfg_trust_default`'s Android branch), an embedded root
@@ -77,3 +78,20 @@ list and the tool that refreshes it, a licence notice. No API change; no change 
 1. `update_roots.py`, `roots_mozilla.h`, `COPYING.MPL`.
 2. The Android branch of `wt_cfg_trust_default`; the tests.
 3. A release of CeeSafe.Web; IPos's pin moved to it; the check on the Sunmi V2.
+
+## 8. As built (2026-11-20)
+
+- `tools/update_roots.py` writes `packages/web_tls/c/roots_mozilla.pem` (curl's extract byte for byte, its SHA-256
+  checked against curl.se's `cacert.pem.sha256`) and `roots_mozilla.h` from it; `--check` (no network) runs in CI.
+  The first extract: Mozilla's roots of 2026-11-05, 118 certificates, SHA-256 `427c0642…8497285`.
+- `tls_shim.c` `android_roots`: Mozilla's list is added when the roots came from the system image, and also when no
+  system directory could be read (a store of none would trust nothing).
+- **Tests, changed from §5.** `web_tls` has no switch to compile the Android branch on the host, so the host tests
+  read the same list from `roots_mozilla.pem` (which `--check` ties to the header): `mozilla_roots_load_as_trust`
+  (at least 100 certificates; `trustPem` takes them) and `mozilla_roots_hold_isrg_root_x2` (the list holds ISRG Root
+  X2, compared with Let's Encrypt's own copy, `tests/certs/isrg-root-x2.pem`). A chain to X2 cannot be checked on the
+  host through the API (it has no verify call without a handshake, and no server with Let's Encrypt's key). Run
+  2026-11-20 on macOS: `ceesafec test` in `packages/web_tls`, 20 passed, 0 failed. By hand: `openssl verify` of
+  `api.rawabialqimma.com`'s chain fails with the Sunmi V2's 156 roots and passes with the list. The Android branch
+  is checked on the device (§5's last item).
+- Web ADR 0005 gains the release step as an amendment.
