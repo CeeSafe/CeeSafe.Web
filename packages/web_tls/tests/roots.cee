@@ -1,4 +1,4 @@
-// Mozilla's root list, which web_tls adds to Android's frozen system roots (Web ADR 0017). The list is
+// Mozilla's root list, which web_tls adds to Android's frozen system roots (Web ADR 0018). The list is
 // c/roots_mozilla.pem, curl's extract, from which c/roots_mozilla.h is made (tools/update_roots.py --check). The oracle
 // for ISRG Root X2 is Let's Encrypt's own copy (https://letsencrypt.org/certs/isrg-root-x2.pem), not the list.
 

@@ -612,7 +612,7 @@ int32_t wt_cfg_key_log(SSL_CTX *ctx, const uint8_t *path, size_t len) {
    not look files up by: each is loaded. The first directory is the updatable one (Android 14 and later), the second
    the system image's. Roots a user added are not an app's to read. The system image's roots are those of the day
    its release was built and never change, so with them Mozilla's list (roots_mozilla.h) is trusted too: a root
-   either has is trusted (Web ADR 0017). The number loaded. */
+   either has is trusted (Web ADR 0018). The number loaded. */
 static int android_roots(SSL_CTX *ctx) {
     static const char *const places[] = {"/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"};
     int loaded = 0;

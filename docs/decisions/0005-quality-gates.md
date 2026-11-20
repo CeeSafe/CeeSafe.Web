@@ -141,7 +141,7 @@ unchanged:
    CeeSafe bug that breaks a test keeps the test failing on a branch until a release fixes it (Web ADR 0006).
 5. §3's M0 deliverable is now CeeSafe's (T1, T2).
 
-## Amendment (2026-11-20, Web ADR 0017 §3.3, accepted by the owner)
+## Amendment (2026-11-20, Web ADR 0018 §3.3, accepted by the owner)
 
 Before a release, `python3 tools/update_roots.py` refreshes `web_tls`'s Android root list from curl's extract of
 Mozilla's root store, and the commit names the extract's date. A list older than the release's previous one is a

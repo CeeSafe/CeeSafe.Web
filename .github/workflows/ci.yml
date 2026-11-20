@@ -130,7 +130,7 @@ jobs:
         shell: bash
         run: python3 tools/api_check.py
 
-      - name: Android's root list is the extract it names (Web ADR 0017)
+      - name: Android's root list is the extract it names (Web ADR 0018)
         shell: bash
         run: python3 tools/update_roots.py --check
 

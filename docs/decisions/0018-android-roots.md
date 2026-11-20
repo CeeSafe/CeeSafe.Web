@@ -1,6 +1,7 @@
-# Web ADR 0017 — Android's frozen roots: Mozilla's root list with the system's, below Android 14
+# Web ADR 0018 — Android's frozen roots: Mozilla's root list with the system's, below Android 14
 
-**Status:** accepted 2026-11-20. The owner: "Yes, I accept both 1 and 2" (§6, both as recommended). Implemented (§8).
+**Status:** accepted 2026-11-20. Written as Web ADR 0017 and accepted under that number; renumbered 0018 because another
+session's Web ADR 0017 (isolated requests) was accepted first the same day. The owner: "Yes, I accept both 1 and 2" (§6, both as recommended). Implemented (§8).
 Asked for by the owner: IPos on a Sunmi V2 (Android 7.1.1) cannot sign in to its
 production server, and of the fixes offered (an RSA certificate on the server, a root in IPos, a root list in
 `web_tls`) the owner chose "Root bundle in web_tls".
