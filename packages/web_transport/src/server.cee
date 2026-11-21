@@ -373,14 +373,23 @@ async fn worker(
             }
             Err(e) => { return Err(e); }
         }
-        let next: Result<Raced<PlainStream>, NetError> = await Async.race(
-            async () => await incoming.next(),
-            async () => await drainStarted<PlainStream>(drain),
+        // `drainBegun` (Web ADR 0021): a connection accepted in the turn the drain starts is served, not dropped.
+        let next: Result<Raced<PlainStream?>, NetError> = await Async.race(
+            async () => match (await incoming.next()) {
+                Ok(s) => Ok(Some(s)),
+                Err(e) => Err(e),
+            },
+            async () => await drainBegun<PlainStream>(drain),
         );
         var stream = match (next) {
             Ok(raced) => {
-                await turns.pass()?; // before the handshake, which may take its whole deadline
-                raced.value
+                match (drainTaken<PlainStream>(raced)) {
+                    Some(s) => {
+                        await turns.pass()?; // before the handshake, which may take its whole deadline
+                        s
+                    }
+                    null => { return Ok(); } // the drain, and no connection came with it
+                }
             },
             Err(NetError.Closed) => {
                 await turns.end()?; // the source ended
@@ -513,12 +522,19 @@ enum Arrival {
 
 /// The next stream, or why there is none.
 async fn nextStream(incoming: borrow dyn Incoming, drain: borrow Drain) -> Result<Arrival, NetError> {
-    let next: Result<Raced<PlainStream>, NetError> = await Async.race(
-        async () => await incoming.next(),
-        async () => await drainStarted<PlainStream>(drain),
+    // `drainBegun` (Web ADR 0021): a connection accepted in the turn the drain starts is served, not dropped.
+    let next: Result<Raced<PlainStream?>, NetError> = await Async.race(
+        async () => match (await incoming.next()) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => Err(e),
+        },
+        async () => await drainBegun<PlainStream>(drain),
     );
     return match (next) {
-        Ok(raced) => Ok(Arrival.Stream(raced.value)),
+        Ok(raced) => match (drainTaken<PlainStream>(raced)) {
+            Some(s) => Ok(Arrival.Stream(s)),
+            null => Ok(Arrival.NoMore),
+        },
         Err(NetError.Closed) => Ok(Arrival.NoMore),
         Err(NetError.Cancelled) => if (drain.isDraining()) Ok(Arrival.NoMore) else Err(NetError.Cancelled),
         Err(NetError.OutOfMemory) => Err(NetError.OutOfMemory),

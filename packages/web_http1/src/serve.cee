@@ -152,19 +152,24 @@ async fn nextHead(
             }
         } else if (idle) {
             let d = Deadline.after(limits.idleTimeoutMs);
-            let r: Result<Raced<usize>, NetError> = await Async.race(
-                async () => await Transports.readWithin(conn, a.spare(), d),
-                async () => await drainStarted<usize>(connection.drain()),
+            // `drainBegun`, not `drainStarted` (Web ADR 0021): a request read in the turn the drain starts is kept.
+            let r: Result<Raced<usize?>, NetError> = await Async.race(
+                async () => match (await Transports.readWithin(conn, a.spare(), d)) {
+                    Ok(v) => Ok(Some(v)),
+                    Err(e) => Err(e),
+                },
+                async () => await drainBegun<usize>(connection.drain()),
             );
             match (r) {
-                Ok(raced) => { n = raced.value; }
-                Err(NetError.TimedOut) => { return Ok(null); } // idle too long
-                Err(NetError.Cancelled) => {
-                    if (connection.isDraining()) {
-                        continue; // the drain began while it waited: wait on within the linger, above
+                Ok(raced) => {
+                    match (drainTaken<usize>(raced)) {
+                        Some(v) => { n = v; }
+                        null => {
+                            continue; // the drain began while it waited, and nothing came: wait on within the linger
+                        }
                     }
-                    return Err(NetError.Cancelled);
                 }
+                Err(NetError.TimedOut) => { return Ok(null); } // idle too long
                 Err(e) => { return Err(e); }
             }
         } else {

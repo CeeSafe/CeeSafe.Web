@@ -45,4 +45,5 @@ written. Measured with httpserver in §5.
 
 ## 5. Measured
 
-See httpserver's `docs/elixir-benchmark.md`, "After Web ADR 0019".
+See httpserver's `docs/elixir-benchmark.md`, "After Web ADR 0019". On one Linux core the linger then cost the one
+request read in the drain's own turn a second: Web ADR 0021.
