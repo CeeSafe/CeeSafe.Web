@@ -165,11 +165,18 @@ struct HeaderSpan {
     valueEnd: u32;
 }
 
+/// How many fields a HeaderList holds in itself; the rest, up to 64, are in a vector made for a head with more.
+fn inlineSpans() -> u32 => 16;
+
 /// A request's fields in arrival order: up to 64, each a name and a value that are views of the head buffer
 /// (`Slice<r, u8>`, since a value may hold obs-text and need not be UTF-8). Lookup is linear.
 public struct HeaderList<region r> {
     private head: Slice<r, u8>;
-    private spans: [HeaderSpan; 64];
+    // The first 16 fields are kept in the list itself and the rest in `more`, which is allocated only for a head with
+    // more fields than that (few have). A list is made, filled and moved with every head; 64 spans in place were
+    // 1,280 bytes zeroed and copied each time, 2-3 % of a relaying proxy's samples (cee-proxy's PORTING_PLAN.md, P8).
+    private spans: [HeaderSpan; 16];
+    private more: Vector<HeaderSpan>;
     private n: u32;
 
     /// The most fields a list holds; `Limits.maxHeaders` may set fewer.
@@ -178,9 +185,14 @@ public struct HeaderList<region r> {
     /// An empty list over `head`, the buffer its fields will point into.
     public fn create(head: Slice<r, u8>) -> HeaderList<r> => HeaderList {
         head: head,
-        spans: [HeaderSpan { name: HeaderName.Other, nameStart: 0, nameEnd: 0, valueStart: 0, valueEnd: 0 }; 64],
+        spans: [HeaderSpan { name: HeaderName.Other, nameStart: 0, nameEnd: 0, valueStart: 0, valueEnd: 0 }; 16],
+        more: Vector<HeaderSpan>.create(),
         n: 0,
     };
+
+    /// Field `i`'s span (i < n).
+    fn span(borrow this, i: u32) -> HeaderSpan =>
+        if (i < inlineSpans()) this.spans[i as usize] else this.more[(i - inlineSpans()) as usize];
 
     /// Adds the field whose name is `head[nameStart..nameEnd]` and value `head[valueStart..valueEnd]` (already
     /// checked by the parser). `Err(TooManyHeaders)` past `limit` or the capacity; `Err(BadHeader)` if a range is
@@ -200,13 +212,19 @@ public struct HeaderList<region r> {
             return Err(ProtocolError.BadHeader);
         }
         let name = HeaderNames.classify(this.head[nameStart..nameEnd]);
-        this.spans[this.n as usize] = HeaderSpan {
+        let span = HeaderSpan {
             name: name,
             nameStart: truncate<u32>(nameStart),
             nameEnd: truncate<u32>(nameEnd),
             valueStart: truncate<u32>(valueStart),
             valueEnd: truncate<u32>(valueEnd),
         };
+        if (this.n < inlineSpans()) {
+            this.spans[this.n as usize] = span;
+        } else if (this.more.push(span).isErr()) {
+            // No memory for the 17th field or a later one: the head is refused as one with too many (431).
+            return Err(ProtocolError.TooManyHeaders);
+        }
         this.n += 1;
         return Ok();
     }
@@ -216,14 +234,14 @@ public struct HeaderList<region r> {
 
     /// Field `i`'s name (0-based; `Other` past the end).
     public fn name(borrow this, i: u32) -> HeaderName =>
-        if (i < this.n) this.spans[i as usize].name else HeaderName.Other;
+        if (i < this.n) this.span(i).name else HeaderName.Other;
 
     /// Field `i`'s name as sent; empty past the end.
     public fn nameBytes(borrow this, i: u32) -> Slice<r, u8> {
         if (i >= this.n) {
             return this.head[0..0];
         }
-        let s = this.spans[i as usize];
+        let s = this.span(i);
         return this.head[s.nameStart as usize..s.nameEnd as usize];
     }
 
@@ -232,14 +250,14 @@ public struct HeaderList<region r> {
         if (i >= this.n) {
             return this.head[0..0];
         }
-        let s = this.spans[i as usize];
+        let s = this.span(i);
         return this.head[s.valueStart as usize..s.valueEnd as usize];
     }
 
     /// The first value of `name` (a recognised name), or null.
     public fn get(borrow this, name: HeaderName) -> Slice<r, u8>? {
         for (i in 0..this.n) {
-            if (HeaderNames.same(this.spans[i as usize].name, name)) {
+            if (HeaderNames.same(this.span(i).name, name)) {
                 return Some(this.value(i));
             }
         }
@@ -260,7 +278,7 @@ public struct HeaderList<region r> {
     public fn countOf(borrow this, name: HeaderName) -> u32 {
         var c: u32 = 0;
         for (i in 0..this.n) {
-            if (HeaderNames.same(this.spans[i as usize].name, name)) {
+            if (HeaderNames.same(this.span(i).name, name)) {
                 c += 1;
             }
         }
@@ -271,7 +289,7 @@ public struct HeaderList<region r> {
     /// `Connection: close`, `Expect: 100-continue`); `token` is lower case.
     public fn hasToken(borrow this, name: HeaderName, token: StringView) -> bool {
         for (i in 0..this.n) {
-            if (HeaderNames.same(this.spans[i as usize].name, name)) {
+            if (HeaderNames.same(this.span(i).name, name)) {
                 let v = this.value(i);
                 var start: usize = 0;
                 for (k in 0..v.length + 1) {
