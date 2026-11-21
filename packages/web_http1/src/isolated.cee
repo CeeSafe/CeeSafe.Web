@@ -57,7 +57,22 @@ struct RequestKit {
     out: OwnedBuffer;
     pending: OwnedBuffer;
     response: ResponseHead;
+    held: Held;
 }
+
+/// What the request has not sent yet (Web ADR 0022): a response whose head and whole body came before anything had
+/// to leave, kept in the kit and written by the connection when the kit comes back with `Done`, so a small response
+/// costs one message and, once the kit's buffers have grown, no allocation.
+struct Held {
+    head: HeaderBlock;
+    body: Vector<u8>;
+    /// HELD_NONE, HELD_HEAD (the head, the body to come) or HELD_WHOLE (the response is complete).
+    state: u8;
+}
+
+const HELD_NONE: u8 = 0;
+const HELD_HEAD: u8 = 1;
+const HELD_WHOLE: u8 = 2;
 
 fn makeKit(limits: borrow Limits) -> Result<RequestKit, NetError> {
     let carry = buffer(16)?;
@@ -67,7 +82,15 @@ fn makeKit(limits: borrow Limits) -> Result<RequestKit, NetError> {
         Ok(h) => h,
         Err(_) => { return Err(NetError.OutOfMemory); },
     };
-    return Ok(RequestKit { head: Vector<u8>.create(), carry: carry, out: out, pending: pending, response: response });
+    let held = Held { head: HeaderBlock.create(), body: Vector<u8>.create(), state: HELD_NONE };
+    return Ok(RequestKit {
+        head: Vector<u8>.create(),
+        carry: carry,
+        out: out,
+        pending: pending,
+        response: response,
+        held: held,
+    });
 }
 
 /// What a request's task needs of its connection's context, owned (an isolated task holds no loan).
@@ -408,8 +431,24 @@ async fn relayRequest(
         };
         match (woke.message) {
             Some(ToConnection.Done(back, keep, broken)) => {
-                let kept = kits.push(back); // out of memory: the kit goes, as a crashed request's does
-                if (broken) {
+                var returned = back;
+                // The response it held (Web ADR 0022): its head, then its body, as Head and Data would have brought.
+                var written = true;
+                if (!broken && returned.held.state != HELD_NONE) {
+                    headSeen = true;
+                    written = applyHead(mut ex, returned.held.head);
+                    if (written && returned.held.state == HELD_WHOLE) {
+                        match (await ex.write(returned.held.body.view())) {
+                            Ok() => {}
+                            Err(_) => { written = false; }
+                        }
+                    }
+                }
+                returned.held.head.clear();
+                returned.held.body.clear();
+                returned.held.state = HELD_NONE;
+                let kept = kits.push(returned); // out of memory: the kit goes, as a crashed request's does
+                if (broken || !written) {
                     return Ok(Ending.Close);
                 }
                 if (!keep) {
@@ -691,7 +730,7 @@ async fn finishRelayed(ex: borrow mut Exchange) -> Ending {
 // ---- The request's task ----
 
 /// A request task's end of its channels, as the `StreamSink` its exchange uses.
-struct RequestPort {
+struct RequestPort<region r> {
     toConnection: Channel<ToConnection>;
     toRequest: Channel<ToRequest>;
     current: Vector<u8>;
@@ -700,9 +739,40 @@ struct RequestPort {
     failed: HandlerError?;
     peerGone: bool;
     trailers: HeaderBlock;
+    /// The kit's held response (Web ADR 0022), sent as messages only when something must leave before the end.
+    held: borrow mut(r) Held;
+    /// The response's head has been held or sent: a later head is its trailers.
+    headed: bool;
 }
 
-impl StreamSink for RequestPort {
+impl<region r> RequestPort<r> {
+    /// What it held, sent as the messages it stands for: before anything that must come after it, or that the
+    /// connection must see now (a flush, a file, a wait for body bytes or for the client's close).
+    async fn release(borrow mut this) -> Result<void, HandlerError> {
+        if (this.held.state == HELD_NONE) {
+            return Ok();
+        }
+        var fields = HeaderBlock.create();
+        if (failed(fields.pushAll(this.held.head))) {
+            return Err(HandlerError.Internal);
+        }
+        let whole = this.held.state == HELD_WHOLE;
+        this.held.head.clear();
+        this.held.state = HELD_NONE;
+        await post(this.toConnection, ToConnection.Head(fields, false))?;
+        if (whole) {
+            var chunk = Vector<u8>.create();
+            if (failed(chunk.extend(this.held.body.view()))) {
+                return Err(HandlerError.Internal);
+            }
+            this.held.body.clear();
+            await post(this.toConnection, ToConnection.Data(chunk, true))?;
+        }
+        return Ok();
+    }
+}
+
+impl<region r> StreamSink for RequestPort<r> {
     async fn readBody(borrow mut this, into: SliceMut<u8>) -> Result<usize, HandlerError> {
         loop {
             if (this.at < this.current.length) {
@@ -720,6 +790,7 @@ impl StreamSink for RequestPort {
             if (this.ended) {
                 return Ok(0);
             }
+            await this.release()?;
             await post(this.toConnection, ToConnection.WantBody)?;
             loop {
                 match (await this.toRequest.recvAsync()) {
@@ -745,10 +816,30 @@ impl StreamSink for RequestPort {
         }
     }
 
-    async fn sendHead(borrow mut this, fields: HeaderBlock, endStream: bool) -> Result<void, HandlerError> =>
-        await post(this.toConnection, ToConnection.Head(fields, endStream));
+    async fn sendHead(borrow mut this, fields: HeaderBlock, endStream: bool) -> Result<void, HandlerError> {
+        // The response's head, held until its body (Web ADR 0022); a head that ends it is the whole response.
+        if (!this.headed) {
+            this.headed = true;
+            if (failed(this.held.head.pushAll(fields))) {
+                return Err(HandlerError.Internal);
+            }
+            this.held.state = if (endStream) HELD_WHOLE else HELD_HEAD;
+            return Ok();
+        }
+        await this.release()?; // trailers, after a held response
+        return await post(this.toConnection, ToConnection.Head(fields, endStream));
+    }
 
     async fn sendData(borrow mut this, bytes: Slice<u8>, endStream: bool) -> Result<void, HandlerError> {
+        // The whole body after a held head: held with it, so the response goes with `Done`.
+        if (this.held.state == HELD_HEAD && endStream) {
+            if (failed(this.held.body.extend(bytes))) {
+                return Err(HandlerError.Internal);
+            }
+            this.held.state = HELD_WHOLE;
+            return Ok();
+        }
+        await this.release()?;
         var chunk = Vector<u8>.create();
         if (failed(chunk.extend(bytes))) {
             return Err(HandlerError.Internal);
@@ -756,8 +847,10 @@ impl StreamSink for RequestPort {
         return await post(this.toConnection, ToConnection.Data(chunk, endStream));
     }
 
-    async fn sendFile(borrow mut this, file: File, offset: u64, length: u64) -> Result<void, HandlerError> =>
-        await post(this.toConnection, ToConnection.File(file, offset, length));
+    async fn sendFile(borrow mut this, file: File, offset: u64, length: u64) -> Result<void, HandlerError> {
+        await this.release()?;
+        return await post(this.toConnection, ToConnection.File(file, offset, length));
+    }
 
     async fn push(borrow mut this, path: Slice<u8>) -> Result<bool, HandlerError> => Ok(false);
 
@@ -769,6 +862,7 @@ impl StreamSink for RequestPort {
         if (this.peerGone) {
             return Ok();
         }
+        await this.release()?;
         await post(this.toConnection, ToConnection.WatchPeer)?;
         loop {
             match (await this.toRequest.recvAsync()) {
@@ -860,6 +954,8 @@ async fn serveRequest(
         failed: null,
         peerGone: false,
         trailers: HeaderBlock.create(),
+        held: borrow mut kit.held,
+        headed: false,
     };
     var none = NoTransport {};
     var date = DateCache.create(limits.sendDate);
