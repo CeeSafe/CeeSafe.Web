@@ -27,6 +27,7 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0019](0019-drain-linger.md) | A drain lets an idle connection's next request in, answered with `connection: close` | Accepted 2026-11-21 (implemented) | after v0.5 |
 | [0020](0020-isolated-sendfile.md) | An isolated request's file goes to its connection, and out with sendfile | Accepted 2026-11-21 (implemented) | after v0.5 |
 | [0021](0021-drain-keeps-what-came.md) | A drain keeps the request, or the connection, that came in its turn | Accepted 2026-11-21 (implemented) | after v0.5 |
+| [0022](0022-isolated-response-held.md) | An isolated request's small response goes back with its kit, in one message | Accepted 2026-11-21 (implemented) | after v0.5 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 
