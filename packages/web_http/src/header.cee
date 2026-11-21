@@ -170,12 +170,11 @@ fn inlineSpans() -> u32 => 16;
 
 /// A request's fields in arrival order: up to 64, each a name and a value that are views of the head buffer
 /// (`Slice<r, u8>`, since a value may hold obs-text and need not be UTF-8). Lookup is linear.
-///
-/// The first 16 fields are kept in the list itself and the rest in `more`, which is allocated only for a head with
-/// more fields than that (few have). A list is made, filled and moved with every head; 64 spans in place were
-/// 1,280 bytes zeroed and copied each time, 2-3 % of a relaying proxy's samples (cee-proxy's PORTING_PLAN.md, P8).
 public struct HeaderList<region r> {
     private head: Slice<r, u8>;
+    // The first 16 fields are kept in the list itself and the rest in `more`, which is allocated only for a head with
+    // more fields than that (few have). A list is made, filled and moved with every head; 64 spans in place were
+    // 1,280 bytes zeroed and copied each time, 2-3 % of a relaying proxy's samples (cee-proxy's PORTING_PLAN.md, P8).
     private spans: [HeaderSpan; 16];
     private more: Vector<HeaderSpan>;
     private n: u32;
