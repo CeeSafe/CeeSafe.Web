@@ -49,13 +49,47 @@ public struct Drain {
 
 /// Waits until `drain` starts, then returns `Err(NetError.Cancelled)`; it never returns `Ok`. So it is the second
 /// child of an `Async.race` that stops an operation when a drain starts, as `deadlineElapsed` does for a deadline;
-/// the caller tells the two apart with `drain.isDraining()`:
+/// the caller tells the two apart with `drain.isDraining()`. Its `Err` decides the race even when the operation
+/// returned a value in the same turn (Web ADR 0021): for an operation whose value must not be lost, a read or an
+/// accept, race `drainBegun` instead.
 ///
 /// ```ceesafe
-/// let r: Result<Raced<PlainStream>, NetError> =
-///     await Async.race(async () => await listener.accept(), async () => await drainStarted<PlainStream>(drain));
+/// let r: Result<Raced<bool>, NetError> =
+///     await Async.race(async () => await turnGiven(channel), async () => await drainStarted<bool>(drain));
 /// ```
 public async fn drainStarted<T>(drain: borrow Drain) -> Result<T, NetError> {
     await drain.wait()?;
     return Err(NetError.Cancelled);
+}
+
+/// Waits until `drain` starts, then returns `Ok(null)` (Web ADR 0021): the second child of an `Async.race` whose first
+/// child wraps its value, `Ok(Some(v))`, for an operation whose result must not be lost (a read's bytes, an accepted
+/// connection). The drain and the operation can both finish in one turn of the executor: a child sees the race's
+/// cancellation only once the race's task has run, so the operation, woken with the drain, may return its value
+/// after the drain returned. `drainStarted`'s `Err` then decides the race and the value is dropped; `Ok(null)` keeps
+/// it in `Raced.other`, and `drainTaken` reads it whichever child came first:
+///
+/// ```ceesafe
+/// let r: Result<Raced<usize?>, NetError> = await Async.race(
+///     async () => match (await conn.read(buffer)) { Ok(n) => Ok(Some(n)), Err(e) => Err(e) },
+///     async () => await drainBegun<usize>(drain),
+/// );
+/// let got: usize? = drainTaken<usize>(r?); // null: the drain, and nothing was read
+/// ```
+public async fn drainBegun<T>(drain: borrow Drain) -> Result<T?, NetError> {
+    await drain.wait()?;
+    return Ok(null);
+}
+
+/// What a race of an operation (`Ok(Some(v))`) against `drainBegun` got: the operation's value if it returned one,
+/// before the drain or in the same turn; null if the drain came first and the operation had nothing.
+public fn drainTaken<T>(raced: Raced<T?>) -> T? {
+    match (raced.value) {
+        Some(v) => { return Some(v); }
+        null => {}
+    }
+    return match (raced.other) {
+        Some(late) => late,
+        null => null,
+    };
 }

@@ -65,3 +65,42 @@ async fn drain_started_races_an_operation() -> Result<void, TestFailure> {
     }, "a drain stops the operation as Cancelled")?;
     return Ok();
 }
+
+@test
+fn drain_taken_reads_every_outcome() -> Result<void, TestFailure> {
+    // Web ADR 0021: the operation's value is kept whichever child returned first. The drain winning with the
+    // operation's value in `other` is the case `drainStarted` lost: both woken in one turn, the operation, a
+    // grandchild under `Async.deadline`, returning before the race's cancellation reached it (seen on Linux with
+    // epoll by the probe in Web ADR 0021 §1; the interleaving is the executor's, which a test here cannot force).
+    let first: Raced<u32?> = Raced { winner: 0, value: Some(7u32), other: null };
+    Check.isTrue(drainTaken<u32>(first) == Some(7u32), "the operation first")?;
+    let both: Raced<u32?> = Raced { winner: 1, value: null, other: Some(Some(7u32)) };
+    Check.isTrue(drainTaken<u32>(both) == Some(7u32), "the drain first, the operation's value in the same turn")?;
+    let late: Raced<u32?> = Raced { winner: 1, value: null, other: null };
+    Check.isTrue(drainTaken<u32>(late).isNull(), "the drain first, and the operation had nothing")?;
+    return Ok();
+}
+
+@test
+async fn drain_begun_races_an_operation() -> Result<void, TestFailure> {
+    // Before a drain the operation's value is the race's; after one, with nothing come, null.
+    let quiet = net(Drain.create())?;
+    let early: Result<Raced<u32?>, NetError> = await Async.race(
+        async () => match (await work(1, 9)) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => Err(e),
+        },
+        async () => await drainBegun<u32>(quiet),
+    );
+    Check.isTrue(drainTaken<u32>(net(early)?) == Some(9u32), "an operation before the drain")?;
+    quiet.start();
+    let none: Result<Raced<u32?>, NetError> = await Async.race(
+        async () => match (await work(1000, 9)) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => Err(e),
+        },
+        async () => await drainBegun<u32>(quiet),
+    );
+    Check.isTrue(drainTaken<u32>(net(none)?).isNull(), "the drain, with nothing taken")?;
+    return Ok();
+}
