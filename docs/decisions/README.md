@@ -24,6 +24,8 @@ accepted ADR is changed only by an amendment, recorded in it.
 | [0016](0016-isolated-connections.md) | Isolated connections and streams: a trap ends one connection or one stream, not the process | Accepted 2026-11-19 (connections and streams implemented) | after v0.5 |
 | [0017](0017-isolated-requests.md) | Isolated requests: a handler that traps is answered 500, and its connection goes on | Accepted 2026-11-20 (implemented) | after v0.5 |
 | [0018](0018-android-roots.md) | Android's frozen roots: Mozilla's root list with the system's, below Android 14 | Accepted 2026-11-20 (implemented) | after v0.5 |
+| [0019](0019-drain-linger.md) | A drain lets an idle connection's next request in, answered with `connection: close` | Accepted 2026-11-21 (implemented) | after v0.5 |
+| [0020](0020-isolated-sendfile.md) | An isolated request's file goes to its connection, and out with sendfile | Accepted 2026-11-21 (implemented) | after v0.5 |
 
 The language facts the ADRs rely on are checked by the programs in `tests/probes/` (results in its README).
 

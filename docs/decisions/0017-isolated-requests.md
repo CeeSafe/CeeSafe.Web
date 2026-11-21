@@ -355,7 +355,7 @@ child; this one is about 2.7 times that, with 0.80.0. It is noted here and not s
 measured once, on a loaded machine.
 
 **Left.**
-- `sendfile` for an isolated request (question 6): its file is read and sent through the channel until then.
+- `sendfile` for an isolated request (question 6): done by Web ADR 0020 (`Exchange.sendFileOwned`); a file lent with `sendFile` is still copied through the channel.
 - The benchmark-machine run that decides the default (question 1).
 - httpserver: its `Service.serve` (`src/app.cee:446`) chooses the entry as `HttpService` does (`serveIsolated` with its
   `Arc` when `limits.isolateRequests`), its `App` gives `Application.crashed` to its access log (§2.5), and
