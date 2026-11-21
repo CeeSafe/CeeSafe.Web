@@ -89,19 +89,20 @@ public struct ResponseHead {
 
     /// Whether a field named `name` (lower case) was added.
     public fn has(borrow this, name: StringView) -> bool {
+        // Line by line: `add` wrote each as "name: value\r\n", the name a token (no ':') and the value free of LF, so
+        // a line holds the name when its first name-length bytes are it and a ':' follows. The next line is found
+        // by indexOfByte, eight bytes at a time; a proxy asks this of every response it relays.
         let f = this.fields.readable();
+        let n = name.bytes().length;
         var start: usize = 0;
-        for (i in 0..f.length) {
-            if (f[i] == 58 && i >= start) {
-                if (Ascii.equalsIgnoringCase(f[start..i], name)) {
-                    return true;
-                }
-                // skip to the end of this line
-                var k = i;
-                while (k < f.length && f[k] != 10) {
-                    k += 1;
-                }
-                start = k + 1;
+        while (start < f.length) {
+            let line = f[start..];
+            if (line.length > n && line[n] == 58 && Ascii.equalsIgnoringCase(line[..n], name)) {
+                return true;
+            }
+            match (line.indexOfByte(10)) {
+                Some(k) => { start += k + 1; }
+                null => { return false; }
             }
         }
         return false;
