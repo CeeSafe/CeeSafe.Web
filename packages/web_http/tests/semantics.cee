@@ -104,6 +104,37 @@ fn header_list_capacity_is_64() -> Result<void, TestFailure> {
 }
 
 @test
+fn header_list_keeps_fields_past_the_inline_ones() -> Result<void, TestFailure> {
+    // Forty one-letter fields "a:0" … : the first 16 are in the list itself, the rest in its vector.
+    var text = Vector<u8>.create();
+    for (i in 0u8..40) {
+        if (text.push(97 + i % 26).isErr() || text.push(58).isErr() || text.push(48 + i % 10).isErr()) {
+            return Err(TestFailure.create("out of memory"));
+        }
+    }
+    var list = HeaderList.create(text.view());
+    for (i in 0usize..40) {
+        match (list.push(3 * i, 3 * i + 1, 3 * i + 2, 3 * i + 3, 64)) {
+            Ok() => {}
+            Err(_) => { return Err(TestFailure.create("40 fields fit")); }
+        }
+    }
+    Check.equalU64(40, list.count() as u64)?;
+    for (i in 0u32..40) {
+        let name = list.nameBytes(i);
+        let value = list.value(i);
+        if (name.length != 1 || name[0] != 97 + truncate<u8>(i % 26) || value.length != 1 ||
+            value[0] != 48 + truncate<u8>(i % 10)) {
+            return Err(TestFailure.create("a field changed past the inline ones"));
+        }
+    }
+    Check.isTrue(list.value(40).length == 0, "nothing past the end")?;
+    let named = list.getNamed("q") ?? "".bytes();
+    Check.equalBytes("6".bytes(), named)?; // field 16, the first in the vector
+    return Ok();
+}
+
+@test
 fn request_path_and_query() -> Result<void, TestFailure> {
     let text = "GET /a/b?x=1&y HTTP/1.1";
     let bytes = text.bytes();
